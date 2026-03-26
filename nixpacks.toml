@@ -1,5 +1,9 @@
-[phases.build]
+[phases.setup]
+nixPkgs = ["nodejs_18"]
+ 
+[phases.install]
 cmds = ["npm install"]
-
+ 
 [start]
 cmd = "node webhook.js"
+ 
