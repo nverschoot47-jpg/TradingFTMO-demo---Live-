@@ -177,7 +177,7 @@ const SYMBOL_MAP = {
 // !! Verifieer in MT5 → rechtermuisknop op symbool → Specificaties !!
 const LOT_VALUE = {
   "index":  20.00,  // indices CFD: €20/punt/lot
-  "gold":   10.00,  // XAUUSD: €10/punt/lot (1 lot = 100oz)
+  "gold":  100.00,  // XAUUSD: €100/punt/lot (1 lot = 100oz, $1 move = $100/lot)
   "brent":  10.00,  // UKOIL: €10/punt/lot
   "wti":    10.00,  // USOIL: €10/punt/lot
   "crypto":  1.00,  // variabel
