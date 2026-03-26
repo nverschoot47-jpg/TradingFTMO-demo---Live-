@@ -52,13 +52,13 @@ const WEBHOOK_SECRET  = process.env.WEBHOOK_SECRET || "FtmoNV2025";
 const ACCOUNT_BALANCE = parseFloat(process.env.ACCOUNT_BALANCE || "10000");
 
 // ── FIXED RISK IN EUR ─────────────────────────────────────────
-const RISK_EUR_BASE   = parseFloat(process.env.RISK_EUR_BASE   || "25");
-const RISK_EUR_MAX    = parseFloat(process.env.RISK_EUR_MAX    || "25");
-const RISK_EUR_MINLOT = parseFloat(process.env.RISK_EUR_MINLOT || "50");
+const RISK_EUR_BASE   = parseFloat(process.env.RISK_EUR_BASE   || "30");
+const RISK_EUR_MAX    = parseFloat(process.env.RISK_EUR_MAX    || "30");
+const RISK_EUR_MINLOT = parseFloat(process.env.RISK_EUR_MINLOT || "60");
 
 // ── FTMO DRAWDOWN GUARDS ──────────────────────────────────────
-const FTMO_DAILY_LOSS_PCT = 0.05;
-const FTMO_TOTAL_LOSS_PCT = 0.10;
+const FTMO_DAILY_LOSS_PCT = 0.02;
+const FTMO_TOTAL_LOSS_PCT = 0.08;
 let   ftmoDailyLossUsed   = 0;
 let   ftmoStartBalance     = ACCOUNT_BALANCE;
 let   ftmoLastDayReset     = new Date().toDateString();
@@ -220,16 +220,16 @@ const LOT_VALUE = {
   "wti":    10.00,
   "crypto":  1.00,
   "stock":   1.00,
-  "forex":  10.00,  // €10/pip/lot (standaard majors)
+  "forex":  2.00,  // €10/pip/lot (standaard majors)
 };
 
 // ── MIN STOP DISTANCE ─────────────────────────────────────────
 const MIN_STOP = {
-  "GER40.cash":    5.0,
-  "UK100.cash":    5.0,
-  "US100.cash":    5.0,
+  "GER40.cash":    6.0,
+  "UK100.cash":    3.0,
+  "US100.cash":    10.0,
   "US30.cash":     5.0,
-  "US500.cash":    2.0,
+  "US500.cash":    3.0,
   "JP225.cash":   10.0,
   "AUS200.cash":   3.0,
   "EU50.cash":     5.0,
@@ -237,7 +237,7 @@ const MIN_STOP = {
   "XAUUSD":        0.5,
   "UKOIL.cash":    0.05,
   "USOIL.cash":    0.05,
-  "BTCUSD":      100.0,
+  "BTCUSD":      200.0,
   "ETHUSD":        5.0,
   "default_stock": 0.5,
   "HK50.cash":    10.0,
@@ -257,13 +257,13 @@ const MIN_STOP = {
 // ── MAX LOTS ──────────────────────────────────────────────────
 // ✅ GEWIJZIGD: Forex max lots → 1.0 (was 10.0)
 const MAX_LOTS = {
-  "index":   5.0,
-  "gold":    2.0,
+  "index":   10.0,
+  "gold":    1.0,
   "brent":   5.0,
   "wti":     5.0,
   "crypto":  1.0,
-  "stock":  50.0,
-  "forex":   1.0,  // ✅ MAX 1 LOT FOREX (was 10.0)
+  "stock":  100.0,
+  "forex":   0.5,  // ✅ MAX 1 LOT FOREX (was 10.0)
 };
 
 // ── SYMBOL HELPERS ────────────────────────────────────────────
