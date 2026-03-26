@@ -34,6 +34,10 @@
 //  ✅ Anti-consolidation risk halving
 //  ✅ Max profit tracker + what-if RR analyse
 //  ✅ Equity curve snapshots (30s)
+// ─────────────────────────────────────────────────────────────
+// WIJZIGINGEN v2.1:
+//  🔼 Index risico x4: €50 → €200/trade
+//  🔽 Forex max lots: 10 → 1 lot (harde cap)
 // ═══════════════════════════════════════════════════════════════
 
 const express = require("express");
@@ -45,23 +49,16 @@ const META_API_TOKEN  = process.env.META_API_TOKEN;
 const META_ACCOUNT_ID = process.env.META_ACCOUNT_ID;
 const WEBHOOK_SECRET  = process.env.WEBHOOK_SECRET || "FtmoNV2025";
 
-// Pas ACCOUNT_BALANCE aan via env var als je challenge account grootte verandert
-// Free Trial = €10.000 | Challenge €25k/50k/100k/200k
 const ACCOUNT_BALANCE = parseFloat(process.env.ACCOUNT_BALANCE || "10000");
 
 // ── FIXED RISK IN EUR ─────────────────────────────────────────
-// Normaal risico per trade : €25 (harde cap)
-// Min-lot fallback cap     : €50 — enkel wanneer SL zo groot is dat
-//                            zelfs 1 min-lot meer kost dan €25
-//                            → dan accepteren we tot €50, anders skip
-// MIN SL + risk-per-min-lot berekening volgt later
-const RISK_EUR_BASE   = parseFloat(process.env.RISK_EUR_BASE   || "25"); // target + cap normaal
-const RISK_EUR_MAX    = parseFloat(process.env.RISK_EUR_MAX    || "25"); // cap normaal €25
-const RISK_EUR_MINLOT = parseFloat(process.env.RISK_EUR_MINLOT || "50"); // cap bij min-lot fallback
+const RISK_EUR_BASE   = parseFloat(process.env.RISK_EUR_BASE   || "25");
+const RISK_EUR_MAX    = parseFloat(process.env.RISK_EUR_MAX    || "25");
+const RISK_EUR_MINLOT = parseFloat(process.env.RISK_EUR_MINLOT || "50");
 
 // ── FTMO DRAWDOWN GUARDS ──────────────────────────────────────
-const FTMO_DAILY_LOSS_PCT = 0.05;  // 5% dagelijks verlies limiet
-const FTMO_TOTAL_LOSS_PCT = 0.10;  // 10% totaal verlies limiet
+const FTMO_DAILY_LOSS_PCT = 0.05;
+const FTMO_TOTAL_LOSS_PCT = 0.10;
 let   ftmoDailyLossUsed   = 0;
 let   ftmoStartBalance     = ACCOUNT_BALANCE;
 let   ftmoLastDayReset     = new Date().toDateString();
@@ -114,7 +111,7 @@ const learnedPatches = {};
 // ══════════════════════════════════════════════════════════════
 const SYMBOL_MAP = {
 
-  // ── INDICES: OANDA namen → FTMO .cash namen ───────────────────
+  // ── INDICES ────────────────────────────────────────────────────
   "DE30EUR":    { mt5: "GER40.cash",  type: "index"  },
   "UK100GBP":   { mt5: "UK100.cash",  type: "index"  },
   "NAS100USD":  { mt5: "US100.cash",  type: "index"  },
@@ -129,7 +126,7 @@ const SYMBOL_MAP = {
   "ESPIXEUR":   { mt5: "SPN35.cash",  type: "index"  },
   "NL25EUR":    { mt5: "NL25.cash",   type: "index"  },
 
-  // Extra aliassen (voor als chart op andere feed staat)
+  // Extra aliassen
   "GER40":      { mt5: "GER40.cash",  type: "index"  },
   "GER40.cash": { mt5: "GER40.cash",  type: "index"  },
   "UK100":      { mt5: "UK100.cash",  type: "index"  },
@@ -152,8 +149,6 @@ const SYMBOL_MAP = {
   "FR40":       { mt5: "FRA40.cash",  type: "index"  },
   "FRA40":      { mt5: "FRA40.cash",  type: "index"  },
   "FRA40.cash": { mt5: "FRA40.cash",  type: "index"  },
-
-  // Nieuwe indices aliassen
   "HK50":       { mt5: "HK50.cash",   type: "index"  },
   "HK50.cash":  { mt5: "HK50.cash",   type: "index"  },
   "US2000":     { mt5: "US2000.cash", type: "index"  },
@@ -173,11 +168,11 @@ const SYMBOL_MAP = {
   "USOIL":      { mt5: "USOIL.cash",  type: "wti"    },
   "USOIL.cash": { mt5: "USOIL.cash",  type: "wti"    },
 
-  // ── CRYPTO (24/5 op werkdagen bij FTMO) ──────────────────────
+  // ── CRYPTO ────────────────────────────────────────────────────
   "BTCUSD":     { mt5: "BTCUSD",      type: "crypto" },
   "ETHUSD":     { mt5: "ETHUSD",      type: "crypto" },
 
-  // ── US STOCKS (FTMO: geen suffix nodig) ───────────────────────
+  // ── US STOCKS ─────────────────────────────────────────────────
   "AAPL":       { mt5: "AAPL",        type: "stock"  },
   "TSLA":       { mt5: "TSLA",        type: "stock"  },
   "NVDA":       { mt5: "NVDA",        type: "stock"  },
@@ -186,7 +181,7 @@ const SYMBOL_MAP = {
   "AMZN":       { mt5: "AMZN",        type: "stock"  },
   "AMD":        { mt5: "AMD",         type: "stock"  },
 
-  // ── FOREX MAJORS (zelfde naam TV → MT5) ──────────────────────
+  // ── FOREX MAJORS ──────────────────────────────────────────────
   "EURUSD":     { mt5: "EURUSD",      type: "forex"  },
   "GBPUSD":     { mt5: "GBPUSD",      type: "forex"  },
   "USDJPY":     { mt5: "USDJPY",      type: "forex"  },
@@ -218,15 +213,14 @@ const SYMBOL_MAP = {
 };
 
 // ── LOT VALUE PER PUNT PER LOT (EUR) ─────────────────────────
-// !! Verifieer in MT5 → rechtermuisknop op symbool → Specificaties !!
 const LOT_VALUE = {
-  "index":  20.00,  // indices CFD: €20/punt/lot
-  "gold":  100.00,  // XAUUSD: €100/punt/lot (1 lot = 100oz, $1 move = $100/lot)
-  "brent":  10.00,  // UKOIL: €10/punt/lot
-  "wti":    10.00,  // USOIL: €10/punt/lot
-  "crypto":  1.00,  // variabel
-  "stock":   1.00,  // 1 lot = 1 share
-  "forex":  10.00,  // €10/pip/lot (standaard majors, 1 lot = 100k units)
+  "index":  20.00,
+  "gold":  100.00,
+  "brent":  10.00,
+  "wti":    10.00,
+  "crypto":  1.00,
+  "stock":   1.00,
+  "forex":  10.00,  // €10/pip/lot (standaard majors)
 };
 
 // ── MIN STOP DISTANCE ─────────────────────────────────────────
@@ -246,12 +240,10 @@ const MIN_STOP = {
   "BTCUSD":      100.0,
   "ETHUSD":        5.0,
   "default_stock": 0.5,
-  // Nieuwe indices
   "HK50.cash":    10.0,
   "US2000.cash":   1.0,
   "SPN35.cash":    2.0,
   "NL25.cash":     1.0,
-  // Forex (pips, 4-decimal pairs = 0.0005, JPY pairs = 0.05)
   "default_forex": 0.0005,
   "USDJPY":        0.05,
   "EURJPY":        0.05,
@@ -263,6 +255,7 @@ const MIN_STOP = {
 };
 
 // ── MAX LOTS ──────────────────────────────────────────────────
+// ✅ GEWIJZIGD: Forex max lots → 1.0 (was 10.0)
 const MAX_LOTS = {
   "index":   5.0,
   "gold":    2.0,
@@ -270,20 +263,27 @@ const MAX_LOTS = {
   "wti":     5.0,
   "crypto":  1.0,
   "stock":  50.0,
-  "forex":  10.0,  // max 10 lots forex
+  "forex":   1.0,  // ✅ MAX 1 LOT FOREX (was 10.0)
 };
 
 // ── SYMBOL HELPERS ────────────────────────────────────────────
 function getMT5Symbol(symbol) {
   if (learnedPatches[symbol]?.mt5Override) return learnedPatches[symbol].mt5Override;
   if (SYMBOL_MAP[symbol]) return SYMBOL_MAP[symbol].mt5;
-  return symbol; // geef onbekende symbolen ongewijzigd terug
+  return symbol;
 }
 
 function getSymbolType(symbol) {
   if (SYMBOL_MAP[symbol]) return SYMBOL_MAP[symbol].type;
   if (["BTC","ETH"].some(c => symbol.startsWith(c))) return "crypto";
   return "stock";
+}
+
+// ── RISICO PER TYPE ───────────────────────────────────────────
+// ✅ GEWIJZIGD: Index risico x4 → €200/trade (was €50)
+function getRiskForType(type) {
+  if (type === "index") return 200; // €200/trade voor indices
+  return RISK_EUR_BASE;
 }
 
 // ── MARKET HOURS (CET) ────────────────────────────────────────
@@ -301,21 +301,18 @@ function isCETMarketOpen(type) {
   const dayOfWeek = cet.getUTCDay();
   const timeHHMM  = cet.getUTCHours() * 100 + cet.getUTCMinutes();
 
-  // FTMO: GEEN weekend trading — ook geen crypto
   if (dayOfWeek === 0 || dayOfWeek === 6) {
     console.warn(`🚫 FTMO: geen weekend trading (dag ${dayOfWeek})`);
     return false;
   }
 
-  if (type === "crypto") return true; // crypto: ma–vr doorlopend
-
-  if (type === "forex") return true;  // forex: ma–vr 24h (weekend al geblokkeerd boven)
+  if (type === "crypto") return true;
+  if (type === "forex")  return true;
 
   if (type === "stock") {
-    return timeHHMM >= 1530 && timeHHMM < 2200; // US stocks 15:30–22:00 CET
+    return timeHHMM >= 1530 && timeHHMM < 2200;
   }
 
-  // Indices / gold / olie: sluit vrijdag 22:50
   if (dayOfWeek === 5 && timeHHMM >= 2250) return false;
   return true;
 }
@@ -358,7 +355,9 @@ async function closePosition(positionId) {
 function getEffectiveRisk(symbol, direction) {
   const key   = `${symbol}_${direction}`;
   const count = openTradeTracker[key] || 0;
-  return Math.max(1, RISK_EUR_BASE / Math.pow(2, count));
+  const type  = getSymbolType(symbol);
+  const base  = getRiskForType(type);
+  return Math.max(1, base / Math.pow(2, count));
 }
 
 function incrementTradeTracker(symbol, direction) {
@@ -499,7 +498,6 @@ function calcWhatIfRR(trade) {
   const lotValue = LOT_VALUE[getSymbolType(symbol)] || 1.0;
   const results  = {};
 
-  // ── Werkelijke max R bereikt ───────────────────────────────
   const maxFavorableMove = direction === "buy"
     ? (maxPrice ?? entry) - entry
     : entry - (maxPrice ?? entry);
@@ -512,7 +510,6 @@ function calcWhatIfRR(trade) {
   results["maxPotentialEUR"] = maxPotentialEUR;
   results["maxPriceReached"] = maxPrice ?? entry;
 
-  // ── Fixed RR targets ──────────────────────────────────────
   for (const rr of [1.5, 2, 2.5, 3, 4]) {
     const tpDist    = slDist * rr;
     const tp        = direction === "buy" ? entry + tpDist : entry - tpDist;
@@ -617,7 +614,6 @@ app.post("/webhook", async (req, res) => {
 
     const { action, entry, sl } = req.body;
 
-    // {{ticker}} vangnet
     const symbol = (req.body.symbol === "{{ticker}}" || !req.body.symbol)
       ? null : req.body.symbol;
 
@@ -648,7 +644,6 @@ app.post("/webhook", async (req, res) => {
       console.warn(`⚠️ Onbekend symbool: "${symbol}" — wordt doorgestuurd als "${mt5Sym}"`);
     }
 
-    // Markturen check
     if (!isCETMarketOpen(symType)) {
       const msg = `🕐 Markt gesloten voor ${symbol} (${symType}) — order genegeerd`;
       console.warn(msg);
@@ -656,7 +651,6 @@ app.post("/webhook", async (req, res) => {
       return res.status(200).json({ status: "SKIP", reason: msg });
     }
 
-    // FTMO dagelijks verlies check
     const effectiveRisk = getEffectiveRisk(symbol, direction);
     const ftmoCheck = ftmoSafetyCheck(effectiveRisk);
     if (!ftmoCheck.ok) {
@@ -764,9 +758,16 @@ app.post("/close", async (req, res) => {
 app.get("/", (req, res) => {
   resetDailyLossIfNewDay();
   res.json({
-    status: "online", versie: "ftmo-v2", broker: "FTMO-Demo",
+    status: "online", versie: "ftmo-v2.1", broker: "FTMO-Demo",
     accountBalance: ACCOUNT_BALANCE,
     risicoEUR: RISK_EUR_BASE, maxRisico: RISK_EUR_MAX,
+    risicoPerType: {
+      index:  200,           // ✅ €200/trade (x4)
+      gold:   RISK_EUR_BASE,
+      forex:  RISK_EUR_BASE,
+      stock:  RISK_EUR_BASE,
+    },
+    maxLotsPerType: MAX_LOTS, // ✅ forex: 1 lot
     ftmo: {
       startBalance:       ftmoStartBalance,
       dailyLossUsed:      parseFloat(ftmoDailyLossUsed.toFixed(2)),
@@ -799,6 +800,8 @@ app.get("/status", (req, res) => {
   res.json({
     openTrades: openTradeTracker, learnedPatches,
     risicoBase: RISK_EUR_BASE, risicoMax: RISK_EUR_MAX,
+    risicoPerType: { index: 200, gold: RISK_EUR_BASE, forex: RISK_EUR_BASE },
+    maxLotsPerType: MAX_LOTS,
     ftmoDailyUsed:      parseFloat(ftmoDailyLossUsed.toFixed(2)),
     ftmoDailyLimit:     parseFloat((ftmoStartBalance * FTMO_DAILY_LOSS_PCT).toFixed(2)),
     ftmoDailyRemaining: parseFloat((ftmoStartBalance * FTMO_DAILY_LOSS_PCT - ftmoDailyLossUsed).toFixed(2)),
@@ -858,5 +861,5 @@ app.get("/history", (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () =>
-  console.log(`🚀 FTMO Webhook v2 | Balance: €${ACCOUNT_BALANCE} | Risico: €${RISK_EUR_BASE}/trade | Daily limit: €${(ACCOUNT_BALANCE * FTMO_DAILY_LOSS_PCT).toFixed(0)} | Symbolen: ${Object.keys(SYMBOL_MAP).length}`)
+  console.log(`🚀 FTMO Webhook v2.1 | Balance: €${ACCOUNT_BALANCE} | Risico index: €200/trade (x4) | Risico overige: €${RISK_EUR_BASE}/trade | Forex max: ${MAX_LOTS.forex} lot | Daily limit: €${(ACCOUNT_BALANCE * FTMO_DAILY_LOSS_PCT).toFixed(0)} | Symbolen: ${Object.keys(SYMBOL_MAP).length}`)
 );
