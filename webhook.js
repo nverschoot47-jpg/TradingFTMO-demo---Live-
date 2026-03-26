@@ -57,7 +57,7 @@ const RISK_EUR_MAX    = parseFloat(process.env.RISK_EUR_MAX    || "30");
 const RISK_EUR_MINLOT = parseFloat(process.env.RISK_EUR_MINLOT || "60");
 
 // ── FTMO DRAWDOWN GUARDS ──────────────────────────────────────
-const FTMO_DAILY_LOSS_PCT = 0.02;
+const FTMO_DAILY_LOSS_PCT = 0.1
 const FTMO_TOTAL_LOSS_PCT = 0.08;
 let   ftmoDailyLossUsed   = 0;
 let   ftmoStartBalance     = ACCOUNT_BALANCE;
