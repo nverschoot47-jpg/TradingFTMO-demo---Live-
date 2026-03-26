@@ -27,7 +27,7 @@
 //  AMZN         →     AMZN          (zelfde)
 // ─────────────────────────────────────────────────────────────
 // FTMO REGELS INGEBOUWD:
-//  ✅ 5% dagelijks verlies guard → orders geblokkeerd
+//  ✅ Dagelijks verlies guard → UITGESCHAKELD
 //  ✅ Weekend auto-close (vrijdag 22:50 CET) — ALLES
 //  ✅ Geen weekend orders (ook geen crypto)
 //  ✅ Self-healing symbool/lot errors
@@ -37,7 +37,8 @@
 // ─────────────────────────────────────────────────────────────
 // WIJZIGINGEN v2.1:
 //  🔼 Index risico x4: €50 → €200/trade
-//  🔽 Forex max lots: 10 → 1 lot (harde cap)
+//  🔽 Forex max lots: 10 → 0.5 lot (harde cap)
+//  🔕 Dagelijks verlies limiet uitgeschakeld
 // ═══════════════════════════════════════════════════════════════
 
 const express = require("express");
@@ -56,10 +57,15 @@ const RISK_EUR_BASE   = parseFloat(process.env.RISK_EUR_BASE   || "30");
 const RISK_EUR_MAX    = parseFloat(process.env.RISK_EUR_MAX    || "30");
 const RISK_EUR_MINLOT = parseFloat(process.env.RISK_EUR_MINLOT || "60");
 
-// ── FTMO DRAWDOWN GUARDS ──────────────────────────────────────
-let   ftmoDailyLossUsed   = 0;
-let   ftmoStartBalance     = ACCOUNT_BALANCE;
-let   ftmoLastDayReset     = new Date().toDateString();
+// ── FTMO DRAWDOWN LIMITS ──────────────────────────────────────
+// Daily loss guard is DISABLED (set to 100% so it never triggers)
+const FTMO_DAILY_LOSS_PCT = parseFloat(process.env.FTMO_DAILY_LOSS_PCT || "1.0");
+const FTMO_TOTAL_LOSS_PCT = parseFloat(process.env.FTMO_TOTAL_LOSS_PCT || "0.10");
+
+// ── FTMO DRAWDOWN STATE ───────────────────────────────────────
+let ftmoDailyLossUsed = 0;
+let ftmoStartBalance  = ACCOUNT_BALANCE;
+let ftmoLastDayReset  = new Date().toDateString();
 
 function resetDailyLossIfNewDay() {
   const today = new Date().toDateString();
@@ -70,21 +76,14 @@ function resetDailyLossIfNewDay() {
   }
 }
 
+// Daily loss check is DISABLED — always returns ok
 function ftmoSafetyCheck(riskEUR) {
-  resetDailyLossIfNewDay();
-  const dailyLimit = ftmoStartBalance * FTMO_DAILY_LOSS_PCT;
-  if (ftmoDailyLossUsed + riskEUR > dailyLimit) {
-    return {
-      ok: false,
-      reason: `🚫 FTMO dagelijkse verliesgrens: €${ftmoDailyLossUsed.toFixed(2)} gebruikt van €${dailyLimit.toFixed(2)} — order geweigerd`,
-    };
-  }
   return { ok: true };
 }
 
 function registerFtmoLoss(riskEUR) {
   ftmoDailyLossUsed += riskEUR;
-  console.log(`📉 FTMO dagelijks verlies bijgewerkt: €${ftmoDailyLossUsed.toFixed(2)}`);
+  console.log(`📉 FTMO dagelijks verlies bijgewerkt: €${ftmoDailyLossUsed.toFixed(2)} (limiet uitgeschakeld)`);
 }
 
 // ── IN-MEMORY STORES ──────────────────────────────────────────
@@ -109,105 +108,105 @@ const learnedPatches = {};
 // ══════════════════════════════════════════════════════════════
 const SYMBOL_MAP = {
 
-  // ── INDICES ────────────────────────────────────────────────────
-  "DE30EUR":    { mt5: "GER40.cash",  type: "index"  },
-  "UK100GBP":   { mt5: "UK100.cash",  type: "index"  },
-  "NAS100USD":  { mt5: "US100.cash",  type: "index"  },
-  "US30USD":    { mt5: "US30.cash",   type: "index"  },
-  "SPX500USD":  { mt5: "US500.cash",  type: "index"  },
-  "JP225USD":   { mt5: "JP225.cash",  type: "index"  },
-  "AU200AUD":   { mt5: "AUS200.cash", type: "index"  },
-  "EU50EUR":    { mt5: "EU50.cash",   type: "index"  },
-  "FR40EUR":    { mt5: "FRA40.cash",  type: "index"  },
-  "HK33HKD":    { mt5: "HK50.cash",   type: "index"  },
-  "US2000USD":  { mt5: "US2000.cash", type: "index"  },
-  "ESPIXEUR":   { mt5: "SPN35.cash",  type: "index"  },
-  "NL25EUR":    { mt5: "NL25.cash",   type: "index"  },
+  // ── INDICES ───────────────────────────────────────────────────
+  "DE30EUR":     { mt5: "GER40.cash",  type: "index"  },
+  "UK100GBP":    { mt5: "UK100.cash",  type: "index"  },
+  "NAS100USD":   { mt5: "US100.cash",  type: "index"  },
+  "US30USD":     { mt5: "US30.cash",   type: "index"  },
+  "SPX500USD":   { mt5: "US500.cash",  type: "index"  },
+  "JP225USD":    { mt5: "JP225.cash",  type: "index"  },
+  "AU200AUD":    { mt5: "AUS200.cash", type: "index"  },
+  "EU50EUR":     { mt5: "EU50.cash",   type: "index"  },
+  "FR40EUR":     { mt5: "FRA40.cash",  type: "index"  },
+  "HK33HKD":     { mt5: "HK50.cash",   type: "index"  },
+  "US2000USD":   { mt5: "US2000.cash", type: "index"  },
+  "ESPIXEUR":    { mt5: "SPN35.cash",  type: "index"  },
+  "NL25EUR":     { mt5: "NL25.cash",   type: "index"  },
 
   // Extra aliassen
-  "GER40":      { mt5: "GER40.cash",  type: "index"  },
-  "GER40.cash": { mt5: "GER40.cash",  type: "index"  },
-  "UK100":      { mt5: "UK100.cash",  type: "index"  },
-  "UK100.cash": { mt5: "UK100.cash",  type: "index"  },
-  "NAS100":     { mt5: "US100.cash",  type: "index"  },
-  "US100":      { mt5: "US100.cash",  type: "index"  },
-  "US100.cash": { mt5: "US100.cash",  type: "index"  },
-  "US30":       { mt5: "US30.cash",   type: "index"  },
-  "US30.cash":  { mt5: "US30.cash",   type: "index"  },
-  "SPX500":     { mt5: "US500.cash",  type: "index"  },
-  "US500":      { mt5: "US500.cash",  type: "index"  },
-  "US500.cash": { mt5: "US500.cash",  type: "index"  },
-  "JP225":      { mt5: "JP225.cash",  type: "index"  },
-  "JP225.cash": { mt5: "JP225.cash",  type: "index"  },
-  "AU200":      { mt5: "AUS200.cash", type: "index"  },
-  "AUS200":     { mt5: "AUS200.cash", type: "index"  },
-  "AUS200.cash":{ mt5: "AUS200.cash", type: "index"  },
-  "EU50":       { mt5: "EU50.cash",   type: "index"  },
-  "EU50.cash":  { mt5: "EU50.cash",   type: "index"  },
-  "FR40":       { mt5: "FRA40.cash",  type: "index"  },
-  "FRA40":      { mt5: "FRA40.cash",  type: "index"  },
-  "FRA40.cash": { mt5: "FRA40.cash",  type: "index"  },
-  "HK50":       { mt5: "HK50.cash",   type: "index"  },
-  "HK50.cash":  { mt5: "HK50.cash",   type: "index"  },
-  "US2000":     { mt5: "US2000.cash", type: "index"  },
-  "US2000.cash":{ mt5: "US2000.cash", type: "index"  },
-  "SPN35":      { mt5: "SPN35.cash",  type: "index"  },
-  "SPN35.cash": { mt5: "SPN35.cash",  type: "index"  },
-  "NL25":       { mt5: "NL25.cash",   type: "index"  },
-  "NL25.cash":  { mt5: "NL25.cash",   type: "index"  },
+  "GER40":       { mt5: "GER40.cash",  type: "index"  },
+  "GER40.cash":  { mt5: "GER40.cash",  type: "index"  },
+  "UK100":       { mt5: "UK100.cash",  type: "index"  },
+  "UK100.cash":  { mt5: "UK100.cash",  type: "index"  },
+  "NAS100":      { mt5: "US100.cash",  type: "index"  },
+  "US100":       { mt5: "US100.cash",  type: "index"  },
+  "US100.cash":  { mt5: "US100.cash",  type: "index"  },
+  "US30":        { mt5: "US30.cash",   type: "index"  },
+  "US30.cash":   { mt5: "US30.cash",   type: "index"  },
+  "SPX500":      { mt5: "US500.cash",  type: "index"  },
+  "US500":       { mt5: "US500.cash",  type: "index"  },
+  "US500.cash":  { mt5: "US500.cash",  type: "index"  },
+  "JP225":       { mt5: "JP225.cash",  type: "index"  },
+  "JP225.cash":  { mt5: "JP225.cash",  type: "index"  },
+  "AU200":       { mt5: "AUS200.cash", type: "index"  },
+  "AUS200":      { mt5: "AUS200.cash", type: "index"  },
+  "AUS200.cash": { mt5: "AUS200.cash", type: "index"  },
+  "EU50":        { mt5: "EU50.cash",   type: "index"  },
+  "EU50.cash":   { mt5: "EU50.cash",   type: "index"  },
+  "FR40":        { mt5: "FRA40.cash",  type: "index"  },
+  "FRA40":       { mt5: "FRA40.cash",  type: "index"  },
+  "FRA40.cash":  { mt5: "FRA40.cash",  type: "index"  },
+  "HK50":        { mt5: "HK50.cash",   type: "index"  },
+  "HK50.cash":   { mt5: "HK50.cash",   type: "index"  },
+  "US2000":      { mt5: "US2000.cash", type: "index"  },
+  "US2000.cash": { mt5: "US2000.cash", type: "index"  },
+  "SPN35":       { mt5: "SPN35.cash",  type: "index"  },
+  "SPN35.cash":  { mt5: "SPN35.cash",  type: "index"  },
+  "NL25":        { mt5: "NL25.cash",   type: "index"  },
+  "NL25.cash":   { mt5: "NL25.cash",   type: "index"  },
 
   // ── GOLD ──────────────────────────────────────────────────────
-  "XAUUSD":     { mt5: "XAUUSD",      type: "gold"   },
-  "GOLD":       { mt5: "XAUUSD",      type: "gold"   },
+  "XAUUSD":      { mt5: "XAUUSD",      type: "gold"   },
+  "GOLD":        { mt5: "XAUUSD",      type: "gold"   },
 
   // ── COMMODITIES ───────────────────────────────────────────────
-  "UKOIL":      { mt5: "UKOIL.cash",  type: "brent"  },
-  "UKOIL.cash": { mt5: "UKOIL.cash",  type: "brent"  },
-  "USOIL":      { mt5: "USOIL.cash",  type: "wti"    },
-  "USOIL.cash": { mt5: "USOIL.cash",  type: "wti"    },
+  "UKOIL":       { mt5: "UKOIL.cash",  type: "brent"  },
+  "UKOIL.cash":  { mt5: "UKOIL.cash",  type: "brent"  },
+  "USOIL":       { mt5: "USOIL.cash",  type: "wti"    },
+  "USOIL.cash":  { mt5: "USOIL.cash",  type: "wti"    },
 
   // ── CRYPTO ────────────────────────────────────────────────────
-  "BTCUSD":     { mt5: "BTCUSD",      type: "crypto" },
-  "ETHUSD":     { mt5: "ETHUSD",      type: "crypto" },
+  "BTCUSD":      { mt5: "BTCUSD",      type: "crypto" },
+  "ETHUSD":      { mt5: "ETHUSD",      type: "crypto" },
 
   // ── US STOCKS ─────────────────────────────────────────────────
-  "AAPL":       { mt5: "AAPL",        type: "stock"  },
-  "TSLA":       { mt5: "TSLA",        type: "stock"  },
-  "NVDA":       { mt5: "NVDA",        type: "stock"  },
-  "MSFT":       { mt5: "MSFT",        type: "stock"  },
-  "PLTR":       { mt5: "PLTR",        type: "stock"  },
-  "AMZN":       { mt5: "AMZN",        type: "stock"  },
-  "AMD":        { mt5: "AMD",         type: "stock"  },
+  "AAPL":        { mt5: "AAPL",        type: "stock"  },
+  "TSLA":        { mt5: "TSLA",        type: "stock"  },
+  "NVDA":        { mt5: "NVDA",        type: "stock"  },
+  "MSFT":        { mt5: "MSFT",        type: "stock"  },
+  "PLTR":        { mt5: "PLTR",        type: "stock"  },
+  "AMZN":        { mt5: "AMZN",        type: "stock"  },
+  "AMD":         { mt5: "AMD",         type: "stock"  },
 
   // ── FOREX MAJORS ──────────────────────────────────────────────
-  "EURUSD":     { mt5: "EURUSD",      type: "forex"  },
-  "GBPUSD":     { mt5: "GBPUSD",      type: "forex"  },
-  "USDJPY":     { mt5: "USDJPY",      type: "forex"  },
-  "USDCHF":     { mt5: "USDCHF",      type: "forex"  },
-  "USDCAD":     { mt5: "USDCAD",      type: "forex"  },
-  "AUDUSD":     { mt5: "AUDUSD",      type: "forex"  },
-  "NZDUSD":     { mt5: "NZDUSD",      type: "forex"  },
+  "EURUSD":      { mt5: "EURUSD",      type: "forex"  },
+  "GBPUSD":      { mt5: "GBPUSD",      type: "forex"  },
+  "USDJPY":      { mt5: "USDJPY",      type: "forex"  },
+  "USDCHF":      { mt5: "USDCHF",      type: "forex"  },
+  "USDCAD":      { mt5: "USDCAD",      type: "forex"  },
+  "AUDUSD":      { mt5: "AUDUSD",      type: "forex"  },
+  "NZDUSD":      { mt5: "NZDUSD",      type: "forex"  },
 
   // ── FOREX CROSSES ─────────────────────────────────────────────
-  "EURGBP":     { mt5: "EURGBP",      type: "forex"  },
-  "EURJPY":     { mt5: "EURJPY",      type: "forex"  },
-  "EURCHF":     { mt5: "EURCHF",      type: "forex"  },
-  "EURAUD":     { mt5: "EURAUD",      type: "forex"  },
-  "EURCAD":     { mt5: "EURCAD",      type: "forex"  },
-  "GBPJPY":     { mt5: "GBPJPY",      type: "forex"  },
-  "GBPCHF":     { mt5: "GBPCHF",      type: "forex"  },
-  "GBPAUD":     { mt5: "GBPAUD",      type: "forex"  },
-  "GBPCAD":     { mt5: "GBPCAD",      type: "forex"  },
-  "AUDJPY":     { mt5: "AUDJPY",      type: "forex"  },
-  "AUDCAD":     { mt5: "AUDCAD",      type: "forex"  },
-  "AUDCHF":     { mt5: "AUDCHF",      type: "forex"  },
-  "AUDNZD":     { mt5: "AUDNZD",      type: "forex"  },
-  "CADJPY":     { mt5: "CADJPY",      type: "forex"  },
-  "CADCHF":     { mt5: "CADCHF",      type: "forex"  },
-  "NZDJPY":     { mt5: "NZDJPY",      type: "forex"  },
-  "NZDCAD":     { mt5: "NZDCAD",      type: "forex"  },
-  "NZDCHF":     { mt5: "NZDCHF",      type: "forex"  },
-  "CHFJPY":     { mt5: "CHFJPY",      type: "forex"  },
+  "EURGBP":      { mt5: "EURGBP",      type: "forex"  },
+  "EURJPY":      { mt5: "EURJPY",      type: "forex"  },
+  "EURCHF":      { mt5: "EURCHF",      type: "forex"  },
+  "EURAUD":      { mt5: "EURAUD",      type: "forex"  },
+  "EURCAD":      { mt5: "EURCAD",      type: "forex"  },
+  "GBPJPY":      { mt5: "GBPJPY",      type: "forex"  },
+  "GBPCHF":      { mt5: "GBPCHF",      type: "forex"  },
+  "GBPAUD":      { mt5: "GBPAUD",      type: "forex"  },
+  "GBPCAD":      { mt5: "GBPCAD",      type: "forex"  },
+  "AUDJPY":      { mt5: "AUDJPY",      type: "forex"  },
+  "AUDCAD":      { mt5: "AUDCAD",      type: "forex"  },
+  "AUDCHF":      { mt5: "AUDCHF",      type: "forex"  },
+  "AUDNZD":      { mt5: "AUDNZD",      type: "forex"  },
+  "CADJPY":      { mt5: "CADJPY",      type: "forex"  },
+  "CADCHF":      { mt5: "CADCHF",      type: "forex"  },
+  "NZDJPY":      { mt5: "NZDJPY",      type: "forex"  },
+  "NZDCAD":      { mt5: "NZDCAD",      type: "forex"  },
+  "NZDCHF":      { mt5: "NZDCHF",      type: "forex"  },
+  "CHFJPY":      { mt5: "CHFJPY",      type: "forex"  },
 };
 
 // ── LOT VALUE PER PUNT PER LOT (EUR) ─────────────────────────
@@ -218,14 +217,14 @@ const LOT_VALUE = {
   "wti":    10.00,
   "crypto":  1.00,
   "stock":   1.00,
-  "forex":  2.00,  // €10/pip/lot (standaard majors)
+  "forex":   2.00,
 };
 
 // ── MIN STOP DISTANCE ─────────────────────────────────────────
 const MIN_STOP = {
   "GER40.cash":    6.0,
   "UK100.cash":    3.0,
-  "US100.cash":    10.0,
+  "US100.cash":   10.0,
   "US30.cash":     5.0,
   "US500.cash":    3.0,
   "JP225.cash":   10.0,
@@ -253,15 +252,14 @@ const MIN_STOP = {
 };
 
 // ── MAX LOTS ──────────────────────────────────────────────────
-// ✅ GEWIJZIGD: Forex max lots → 1.0 (was 10.0)
 const MAX_LOTS = {
   "index":   10.0,
-  "gold":    1.0,
-  "brent":   5.0,
-  "wti":     5.0,
-  "crypto":  1.0,
+  "gold":     1.0,
+  "brent":    5.0,
+  "wti":      5.0,
+  "crypto":   1.0,
   "stock":  100.0,
-  "forex":   0.5,  // ✅ MAX 1 LOT FOREX (was 10.0)
+  "forex":    0.5,
 };
 
 // ── SYMBOL HELPERS ────────────────────────────────────────────
@@ -278,9 +276,8 @@ function getSymbolType(symbol) {
 }
 
 // ── RISICO PER TYPE ───────────────────────────────────────────
-// ✅ GEWIJZIGD: Index risico x4 → €200/trade (was €50)
 function getRiskForType(type) {
-  if (type === "index") return 200; // €200/trade voor indices
+  if (type === "index") return 200;
   return RISK_EUR_BASE;
 }
 
@@ -587,7 +584,7 @@ async function syncPositions() {
         margin:          info.margin     ?? null,
         freeMargin:      info.freeMargin ?? null,
         ftmoDailyLossUsed,
-        ftmoDailyLimit:  ftmoStartBalance * FTMO_DAILY_LOSS_PCT,
+        ftmoDailyLimit:  "DISABLED",
       });
       if (accountSnapshots.length > MAX_SNAPSHOTS) accountSnapshots.shift();
     } catch (e) { console.warn("⚠️ Equity snapshot mislukt:", e.message); }
@@ -650,6 +647,8 @@ app.post("/webhook", async (req, res) => {
     }
 
     const effectiveRisk = getEffectiveRisk(symbol, direction);
+
+    // ftmoSafetyCheck always returns ok (daily limit disabled)
     const ftmoCheck = ftmoSafetyCheck(effectiveRisk);
     if (!ftmoCheck.ok) {
       console.warn(ftmoCheck.reason);
@@ -722,8 +721,8 @@ app.post("/webhook", async (req, res) => {
       risicoEUR:          effectiveRisk.toFixed(2),
       maxRisicoEUR:       RISK_EUR_MAX.toFixed(2),
       ftmoDailyUsed:      ftmoDailyLossUsed.toFixed(2),
-      ftmoDailyLimit:     (ftmoStartBalance * FTMO_DAILY_LOSS_PCT).toFixed(2),
-      ftmoDailyRemaining: (ftmoStartBalance * FTMO_DAILY_LOSS_PCT - ftmoDailyLossUsed).toFixed(2),
+      ftmoDailyLimit:     "DISABLED",
+      ftmoDailyRemaining: "DISABLED",
       tradeNummer:        openTradeTracker[`${symbol}_${direction}`] || 1,
       positionId:         posId,
       metaApi:            result,
@@ -760,18 +759,18 @@ app.get("/", (req, res) => {
     accountBalance: ACCOUNT_BALANCE,
     risicoEUR: RISK_EUR_BASE, maxRisico: RISK_EUR_MAX,
     risicoPerType: {
-      index:  200,           // ✅ €200/trade (x4)
+      index:  200,
       gold:   RISK_EUR_BASE,
       forex:  RISK_EUR_BASE,
       stock:  RISK_EUR_BASE,
     },
-    maxLotsPerType: MAX_LOTS, // ✅ forex: 1 lot
+    maxLotsPerType: MAX_LOTS,
     ftmo: {
       startBalance:       ftmoStartBalance,
       dailyLossUsed:      parseFloat(ftmoDailyLossUsed.toFixed(2)),
-      dailyLossLimit:     parseFloat((ftmoStartBalance * FTMO_DAILY_LOSS_PCT).toFixed(2)),
+      dailyLossLimit:     "DISABLED",
       totalLossLimit:     parseFloat((ftmoStartBalance * FTMO_TOTAL_LOSS_PCT).toFixed(2)),
-      dailyLossRemaining: parseFloat((ftmoStartBalance * FTMO_DAILY_LOSS_PCT - ftmoDailyLossUsed).toFixed(2)),
+      dailyLossRemaining: "DISABLED",
     },
     symbolMap: Object.fromEntries(Object.entries(SYMBOL_MAP).map(([tv, v]) => [tv, v.mt5])),
     endpoints: {
@@ -801,8 +800,8 @@ app.get("/status", (req, res) => {
     risicoPerType: { index: 200, gold: RISK_EUR_BASE, forex: RISK_EUR_BASE },
     maxLotsPerType: MAX_LOTS,
     ftmoDailyUsed:      parseFloat(ftmoDailyLossUsed.toFixed(2)),
-    ftmoDailyLimit:     parseFloat((ftmoStartBalance * FTMO_DAILY_LOSS_PCT).toFixed(2)),
-    ftmoDailyRemaining: parseFloat((ftmoStartBalance * FTMO_DAILY_LOSS_PCT - ftmoDailyLossUsed).toFixed(2)),
+    ftmoDailyLimit:     "DISABLED",
+    ftmoDailyRemaining: "DISABLED",
   });
 });
 
@@ -857,7 +856,8 @@ app.get("/history", (req, res) => {
   res.json({ count: webhookHistory.length, history: webhookHistory.slice(0, limit) });
 });
 
+// ── START ─────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () =>
-  console.log(`🚀 FTMO Webhook v2.1 | Balance: €${ACCOUNT_BALANCE} | Risico index: €200/trade (x4) | Risico overige: €${RISK_EUR_BASE}/trade | Forex max: ${MAX_LOTS.forex} lot | Daily limit: €${(ACCOUNT_BALANCE * FTMO_DAILY_LOSS_PCT).toFixed(0)} | Symbolen: ${Object.keys(SYMBOL_MAP).length}`)
+  console.log(`🚀 FTMO Webhook v2.1 | Balance: €${ACCOUNT_BALANCE} | Risico index: €200/trade (x4) | Risico overige: €${RISK_EUR_BASE}/trade | Forex max: ${MAX_LOTS.forex} lot | Dagelijks verlies: UITGESCHAKELD | Symbolen: ${Object.keys(SYMBOL_MAP).length}`)
 );
