@@ -34,6 +34,10 @@
 //  ✅ Anti-consolidation risk halving
 //  ✅ Max profit tracker + what-if RR analyse
 //  ✅ Equity curve snapshots (30s)
+// ─────────────────────────────────────────────────────────────
+// WIJZIGINGEN v2.1:
+//  🔼 Index risico x4: €50 → €200/trade (via RISK_EUR_INDEX)
+//  🔽 Forex max lots: 10 → 1 lot (harde cap)
 // ═══════════════════════════════════════════════════════════════
 
 const express = require("express");
@@ -54,16 +58,14 @@ const ACCOUNT_BALANCE = parseFloat(process.env.ACCOUNT_BALANCE || "10000");
 // Min-lot fallback cap     : €50 — enkel wanneer SL zo groot is dat
 //                            zelfs 1 min-lot meer kost dan €25
 //                            → dan accepteren we tot €50, anders skip
-// MIN SL + risk-per-min-lot berekening volgt later
 const RISK_EUR_BASE   = parseFloat(process.env.RISK_EUR_BASE   || "25"); // target + cap normaal
 const RISK_EUR_MAX    = parseFloat(process.env.RISK_EUR_MAX    || "25"); // cap normaal €25
 const RISK_EUR_MINLOT = parseFloat(process.env.RISK_EUR_MINLOT || "50"); // cap bij min-lot fallback
 
 // ── PER-TYPE RISICO OVERSCHRIJVING ────────────────────────────
-// Overschrijf het risico per type (optioneel — als niet ingesteld: RISK_EUR_BASE)
-// Index: €50/trade | Gold: €25/trade (default) | Forex: €25/trade (default)
-const RISK_EUR_INDEX = parseFloat(process.env.RISK_EUR_INDEX || "50"); // indices: €50/trade
+// ✅ GEWIJZIGD: Index risico x4 → van €50 naar €200/trade
 // Gold en andere types gebruiken RISK_EUR_BASE tenzij apart geconfigureerd
+const RISK_EUR_INDEX = parseFloat(process.env.RISK_EUR_INDEX || "200"); // indices: €200/trade (x4 van €50)
 
 function getRiskForType(type) {
   if (type === "index") return RISK_EUR_INDEX;
@@ -230,10 +232,6 @@ const SYMBOL_MAP = {
 
 // ── LOT VALUE PER PUNT PER LOT (EUR) ─────────────────────────
 // !! Verifieer in MT5 → rechtermuisknop op symbool → Specificaties !!
-// WIJZIGINGEN t.o.v. vorige versie:
-//   index:  €20 → €20  (ongewijzigd; risico verhoogd via RISK_EUR_INDEX = €50)
-//   gold:   €100        (ongewijzigd ✅)
-//   forex:  €10 → €100  (risico was 10x te hoog → fix: hogere lotValue = kleinere lots)
 const LOT_VALUE = {
   "index":  20.00,  // indices CFD: €20/punt/lot
   "gold":  100.00,  // XAUUSD: €100/punt/lot (1 lot = 100oz, $1 move = $100/lot)
@@ -241,7 +239,7 @@ const LOT_VALUE = {
   "wti":    10.00,  // USOIL: €10/punt/lot
   "crypto":  1.00,  // variabel
   "stock":   1.00,  // 1 lot = 1 share
-  "forex":  100.00, // ✅ GECORRIGEERD: was €10 → €100 (risico /10, van €330 naar €33)
+  "forex":  100.00, // ✅ €100/pip/lot (gecorrigeerd)
 };
 
 // ── MIN STOP DISTANCE ─────────────────────────────────────────
@@ -278,6 +276,7 @@ const MIN_STOP = {
 };
 
 // ── MAX LOTS ──────────────────────────────────────────────────
+// ✅ GEWIJZIGD: Forex max lots → 1.0 (was 10.0)
 const MAX_LOTS = {
   "index":   5.0,
   "gold":    2.0,
@@ -285,14 +284,14 @@ const MAX_LOTS = {
   "wti":     5.0,
   "crypto":  1.0,
   "stock":  50.0,
-  "forex":  10.0,  // max 10 lots forex
+  "forex":   1.0,  // ✅ MAX 1 LOT FOREX (was 10.0)
 };
 
 // ── SYMBOL HELPERS ────────────────────────────────────────────
 function getMT5Symbol(symbol) {
   if (learnedPatches[symbol]?.mt5Override) return learnedPatches[symbol].mt5Override;
   if (SYMBOL_MAP[symbol]) return SYMBOL_MAP[symbol].mt5;
-  return symbol; // geef onbekende symbolen ongewijzigd terug
+  return symbol;
 }
 
 function getSymbolType(symbol) {
@@ -323,8 +322,7 @@ function isCETMarketOpen(type) {
   }
 
   if (type === "crypto") return true; // crypto: ma–vr doorlopend
-
-  if (type === "forex") return true;  // forex: ma–vr 24h (weekend al geblokkeerd boven)
+  if (type === "forex")  return true; // forex: ma–vr 24h
 
   if (type === "stock") {
     return timeHHMM >= 1530 && timeHHMM < 2200; // US stocks 15:30–22:00 CET
@@ -516,7 +514,6 @@ function calcWhatIfRR(trade) {
   const lotValue = LOT_VALUE[getSymbolType(symbol)] || 1.0;
   const results  = {};
 
-  // ── Werkelijke max R bereikt ───────────────────────────────
   const maxFavorableMove = direction === "buy"
     ? (maxPrice ?? entry) - entry
     : entry - (maxPrice ?? entry);
@@ -529,7 +526,6 @@ function calcWhatIfRR(trade) {
   results["maxPotentialEUR"] = maxPotentialEUR;
   results["maxPriceReached"] = maxPrice ?? entry;
 
-  // ── Fixed RR targets ──────────────────────────────────────
   for (const rr of [1.5, 2, 2.5, 3, 4]) {
     const tpDist    = slDist * rr;
     const tp        = direction === "buy" ? entry + tpDist : entry - tpDist;
@@ -781,10 +777,16 @@ app.post("/close", async (req, res) => {
 app.get("/", (req, res) => {
   resetDailyLossIfNewDay();
   res.json({
-    status: "online", versie: "ftmo-v2", broker: "FTMO-Demo",
+    status: "online", versie: "ftmo-v2.1", broker: "FTMO-Demo",
     accountBalance: ACCOUNT_BALANCE,
     risicoEUR: RISK_EUR_BASE, maxRisico: RISK_EUR_MAX,
-    risicoPerType: { index: RISK_EUR_INDEX, gold: RISK_EUR_BASE, forex: RISK_EUR_BASE, stock: RISK_EUR_BASE },
+    risicoPerType: {
+      index:  RISK_EUR_INDEX,   // ✅ €200/trade (x4)
+      gold:   RISK_EUR_BASE,
+      forex:  RISK_EUR_BASE,
+      stock:  RISK_EUR_BASE,
+    },
+    maxLotsPerType: MAX_LOTS,   // ✅ forex max 1 lot zichtbaar
     ftmo: {
       startBalance:       ftmoStartBalance,
       dailyLossUsed:      parseFloat(ftmoDailyLossUsed.toFixed(2)),
@@ -817,7 +819,12 @@ app.get("/status", (req, res) => {
   res.json({
     openTrades: openTradeTracker, learnedPatches,
     risicoBase: RISK_EUR_BASE, risicoMax: RISK_EUR_MAX,
-    risicoPerType: { index: RISK_EUR_INDEX, gold: RISK_EUR_BASE, forex: RISK_EUR_BASE },
+    risicoPerType: {
+      index: RISK_EUR_INDEX,
+      gold:  RISK_EUR_BASE,
+      forex: RISK_EUR_BASE,
+    },
+    maxLotsPerType: MAX_LOTS,
     ftmoDailyUsed:      parseFloat(ftmoDailyLossUsed.toFixed(2)),
     ftmoDailyLimit:     parseFloat((ftmoStartBalance * FTMO_DAILY_LOSS_PCT).toFixed(2)),
     ftmoDailyRemaining: parseFloat((ftmoStartBalance * FTMO_DAILY_LOSS_PCT - ftmoDailyLossUsed).toFixed(2)),
@@ -877,5 +884,5 @@ app.get("/history", (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () =>
-  console.log(`🚀 FTMO Webhook v2 | Balance: €${ACCOUNT_BALANCE} | Risico index: €${RISK_EUR_INDEX} | Risico overige: €${RISK_EUR_BASE}/trade | Daily limit: €${(ACCOUNT_BALANCE * FTMO_DAILY_LOSS_PCT).toFixed(0)} | Symbolen: ${Object.keys(SYMBOL_MAP).length}`)
+  console.log(`🚀 FTMO Webhook v2.1 | Balance: €${ACCOUNT_BALANCE} | Risico index: €${RISK_EUR_INDEX} (x4) | Risico overige: €${RISK_EUR_BASE}/trade | Forex max: ${MAX_LOTS.forex} lot | Daily limit: €${(ACCOUNT_BALANCE * FTMO_DAILY_LOSS_PCT).toFixed(0)} | Symbolen: ${Object.keys(SYMBOL_MAP).length}`)
 );
