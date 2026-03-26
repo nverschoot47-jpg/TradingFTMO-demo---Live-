@@ -498,17 +498,31 @@ function calcWhatIfRR(trade) {
   const slDist   = Math.abs(entry - sl);
   const lotValue = LOT_VALUE[getSymbolType(symbol)] || 1.0;
   const results  = {};
-  for (const rr of [2, 3, 4]) {
+
+  // ── Werkelijke max R bereikt ───────────────────────────────
+  const maxFavorableMove = direction === "buy"
+    ? (maxPrice ?? entry) - entry
+    : entry - (maxPrice ?? entry);
+  const maxR = slDist > 0
+    ? parseFloat((Math.max(0, maxFavorableMove) / slDist).toFixed(2))
+    : 0;
+  const maxPotentialEUR = parseFloat((Math.max(0, maxFavorableMove) * lots * lotValue).toFixed(2));
+
+  results["maxR"]            = maxR;
+  results["maxPotentialEUR"] = maxPotentialEUR;
+  results["maxPriceReached"] = maxPrice ?? entry;
+
+  // ── Fixed RR targets ──────────────────────────────────────
+  for (const rr of [1.5, 2, 2.5, 3, 4]) {
     const tpDist    = slDist * rr;
     const tp        = direction === "buy" ? entry + tpDist : entry - tpDist;
-    const potential = lots * tpDist * lotValue;
-    const wouldHit  = direction === "buy" ? maxPrice >= tp : maxPrice <= tp;
-    results[`${rr}:1`] = {
-      tp: parseFloat(tp.toFixed(5)),
-      potential: parseFloat(potential.toFixed(2)),
-      wouldHit,
-    };
+    const potential = parseFloat((lots * tpDist * lotValue).toFixed(2));
+    const wouldHit  = direction === "buy"
+      ? (maxPrice ?? entry) >= tp
+      : (maxPrice ?? entry) <= tp;
+    results[`${rr}:1`] = { tp: parseFloat(tp.toFixed(5)), potential, wouldHit };
   }
+
   return results;
 }
 
