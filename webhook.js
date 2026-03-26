@@ -124,6 +124,10 @@ const SYMBOL_MAP = {
   "AU200AUD":   { mt5: "AUS200.cash", type: "index"  },
   "EU50EUR":    { mt5: "EU50.cash",   type: "index"  },
   "FR40EUR":    { mt5: "FRA40.cash",  type: "index"  },
+  "HK33HKD":    { mt5: "HK50.cash",   type: "index"  },
+  "US2000USD":  { mt5: "US2000.cash", type: "index"  },
+  "ESPIXEUR":   { mt5: "SPN35.cash",  type: "index"  },
+  "NL25EUR":    { mt5: "NL25.cash",   type: "index"  },
 
   // Extra aliassen (voor als chart op andere feed staat)
   "GER40":      { mt5: "GER40.cash",  type: "index"  },
@@ -149,6 +153,16 @@ const SYMBOL_MAP = {
   "FRA40":      { mt5: "FRA40.cash",  type: "index"  },
   "FRA40.cash": { mt5: "FRA40.cash",  type: "index"  },
 
+  // Nieuwe indices aliassen
+  "HK50":       { mt5: "HK50.cash",   type: "index"  },
+  "HK50.cash":  { mt5: "HK50.cash",   type: "index"  },
+  "US2000":     { mt5: "US2000.cash", type: "index"  },
+  "US2000.cash":{ mt5: "US2000.cash", type: "index"  },
+  "SPN35":      { mt5: "SPN35.cash",  type: "index"  },
+  "SPN35.cash": { mt5: "SPN35.cash",  type: "index"  },
+  "NL25":       { mt5: "NL25.cash",   type: "index"  },
+  "NL25.cash":  { mt5: "NL25.cash",   type: "index"  },
+
   // ── GOLD ──────────────────────────────────────────────────────
   "XAUUSD":     { mt5: "XAUUSD",      type: "gold"   },
   "GOLD":       { mt5: "XAUUSD",      type: "gold"   },
@@ -171,6 +185,36 @@ const SYMBOL_MAP = {
   "PLTR":       { mt5: "PLTR",        type: "stock"  },
   "AMZN":       { mt5: "AMZN",        type: "stock"  },
   "AMD":        { mt5: "AMD",         type: "stock"  },
+
+  // ── FOREX MAJORS (zelfde naam TV → MT5) ──────────────────────
+  "EURUSD":     { mt5: "EURUSD",      type: "forex"  },
+  "GBPUSD":     { mt5: "GBPUSD",      type: "forex"  },
+  "USDJPY":     { mt5: "USDJPY",      type: "forex"  },
+  "USDCHF":     { mt5: "USDCHF",      type: "forex"  },
+  "USDCAD":     { mt5: "USDCAD",      type: "forex"  },
+  "AUDUSD":     { mt5: "AUDUSD",      type: "forex"  },
+  "NZDUSD":     { mt5: "NZDUSD",      type: "forex"  },
+
+  // ── FOREX CROSSES ─────────────────────────────────────────────
+  "EURGBP":     { mt5: "EURGBP",      type: "forex"  },
+  "EURJPY":     { mt5: "EURJPY",      type: "forex"  },
+  "EURCHF":     { mt5: "EURCHF",      type: "forex"  },
+  "EURAUD":     { mt5: "EURAUD",      type: "forex"  },
+  "EURCAD":     { mt5: "EURCAD",      type: "forex"  },
+  "GBPJPY":     { mt5: "GBPJPY",      type: "forex"  },
+  "GBPCHF":     { mt5: "GBPCHF",      type: "forex"  },
+  "GBPAUD":     { mt5: "GBPAUD",      type: "forex"  },
+  "GBPCAD":     { mt5: "GBPCAD",      type: "forex"  },
+  "AUDJPY":     { mt5: "AUDJPY",      type: "forex"  },
+  "AUDCAD":     { mt5: "AUDCAD",      type: "forex"  },
+  "AUDCHF":     { mt5: "AUDCHF",      type: "forex"  },
+  "AUDNZD":     { mt5: "AUDNZD",      type: "forex"  },
+  "CADJPY":     { mt5: "CADJPY",      type: "forex"  },
+  "CADCHF":     { mt5: "CADCHF",      type: "forex"  },
+  "NZDJPY":     { mt5: "NZDJPY",      type: "forex"  },
+  "NZDCAD":     { mt5: "NZDCAD",      type: "forex"  },
+  "NZDCHF":     { mt5: "NZDCHF",      type: "forex"  },
+  "CHFJPY":     { mt5: "CHFJPY",      type: "forex"  },
 };
 
 // ── LOT VALUE PER PUNT PER LOT (EUR) ─────────────────────────
@@ -182,6 +226,7 @@ const LOT_VALUE = {
   "wti":    10.00,  // USOIL: €10/punt/lot
   "crypto":  1.00,  // variabel
   "stock":   1.00,  // 1 lot = 1 share
+  "forex":  10.00,  // €10/pip/lot (standaard majors, 1 lot = 100k units)
 };
 
 // ── MIN STOP DISTANCE ─────────────────────────────────────────
@@ -201,6 +246,20 @@ const MIN_STOP = {
   "BTCUSD":      100.0,
   "ETHUSD":        5.0,
   "default_stock": 0.5,
+  // Nieuwe indices
+  "HK50.cash":    10.0,
+  "US2000.cash":   1.0,
+  "SPN35.cash":    2.0,
+  "NL25.cash":     1.0,
+  // Forex (pips, 4-decimal pairs = 0.0005, JPY pairs = 0.05)
+  "default_forex": 0.0005,
+  "USDJPY":        0.05,
+  "EURJPY":        0.05,
+  "GBPJPY":        0.05,
+  "AUDJPY":        0.05,
+  "CADJPY":        0.05,
+  "NZDJPY":        0.05,
+  "CHFJPY":        0.05,
 };
 
 // ── MAX LOTS ──────────────────────────────────────────────────
@@ -211,6 +270,7 @@ const MAX_LOTS = {
   "wti":     5.0,
   "crypto":  1.0,
   "stock":  50.0,
+  "forex":  10.0,  // max 10 lots forex
 };
 
 // ── SYMBOL HELPERS ────────────────────────────────────────────
@@ -248,6 +308,8 @@ function isCETMarketOpen(type) {
   }
 
   if (type === "crypto") return true; // crypto: ma–vr doorlopend
+
+  if (type === "forex") return true;  // forex: ma–vr 24h (weekend al geblokkeerd boven)
 
   if (type === "stock") {
     return timeHHMM >= 1530 && timeHHMM < 2200; // US stocks 15:30–22:00 CET
@@ -356,7 +418,9 @@ function calcLots(symbol, entry, sl, effectiveRisk) {
 
 // ── SL VALIDATIE ──────────────────────────────────────────────
 function validateSL(direction, entry, sl, mt5Symbol) {
-  const minDist = MIN_STOP[mt5Symbol] || MIN_STOP["default_stock"] || 0.01;
+  const type    = getSymbolType(mt5Symbol) === "forex" ? "forex" : null;
+  const minDist = MIN_STOP[mt5Symbol] ||
+    (type === "forex" ? MIN_STOP["default_forex"] : MIN_STOP["default_stock"]) || 0.01;
   const slDist  = Math.abs(entry - sl);
   if (slDist < minDist) {
     const adjusted = direction === "buy" ? entry - minDist : entry + minDist;
