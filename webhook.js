@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════
-// TradingView → MetaApi REST → MT5  |  FTMO Webhook Server v3.2
+// TradingView → MetaApi REST → MT5  |  FTMO Webhook Server v3.3
 // Account : Nick Verschoot — FTMO Demo
 // MetaApi : 7cb566c1-be02-415b-ab95-495368f3885c
 // ───────────────────────────────────────────────────────────────
@@ -18,6 +18,7 @@
 //  ✅ Equity curve snapshots (30s)
 //  ✅ /research/tp-optimizer        — beste TP per symbool op basis van history
 //  ✅ POST /research/tp-optimizer/apply — past TP_RR_BY_SYMBOL aan (≥10 trades, EV>0)
+//  ✅ Live TP-correctie open posities — na apply worden open MT5 orders direct bijgewerkt
 // ═══════════════════════════════════════════════════════════════
 
 const express = require("express");
@@ -413,6 +414,60 @@ async function closePosition(positionId) {
   return data;
 }
 
+// ── UPDATE TP VAN OPEN POSITIES IN MT5 ───────────────────────
+// Wordt aangeroepen na elke TP_RR_BY_SYMBOL update (cron + apply endpoint).
+// Zoekt alle open posities voor een symbool en stuurt de nieuwe TP door naar MT5.
+async function updateOpenPositionsTP(mt5Sym, newRR) {
+  const affected = Object.values(openPositions).filter(p => p.mt5Symbol === mt5Sym);
+  if (affected.length === 0) {
+    console.log(`[TP-UPDATE] Geen open posities voor ${mt5Sym} — niets te updaten`);
+    return { updated: 0, skipped: 0, errors: [] };
+  }
+
+  let updated = 0;
+  let skipped = 0;
+  const errors = [];
+
+  for (const pos of affected) {
+    try {
+      const slDist = Math.abs(pos.entry - pos.sl);
+      if (!slDist) { skipped++; continue; }
+
+      const newTP = pos.direction === "buy"
+        ? parseFloat((pos.entry + slDist * newRR).toFixed(5))
+        : parseFloat((pos.entry - slDist * newRR).toFixed(5));
+
+      const res = await fetch(`${META_BASE}/positions/${pos.id}`, {
+        method:  "PUT",
+        headers: { "Content-Type": "application/json", "auth-token": META_API_TOKEN },
+        body:    JSON.stringify({ takeProfit: newTP }),
+      });
+
+      const data = await res.json();
+      const isErr = data?.error || (data?.retcode && data?.retcode !== 10009 && data?.retcode !== "TRADE_RETCODE_DONE");
+
+      if (isErr) {
+        const msg = data?.error?.message || data?.comment || JSON.stringify(data);
+        console.warn(`⚠️ [TP-UPDATE] ${mt5Sym} pos ${pos.id} — MT5 fout: ${msg}`);
+        errors.push({ posId: pos.id, error: msg });
+        skipped++;
+      } else {
+        const oldTP = pos.tp ?? "geen";
+        pos.tp = newTP;
+        console.log(`✅ [TP-UPDATE] ${mt5Sym} pos ${pos.id} | ${pos.direction} | TP: ${oldTP} → ${newTP}  (${newRR}RR)`);
+        updated++;
+      }
+    } catch (e) {
+      console.error(`❌ [TP-UPDATE] ${mt5Sym} pos ${pos.id} — exception: ${e.message}`);
+      errors.push({ posId: pos.id, error: e.message });
+      skipped++;
+    }
+  }
+
+  console.log(`[TP-UPDATE] ${mt5Sym} klaar — ${updated} bijgewerkt, ${skipped} overgeslagen, ${errors.length} fouten`);
+  return { updated, skipped, errors };
+}
+
 // ── FRIDAY AUTO-CLOSE (22:50 CET) — ALLE POSITIES ────────────
 async function checkFridayClose() {
   const t   = getGMT1Time();
@@ -485,7 +540,7 @@ console.log("⏰ Daily stock auto-close actief: elke werkdag om 20:50 (Europe/Br
 // ── NACHTELIJKE TP AUTO-UPDATE (03:00 CET) ────────────────────
 // Elke nacht om 03:00 berekent de optimizer de beste RR per symbool
 // en past TP_RR_BY_SYMBOL aan voor symbolen met ≥10 trades en positieve EV.
-cron.schedule("0 3 * * *", () => {
+cron.schedule("0 3 * * *", async () => {
   console.log("🌙 [TP AUTO-UPDATE] Nachtelijke optimizer gestart (03:00 CET)...");
 
   const MIN_TRADES = 10;
@@ -523,6 +578,9 @@ cron.schedule("0 3 * * *", () => {
 
     applied.push(`${mt5Sym}: ${oldRR ?? "?"} → ${newRR}RR  (EV: +${r.bestEV} | ${r.trades} trades)`);
     console.log(`✅ [TP AUTO-UPDATE] ${mt5Sym}: ${oldRR ?? "?"} → ${newRR}RR  (EV: +${r.bestEV} | winrate: ${r.bestWinrate} | ${r.trades} trades)`);
+
+    // ── Pas open posities in MT5 direct aan naar nieuwe TP ──
+    await updateOpenPositionsTP(mt5Sym, newRR);
   }
 
   if (skipped.length)  console.log(`⏭️  [TP AUTO-UPDATE] Overgeslagen: ${skipped.join(" | ")}`);
@@ -940,7 +998,7 @@ app.get("/", (req, res) => {
   resetDailyLossIfNewDay();
   res.json({
     status: "online",
-    versie:  "ftmo-v3.2",
+    versie:  "ftmo-v3.3",
     broker:  "FTMO-Demo",
     account: ACCOUNT_BALANCE,
     risicoPerType: RISK,
@@ -1166,7 +1224,7 @@ app.get("/research/tp-optimizer", (req, res) => {
 // POST /research/tp-optimizer/apply
 // Past TP_RR_BY_SYMBOL in memory aan voor symbolen met ≥10 trades en positieve EV.
 // Nooit automatisch — alleen als jij dit endpoint aanroept.
-app.post("/research/tp-optimizer/apply", (req, res) => {
+app.post("/research/tp-optimizer/apply", async (req, res) => {
   const secret = req.query.secret || req.headers["x-secret"];
   if (secret !== WEBHOOK_SECRET) return res.status(401).json({ error: "Unauthorized" });
 
@@ -1211,26 +1269,30 @@ app.post("/research/tp-optimizer/apply", (req, res) => {
       TP_RR_BY_SYMBOL[mt5Sym] = newRR;
     }
 
+    console.log(`✅ TP-APPLY: ${mt5Sym} → ${newRR}RR  (was: ${oldRR ?? "onbekend"} | EV: +${r.bestEV} | ${r.trades} trades)`);
+
+    // ── Pas open posities in MT5 direct aan naar nieuwe TP ──
+    const liveUpdate = await updateOpenPositionsTP(mt5Sym, newRR);
+
     applied.push({
-      symbol:  r.symbol,
+      symbol:      r.symbol,
       mt5Sym,
       oldRR,
       newRR,
-      trades:  r.trades,
-      bestEV:  r.bestEV,
-      winrate: r.bestWinrate,
+      trades:      r.trades,
+      bestEV:      r.bestEV,
+      winrate:     r.bestWinrate,
+      liveUpdate,
     });
-
-    console.log(`✅ TP-APPLY: ${mt5Sym} → ${newRR}RR  (was: ${oldRR ?? "onbekend"} | EV: +${r.bestEV} | ${r.trades} trades)`);
   }
 
   res.json({
-    status:         "OK",
-    appliedAt:      new Date().toISOString(),
+    status:           "OK",
+    appliedAt:        new Date().toISOString(),
     minTradesVereist: MIN_TRADES,
     applied,
-    skipped:        skippedSymbols,
-    tpRrBySimbool:  TP_RR_BY_SYMBOL,
+    skipped:          skippedSymbols,
+    tpRrBySimbool:    TP_RR_BY_SYMBOL,
   });
 });
 
@@ -1252,7 +1314,7 @@ app.get("/history", (req, res) => {
 const PORT = process.env.PORT || 3000;
 const server = app.listen(PORT, () =>
   console.log([
-    `🚀 FTMO Webhook v3.2 — online op poort ${PORT}`,
+    `🚀 FTMO Webhook v3.3 — online op poort ${PORT}`,
     `💰 Balance: €${ACCOUNT_BALANCE}`,
     `📈 Risico  | Index: €${RISK.index} | Forex: €${RISK.forex} | Stock: €${RISK.stock} | Gold: €${RISK.gold}`,
     `🎯 TP      | Dynamisch via TP_RR_BY_SYMBOL (zie GET /)`,
