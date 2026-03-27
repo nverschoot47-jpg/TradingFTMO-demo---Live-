@@ -195,17 +195,90 @@ const SYMBOL_MAP = {
   "CHFJPY":      { mt5: "CHFJPY",      type: "forex"  },
 };
 
-// ── TAKE PROFIT CONFIG PER TYPE ───────────────────────────────
+// ── TAKE PROFIT CONFIG ────────────────────────────────────────
+// Symbool-specifieke TP heeft altijd voorrang op type-default.
+// Gebruik MT5 symboolnaam (rechterkolom van SYMBOL_MAP).
 // null = geen auto-TP (manueel sluiten)
-const TP_RR = {
-  index:  3,    // 3RR preset
-  forex:  2,    // 2RR preset
-  gold:   null, // manueel
+
+const TP_RR_BY_SYMBOL = {
+  // ── Indices ── pas aan op basis van /research/tp-optimizer
+  "GER40.cash":  3,
+  "UK100.cash":  3,
+  "US100.cash":  3,
+  "US30.cash":   3,
+  "US500.cash":  3,
+  "JP225.cash":  3,
+  "AUS200.cash": 3,
+  "EU50.cash":   3,
+  "FRA40.cash":  3,
+  "HK50.cash":   3,
+  "US2000.cash": 3,
+  "SPN35.cash":  3,
+  "NL25.cash":   3,
+
+  // ── Forex ── pas aan op basis van /research/tp-optimizer
+  "EURUSD": 2,
+  "GBPUSD": 2,
+  "USDJPY": 2,
+  "USDCHF": 2,
+  "USDCAD": 2,
+  "AUDUSD": 2,
+  "NZDUSD": 2,
+  "EURGBP": 2,
+  "EURJPY": 2,
+  "EURCHF": 2,
+  "EURAUD": 2,
+  "EURCAD": 2,
+  "GBPJPY": 2,
+  "GBPCHF": 2,
+  "GBPAUD": 2,
+  "GBPCAD": 2,
+  "AUDJPY": 2,
+  "AUDCAD": 2,
+  "AUDCHF": 2,
+  "AUDNZD": 2,
+  "CADJPY": 2,
+  "CADCHF": 2,
+  "NZDJPY": 2,
+  "NZDCAD": 2,
+  "NZDCHF": 2,
+  "CHFJPY": 2,
+
+  // ── Gold / Commodities / Crypto / Stocks ── null = manueel
+  "XAUUSD":     null,
+  "UKOIL.cash": null,
+  "USOIL.cash": null,
+  "BTCUSD":     null,
+  "ETHUSD":     null,
+  "AAPL":       null,
+  "TSLA":       null,
+  "NVDA":       null,
+  "MSFT":       null,
+  "PLTR":       null,
+  "AMZN":       null,
+  "AMD":        null,
+  "META":       null,
+  "MU":         null,
+  "GOOGL":      null,
+  "NFLX":       null,
+};
+
+// Type-defaults als fallback (symbool niet in TP_RR_BY_SYMBOL)
+const TP_RR_DEFAULT = {
+  index:  3,
+  forex:  2,
+  gold:   null,
   brent:  null,
   wti:    null,
   crypto: null,
-  stock:  null, // manueel — aandelen zelf sluiten
+  stock:  null,
 };
+
+// Helper — geeft TP RR terug voor een symbool (MT5 naam)
+function getTPRR(mt5Symbol, type) {
+  if (mt5Symbol in TP_RR_BY_SYMBOL) return TP_RR_BY_SYMBOL[mt5Symbol];
+  return TP_RR_DEFAULT[type] ?? null;
+}
 
 // ── LOT VALUE PER PUNT PER LOT (EUR) ─────────────────────────
 const LOT_VALUE = {
@@ -486,8 +559,8 @@ function calcLots(symbol, entry, sl, effectiveRisk) {
 }
 
 // ── TAKE PROFIT BEREKENING ────────────────────────────────────
-function calcTP(direction, entry, sl, type) {
-  const rr = TP_RR[type];
+function calcTP(direction, entry, sl, type, mt5Symbol) {
+  const rr = getTPRR(mt5Symbol, type);
   if (!rr) return null;
   const slDist = Math.abs(entry - sl);
   const tp = direction === "buy"
@@ -501,7 +574,7 @@ async function placeOrder(direction, symbol, entry, sl, lots) {
   const mt5Symbol = getMT5Symbol(symbol);
   const type      = getSymbolType(symbol);
   const slPrice   = validateSL(direction, parseFloat(entry), parseFloat(sl), mt5Symbol);
-  const tpPrice   = calcTP(direction, parseFloat(entry), slPrice, type);
+  const tpPrice   = calcTP(direction, parseFloat(entry), slPrice, type, mt5Symbol);
 
   const body = {
     symbol:     mt5Symbol,
@@ -513,7 +586,7 @@ async function placeOrder(direction, symbol, entry, sl, lots) {
 
   if (tpPrice !== null) {
     body.takeProfit = tpPrice;
-    const rrLabel   = TP_RR[type];
+    const rrLabel   = getTPRR(mt5Symbol, type);
     console.log(`🎯 TP ingesteld op ${rrLabel}RR: ${tpPrice}`);
   }
 
