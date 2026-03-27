@@ -482,12 +482,74 @@ cron.schedule("50 20 * * 1-5", async () => {
 
 console.log("⏰ Daily stock auto-close actief: elke werkdag om 20:50 (Europe/Brussels)");
 
+// ── NACHTELIJKE TP AUTO-UPDATE (03:00 CET) ────────────────────
+// Elke nacht om 03:00 berekent de optimizer de beste RR per symbool
+// en past TP_RR_BY_SYMBOL aan voor symbolen met ≥10 trades en positieve EV.
+cron.schedule("0 3 * * *", () => {
+  console.log("🌙 [TP AUTO-UPDATE] Nachtelijke optimizer gestart (03:00 CET)...");
+
+  const MIN_TRADES = 10;
+
+  if (closedTrades.length < MIN_TRADES) {
+    console.log(`[TP AUTO-UPDATE] Te weinig gesloten trades (${closedTrades.length}) — overgeslagen`);
+    return;
+  }
+
+  const { results } = buildOptimizerResults(MIN_TRADES);
+  const applied   = [];
+  const skipped   = [];
+
+  for (const r of results) {
+    if (r.bestEV === null) {
+      skipped.push(`${r.symbol}: te weinig data (${r.trades} trades)`);
+      continue;
+    }
+    if (r.bestEV <= 0) {
+      skipped.push(`${r.symbol}: EV negatief (${r.bestEV}) — niet aangepast`);
+      continue;
+    }
+
+    const mt5Sym = getMT5Symbol(r.symbol);
+    const newRR  = parseFloat(r.bestTP);
+    const oldRR  = TP_RR_BY_SYMBOL[mt5Sym] ?? TP_RR_BY_SYMBOL[r.symbol] ?? null;
+
+    if (mt5Sym in TP_RR_BY_SYMBOL) {
+      TP_RR_BY_SYMBOL[mt5Sym] = newRR;
+    } else if (r.symbol in TP_RR_BY_SYMBOL) {
+      TP_RR_BY_SYMBOL[r.symbol] = newRR;
+    } else {
+      TP_RR_BY_SYMBOL[mt5Sym] = newRR;
+    }
+
+    applied.push(`${mt5Sym}: ${oldRR ?? "?"} → ${newRR}RR  (EV: +${r.bestEV} | ${r.trades} trades)`);
+    console.log(`✅ [TP AUTO-UPDATE] ${mt5Sym}: ${oldRR ?? "?"} → ${newRR}RR  (EV: +${r.bestEV} | winrate: ${r.bestWinrate} | ${r.trades} trades)`);
+  }
+
+  if (skipped.length)  console.log(`⏭️  [TP AUTO-UPDATE] Overgeslagen: ${skipped.join(" | ")}`);
+  if (!applied.length) console.log("ℹ️  [TP AUTO-UPDATE] Geen wijzigingen — alle symbolen overgeslagen of EV negatief");
+  else                 console.log(`📊 [TP AUTO-UPDATE] Klaar — ${applied.length} symbool/symbolen bijgewerkt`);
+
+}, { timezone: "Europe/Brussels" });
+
+console.log("🌙 Nachtelijke TP auto-update actief: elke nacht om 03:00 (Europe/Brussels)");
+
 // ── ANTI-CONSOLIDATION ────────────────────────────────────────
+// Elke extra open trade in dezelfde richting op hetzelfde symbool
+// halveert het risico (geldt voor ALLE types: indices, forex, gold, crypto, stocks).
+// Vloer = 10% van basisrisico zodat de trade altijd door kan op min-lot.
 function getEffectiveRisk(symbol, direction) {
   const key   = `${symbol}_${direction}`;
   const count = openTradeTracker[key] || 0;
-  const base  = RISK[getSymbolType(symbol)] || 30;
-  return Math.max(1, base / Math.pow(2, count));
+  const type  = getSymbolType(symbol);
+  const base  = RISK[type] || 30;
+  const halved = base / Math.pow(2, count);
+  const floor  = base * 0.10;
+  const effective = Math.max(floor, halved);
+
+  if (count > 0) {
+    console.log(`⚖️ Anti-consolidatie [${type}] ${symbol} ${direction}: trade #${count + 1} → €${effective.toFixed(2)} (basis €${base}, halvering ×${count})`);
+  }
+  return effective;
 }
 
 function incrementTradeTracker(symbol, direction) {
@@ -1207,16 +1269,8 @@ const server = app.listen(PORT, () =>
 // ── GRACEFUL SHUTDOWN ─────────────────────────────────────────
 function shutdown(signal) {
   console.log(`🛑 ${signal} ontvangen — server netjes afsluiten...`);
-  server.close(() => {
-    console.log("✅ Server afgesloten");
-    process.exit(0);
-  });
-  // Force exit after 10s if connections linger
-  setTimeout(() => {
-    console.warn("⚠️ Geforceerde exit na 10s timeout");
-    process.exit(1);
-  }, 10_000).unref();
+  server.close(() => { console.log("✅ Server afgesloten"); process.exit(0); });
+  setTimeout(() => { console.warn("⚠️ Geforceerde exit na 10s"); process.exit(1); }, 10_000).unref();
 }
-
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT",  () => shutdown("SIGINT"));
