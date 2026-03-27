@@ -1,7 +1,7 @@
 {
   "name": "nv-tradingview-webhook",
-  "version": "3.1.0",
-  "description": "TradingView → MetaApi REST → FTMO MT5 | NV Clean v3",
+  "version": "3.2.0",
+  "description": "TradingView \u2192 MetaApi REST \u2192 FTMO MT5 | NV Clean v3",
   "main": "webhook.js",
   "scripts": {
     "start": "node webhook.js",
@@ -17,7 +17,7 @@
   "engines": {
     "node": ">=18.0.0"
   },
-  "author": "Nick Verschoot — PRONTO-AI",
+  "author": "Nick Verschoot \u2014 PRONTO-AI",
   "license": "UNLICENSED",
   "private": true
 }
