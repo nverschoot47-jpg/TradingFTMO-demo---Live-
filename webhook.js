@@ -10,15 +10,18 @@
 //  ✅ Gold     → geen auto-TP  | risico €30/trade
 //  ✅ Crypto   → geen auto-TP  | risico €30/trade
 //  ✅ Weekend auto-close (vrijdag 22:50 CET) — ALLES
+//  ✅ Daily stock auto-close (elke werkdag 20:50 CET) — AANDELEN
 //  ✅ Geen weekend orders (ook geen crypto)
 //  ✅ Self-healing symbool/lot errors
 //  ✅ Anti-consolidation risk halving
 //  ✅ Max RR tracker — wat was max RR vóór SL
 //  ✅ Equity curve snapshots (30s)
+//  ✅ /research/tp-optimizer — beste TP per symbool op basis van history
 // ═══════════════════════════════════════════════════════════════
 
 const express = require("express");
-const app = express();
+const cron    = require("node-cron");
+const app     = express();
 app.use(express.json());
 
 // ── CONFIG ────────────────────────────────────────────────────
@@ -271,8 +274,6 @@ function getSymbolType(symbol) {
 }
 
 // ── MARKTUREN CHECK (GMT+1) ───────────────────────────────────
-// Gebruikt vaste GMT+1 — niet DST-afhankelijk, zodat de stock window
-// altijd 15:30–20:00 lokale tijd is zoals gevraagd
 function getGMT1Time() {
   const now = new Date();
   return new Date(now.getTime() + 1 * 3600 * 1000);
@@ -308,27 +309,6 @@ function isMarketOpen(type) {
   return true;
 }
 
-// ── FRIDAY AUTO-CLOSE ─────────────────────────────────────────
-async function checkFridayClose() {
-  const t   = getGMT1Time();
-  const day = t.getUTCDay();
-  const h   = t.getUTCHours();
-  const m   = t.getUTCMinutes();
-  if (day === 5 && h === 22 && m === 50) {
-    console.log("🔔 Vrijdag 22:50 GMT+1 — sluit ALLE posities voor weekend...");
-    try {
-      const positions = await fetchOpenPositions();
-      for (const pos of (positions || [])) {
-        await closePosition(pos.id);
-        console.log(`🔒 Weekend-close: ${pos.symbol}`);
-      }
-    } catch (e) {
-      console.error("❌ Weekend auto-close fout:", e.message);
-    }
-  }
-}
-setInterval(checkFridayClose, 60 * 1000);
-
 // ── METAAPI REST BASE ─────────────────────────────────────────
 const META_BASE = `https://mt-client-api-v1.london.agiliumtrade.ai/users/current/accounts/${META_ACCOUNT_ID}`;
 
@@ -358,6 +338,75 @@ async function closePosition(positionId) {
   console.log(`🔒 Positie ${positionId} gesloten:`, JSON.stringify(data));
   return data;
 }
+
+// ── FRIDAY AUTO-CLOSE (22:50 CET) — ALLE POSITIES ────────────
+async function checkFridayClose() {
+  const t   = getGMT1Time();
+  const day = t.getUTCDay();
+  const h   = t.getUTCHours();
+  const m   = t.getUTCMinutes();
+  if (day === 5 && h === 22 && m === 50) {
+    console.log("🔔 Vrijdag 22:50 GMT+1 — sluit ALLE posities voor weekend...");
+    try {
+      const positions = await fetchOpenPositions();
+      for (const pos of (positions || [])) {
+        await closePosition(pos.id);
+        console.log(`🔒 Weekend-close: ${pos.symbol}`);
+      }
+    } catch (e) {
+      console.error("❌ Weekend auto-close fout:", e.message);
+    }
+  }
+}
+setInterval(checkFridayClose, 60 * 1000);
+
+// ── DAILY STOCK AUTO-CLOSE (20:50 CET) — ALLEEN AANDELEN ─────
+// Elke werkdag (ma–vr) om 20:50 Europe/Brussels
+// Sluit alle open aandelenposities zodat er geen overnacht exposure is
+cron.schedule("50 20 * * 1-5", async () => {
+  console.log("🔔 20:50 CET — daily stock auto-close gestart...");
+  try {
+    const positions = await fetchOpenPositions();
+
+    if (!Array.isArray(positions) || positions.length === 0) {
+      console.log("[STOCK AUTO-CLOSE] Geen open posities.");
+      return;
+    }
+
+    // Filter op aandelen — zowel via SYMBOL_MAP als type check
+    const stockPositions = positions.filter(p => {
+      const tvSym = Object.keys(SYMBOL_MAP).find(k => SYMBOL_MAP[k].mt5 === p.symbol) || p.symbol;
+      return getSymbolType(tvSym) === "stock";
+    });
+
+    if (stockPositions.length === 0) {
+      console.log("[STOCK AUTO-CLOSE] Geen open aandelenposities.");
+      return;
+    }
+
+    console.log(`[STOCK AUTO-CLOSE] ${stockPositions.length} aandelenposities sluiten...`);
+
+    for (const pos of stockPositions) {
+      try {
+        const result = await closePosition(pos.id);
+        const pnl    = pos.unrealizedProfit != null ? `P&L: €${pos.unrealizedProfit}` : "";
+        console.log(`✅ [STOCK AUTO-CLOSE] ${pos.symbol} gesloten ${pnl}`, JSON.stringify(result));
+        addWebhookHistory({
+          type:       "STOCK_AUTOCLOSE",
+          symbol:     pos.symbol,
+          positionId: pos.id,
+          reason:     "daily 20:50 close",
+        });
+      } catch (e) {
+        console.error(`❌ [STOCK AUTO-CLOSE] Fout bij sluiten ${pos.symbol}:`, e.message);
+      }
+    }
+  } catch (e) {
+    console.error("❌ [STOCK AUTO-CLOSE] Fout bij ophalen posities:", e.message);
+  }
+}, { timezone: "Europe/Brussels" });
+
+console.log("⏰ Daily stock auto-close actief: elke werkdag om 20:50 (Europe/Brussels)");
 
 // ── ANTI-CONSOLIDATION ────────────────────────────────────────
 function getEffectiveRisk(symbol, direction) {
@@ -439,7 +488,7 @@ function calcLots(symbol, entry, sl, effectiveRisk) {
 // ── TAKE PROFIT BEREKENING ────────────────────────────────────
 function calcTP(direction, entry, sl, type) {
   const rr = TP_RR[type];
-  if (!rr) return null; // geen auto-TP voor dit type
+  if (!rr) return null;
   const slDist = Math.abs(entry - sl);
   const tp = direction === "buy"
     ? entry + slDist * rr
@@ -484,7 +533,7 @@ function learnFromError(symbol, errorCode, errorMessage, requestBody) {
   if (!learnedPatches[symbol]) learnedPatches[symbol] = {};
 
   if (errorCode === "TRADE_RETCODE_INVALID" && msg.includes("symbol")) {
-    const current  = getMT5Symbol(symbol);
+    const current   = getMT5Symbol(symbol);
     const fallbacks = [
       current.replace(".cash", ""),
       current + ".cash",
@@ -516,7 +565,6 @@ function learnFromError(symbol, errorCode, errorMessage, requestBody) {
 }
 
 // ── MAX RR TRACKER ────────────────────────────────────────────
-// Berekent hoeveel R de prijs maximaal heeft bewogen vóór SL/TP
 function calcMaxRR(trade) {
   const { direction, entry, sl, maxPrice } = trade;
   const slDist = Math.abs(entry - sl);
@@ -546,8 +594,8 @@ async function syncPositions() {
         ? cur > (trade.maxPrice ?? trade.entry)
         : cur < (trade.maxPrice ?? trade.entry);
       if (better) {
-        trade.maxPrice  = cur;
-        trade.maxRR     = calcMaxRR({ ...trade, maxPrice: cur });
+        trade.maxPrice = cur;
+        trade.maxRR    = calcMaxRR({ ...trade, maxPrice: cur });
       }
       trade.currentPrice = cur;
       trade.currentPnL   = parseFloat(pnl.toFixed(2));
@@ -575,12 +623,12 @@ async function syncPositions() {
         console.log(`📊 FTMO startbalans: €${ftmoStartBalance}`);
       }
       accountSnapshots.push({
-        ts:           new Date().toISOString(),
-        balance:      info.balance    ?? null,
-        equity:       info.equity     ?? null,
-        floatingPL:   parseFloat(((info.equity ?? 0) - (info.balance ?? 0)).toFixed(2)),
-        margin:       info.margin     ?? null,
-        freeMargin:   info.freeMargin ?? null,
+        ts:            new Date().toISOString(),
+        balance:       info.balance    ?? null,
+        equity:        info.equity     ?? null,
+        floatingPL:    parseFloat(((info.equity ?? 0) - (info.balance ?? 0)).toFixed(2)),
+        margin:        info.margin     ?? null,
+        freeMargin:    info.freeMargin ?? null,
         ftmoDailyUsed: ftmoDailyLossUsed,
         ftmoDailyLimit: ftmoStartBalance * FTMO_DAILY_LOSS_PCT,
       });
@@ -599,14 +647,12 @@ app.post("/webhook", async (req, res) => {
     console.log("📨 Webhook ontvangen:", JSON.stringify(req.body));
     addWebhookHistory({ type: "RECEIVED", body: req.body });
 
-    // Secret check
     const secret = req.query.secret || req.headers["x-secret"];
     if (secret !== WEBHOOK_SECRET) {
       console.warn("⚠️ Ongeldige secret");
       return res.status(401).json({ error: "Unauthorized" });
     }
 
-    // {{ticker}} vangnet
     const symbol = (req.body.symbol === "{{ticker}}" || !req.body.symbol)
       ? null : req.body.symbol;
     if (!symbol) {
@@ -637,7 +683,6 @@ app.post("/webhook", async (req, res) => {
       console.warn(`⚠️ Onbekend symbool: "${symbol}" → doorgestuurd als "${mt5Sym}"`);
     }
 
-    // Markturen check
     if (!isMarketOpen(symType)) {
       const msg = `🕐 Markt gesloten voor ${symbol} (${symType}) — order genegeerd`;
       console.warn(msg);
@@ -645,7 +690,6 @@ app.post("/webhook", async (req, res) => {
       return res.status(200).json({ status: "SKIP", reason: msg });
     }
 
-    // FTMO dagelijks verlies check
     const effectiveRisk = getEffectiveRisk(symbol, direction);
     const ftmoCheck     = ftmoSafetyCheck(effectiveRisk);
     if (!ftmoCheck.ok) {
@@ -667,8 +711,8 @@ app.post("/webhook", async (req, res) => {
       });
     }
 
-    const tpRR    = TP_RR[symType];
-    const slDist  = Math.abs(entryNum - slNum).toFixed(5);
+    const tpRR   = TP_RR[symType];
+    const slDist = Math.abs(entryNum - slNum).toFixed(5);
     console.log(`📊 ${direction.toUpperCase()} ${symbol} → ${mt5Sym} [${symType}] | Entry: ${entryNum} | SL: ${slNum} | Dist: ${slDist} | Lots: ${lots} | Risico: €${effectiveRisk.toFixed(2)} | TP: ${tpRR ? tpRR + "RR" : "geen"}`);
 
     let { result, mt5Symbol, slPrice, tpPrice, body } = await placeOrder(direction, symbol, entryNum, slNum, lots);
@@ -685,8 +729,8 @@ app.post("/webhook", async (req, res) => {
       const retryLots = calcLots(symbol, entryNum, slNum, effectiveRisk);
       if (retryLots !== null) {
         const retry = await placeOrder(direction, symbol, entryNum, slNum, retryLots);
-        result       = retry.result;
-        tpPrice      = retry.tpPrice;
+        result      = retry.result;
+        tpPrice     = retry.tpPrice;
         console.log("🔄 Retry resultaat:", JSON.stringify(result));
         const retryErr = result?.error ||
           (result?.retcode && result?.retcode !== 10009 && result?.retcode !== "TRADE_RETCODE_DONE");
@@ -759,7 +803,7 @@ app.get("/", (req, res) => {
   resetDailyLossIfNewDay();
   res.json({
     status: "online",
-    versie:  "ftmo-v3.0",
+    versie:  "ftmo-v3.1",
     broker:  "FTMO-Demo",
     account: ACCOUNT_BALANCE,
     risicoPerType: RISK,
@@ -771,7 +815,8 @@ app.get("/", (req, res) => {
       gold:   "geen (manueel)",
       crypto: "geen (manueel)",
     },
-    stockTradingWindow: "15:30–20:00 GMT+1",
+    stockTradingWindow:  "15:30–20:00 GMT+1",
+    stockDailyAutoClose: "20:50 GMT+1 (elke werkdag)",
     ftmo: {
       startBalance:       ftmoStartBalance,
       dailyLossUsed:      parseFloat(ftmoDailyLossUsed.toFixed(2)),
@@ -781,13 +826,14 @@ app.get("/", (req, res) => {
     },
     symbolMap: Object.fromEntries(Object.entries(SYMBOL_MAP).map(([tv, v]) => [tv, v.mt5])),
     endpoints: {
-      "POST /webhook":               "TradingView → FTMO MT5",
-      "POST /close":                 "Manueel positie sluiten",
-      "GET  /status":                "Open trades + FTMO limieten",
-      "GET  /live/positions":        "Live posities met P&L + max RR",
-      "GET  /analysis/rr":           "Max RR analyse per gesloten trade",
-      "GET  /analysis/equity-curve": "Equity history",
-      "GET  /history":               "Webhook log",
+      "POST /webhook":                "TradingView → FTMO MT5",
+      "POST /close":                  "Manueel positie sluiten",
+      "GET  /status":                 "Open trades + FTMO limieten",
+      "GET  /live/positions":         "Live posities met P&L + max RR",
+      "GET  /analysis/rr":            "Max RR analyse per gesloten trade",
+      "GET  /analysis/equity-curve":  "Equity history",
+      "GET  /research/tp-optimizer":  "Beste TP per symbool (EV-gebaseerd)",
+      "GET  /history":                "Webhook log",
     },
     tracking: {
       openPositions:   Object.keys(openPositions).length,
@@ -835,7 +881,6 @@ app.get("/live/positions", (req, res) => {
 });
 
 // ── MAX RR ANALYSE ────────────────────────────────────────────
-// Toont per gesloten trade: max RR bereikt vóór SL/TP — geen bedragen
 app.get("/analysis/rr", (req, res) => {
   const { symbol } = req.query;
   const trades = symbol
@@ -855,7 +900,7 @@ app.get("/analysis/rr", (req, res) => {
       sl:        t.sl,
       tp:        t.tp ?? null,
       maxRR,
-      tpHit:     t.tp
+      tpHit: t.tp
         ? (t.direction === "buy" ? t.maxPrice >= t.tp : t.maxPrice <= t.tp)
         : null,
     });
@@ -864,16 +909,122 @@ app.get("/analysis/rr", (req, res) => {
   }
 
   const summary = Object.entries(bySymbol).map(([sym, g]) => ({
-    symbol:     sym,
-    trades:     g.count,
-    avgMaxRR:   parseFloat((g.totalMaxRR / g.count).toFixed(2)),
-    details:    g.trades,
+    symbol:   sym,
+    trades:   g.count,
+    avgMaxRR: parseFloat((g.totalMaxRR / g.count).toFixed(2)),
+    details:  g.trades,
   }));
 
   res.json({
     totalTrades: trades.length,
     info: "maxRR = hoeveel R de prijs maximaal bewoog vóór SL of TP",
     bySymbol: summary,
+  });
+});
+
+// ── TP OPTIMIZER ─────────────────────────────────────────────
+// GET /research/tp-optimizer
+// Berekent per symbool welk TP-niveau de hoogste Expected Value geeft
+// op basis van in-memory closedTrades + webhookHistory (voor SL-data)
+// EV formule: winrate_at_X × X − (1 − winrate_at_X) × 1
+app.get("/research/tp-optimizer", (req, res) => {
+  const RR_LEVELS = [1, 1.5, 2, 2.5, 3, 4];
+
+  if (closedTrades.length === 0) {
+    return res.json({
+      info:    "Nog geen gesloten trades beschikbaar. EV-analyse start automatisch zodra trades gesloten zijn.",
+      trades:  0,
+      bySymbol: [],
+    });
+  }
+
+  // Bouw SL-map uit webhookHistory voor trades waarbij SL niet in closedTrades zit
+  const slMap = {};
+  for (const log of webhookHistory) {
+    if (log.body?.symbol && log.body?.entry && log.body?.sl) {
+      const key = `${log.body.symbol}_${parseFloat(log.body.entry).toFixed(5)}`;
+      slMap[key] = parseFloat(log.body.sl);
+    }
+  }
+
+  // Groepeer closedTrades per symbool
+  const bySymbol = {};
+  let skipped    = 0;
+
+  for (const t of closedTrades) {
+    // SL ophalen — eerst uit trade zelf, anders uit slMap
+    const sl = t.sl ?? slMap[`${t.symbol}_${parseFloat(t.entry).toFixed(5)}`];
+    if (!sl || !t.entry || !t.maxPrice) { skipped++; continue; }
+
+    const slDist = Math.abs(t.entry - sl);
+    if (slDist === 0) { skipped++; continue; }
+
+    const favMove  = t.direction === "buy"
+      ? t.maxPrice - t.entry
+      : t.entry   - t.maxPrice;
+    const achievedR = favMove / slDist;
+
+    if (!bySymbol[t.symbol]) bySymbol[t.symbol] = [];
+    bySymbol[t.symbol].push({ achievedR, direction: t.direction });
+  }
+
+  // Bereken EV per RR-niveau per symbool
+  const results = [];
+
+  for (const [symbol, trades] of Object.entries(bySymbol)) {
+    if (trades.length < 3) {
+      results.push({
+        symbol,
+        trades:  trades.length,
+        note:    "Te weinig data (min. 3 trades vereist)",
+        bestTP:  null,
+        bestEV:  null,
+      });
+      continue;
+    }
+
+    const evTable = RR_LEVELS.map(rr => {
+      const wins    = trades.filter(t => t.achievedR >= rr).length;
+      const winrate = wins / trades.length;
+      const ev      = winrate * rr - (1 - winrate) * 1;
+      return {
+        rr,
+        wins,
+        total:   trades.length,
+        winrate: `${(winrate * 100).toFixed(1)}%`,
+        ev:      parseFloat(ev.toFixed(3)),
+      };
+    });
+
+    const best = evTable.reduce((a, b) => b.ev > a.ev ? b : a);
+
+    results.push({
+      symbol,
+      trades:        trades.length,
+      bestTP:        `${best.rr}R`,
+      bestEV:        best.ev,
+      bestWinrate:   best.winrate,
+      recommendation: best.ev > 0
+        ? `Gebruik TP = ${best.rr}R  (EV: +${best.ev}R per trade)`
+        : "EV negatief op alle niveaus — herbekijk strategie op dit symbool",
+      evTable,
+    });
+  }
+
+  // Sorteer: positieve EV eerst, daarna op best EV desc
+  results.sort((a, b) => {
+    if (a.bestEV === null) return 1;
+    if (b.bestEV === null) return -1;
+    return b.bestEV - a.bestEV;
+  });
+
+  res.json({
+    generated:   new Date().toISOString(),
+    totalTrades: closedTrades.length,
+    skipped,
+    rrLevels:    RR_LEVELS,
+    info:        "EV = winrate_op_X × X − (1 − winrate_op_X) × 1  |  positief = winstgevend TP-niveau",
+    bySymbol:    results,
   });
 });
 
@@ -895,13 +1046,15 @@ app.get("/history", (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () =>
   console.log([
-    `🚀 FTMO Webhook v3.0 — online op poort ${PORT}`,
+    `🚀 FTMO Webhook v3.1 — online op poort ${PORT}`,
     `💰 Balance: €${ACCOUNT_BALANCE}`,
     `📈 Risico  | Index: €${RISK.index} | Forex: €${RISK.forex} | Stock: €${RISK.stock} | Gold: €${RISK.gold}`,
     `🎯 TP      | Index: 3RR | Forex: 2RR | Aandelen/Gold/Crypto: manueel`,
-    `🕐 Aandelen venster: 15:30–20:00 GMT+1`,
+    `🕐 Aandelen venster  : 15:30–20:00 GMT+1`,
+    `⏰ Stock auto-close  : 20:50 GMT+1 (elke werkdag)`,
     `📉 Forex max: ${MAX_LOTS.forex} lot`,
     `🛡️  FTMO dagelijks verlies: ${(FTMO_DAILY_LOSS_PCT * 100).toFixed(0)}% van startbalans`,
     `🗺️  Symbolen in map: ${Object.keys(SYMBOL_MAP).length}`,
+    `🔬 TP optimizer: GET /research/tp-optimizer`,
   ].join("\n"))
 );
