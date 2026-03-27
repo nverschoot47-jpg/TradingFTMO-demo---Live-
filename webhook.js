@@ -1188,7 +1188,7 @@ app.get("/history", (req, res) => {
 
 // ── START ─────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () =>
+const server = app.listen(PORT, () =>
   console.log([
     `🚀 FTMO Webhook v3.2 — online op poort ${PORT}`,
     `💰 Balance: €${ACCOUNT_BALANCE}`,
@@ -1203,3 +1203,20 @@ app.listen(PORT, () =>
     `⚡ TP auto-apply    : POST /research/tp-optimizer/apply`,
   ].join("\n"))
 );
+
+// ── GRACEFUL SHUTDOWN ─────────────────────────────────────────
+function shutdown(signal) {
+  console.log(`🛑 ${signal} ontvangen — server netjes afsluiten...`);
+  server.close(() => {
+    console.log("✅ Server afgesloten");
+    process.exit(0);
+  });
+  // Force exit after 10s if connections linger
+  setTimeout(() => {
+    console.warn("⚠️ Geforceerde exit na 10s timeout");
+    process.exit(1);
+  }, 10_000).unref();
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT",  () => shutdown("SIGINT"));
