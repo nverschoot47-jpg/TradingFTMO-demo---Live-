@@ -1,11 +1,11 @@
 // ═══════════════════════════════════════════════════════════════
-// TradingView → MetaApi REST → MT5  |  FTMO Webhook Server v3
+// TradingView → MetaApi REST → MT5  |  FTMO Webhook Server v3.2
 // Account : Nick Verschoot — FTMO Demo
 // MetaApi : 7cb566c1-be02-415b-ab95-495368f3885c
 // ───────────────────────────────────────────────────────────────
 // REGELS:
-//  ✅ Indices  → TP 3RR preset | risico €200/trade
-//  ✅ Forex    → TP 2RR preset | risico €15/trade | max 0.25 lot
+//  ✅ Indices  → TP via TP_RR_BY_SYMBOL (dynamisch) | risico €200/trade
+//  ✅ Forex    → TP via TP_RR_BY_SYMBOL (dynamisch) | risico €15/trade | max 0.25 lot
 //  ✅ Aandelen → geen auto-TP  | manueel sluiten  | venster 15:30–20:00 GMT+1
 //  ✅ Gold     → geen auto-TP  | risico €30/trade
 //  ✅ Crypto   → geen auto-TP  | risico €30/trade
@@ -16,7 +16,8 @@
 //  ✅ Anti-consolidation risk halving
 //  ✅ Max RR tracker — wat was max RR vóór SL
 //  ✅ Equity curve snapshots (30s)
-//  ✅ /research/tp-optimizer — beste TP per symbool op basis van history
+//  ✅ /research/tp-optimizer        — beste TP per symbool op basis van history
+//  ✅ POST /research/tp-optimizer/apply — past TP_RR_BY_SYMBOL aan (≥10 trades, EV>0)
 // ═══════════════════════════════════════════════════════════════
 
 const express = require("express");
@@ -196,12 +197,12 @@ const SYMBOL_MAP = {
 };
 
 // ── TAKE PROFIT CONFIG ────────────────────────────────────────
-// Symbool-specifieke TP heeft altijd voorrang op type-default.
+// Symbool-specifieke TP in RR. null = geen auto-TP (manueel sluiten).
 // Gebruik MT5 symboolnaam (rechterkolom van SYMBOL_MAP).
-// null = geen auto-TP (manueel sluiten)
+// Pas aan via POST /research/tp-optimizer/apply (of manueel hieronder).
 
 const TP_RR_BY_SYMBOL = {
-  // ── Indices ── pas aan op basis van /research/tp-optimizer
+  // ── Indices ──
   "GER40.cash":  3,
   "UK100.cash":  3,
   "US100.cash":  3,
@@ -216,7 +217,7 @@ const TP_RR_BY_SYMBOL = {
   "SPN35.cash":  3,
   "NL25.cash":   3,
 
-  // ── Forex ── pas aan op basis van /research/tp-optimizer
+  // ── Forex ──
   "EURUSD": 2,
   "GBPUSD": 2,
   "USDJPY": 2,
@@ -784,7 +785,8 @@ app.post("/webhook", async (req, res) => {
       });
     }
 
-    const tpRR   = TP_RR[symType];
+    // ── TP lookup via getTPRR (fix: was TP_RR[symType] wat niet bestond) ──
+    const tpRR   = getTPRR(mt5Sym, symType);
     const slDist = Math.abs(entryNum - slNum).toFixed(5);
     console.log(`📊 ${direction.toUpperCase()} ${symbol} → ${mt5Sym} [${symType}] | Entry: ${entryNum} | SL: ${slNum} | Dist: ${slDist} | Lots: ${lots} | Risico: €${effectiveRisk.toFixed(2)} | TP: ${tpRR ? tpRR + "RR" : "geen"}`);
 
@@ -876,18 +878,13 @@ app.get("/", (req, res) => {
   resetDailyLossIfNewDay();
   res.json({
     status: "online",
-    versie:  "ftmo-v3.1",
+    versie:  "ftmo-v3.2",
     broker:  "FTMO-Demo",
     account: ACCOUNT_BALANCE,
     risicoPerType: RISK,
     maxLotsPerType: MAX_LOTS,
-    tpPreset: {
-      index:  "3RR",
-      forex:  "2RR",
-      stock:  "geen (manueel)",
-      gold:   "geen (manueel)",
-      crypto: "geen (manueel)",
-    },
+    // Actuele TP RR per symbool (dynamisch — aanpasbaar via POST /research/tp-optimizer/apply)
+    tpRrBySimbool: TP_RR_BY_SYMBOL,
     stockTradingWindow:  "15:30–20:00 GMT+1",
     stockDailyAutoClose: "20:50 GMT+1 (elke werkdag)",
     ftmo: {
@@ -899,14 +896,15 @@ app.get("/", (req, res) => {
     },
     symbolMap: Object.fromEntries(Object.entries(SYMBOL_MAP).map(([tv, v]) => [tv, v.mt5])),
     endpoints: {
-      "POST /webhook":                "TradingView → FTMO MT5",
-      "POST /close":                  "Manueel positie sluiten",
-      "GET  /status":                 "Open trades + FTMO limieten",
-      "GET  /live/positions":         "Live posities met P&L + max RR",
-      "GET  /analysis/rr":            "Max RR analyse per gesloten trade",
-      "GET  /analysis/equity-curve":  "Equity history",
-      "GET  /research/tp-optimizer":  "Beste TP per symbool (EV-gebaseerd)",
-      "GET  /history":                "Webhook log",
+      "POST /webhook":                       "TradingView → FTMO MT5",
+      "POST /close":                         "Manueel positie sluiten",
+      "GET  /status":                        "Open trades + FTMO limieten",
+      "GET  /live/positions":                "Live posities met P&L + max RR",
+      "GET  /analysis/rr":                   "Max RR analyse per gesloten trade",
+      "GET  /analysis/equity-curve":         "Equity history",
+      "GET  /research/tp-optimizer":         "Beste TP per symbool (EV-gebaseerd)",
+      "POST /research/tp-optimizer/apply":   "Pas TP_RR_BY_SYMBOL aan op basis van EV (≥10 trades, EV>0)",
+      "GET  /history":                       "Webhook log",
     },
     tracking: {
       openPositions:   Object.keys(openPositions).length,
@@ -998,20 +996,10 @@ app.get("/analysis/rr", (req, res) => {
 // ── TP OPTIMIZER ─────────────────────────────────────────────
 // GET /research/tp-optimizer
 // Berekent per symbool welk TP-niveau de hoogste Expected Value geeft
-// op basis van in-memory closedTrades + webhookHistory (voor SL-data)
 // EV formule: winrate_at_X × X − (1 − winrate_at_X) × 1
-app.get("/research/tp-optimizer", (req, res) => {
+function buildOptimizerResults(minTrades = 3) {
   const RR_LEVELS = [1, 1.5, 2, 2.5, 3, 4];
 
-  if (closedTrades.length === 0) {
-    return res.json({
-      info:    "Nog geen gesloten trades beschikbaar. EV-analyse start automatisch zodra trades gesloten zijn.",
-      trades:  0,
-      bySymbol: [],
-    });
-  }
-
-  // Bouw SL-map uit webhookHistory voor trades waarbij SL niet in closedTrades zit
   const slMap = {};
   for (const log of webhookHistory) {
     if (log.body?.symbol && log.body?.entry && log.body?.sl) {
@@ -1020,12 +1008,10 @@ app.get("/research/tp-optimizer", (req, res) => {
     }
   }
 
-  // Groepeer closedTrades per symbool
   const bySymbol = {};
   let skipped    = 0;
 
   for (const t of closedTrades) {
-    // SL ophalen — eerst uit trade zelf, anders uit slMap
     const sl = t.sl ?? slMap[`${t.symbol}_${parseFloat(t.entry).toFixed(5)}`];
     if (!sl || !t.entry || !t.maxPrice) { skipped++; continue; }
 
@@ -1041,15 +1027,14 @@ app.get("/research/tp-optimizer", (req, res) => {
     bySymbol[t.symbol].push({ achievedR, direction: t.direction });
   }
 
-  // Bereken EV per RR-niveau per symbool
   const results = [];
 
   for (const [symbol, trades] of Object.entries(bySymbol)) {
-    if (trades.length < 3) {
+    if (trades.length < minTrades) {
       results.push({
         symbol,
         trades:  trades.length,
-        note:    "Te weinig data (min. 3 trades vereist)",
+        note:    `Te weinig data (min. ${minTrades} trades vereist)`,
         bestTP:  null,
         bestEV:  null,
       });
@@ -1084,20 +1069,106 @@ app.get("/research/tp-optimizer", (req, res) => {
     });
   }
 
-  // Sorteer: positieve EV eerst, daarna op best EV desc
   results.sort((a, b) => {
     if (a.bestEV === null) return 1;
     if (b.bestEV === null) return -1;
     return b.bestEV - a.bestEV;
   });
 
+  return { results, skipped, rrLevels: RR_LEVELS };
+}
+
+app.get("/research/tp-optimizer", (req, res) => {
+  if (closedTrades.length === 0) {
+    return res.json({
+      info:    "Nog geen gesloten trades beschikbaar. EV-analyse start automatisch zodra trades gesloten zijn.",
+      trades:  0,
+      bySymbol: [],
+    });
+  }
+
+  const { results, skipped, rrLevels } = buildOptimizerResults(3);
+
   res.json({
     generated:   new Date().toISOString(),
     totalTrades: closedTrades.length,
     skipped,
-    rrLevels:    RR_LEVELS,
+    rrLevels,
     info:        "EV = winrate_op_X × X − (1 − winrate_op_X) × 1  |  positief = winstgevend TP-niveau",
+    applyHint:   "POST /research/tp-optimizer/apply om TP_RR_BY_SYMBOL bij te werken (≥10 trades, EV>0)",
     bySymbol:    results,
+  });
+});
+
+// ── TP OPTIMIZER AUTO-APPLY ───────────────────────────────────
+// POST /research/tp-optimizer/apply
+// Past TP_RR_BY_SYMBOL in memory aan voor symbolen met ≥10 trades en positieve EV.
+// Nooit automatisch — alleen als jij dit endpoint aanroept.
+app.post("/research/tp-optimizer/apply", (req, res) => {
+  const secret = req.query.secret || req.headers["x-secret"];
+  if (secret !== WEBHOOK_SECRET) return res.status(401).json({ error: "Unauthorized" });
+
+  const MIN_TRADES = 10;
+
+  if (closedTrades.length === 0) {
+    return res.json({
+      status:  "SKIP",
+      reason:  "Geen gesloten trades beschikbaar.",
+      applied: [],
+      skipped: [],
+    });
+  }
+
+  const { results } = buildOptimizerResults(MIN_TRADES);
+
+  const applied = [];
+  const skippedSymbols = [];
+
+  for (const r of results) {
+    if (r.bestEV === null) {
+      skippedSymbols.push({ symbol: r.symbol, reason: `Te weinig data (${r.trades} < ${MIN_TRADES} trades)` });
+      continue;
+    }
+    if (r.bestEV <= 0) {
+      skippedSymbols.push({ symbol: r.symbol, reason: `EV negatief (${r.bestEV}) — geen wijziging` });
+      continue;
+    }
+
+    // Bepaal de MT5 symboolnaam voor lookup in TP_RR_BY_SYMBOL
+    const mt5Sym = getMT5Symbol(r.symbol);
+    const newRR  = parseFloat(r.bestTP); // "2.5R" → 2.5
+    const oldRR  = TP_RR_BY_SYMBOL[mt5Sym] ?? TP_RR_BY_SYMBOL[r.symbol] ?? null;
+
+    // Schrijf naar beide keys zodat we zeker de juiste raken
+    if (mt5Sym in TP_RR_BY_SYMBOL) {
+      TP_RR_BY_SYMBOL[mt5Sym] = newRR;
+    } else if (r.symbol in TP_RR_BY_SYMBOL) {
+      TP_RR_BY_SYMBOL[r.symbol] = newRR;
+    } else {
+      // Symbool nog niet in map — voeg toe op MT5 naam
+      TP_RR_BY_SYMBOL[mt5Sym] = newRR;
+    }
+
+    applied.push({
+      symbol:  r.symbol,
+      mt5Sym,
+      oldRR,
+      newRR,
+      trades:  r.trades,
+      bestEV:  r.bestEV,
+      winrate: r.bestWinrate,
+    });
+
+    console.log(`✅ TP-APPLY: ${mt5Sym} → ${newRR}RR  (was: ${oldRR ?? "onbekend"} | EV: +${r.bestEV} | ${r.trades} trades)`);
+  }
+
+  res.json({
+    status:         "OK",
+    appliedAt:      new Date().toISOString(),
+    minTradesVereist: MIN_TRADES,
+    applied,
+    skipped:        skippedSymbols,
+    tpRrBySimbool:  TP_RR_BY_SYMBOL,
   });
 });
 
@@ -1119,15 +1190,16 @@ app.get("/history", (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () =>
   console.log([
-    `🚀 FTMO Webhook v3.1 — online op poort ${PORT}`,
+    `🚀 FTMO Webhook v3.2 — online op poort ${PORT}`,
     `💰 Balance: €${ACCOUNT_BALANCE}`,
     `📈 Risico  | Index: €${RISK.index} | Forex: €${RISK.forex} | Stock: €${RISK.stock} | Gold: €${RISK.gold}`,
-    `🎯 TP      | Index: 3RR | Forex: 2RR | Aandelen/Gold/Crypto: manueel`,
+    `🎯 TP      | Dynamisch via TP_RR_BY_SYMBOL (zie GET /)`,
     `🕐 Aandelen venster  : 15:30–20:00 GMT+1`,
     `⏰ Stock auto-close  : 20:50 GMT+1 (elke werkdag)`,
     `📉 Forex max: ${MAX_LOTS.forex} lot`,
-    `🛡️  FTMO dagelijks verlies: ${(FTMO_DAILY_LOSS_PCT * 100).toFixed(0)}% van startbalans`,
+    `🛡️  FTMO dagelijks verlies: UITGESCHAKELD`,
     `🗺️  Symbolen in map: ${Object.keys(SYMBOL_MAP).length}`,
-    `🔬 TP optimizer: GET /research/tp-optimizer`,
+    `🔬 TP optimizer     : GET  /research/tp-optimizer`,
+    `⚡ TP auto-apply    : POST /research/tp-optimizer/apply`,
   ].join("\n"))
 );
