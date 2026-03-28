@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════
-// TradingView → MetaApi REST → MT5  |  FTMO Webhook Server v3.4
+// TradingView → MetaApi REST → MT5  |  FTMO Webhook Server v3.5
 // Account : Nick Verschoot — FTMO Demo
 // MetaApi : 7cb566c1-be02-415b-ab95-495368f3885c
 // ───────────────────────────────────────────────────────────────
@@ -9,9 +9,12 @@
 //  ✅ Aandelen → geen auto-TP  | manueel sluiten  | venster 15:30–20:00 GMT+1
 //  ✅ Gold     → geen auto-TP  | risico €30/trade
 //  ✅ Crypto   → geen auto-TP  | risico €30/trade
-//  ✅ Weekend auto-close (vrijdag 22:50 CET) — ALLES
-//  ✅ Daily stock auto-close (elke werkdag 20:50 CET) — AANDELEN
-//  ✅ Geen weekend orders (ook geen crypto)
+//  ✅ Trading venster: 02:00–20:00 GMT+1 (alle types behalve aandelen)
+//  ✅ Aandelen venster: 15:30–20:00 GMT+1
+//  ✅ Dagelijkse auto-close 20:50 GMT+1 — ALLES (werkdagen)
+//  ✅ Vrijdag auto-close 20:50 GMT+1 — ALLES (ook vrijdag)
+//  ✅ Weekend: alleen BTC/ETH mag traden (02:00–20:00 GMT+1 ook in weekend)
+//  ✅ Geen weekend orders voor niet-crypto
 //  ✅ Self-healing symbool/lot errors
 //  ✅ Anti-consolidation risk halving
 //  ✅ Max RR tracker — wat was max RR vóór SL
@@ -263,6 +266,15 @@ const MIN_STOP = {
   "AUDJPY": 0.05, "CADJPY": 0.05, "NZDJPY": 0.05, "CHFJPY": 0.05,
 };
 
+// ── CRYPTO SYMBOLS SET ────────────────────────────────────────
+// Alleen deze symbolen mogen in het weekend traden
+const WEEKEND_ALLOWED_SYMBOLS = new Set(["BTCUSD", "ETHUSD", "BTC", "ETH"]);
+
+function isCryptoWeekendAllowed(symbol) {
+  return WEEKEND_ALLOWED_SYMBOLS.has(symbol) ||
+    ["BTC", "ETH"].some(c => symbol.startsWith(c));
+}
+
 // ── SYMBOL HELPERS ────────────────────────────────────────────
 function getMT5Symbol(symbol) {
   if (learnedPatches[symbol]?.mt5Override) return learnedPatches[symbol].mt5Override;
@@ -276,31 +288,60 @@ function getSymbolType(symbol) {
   return "stock";
 }
 
-// ── MARKTUREN CHECK (GMT+1) ───────────────────────────────────
+// ══════════════════════════════════════════════════════════════
+// MARKTUREN CHECK (GMT+1)
+// ──────────────────────────────────────────────────────────────
+// Regels:
+//  • Alle types: trading venster 02:00–20:00 GMT+1
+//  • Aandelen:   extra beperking 15:30–20:00 GMT+1
+//  • Weekend:    alleen crypto (BTC/ETH) mag traden, ook binnen 02:00–20:00
+//  • Vrijdag:    zelfde venster 02:00–20:00, crypto mag door in weekend
+// ══════════════════════════════════════════════════════════════
 function getGMT1Time() {
   const now = new Date();
   return new Date(now.getTime() + 1 * 3600 * 1000);
 }
 
-function isMarketOpen(type) {
+function isMarketOpen(type, symbol) {
   const t    = getGMT1Time();
-  const day  = t.getUTCDay();
+  const day  = t.getUTCDay(); // 0=zondag, 6=zaterdag
   const hhmm = t.getUTCHours() * 100 + t.getUTCMinutes();
 
-  if (day === 0 || day === 6) {
-    console.warn(`🚫 Weekend — geen trading (dag ${day})`);
+  // ── Weekend check ─────────────────────────────────────────
+  const isWeekend = (day === 0 || day === 6);
+  if (isWeekend) {
+    // Alleen BTC/ETH toegestaan in weekend
+    if (!isCryptoWeekendAllowed(symbol || "")) {
+      console.warn(`🚫 Weekend — enkel crypto toegestaan (${symbol} geblokkeerd)`);
+      return false;
+    }
+    // Crypto in weekend: ook beperkt tot 02:00–20:00 GMT+1
+    if (hhmm < 200 || hhmm >= 2000) {
+      console.warn(`🚫 Weekend crypto buiten venster (${hhmm} — venster 0200–2000 GMT+1)`);
+      return false;
+    }
+    return true;
+  }
+
+  // ── Werkdag + vrijdag: globaal venster 02:00–20:00 GMT+1 ──
+  if (hhmm < 200) {
+    console.warn(`🚫 Voor 02:00 GMT+1 (${hhmm}) — geen trading (heropening om 02:00)`);
     return false;
   }
-  if (type === "crypto") return true;
-  if (type === "forex")  return true;
+  if (hhmm >= 2000) {
+    console.warn(`🚫 Na 20:00 GMT+1 (${hhmm}) — geen nieuwe orders meer (gesloten om 20:50)`);
+    return false;
+  }
+
+  // ── Aandelen: extra venster 15:30–20:00 GMT+1 ─────────────
   if (type === "stock") {
-    if (hhmm < 1530 || hhmm >= 2000) {
+    if (hhmm < 1530) {
       console.warn(`🚫 Aandelen buiten venster (${hhmm} — venster 1530–2000 GMT+1)`);
       return false;
     }
     return true;
   }
-  if (day === 5 && hhmm >= 2250) return false;
+
   return true;
 }
 
@@ -379,60 +420,56 @@ async function updateOpenPositionsTP(mt5Sym, newRR) {
   return { updated, skipped, errors };
 }
 
-// ── FRIDAY AUTO-CLOSE (22:50 CET) ────────────────────────────
-async function checkFridayClose() {
+// ══════════════════════════════════════════════════════════════
+// DAGELIJKSE AUTO-CLOSE — 20:50 GMT+1, ELKE DAG (ma–zo)
+// Sluit ALLES: aandelen, indices, forex, gold, crypto, ...
+// Uitzondering: crypto (BTC/ETH) in weekend wordt NIET gesloten
+// zodat ze de nacht door kunnen gaan (wordt geblokkeerd via isMarketOpen)
+// ══════════════════════════════════════════════════════════════
+cron.schedule("50 20 * * *", async () => {
   const t   = getGMT1Time();
   const day = t.getUTCDay();
-  const h   = t.getUTCHours();
-  const m   = t.getUTCMinutes();
-  if (day === 5 && h === 22 && m === 50) {
-    console.log("🔔 Vrijdag 22:50 GMT+1 — sluit ALLE posities voor weekend...");
-    try {
-      const positions = await fetchOpenPositions();
-      for (const pos of (positions || [])) {
-        await closePosition(pos.id);
-        console.log(`🔒 Weekend-close: ${pos.symbol}`);
-      }
-    } catch (e) {
-      console.error("❌ Weekend auto-close fout:", e.message);
-    }
-  }
-}
-setInterval(checkFridayClose, 60 * 1000);
 
-// ── DAILY STOCK AUTO-CLOSE (20:50 CET) ───────────────────────
-cron.schedule("50 20 * * 1-5", async () => {
-  console.log("🔔 20:50 CET — daily stock auto-close gestart...");
+  console.log("🔔 20:50 GMT+1 — auto-close ALLE posities gestart...");
   try {
     const positions = await fetchOpenPositions();
     if (!Array.isArray(positions) || positions.length === 0) {
-      console.log("[STOCK AUTO-CLOSE] Geen open posities.");
+      console.log("[AUTO-CLOSE 20:50] Geen open posities.");
       return;
     }
-    const stockPositions = positions.filter(p => {
-      const tvSym = Object.keys(SYMBOL_MAP).find(k => SYMBOL_MAP[k].mt5 === p.symbol) || p.symbol;
-      return getSymbolType(tvSym) === "stock";
-    });
-    if (stockPositions.length === 0) {
-      console.log("[STOCK AUTO-CLOSE] Geen open aandelenposities.");
-      return;
-    }
-    for (const pos of stockPositions) {
+
+    for (const pos of positions) {
+      // In het weekend: BTC/ETH laten staan (die mogen 's nachts doorlopen)
+      // Op werkdagen: alles sluiten
+      const tvSym  = Object.keys(SYMBOL_MAP).find(k => SYMBOL_MAP[k].mt5 === pos.symbol) || pos.symbol;
+      const symType = getSymbolType(tvSym);
+      const isWeekend = (day === 0 || day === 6);
+
+      if (isWeekend && symType === "crypto" && isCryptoWeekendAllowed(tvSym)) {
+        // Weekend crypto mag blijven — wordt om 20:00 geblokkeerd voor nieuwe orders
+        // maar bestaande posities mogen doorlopen
+        console.log(`⏭️  [AUTO-CLOSE 20:50] ${pos.symbol} — weekend crypto, niet gesloten`);
+        continue;
+      }
+
       try {
         const result = await closePosition(pos.id);
         const pnl    = pos.unrealizedProfit != null ? `P&L: €${pos.unrealizedProfit}` : "";
-        console.log(`✅ [STOCK AUTO-CLOSE] ${pos.symbol} gesloten ${pnl}`, JSON.stringify(result));
-        addWebhookHistory({ type: "STOCK_AUTOCLOSE", symbol: pos.symbol, positionId: pos.id, reason: "daily 20:50 close" });
+        console.log(`✅ [AUTO-CLOSE 20:50] ${pos.symbol} gesloten ${pnl}`, JSON.stringify(result));
+        addWebhookHistory({
+          type: "AUTOCLOSE_2050", symbol: pos.symbol, positionId: pos.id,
+          reason: "daily 20:50 close — alles"
+        });
       } catch (e) {
-        console.error(`❌ [STOCK AUTO-CLOSE] Fout bij sluiten ${pos.symbol}:`, e.message);
+        console.error(`❌ [AUTO-CLOSE 20:50] Fout bij sluiten ${pos.symbol}:`, e.message);
       }
     }
   } catch (e) {
-    console.error("❌ [STOCK AUTO-CLOSE] Fout bij ophalen posities:", e.message);
+    console.error("❌ [AUTO-CLOSE 20:50] Fout bij ophalen posities:", e.message);
   }
 }, { timezone: "Europe/Brussels" });
 
-console.log("⏰ Daily stock auto-close actief: elke werkdag om 20:50 (Europe/Brussels)");
+console.log("⏰ Auto-close 20:50 actief: elke dag (Europe/Brussels) — sluit ALLES behalve weekend crypto");
 
 // ── NACHTELIJKE TP AUTO-UPDATE (03:00 CET) ────────────────────
 cron.schedule("0 3 * * *", async () => {
@@ -633,20 +670,12 @@ async function syncPositions() {
     for (const [id, trade] of Object.entries(openPositions)) {
       if (!liveIds.has(id)) {
         const maxRR   = calcMaxRR(trade);
-        const session = getSession(trade.openedAt); // 🆕 sessie detectie
-        const closed  = {
-          ...trade,
-          closedAt: new Date().toISOString(),
-          maxRR,
-          session,
-        };
+        const session = getSession(trade.openedAt);
+        const closed  = { ...trade, closedAt: new Date().toISOString(), maxRR, session };
         closedTrades.push(closed);
-
-        // 🆕 Persistent opslaan in Postgres
         saveTrade(closed).catch(e =>
           console.error(`❌ [DB] saveTrade mislukt voor ${trade.symbol}:`, e.message)
         );
-
         if (trade.symbol && trade.direction) decrementTradeTracker(trade.symbol, trade.direction);
         delete openPositions[id];
         console.log(`📦 ${trade.symbol} gesloten | Max RR: ${maxRR}R | Sessie: ${session}`);
@@ -671,10 +700,7 @@ async function syncPositions() {
       };
       accountSnapshots.push(snap);
       if (accountSnapshots.length > MAX_SNAPSHOTS) accountSnapshots.shift();
-
-      // 🆕 Throttled Postgres snapshot (1x per 5 min)
       saveSnapshot(snap).catch(e => console.warn("⚠️ [DB] saveSnapshot mislukt:", e.message));
-
     } catch (e) { console.warn("⚠️ Equity snapshot mislukt:", e.message); }
 
   } catch (e) { console.warn("⚠️ syncPositions fout:", e.message); }
@@ -716,7 +742,8 @@ app.post("/webhook", async (req, res) => {
 
     if (!SYMBOL_MAP[symbol]) console.warn(`⚠️ Onbekend symbool: "${symbol}" → doorgestuurd als "${mt5Sym}"`);
 
-    if (!isMarketOpen(symType)) {
+    // ── Markt open check (met symbool doorgeven voor weekend-crypto check) ──
+    if (!isMarketOpen(symType, symbol)) {
       const msg = `🕐 Markt gesloten voor ${symbol} (${symType}) — order genegeerd`;
       console.warn(msg);
       addWebhookHistory({ type: "MARKET_CLOSED", symbol, symType });
@@ -772,7 +799,7 @@ app.post("/webhook", async (req, res) => {
       entry: entryNum, sl: slPrice, tp: tpPrice ?? null, lots,
       riskEUR:    effectiveRisk,
       openedAt:   new Date().toISOString(),
-      session:    getSession(), // 🆕
+      session:    getSession(),
       maxPrice:   entryNum,
       maxRR:      0,
       currentPnL: 0,
@@ -818,11 +845,13 @@ app.post("/close", async (req, res) => {
 app.get("/", (req, res) => {
   resetDailyLossIfNewDay();
   res.json({
-    status: "online", versie: "ftmo-v3.4", broker: "FTMO-Demo",
+    status: "online", versie: "ftmo-v3.5", broker: "FTMO-Demo",
     account: ACCOUNT_BALANCE, risicoPerType: RISK, maxLotsPerType: MAX_LOTS,
     tpRrBySimbool: TP_RR_BY_SYMBOL,
-    stockTradingWindow: "15:30–20:00 GMT+1",
-    stockDailyAutoClose: "20:50 GMT+1 (elke werkdag)",
+    tradingVenster: "02:00–20:00 GMT+1 (alle types)",
+    stockTradingWindow: "15:30–20:00 GMT+1 (aandelen)",
+    dailyAutoClose: "20:50 GMT+1 (elke dag — ALLES, behalve weekend crypto)",
+    weekendTrading: "Alleen BTC/ETH (02:00–20:00 GMT+1)",
     ftmo: {
       startBalance:       ftmoStartBalance,
       dailyLossUsed:      parseFloat(ftmoDailyLossUsed.toFixed(2)),
@@ -1108,12 +1137,14 @@ async function startServer() {
 
   const server = app.listen(PORT, () =>
     console.log([
-      `🚀 FTMO Webhook v3.4 — online op poort ${PORT}`,
+      `🚀 FTMO Webhook v3.5 — online op poort ${PORT}`,
       `💰 Balance: €${ACCOUNT_BALANCE}`,
       `📈 Risico  | Index: €${RISK.index} | Forex: €${RISK.forex} | Stock: €${RISK.stock} | Gold: €${RISK.gold}`,
       `🎯 TP      | Dynamisch via TP_RR_BY_SYMBOL (zie GET /)`,
+      `🕐 Venster algemeen  : 02:00–20:00 GMT+1 (heropening 02:00, laatste order 20:00)`,
       `🕐 Aandelen venster  : 15:30–20:00 GMT+1`,
-      `⏰ Stock auto-close  : 20:50 GMT+1 (elke werkdag)`,
+      `⏰ Auto-close 20:50  : elke dag — ALLES (behalve weekend crypto)`,
+      `🌙 Weekend trading   : alleen BTC/ETH (02:00–20:00 GMT+1)`,
       `📉 Forex max: ${MAX_LOTS.forex} lot`,
       `🛡️  FTMO dagelijks verlies: UITGESCHAKELD`,
       `🗺️  Symbolen in map: ${Object.keys(SYMBOL_MAP).length}`,
