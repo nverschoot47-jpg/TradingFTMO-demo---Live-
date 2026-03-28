@@ -1,33 +1,34 @@
 // ═══════════════════════════════════════════════════════════════
-// session.js — Trading sessie detectie (UTC gebaseerd)
+// session.js — Trading sessie detectie (GMT+1)
 //
-// Asia    : 00:00 – 08:00 UTC
-// London  : 07:00 – 16:00 UTC  (overlap met Asia 07-08)
-// New York: 13:00 – 22:00 UTC  (overlap met London 13-16)
-// Overlap London/NY is eigen categorie — vaak meest volatiel
+// Asia         : 00:00 – 08:00 GMT+1
+// London       : 08:00 – 15:30 GMT+1
+// LDN/NY Overlap: 15:30 – 17:00 GMT+1
+// New York     : 17:00 – 00:00 GMT+1
 // ═══════════════════════════════════════════════════════════════
 
-function getSession(dateInput) {
-  const d    = dateInput ? new Date(dateInput) : new Date();
-  const hour = d.getUTCHours(); // 0–23
-
-  // London/NY overlap — meest volatiel, apart bijhouden
-  if (hour >= 13 && hour < 16) return "overlap_lndy";
-
-  if (hour >= 7  && hour < 16) return "london";
-  if (hour >= 13 && hour < 22) return "new_york";
-  if (hour >= 22 || hour < 7)  return "asia";
-
-  return "asia"; // fallback
+function getGMT1Time(dateInput) {
+  const d = dateInput ? new Date(dateInput) : new Date();
+  return new Date(d.getTime() + 1 * 3600 * 1000);
 }
 
-// Geeft een leesbaar label terug voor in rapporten
+function getSession(dateInput) {
+  const d    = getGMT1Time(dateInput);
+  const hhmm = d.getUTCHours() * 100 + d.getUTCMinutes();
+
+  if (hhmm >= 1530 && hhmm < 1700) return "overlap_lndy";
+  if (hhmm >= 800  && hhmm < 1530) return "london";
+  if (hhmm >= 1700 && hhmm < 2400) return "new_york";
+
+  return "asia"; // 00:00 – 08:00
+}
+
 function getSessionLabel(session) {
   return {
-    asia:          "🌏 Asia        (00–07 UTC)",
-    london:        "🇬🇧 London      (07–16 UTC)",
-    overlap_lndy:  "⚡ LDN/NY Overlap (13–16 UTC)",
-    new_york:      "🗽 New York     (13–22 UTC)",
+    asia:         "🌏 Asia          (00:00–08:00 GMT+1)",
+    london:       "🇬🇧 London        (08:00–15:30 GMT+1)",
+    overlap_lndy: "⚡ LDN/NY Overlap (15:30–17:00 GMT+1)",
+    new_york:     "🗽 New York       (17:00–00:00 GMT+1)",
   }[session] || session;
 }
 
