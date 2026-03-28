@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════
-// db.js — PostgreSQL persistence layer
+// Db.js — PostgreSQL persistence layer
 // Railway: voeg Postgres plugin toe → DATABASE_URL wordt auto-gezet
 // ═══════════════════════════════════════════════════════════════
 
