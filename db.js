@@ -211,8 +211,6 @@ async function loadSnapshots(hours = 24) {
   return res.rows;
 }
 
-module.exports = { initDB, saveTrade, loadAllTrades, saveSnapshot, loadSnapshots, loadTPConfig, saveTPConfig, logTPUpdate, loadTPUpdateLog };
-
 // ── TP CONFIG ─────────────────────────────────────────────────
 async function loadTPConfig() {
   try {
@@ -275,3 +273,5 @@ async function loadTPUpdateLog(limit = 50) {
     return [];
   }
 }
+
+module.exports = { initDB, saveTrade, loadAllTrades, saveSnapshot, loadSnapshots, loadTPConfig, saveTPConfig, logTPUpdate, loadTPUpdateLog };
