@@ -1,11 +1,11 @@
 {
   "name": "nv-tradingview-webhook",
-  "version": "3.4.0",
-  "description": "TradingView → MetaApi REST → FTMO MT5 | NV Clean v3.4",
-  "main": "webhook.js",
+  "version": "3.8.0",
+  "description": "TradingView → MetaApi REST → FTMO MT5 | NV v3.8 — geen auto-TP, ghost tracker (24u)",
+  "main": "webhook-server-v3_8.js",
   "scripts": {
-    "start": "node webhook.js",
-    "dev": "nodemon webhook.js"
+    "start": "node webhook-server-v3_8.js",
+    "dev": "nodemon webhook-server-v3_8.js"
   },
   "dependencies": {
     "express": "^4.18.2",
