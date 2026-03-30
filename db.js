@@ -1,6 +1,13 @@
 // ═══════════════════════════════════════════════════════════════
-// db.js — PostgreSQL persistence layer
+// db.js — PostgreSQL persistence layer  |  v3.8
 // Railway: voeg Postgres plugin toe → DATABASE_URL wordt auto-gezet
+//
+// Wijzigingen t.o.v. v3.7:
+//  ✅ position_id kolom (MT5 positie-ID) als unieke sleutel
+//  ✅ true_max_rr / true_max_price / ghost_stop_reason / ghost_finalized_at
+//  ✅ saveTrade = UPSERT op position_id
+//     → eerste call slaat trade op bij sluiting
+//     → tweede call (ghost klaar) update alleen de ghost-velden
 // ═══════════════════════════════════════════════════════════════
 
 const { Pool } = require("pg");
@@ -14,22 +21,34 @@ const pool = new Pool({
 async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS closed_trades (
-      id            SERIAL PRIMARY KEY,
-      symbol        TEXT        NOT NULL,
-      mt5_symbol    TEXT,
-      direction     TEXT        NOT NULL,
-      entry         NUMERIC     NOT NULL,
-      sl            NUMERIC     NOT NULL,
-      tp            NUMERIC,
-      lots          NUMERIC,
-      risk_eur      NUMERIC,
-      max_price     NUMERIC,
-      max_rr        NUMERIC,
-      session       TEXT,
-      opened_at     TIMESTAMPTZ,
-      closed_at     TIMESTAMPTZ DEFAULT NOW(),
-      created_at    TIMESTAMPTZ DEFAULT NOW()
+      id                  SERIAL PRIMARY KEY,
+      position_id         TEXT        UNIQUE,          -- MT5 positie-ID (upsert sleutel)
+      symbol              TEXT        NOT NULL,
+      mt5_symbol          TEXT,
+      direction           TEXT        NOT NULL,
+      entry               NUMERIC     NOT NULL,
+      sl                  NUMERIC     NOT NULL,
+      tp                  NUMERIC,
+      lots                NUMERIC,
+      risk_eur            NUMERIC,
+      max_price           NUMERIC,
+      max_rr              NUMERIC,
+      true_max_rr         NUMERIC,                     -- ghost tracker resultaat
+      true_max_price      NUMERIC,                     -- beste prijs na sluiting
+      ghost_stop_reason   TEXT,                        -- timeout / sl_breach / market_closed / failsafe
+      ghost_finalized_at  TIMESTAMPTZ,
+      session             TEXT,
+      opened_at           TIMESTAMPTZ,
+      closed_at           TIMESTAMPTZ DEFAULT NOW(),
+      created_at          TIMESTAMPTZ DEFAULT NOW()
     );
+
+    -- Voeg nieuwe kolommen toe als ze nog niet bestaan (veilig bij upgrade van v3.7)
+    ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS position_id        TEXT        UNIQUE;
+    ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS true_max_rr        NUMERIC;
+    ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS true_max_price     NUMERIC;
+    ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS ghost_stop_reason  TEXT;
+    ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS ghost_finalized_at TIMESTAMPTZ;
 
     CREATE TABLE IF NOT EXISTS equity_snapshots (
       id            SERIAL PRIMARY KEY,
@@ -41,58 +60,88 @@ async function initDB() {
       free_margin   NUMERIC
     );
 
-    CREATE INDEX IF NOT EXISTS idx_trades_symbol   ON closed_trades(symbol);
-    CREATE INDEX IF NOT EXISTS idx_trades_closed   ON closed_trades(closed_at);
-    CREATE INDEX IF NOT EXISTS idx_trades_session  ON closed_trades(session);
-    CREATE INDEX IF NOT EXISTS idx_equity_ts       ON equity_snapshots(ts);
+    CREATE INDEX IF NOT EXISTS idx_trades_symbol      ON closed_trades(symbol);
+    CREATE INDEX IF NOT EXISTS idx_trades_closed      ON closed_trades(closed_at);
+    CREATE INDEX IF NOT EXISTS idx_trades_session     ON closed_trades(session);
+    CREATE INDEX IF NOT EXISTS idx_trades_position_id ON closed_trades(position_id);
+    CREATE INDEX IF NOT EXISTS idx_equity_ts          ON equity_snapshots(ts);
   `);
-  console.log("✅ [DB] Schema klaar");
+  console.log("✅ [DB] Schema klaar (v3.8)");
 }
 
 // ── TRADES ────────────────────────────────────────────────────
+// UPSERT op position_id:
+//   - Nieuwe trade → volledige INSERT
+//   - Ghost klaar  → update alleen de ghost-velden (trueMaxRR etc.)
 
 async function saveTrade(trade) {
   const q = `
     INSERT INTO closed_trades
-      (symbol, mt5_symbol, direction, entry, sl, tp, lots, risk_eur,
-       max_price, max_rr, session, opened_at, closed_at)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+      (position_id, symbol, mt5_symbol, direction, entry, sl, tp, lots, risk_eur,
+       max_price, max_rr, true_max_rr, true_max_price,
+       ghost_stop_reason, ghost_finalized_at,
+       session, opened_at, closed_at)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+    ON CONFLICT (position_id) DO UPDATE SET
+      max_price           = EXCLUDED.max_price,
+      max_rr              = EXCLUDED.max_rr,
+      true_max_rr         = EXCLUDED.true_max_rr,
+      true_max_price      = EXCLUDED.true_max_price,
+      ghost_stop_reason   = EXCLUDED.ghost_stop_reason,
+      ghost_finalized_at  = EXCLUDED.ghost_finalized_at
     RETURNING id
   `;
   const vals = [
+    trade.id             ?? null,          // position_id = MT5 positie-ID
     trade.symbol,
-    trade.mt5Symbol    ?? null,
+    trade.mt5Symbol      ?? null,
     trade.direction,
     trade.entry,
     trade.sl,
-    trade.tp           ?? null,
-    trade.lots         ?? null,
-    trade.riskEUR      ?? null,
-    trade.maxPrice     ?? null,
-    trade.maxRR        ?? null,
-    trade.session      ?? null,
-    trade.openedAt     ?? null,
-    trade.closedAt     ?? new Date().toISOString(),
+    trade.tp             ?? null,
+    trade.lots           ?? null,
+    trade.riskEUR        ?? null,
+    trade.maxPrice       ?? null,
+    trade.maxRR          ?? null,
+    trade.trueMaxRR      ?? null,
+    trade.trueMaxPrice   ?? null,
+    trade.ghostStopReason   ?? null,
+    trade.ghostFinalizedAt  ?? null,
+    trade.session        ?? null,
+    trade.openedAt       ?? null,
+    trade.closedAt       ?? new Date().toISOString(),
   ];
   const res = await pool.query(q, vals);
-  console.log(`💾 [DB] Trade opgeslagen: id=${res.rows[0].id} ${trade.symbol} maxRR=${trade.maxRR}`);
+  const isGhostUpdate = trade.trueMaxRR !== null && trade.trueMaxRR !== undefined;
+  console.log(
+    isGhostUpdate
+      ? `👻 [DB] Ghost update: id=${res.rows[0].id} ${trade.symbol} trueMaxRR=${trade.trueMaxRR}`
+      : `💾 [DB] Trade opgeslagen: id=${res.rows[0].id} ${trade.symbol} maxRR=${trade.maxRR}`
+  );
   return res.rows[0].id;
 }
 
 async function loadAllTrades() {
   const res = await pool.query(`
     SELECT
-      symbol, mt5_symbol AS "mt5Symbol", direction,
-      CAST(entry     AS FLOAT) AS entry,
-      CAST(sl        AS FLOAT) AS sl,
-      CAST(tp        AS FLOAT) AS tp,
-      CAST(lots      AS FLOAT) AS lots,
-      CAST(risk_eur  AS FLOAT) AS "riskEUR",
-      CAST(max_price AS FLOAT) AS "maxPrice",
-      CAST(max_rr    AS FLOAT) AS "maxRR",
+      position_id         AS "id",
+      symbol,
+      mt5_symbol          AS "mt5Symbol",
+      direction,
+      CAST(entry          AS FLOAT) AS entry,
+      CAST(sl             AS FLOAT) AS sl,
+      CAST(tp             AS FLOAT) AS tp,
+      CAST(lots           AS FLOAT) AS lots,
+      CAST(risk_eur       AS FLOAT) AS "riskEUR",
+      CAST(max_price      AS FLOAT) AS "maxPrice",
+      CAST(max_rr         AS FLOAT) AS "maxRR",
+      CAST(true_max_rr    AS FLOAT) AS "trueMaxRR",
+      CAST(true_max_price AS FLOAT) AS "trueMaxPrice",
+      ghost_stop_reason   AS "ghostStopReason",
+      ghost_finalized_at  AS "ghostFinalizedAt",
       session,
-      opened_at AS "openedAt",
-      closed_at AS "closedAt"
+      opened_at           AS "openedAt",
+      closed_at           AS "closedAt"
     FROM closed_trades
     ORDER BY closed_at ASC
   `);
@@ -101,15 +150,14 @@ async function loadAllTrades() {
 }
 
 // ── EQUITY SNAPSHOTS ──────────────────────────────────────────
-// Sla elke 30s snapshot op maar throttle DB writes naar elke 5 minuten
-// om Postgres niet te overbelasten.
+// Throttle DB writes naar elke 5 minuten om Postgres niet te overbelasten
 
 let lastSnapshotSave = 0;
-const SNAPSHOT_INTERVAL_MS = 5 * 60 * 1000; // 5 minuten
+const SNAPSHOT_INTERVAL_MS = 5 * 60 * 1000;
 
 async function saveSnapshot(snap) {
   const now = Date.now();
-  if (now - lastSnapshotSave < SNAPSHOT_INTERVAL_MS) return; // throttle
+  if (now - lastSnapshotSave < SNAPSHOT_INTERVAL_MS) return;
   lastSnapshotSave = now;
   await pool.query(`
     INSERT INTO equity_snapshots (ts, balance, equity, floating_pl, margin, free_margin)
