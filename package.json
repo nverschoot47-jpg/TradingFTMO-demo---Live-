@@ -2,10 +2,10 @@
   "name": "nv-tradingview-webhook",
   "version": "3.8.0",
   "description": "TradingView → MetaApi REST → FTMO MT5 | NV v3.8 — geen auto-TP, ghost tracker (24u)",
-  "main": "webhook-server-v3_8.js",
+  "main": "server.js",
   "scripts": {
-    "start": "node webhook-server-v3_8.js",
-    "dev": "nodemon webhook-server-v3_8.js"
+    "start": "node server.js",
+    "dev": "nodemon server.js"
   },
   "dependencies": {
     "express": "^4.18.2",
