@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════
-// TradingView → MetaApi REST → MT5  |  FTMO Webhook Server v3.8
+// TradingView → MetaApi REST → MT5  |  FTMO Webhook Server v3.8.1
 // Account : Nick Verschoot — FTMO Demo
 // MetaApi : 7cb566c1-be02-415b-ab95-495368f3885c
 // ───────────────────────────────────────────────────────────────
@@ -29,7 +29,8 @@ const cron    = require("node-cron");
 const app     = express();
 app.use(express.json());
 
-const { initDB, saveTrade, loadAllTrades, saveSnapshot, loadSnapshots } = require("./db");
+const { initDB, saveTrade, loadAllTrades, saveSnapshot, loadSnapshots,
+        loadTPConfig, saveTPConfig, logTPUpdate, loadTPUpdateLog } = require("./db");
 
 // ── CONFIG ────────────────────────────────────────────────────
 const META_API_TOKEN  = process.env.META_API_TOKEN;
@@ -110,6 +111,14 @@ const accountSnapshots = [];
 const webhookHistory   = [];
 // ghostTrackers = post-close trackers per tijdelijk ID
 const ghostTrackers    = {};
+
+// ── TP LOCK CONFIG ────────────────────────────────────────────
+const TP_LOCK_THRESHOLD  = 10;   // eerste lock na X trades
+const TP_UPDATE_INTERVAL = 10;   // herbereken elke X nieuwe trades
+// In-memory: { [symbol]: { lockedRR, lockedAt, lockedTrades, prevRR, prevLockedAt, evAtLock } }
+const tpLocks     = {};
+const tpUpdateLog = [];          // in-memory log, max 100 entries
+const MAX_TP_LOG  = 100;
 
 const MAX_SNAPSHOTS = 86400;
 const MAX_HISTORY   = 200;
@@ -497,6 +506,9 @@ function finaliseGhost(ghostId, trade, bestPrice, reason) {
     saveTrade(closedTrades[idx]).catch(e => console.error(`❌ [DB] ghost saveTrade:`, e.message));
 
     console.log(`✅ Ghost ${trade.symbol} → trueMaxRR: ${trueMaxRR}R (was maxRR: ${trade.maxRR}R) | reden: ${reason}`);
+
+    // ── TP Lock engine: herbereken na elke ghost finalisatie ──
+    runTPLockEngine(trade.symbol).catch(e => console.error(`❌ [TP Lock] engine fout:`, e.message));
   }
 }
 
@@ -504,6 +516,93 @@ function finaliseGhost(ghostId, trade, bestPrice, reason) {
 // Gebruikt trueMaxRR als beschikbaar, anders maxRR
 function getBestRR(trade) {
   return trade.trueMaxRR ?? trade.maxRR ?? 0;
+}
+
+// ══════════════════════════════════════════════════════════════
+// TP LOCK ENGINE
+// ──────────────────────────────────────────────────────────────
+// Draait na elke ghost finalisatie + bij startup.
+// Regels:
+//   - Eerste lock: zodra symbool >= TP_LOCK_THRESHOLD trades heeft
+//   - Update:      elke TP_UPDATE_INTERVAL nieuwe trades daarna
+//   - Altijd automatisch, wordt gelogd in tpUpdateLog + Postgres
+// ══════════════════════════════════════════════════════════════
+async function runTPLockEngine(symbol) {
+  const trades = closedTrades.filter(t => t.symbol === symbol && t.sl && t.entry);
+  const n = trades.length;
+
+  // Nog niet genoeg trades
+  if (n < TP_LOCK_THRESHOLD) return;
+
+  const existing = tpLocks[symbol];
+
+  // Bepaal of update nodig is
+  if (existing) {
+    const tradesSinceLock = n - existing.lockedTrades;
+    if (tradesSinceLock < TP_UPDATE_INTERVAL) return; // nog geen 10 nieuwe
+  }
+
+  // Bereken beste RR op basis van alle trades voor dit symbool
+  const evTable = RR_LEVELS.map(rr => {
+    const wins = trades.filter(t => getBestRR(t) >= rr).length;
+    const wr   = wins / n;
+    return { rr, ev: parseFloat((wr * rr - (1 - wr)).toFixed(3)) };
+  });
+  const best = evTable.reduce((a, b) => b.ev > a.ev ? b : a);
+
+  // Geen positieve EV → geen lock
+  if (best.ev <= 0) {
+    console.log(`⚠️ [TP Lock] ${symbol}: EV negatief op alle niveaus — geen lock`);
+    return;
+  }
+
+  const oldRR       = existing?.lockedRR ?? null;
+  const oldLockedAt = existing?.lockedAt ?? null;
+  const isNew       = !existing;
+  const changed     = existing && existing.lockedRR !== best.rr;
+
+  if (!isNew && !changed) {
+    // Zelfde RR, update lockedTrades zodat teller correct blijft
+    tpLocks[symbol] = { ...existing, lockedTrades: n };
+    return;
+  }
+
+  const reason = isNew ? `eerste lock na ${n} trades` : `update na ${n} trades (${oldRR}R → ${best.rr}R)`;
+
+  tpLocks[symbol] = {
+    lockedRR:     best.rr,
+    lockedAt:     new Date().toISOString(),
+    lockedTrades: n,
+    prevRR:       oldRR,
+    prevLockedAt: oldLockedAt,
+    evAtLock:     best.ev,
+  };
+
+  // Log in memory
+  const logEntry = {
+    symbol, oldRR, newRR: best.rr, trades: n, ev: best.ev, reason,
+    ts: new Date().toISOString(),
+  };
+  tpUpdateLog.unshift(logEntry);
+  if (tpUpdateLog.length > MAX_TP_LOG) tpUpdateLog.length = MAX_TP_LOG;
+
+  // Persist naar Postgres
+  try {
+    await saveTPConfig(symbol, best.rr, n, best.ev, oldRR, oldLockedAt);
+    await logTPUpdate(symbol, oldRR, best.rr, n, best.ev, reason);
+  } catch (e) {
+    console.error(`❌ [TP Lock] DB fout voor ${symbol}:`, e.message);
+  }
+
+  console.log(`🔒 [TP Lock] ${symbol}: ${isNew ? "NIEUW" : "UPDATE"} → ${best.rr}R (EV +${best.ev}R) op basis van ${n} trades`);
+}
+
+// Helper: berekent TP prijs op basis van gelockte RR
+function calcTPPrice(direction, entry, sl, lockedRR) {
+  const dist = Math.abs(entry - sl);
+  return direction === "buy"
+    ? parseFloat((entry + dist * lockedRR).toFixed(5))
+    : parseFloat((entry - dist * lockedRR).toFixed(5));
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -519,10 +618,13 @@ async function syncPositions() {
       const trade = openPositions[id];
       if (!trade) continue;
       const cur   = pos.currentPrice ?? pos.openPrice ?? 0;
+      // ── P&L: gebruik MetaApi's echte waarde (incl. spread, commissie, swap)
+      // Fallback naar eigen berekening als MetaApi geen profit geeft
       const lotV  = LOT_VALUE[getSymbolType(trade.symbol)] || 1;
-      trade.currentPnL = parseFloat(
-        ((trade.direction==="buy" ? cur-trade.entry : trade.entry-cur) * trade.lots * lotV).toFixed(2)
-      );
+      trade.currentPnL = parseFloat((
+        pos.unrealizedProfit ?? pos.profit ??
+        ((trade.direction==="buy" ? cur-trade.entry : trade.entry-cur) * trade.lots * lotV)
+      ).toFixed(2));
       const better = trade.direction==="buy"
         ? cur > (trade.maxPrice ?? trade.entry)
         : cur < (trade.maxPrice ?? trade.entry);
@@ -607,15 +709,21 @@ async function placeOrder(dir, symbol, entry, sl, lots) {
   const mt5Symbol = getMT5Symbol(symbol);
   const slPrice   = validateSL(dir, entry, sl, mt5Symbol);
 
-  // ── Geen TP ingesteld — optimizer bepaalt optimale RR achteraf ──
+  // ── TP: gebruik gelockte waarde indien beschikbaar ──
+  const lock   = tpLocks[symbol];
+  const tpPrice = lock ? calcTPPrice(dir, entry, slPrice, lock.lockedRR) : null;
+
   const body = {
     symbol:     mt5Symbol,
     volume:     lots,
     actionType: dir==="buy" ? "ORDER_TYPE_BUY" : "ORDER_TYPE_SELL",
     stopLoss:   slPrice,
-    comment:    `FTMO-NV-${dir.toUpperCase()}-${symbol}`,
-    // takeProfit: BEWUST WEGGELATEN
+    comment:    `FTMO-NV-${dir.toUpperCase()}-${symbol}${lock ? `-TP${lock.lockedRR}R` : ""}`,
+    ...(tpPrice ? { takeProfit: tpPrice } : {}),
   };
+  if (tpPrice) {
+    console.log(`🔒 [TP Lock] ${symbol} TP ingesteld op ${tpPrice} (${lock.lockedRR}R)`);
+  }
 
   const r = await fetch(`${META_BASE}/trade`, {
     method:  "POST",
@@ -704,7 +812,10 @@ app.post("/webhook", async (req, res) => {
       maxPrice: entryNum, maxRR: 0, currentPnL: 0, lastSync: null,
     };
 
-    addWebhookHistory({ type:"SUCCESS", symbol, mt5Symbol, direction, lots, posId, session, tp: "geen (ghost tracker actief)" });
+    const activeLock = tpLocks[symbol];
+    const tpUsed     = activeLock ? calcTPPrice(direction, entryNum, slPrice, activeLock.lockedRR) : null;
+    addWebhookHistory({ type:"SUCCESS", symbol, mt5Symbol, direction, lots, posId, session,
+      tp: tpUsed ? `${activeLock.lockedRR}R (${tpUsed})` : "geen — wacht op TP lock (min 10 trades)" });
 
     res.json({
       status:     "OK",
@@ -713,8 +824,11 @@ app.post("/webhook", async (req, res) => {
       mt5Symbol,
       entry:      entryNum,
       sl:         slPrice,
-      tp:         null,
-      tpInfo:     "Geen TP ingesteld — ghost tracker meet trueMaxRR na close voor TP optimizer",
+      tp:         tpUsed,
+      tpRR:       activeLock?.lockedRR ?? null,
+      tpInfo:     tpUsed
+        ? `TP gelockt op ${activeLock.lockedRR}R (obv ${activeLock.lockedTrades} trades) → prijs: ${tpUsed}`
+        : "Geen TP — ghost tracker actief, lock na 10 trades",
       slDist,
       lots,
       risicoEUR:  risk.toFixed(2),
@@ -748,7 +862,7 @@ app.get("/", (req, res) => {
   resetDailyLossIfNewDay();
   res.json({
     status:   "online",
-    versie:   "ftmo-v3.8",
+    versie:   "ftmo-v3.8.1",
     tradingVenster:  "02:00–20:00 GMT+1",
     aandelenVenster: "15:30–20:00 GMT+1",
     autoClose:       "20:50 GMT+1 (elke dag)",
@@ -1194,6 +1308,413 @@ app.get("/history", (req, res) => {
   res.json({ count: webhookHistory.length, history: webhookHistory.slice(0, limit) });
 });
 
+// ── TP LOCK STATUS API ────────────────────────────────────────
+app.get("/tp-locks", (req, res) => {
+  res.json({
+    generated: new Date().toISOString(),
+    threshold: TP_LOCK_THRESHOLD,
+    updateInterval: TP_UPDATE_INTERVAL,
+    locks: tpLocks,
+    recentLog: tpUpdateLog.slice(0, 20),
+  });
+});
+
+// ── TP LOCK LOG API (uit Postgres) ───────────────────────────
+app.get("/tp-locks/log", async (req, res) => {
+  try {
+    const log = await loadTPUpdateLog(50);
+    res.json({ count: log.length, log });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── TP LOCK MANUEEL RESETTEN (per symbool) ───────────────────
+app.delete("/tp-locks/:symbol", (req, res) => {
+  const secret = req.query.secret || req.headers["x-secret"];
+  if (secret !== WEBHOOK_SECRET) return res.status(401).json({ error: "Unauthorized" });
+  const sym = req.params.symbol.toUpperCase();
+  if (!tpLocks[sym]) return res.status(404).json({ error: "Geen lock voor dit symbool" });
+  delete tpLocks[sym];
+  console.log(`🗑️ [TP Lock] ${sym} manueel gereset`);
+  res.json({ status: "OK", message: `TP lock voor ${sym} verwijderd` });
+});
+
+// ══════════════════════════════════════════════════════════════
+// DASHBOARD — visueel overzicht met adviezen per symbool/sessie
+// ══════════════════════════════════════════════════════════════
+app.get("/dashboard", (req, res) => {
+  const SESSIONS = ["asia","london","ny"];
+
+  // ── Per symbool analyse ──
+  const bySymbol = {};
+  for (const t of closedTrades) {
+    if (!t.sl || !t.entry) continue;
+    const sym  = t.symbol || "UNKNOWN";
+    const sess = t.session || "buiten_venster";
+    if (!bySymbol[sym]) bySymbol[sym] = { all: [], sessions: {} };
+    bySymbol[sym].all.push(t);
+    if (!bySymbol[sym].sessions[sess]) bySymbol[sym].sessions[sess] = [];
+    bySymbol[sym].sessions[sess].push(t);
+  }
+
+  const symbolCards = Object.entries(bySymbol)
+    .sort((a,b) => b[1].all.length - a[1].all.length)
+    .map(([sym, d]) => {
+      const allTrades = d.all;
+      const n = allTrades.length;
+      const avgRR = parseFloat((allTrades.reduce((s,t) => s + getBestRR(t), 0) / n).toFixed(2));
+
+      const globalEV = RR_LEVELS.map(rr => {
+        const wins = allTrades.filter(t => getBestRR(t) >= rr).length;
+        const wr = wins / n;
+        return { rr, ev: parseFloat((wr*rr-(1-wr)).toFixed(3)), wr };
+      });
+      const bestGlobal = globalEV.reduce((a,b) => b.ev>a.ev ? b : a);
+
+      const sessieData = SESSIONS.map(sess => {
+        const st = d.sessions[sess] || [];
+        if (st.length < 3) return { sess, label: SESSION_LABELS[sess], trades: st.length, skip: true };
+        const avgSessRR = parseFloat((st.reduce((s,t) => s + getBestRR(t), 0) / st.length).toFixed(2));
+        const evTable = RR_LEVELS.map(rr => {
+          const wins = st.filter(t => getBestRR(t) >= rr).length;
+          const wr = wins / st.length;
+          return { rr, ev: parseFloat((wr*rr-(1-wr)).toFixed(3)), wr: parseFloat((wr*100).toFixed(1)) };
+        });
+        const bestTP = evTable.reduce((a,b) => b.ev>a.ev ? b : a);
+
+        const slAnalysis = SL_MULTIPLES.map(mult => {
+          const evT = RR_LEVELS.map(rr => {
+            const wins = st.filter(t => {
+              const origDist = Math.abs(t.entry - t.sl);
+              if (!origDist) return false;
+              return (getBestRR(t) * origDist / (origDist * mult)) >= rr;
+            }).length;
+            const wr = wins / st.length;
+            return { rr, ev: parseFloat((wr*rr-(1-wr)).toFixed(3)) };
+          });
+          const best = evT.reduce((a,b) => b.ev>a.ev ? b : a);
+          return { mult, bestEV: best.ev, bestRR: best.rr };
+        });
+        const currentSL = slAnalysis.find(s => s.mult === 1.0);
+        const bestSL    = slAnalysis.reduce((a,b) => b.bestEV>a.bestEV ? b : a);
+
+        let slAdvies = bestSL.mult < 1.0
+          ? `🔽 Kleinere SL (${bestSL.mult}×) geeft +${(bestSL.bestEV-(currentSL?.bestEV||0)).toFixed(2)}R EV`
+          : bestSL.mult > 1.0
+            ? `🔼 Bredere SL (${bestSL.mult}×) geeft +${(bestSL.bestEV-(currentSL?.bestEV||0)).toFixed(2)}R EV`
+            : `✅ Huidige SL is optimaal`;
+
+        let tpAdvies = bestTP.ev > 0.5
+          ? `🎯 Sterk: target ${bestTP.rr}R (EV +${bestTP.ev}R)`
+          : bestTP.ev > 0
+            ? `⚠️ Matig: target ${bestTP.rr}R (EV +${bestTP.ev}R)`
+            : `❌ EV negatief op alle niveaus`;
+
+        return {
+          sess, label: SESSION_LABELS[sess], trades: st.length, avgRR: avgSessRR,
+          bestTP: bestTP.rr, bestEV: bestTP.ev, bestWR: bestTP.wr,
+          slAdvies, tpAdvies, sessieKleur: bestTP.ev > 0.3 ? "green" : bestTP.ev > 0 ? "orange" : "red",
+          skip: false,
+        };
+      }).filter(s => !s.skip || s.trades > 0);
+
+      const validSessies = sessieData.filter(s => !s.skip);
+      const bestSessie   = validSessies.length ? validSessies.reduce((a,b) => b.bestEV>a.bestEV ? b : a) : null;
+      const worstSessie  = validSessies.length > 1 ? validSessies.reduce((a,b) => b.bestEV<a.bestEV ? b : a) : null;
+
+      // ── TP Lock info voor dit symbool ──
+      const lock = tpLocks[sym];
+      const tradesLeft = lock ? Math.max(0, (Math.ceil(lock.lockedTrades / TP_UPDATE_INTERVAL) * TP_UPDATE_INTERVAL + TP_UPDATE_INTERVAL) - n) : Math.max(0, TP_LOCK_THRESHOLD - n);
+      const lockOptimizer = bestGlobal.rr;
+      const lockDiffers   = lock && lock.lockedRR !== lockOptimizer && bestGlobal.ev > 0;
+
+      let globalAdvies = [];
+      if (bestGlobal.ev > 0.5) globalAdvies.push(`✅ Sterke setup: EV +${bestGlobal.ev}R bij ${bestGlobal.rr}R TP`);
+      else if (bestGlobal.ev > 0) globalAdvies.push(`⚠️ Matige EV: +${bestGlobal.ev}R bij ${bestGlobal.rr}R`);
+      else globalAdvies.push(`❌ Negatieve EV — herbekijk strategie`);
+      if (bestSessie) globalAdvies.push(`🏆 Beste sessie: ${bestSessie.label} (EV +${bestSessie.bestEV}R @ ${bestSessie.bestTP}R)`);
+      if (worstSessie && worstSessie.bestEV < 0) globalAdvies.push(`🚫 Vermijd: ${worstSessie.label}`);
+      const ghostPending = allTrades.filter(t => t.trueMaxRR === null).length;
+      if (ghostPending > 0) globalAdvies.push(`👻 ${ghostPending}/${n} ghost pending`);
+
+      return { sym, n, avgRR, bestGlobalTP: bestGlobal.rr, bestGlobalEV: bestGlobal.ev,
+               sessieData, globalAdvies, ghostPending, lock, tradesLeft, lockOptimizer, lockDiffers };
+    });
+
+  const equityData  = accountSnapshots.slice(-50).map(s => ({ ts: s.ts, equity: s.equity, balance: s.balance }));
+  const activeGhosts = Object.values(ghostTrackers).map(g => ({
+    symbol: g.trade.symbol, direction: g.trade.direction,
+    elapsed: Math.round((Date.now()-g.startedAt)/60000),
+    remaining: Math.round((GHOST_DURATION_MS-(Date.now()-g.startedAt))/60000),
+    currentRR: calcMaxRRFromPrice(g.trade, g.bestPrice),
+  }));
+  const recentTPLog = tpUpdateLog.slice(0, 10);
+  const lockedCount = Object.keys(tpLocks).length;
+
+  // ── HTML ──
+  const html = `<!DOCTYPE html>
+<html lang="nl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FTMO Dashboard — NV v3.8.1</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+:root{--bg:#0d0f14;--card:#161920;--border:#252a35;--green:#00c896;--orange:#f59e0b;--red:#ef4444;--blue:#3b82f6;--purple:#a855f7;--text:#e2e8f0;--muted:#64748b;--accent:#6366f1}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,sans-serif;font-size:14px}
+header{background:var(--card);border-bottom:1px solid var(--border);padding:16px 24px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+header h1{font-size:18px;font-weight:700;color:var(--green)}
+.badge{background:#1e2433;border:1px solid var(--border);border-radius:6px;padding:3px 10px;font-size:11px;color:var(--muted)}
+.badge.live{border-color:var(--green);color:var(--green)}
+.badge.lock{border-color:var(--purple);color:var(--purple)}
+.badge.warn{border-color:var(--orange);color:var(--orange)}
+main{max-width:1400px;margin:0 auto;padding:24px 20px}
+.section-title{font-size:12px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin:28px 0 12px;display:flex;align-items:center;gap:8px}
+.section-title::after{content:'';flex:1;height:1px;background:var(--border)}
+/* Stats */
+.summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:4px}
+.stat{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:16px}
+.stat .val{font-size:24px;font-weight:700;color:var(--green)}
+.stat .lbl{font-size:11px;color:var(--muted);margin-top:3px}
+/* Chart */
+.chart-wrap{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:20px;margin-bottom:4px}
+/* TP Lock panel */
+.tp-panel{background:var(--card);border:1px solid var(--border);border-radius:12px;overflow:hidden;margin-bottom:4px}
+.tp-panel-header{background:#1a1330;border-bottom:1px solid var(--border);padding:14px 20px;display:flex;align-items:center;gap:10px}
+.tp-panel-header h3{font-size:14px;font-weight:700;color:var(--purple)}
+.tp-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:0}
+.tp-cell{padding:14px 18px;border-right:1px solid var(--border);border-bottom:1px solid var(--border)}
+.tp-cell:last-child{border-right:none}
+.tp-sym{font-weight:700;font-size:15px;margin-bottom:6px}
+.tp-locked{color:var(--purple);font-size:22px;font-weight:700}
+.tp-meta{font-size:11px;color:var(--muted);margin-top:3px;line-height:1.6}
+.tp-badge{display:inline-block;border-radius:4px;padding:2px 7px;font-size:10px;font-weight:600;margin-top:6px}
+.tp-badge.new{background:#1e1035;color:var(--purple);border:1px solid var(--purple)}
+.tp-badge.updated{background:#1a2a10;color:var(--green);border:1px solid var(--green)}
+.tp-badge.differs{background:#2a1a05;color:var(--orange);border:1px solid var(--orange)}
+.tp-badge.pending{background:#1a1f2e;color:var(--muted);border:1px solid var(--border)}
+.tp-pending-cell{padding:14px 18px;border-right:1px solid var(--border);border-bottom:1px solid var(--border);color:var(--muted);font-size:12px}
+/* TP Update log */
+.log-table{width:100%;border-collapse:collapse;font-size:12px}
+.log-table th{text-align:left;color:var(--muted);font-weight:600;padding:8px 12px;border-bottom:1px solid var(--border);font-size:11px}
+.log-table td{padding:9px 12px;border-bottom:1px solid #1a1f2e}
+.log-table tr:last-child td{border-bottom:none}
+.log-table tr:hover td{background:#1a1f2e}
+.arr-up{color:var(--green)}
+.arr-dn{color:var(--red)}
+.arr-eq{color:var(--muted)}
+/* Symbol cards */
+.sym-card{background:var(--card);border:1px solid var(--border);border-radius:12px;margin-bottom:14px;overflow:hidden}
+.sym-header{display:flex;align-items:center;gap:14px;padding:14px 20px;border-bottom:1px solid var(--border);background:#1a1f2e}
+.sym-name{font-size:17px;font-weight:700}
+.sym-meta{color:var(--muted);font-size:12px}
+.sym-ev{margin-left:auto;text-align:right}
+.sym-ev .val{font-size:19px;font-weight:700}
+.sym-ev .lbl{font-size:11px;color:var(--muted)}
+.ev-pos{color:var(--green)}.ev-neg{color:var(--red)}.ev-mid{color:var(--orange)}
+/* TP lock inline badge */
+.tp-inline{display:inline-flex;align-items:center;gap:6px;background:#1e1035;border:1px solid var(--purple);border-radius:6px;padding:4px 10px;font-size:12px;color:var(--purple);margin-left:12px}
+.tp-inline.no-lock{background:#1a1f2e;border-color:var(--border);color:var(--muted)}
+.tp-inline.differs{background:#2a1a05;border-color:var(--orange);color:var(--orange)}
+.global-advies{padding:10px 20px;border-bottom:1px solid var(--border);display:flex;flex-wrap:wrap;gap:6px}
+.advies-pill{background:#1e2433;border-radius:20px;padding:4px 11px;font-size:12px}
+.sessie-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr))}
+.sessie-col{padding:14px 18px;border-right:1px solid var(--border)}
+.sessie-col:last-child{border-right:none}
+.sessie-label{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px}
+.sessie-label.green{color:var(--green)}.sessie-label.orange{color:var(--orange)}.sessie-label.red{color:var(--red)}.sessie-label.gray{color:var(--muted)}
+.sessie-stat{display:flex;justify-content:space-between;margin-bottom:5px;font-size:12px}
+.sessie-stat .k{color:var(--muted)}.sessie-stat .v{font-weight:600}
+.sessie-advies{margin-top:8px;padding:7px 9px;background:#1a1f2e;border-radius:6px;font-size:12px;line-height:1.5}
+.sessie-advies .sl{margin-top:4px;color:var(--blue)}
+.no-data{color:var(--muted);font-size:12px;font-style:italic}
+/* Ghost */
+.ghost-bar{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:14px 20px}
+.ghost-item{display:flex;gap:12px;align-items:center;padding:7px 0;border-bottom:1px solid var(--border)}
+.ghost-item:last-child{border-bottom:none}
+.ghost-sym{font-weight:600;width:90px;font-size:13px}
+.ghost-detail{color:var(--muted);font-size:12px;flex:1}
+.ghost-rr{font-weight:700;color:var(--green);width:40px;text-align:right}
+.prog-wrap{width:80px;height:4px;background:#252a35;border-radius:2px}
+.prog-fill{height:100%;background:var(--accent);border-radius:2px}
+footer{text-align:center;color:var(--muted);font-size:11px;padding:28px 20px}
+a{color:var(--muted);text-decoration:none}
+</style>
+</head>
+<body>
+<header>
+  <h1>⚡ FTMO Dashboard</h1>
+  <span style="color:var(--muted);font-size:12px">NV v3.8.1</span>
+  <span class="badge live">● Live</span>
+  <span class="badge">${new Date().toLocaleString("nl-BE",{timeZone:"Europe/Brussels"})}</span>
+  ${lockedCount ? `<span class="badge lock">🔒 ${lockedCount} TP gelockt</span>` : ""}
+  ${activeGhosts.length ? `<span class="badge warn">👻 ${activeGhosts.length} ghost actief</span>` : ""}
+</header>
+<main>
+
+<!-- SUMMARY -->
+<p class="section-title">Overzicht</p>
+<div class="summary">
+  <div class="stat"><div class="val">${closedTrades.length}</div><div class="lbl">Gesloten trades</div></div>
+  <div class="stat"><div class="val" style="color:var(--blue)">${symbolCards.length}</div><div class="lbl">Symbolen</div></div>
+  <div class="stat"><div class="val" style="color:var(--purple)">${lockedCount}</div><div class="lbl">TP locks actief</div></div>
+  <div class="stat"><div class="val" style="color:var(--orange)">${closedTrades.filter(t=>t.trueMaxRR===null).length}</div><div class="lbl">Ghost pending</div></div>
+  <div class="stat"><div class="val">${closedTrades.length ? (closedTrades.reduce((s,t)=>s+getBestRR(t),0)/closedTrades.length).toFixed(2) : "–"}R</div><div class="lbl">Gem. best RR</div></div>
+</div>
+
+${equityData.length >= 2 ? `
+<!-- EQUITY -->
+<p class="section-title">Equity Curve</p>
+<div class="chart-wrap">
+  <canvas id="eqChart" height="70"></canvas>
+</div>` : ""}
+
+<!-- TP LOCK PANEL -->
+<p class="section-title">TP Lock — Automatische Optimalisatie</p>
+<div class="tp-panel">
+  <div class="tp-panel-header">
+    <span style="font-size:18px">🔒</span>
+    <h3>Gelockte TP niveaus per symbool</h3>
+    <span style="color:var(--muted);font-size:12px;margin-left:auto">Lock na ${TP_LOCK_THRESHOLD} trades · Update elke ${TP_UPDATE_INTERVAL} trades</span>
+  </div>
+  <div class="tp-grid">
+    ${symbolCards.map(c => {
+      if (c.lock) {
+        const diffArrow = c.lock.prevRR ? (c.lock.lockedRR > c.lock.prevRR ? "▲" : c.lock.lockedRR < c.lock.prevRR ? "▼" : "=") : null;
+        const diffClass = c.lock.prevRR ? (c.lock.lockedRR > c.lock.prevRR ? "arr-up" : c.lock.lockedRR < c.lock.prevRR ? "arr-dn" : "arr-eq") : "";
+        const badgeLabel = c.lock.prevRR ? "🔄 geüpdated" : "🔒 gelockt";
+        const badgeClass = c.lockDiffers ? "differs" : c.lock.prevRR ? "updated" : "new";
+        return `<div class="tp-cell">
+  <div class="tp-sym">${c.sym}</div>
+  <div class="tp-locked">${c.lock.lockedRR}R TP</div>
+  <div class="tp-meta">
+    EV: +${c.lock.evAtLock ?? "–"}R &nbsp;·&nbsp; ${c.lock.lockedTrades} trades<br>
+    ${c.lock.prevRR ? `Vorige: <span class="${diffClass}">${diffArrow} ${c.lock.prevRR}R</span><br>` : ""}
+    Gezet: ${new Date(c.lock.lockedAt).toLocaleString("nl-BE",{timeZone:"Europe/Brussels",day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit"})}
+  </div>
+  <span class="tp-badge ${badgeClass}">${badgeLabel}</span>
+  ${c.lockDiffers ? `<span class="tp-badge differs" style="margin-left:4px">⚡ optimizer: ${c.lockOptimizer}R</span>` : ""}
+</div>`;
+      } else {
+        return `<div class="tp-pending-cell">
+  <div style="font-weight:600;margin-bottom:4px">${c.sym}</div>
+  <div style="color:var(--orange);font-size:13px">⏳ ${c.n}/${TP_LOCK_THRESHOLD} trades</div>
+  <div style="margin-top:4px;font-size:11px">Nog ${c.tradesLeft} trade${c.tradesLeft===1?"":"s"} nodig voor eerste lock</div>
+</div>`;
+      }
+    }).join("")}
+  </div>
+</div>
+
+${recentTPLog.length ? `
+<!-- TP UPDATE LOG -->
+<p class="section-title">TP Wijzigingen — Historiek</p>
+<div class="tp-panel">
+  <table class="log-table">
+    <thead><tr>
+      <th>Tijdstip</th><th>Symbool</th><th>Oud RR</th><th></th><th>Nieuw RR</th><th>Trades</th><th>EV</th><th>Reden</th>
+    </tr></thead>
+    <tbody>
+      ${recentTPLog.map(l => {
+        const arrow = l.oldRR === null ? "🆕" : l.newRR > l.oldRR ? `<span class="arr-up">▲</span>` : l.newRR < l.oldRR ? `<span class="arr-dn">▼</span>` : `<span class="arr-eq">=</span>`;
+        return `<tr>
+          <td>${new Date(l.ts).toLocaleString("nl-BE",{timeZone:"Europe/Brussels",day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit"})}</td>
+          <td style="font-weight:600">${l.symbol}</td>
+          <td style="color:var(--muted)">${l.oldRR !== null ? l.oldRR+"R" : "–"}</td>
+          <td>${arrow}</td>
+          <td style="font-weight:700;color:var(--purple)">${l.newRR}R</td>
+          <td>${l.trades}</td>
+          <td style="color:${(l.ev||0)>0?"var(--green)":"var(--red)"}">${l.ev !== null ? (l.ev>0?"+":"")+l.ev+"R" : "–"}</td>
+          <td style="color:var(--muted);font-size:11px">${l.reason}</td>
+        </tr>`;
+      }).join("")}
+    </tbody>
+  </table>
+</div>` : ""}
+
+<!-- SYMBOOL ANALYSE -->
+<p class="section-title">Analyse per symbool &amp; sessie</p>
+${symbolCards.length === 0 ? `<p style="color:var(--muted)">Nog geen gesloten trades.</p>` : symbolCards.map(c => {
+  const evCls = c.bestGlobalEV > 0.3 ? "ev-pos" : c.bestGlobalEV > 0 ? "ev-mid" : "ev-neg";
+  const lockBadge = c.lock
+    ? `<span class="tp-inline${c.lockDiffers?" differs":""}">🔒 TP ${c.lock.lockedRR}R${c.lockDiffers ? ` · optimizer: ${c.lockOptimizer}R ⚡` : ""}</span>`
+    : `<span class="tp-inline no-lock">⏳ ${c.n}/${TP_LOCK_THRESHOLD} — geen lock</span>`;
+  return `
+<div class="sym-card">
+  <div class="sym-header">
+    <div>
+      <div style="display:flex;align-items:center;gap:8px">
+        <span class="sym-name">${c.sym}</span>${lockBadge}
+      </div>
+      <div class="sym-meta">${c.n} trades · gem. best RR: ${c.avgRR}R · ${c.ghostPending>0?`👻 ${c.ghostPending} ghost pending`:"✅ ghost compleet"}</div>
+    </div>
+    <div class="sym-ev">
+      <div class="val ${evCls}">${c.bestGlobalEV>0?"+":""}${c.bestGlobalEV}R</div>
+      <div class="lbl">beste EV @ ${c.bestGlobalTP}R</div>
+    </div>
+  </div>
+  <div class="global-advies">${c.globalAdvies.map(a=>`<span class="advies-pill">${a}</span>`).join("")}</div>
+  <div class="sessie-grid">
+    ${c.sessieData.map(s => {
+      if (s.skip) return `<div class="sessie-col"><div class="sessie-label gray">${s.label}</div><p class="no-data">Te weinig data (${s.trades})</p></div>`;
+      return `<div class="sessie-col">
+  <div class="sessie-label ${s.sessieKleur}">${s.label}</div>
+  <div class="sessie-stat"><span class="k">Trades</span><span class="v">${s.trades}</span></div>
+  <div class="sessie-stat"><span class="k">Gem. best RR</span><span class="v">${s.avgRR}R</span></div>
+  <div class="sessie-stat"><span class="k">Beste TP</span><span class="v">${s.bestTP}R</span></div>
+  <div class="sessie-stat"><span class="k">EV @ beste TP</span><span class="v ${s.bestEV>0?"ev-pos":s.bestEV>-0.1?"ev-mid":"ev-neg"}">${s.bestEV>0?"+":""}${s.bestEV}R</span></div>
+  <div class="sessie-stat"><span class="k">Winrate</span><span class="v">${s.bestWR}%</span></div>
+  <div class="sessie-advies">${s.tpAdvies}<div class="sl">${s.slAdvies}</div></div>
+</div>`;
+    }).join("")}
+  </div>
+</div>`;
+}).join("")}
+
+${activeGhosts.length ? `
+<!-- GHOSTS -->
+<p class="section-title">Actieve Ghost Trackers</p>
+<div class="ghost-bar">
+  ${activeGhosts.map(g=>`<div class="ghost-item">
+  <div class="ghost-sym">👻 ${g.symbol}</div>
+  <div class="ghost-detail">${g.direction.toUpperCase()} · ${g.elapsed}min geleden · ${g.remaining}min resterend</div>
+  <div class="ghost-rr">${g.currentRR}R</div>
+  <div class="prog-wrap"><div class="prog-fill" style="width:${Math.min(100,Math.round(g.elapsed/(g.elapsed+g.remaining||1)*100))}%"></div></div>
+</div>`).join("")}
+</div>` : ""}
+
+</main>
+<footer>FTMO NV v3.8.1 · Auto-refresh 60s · GMT+1 · <a href="/">API</a> · <a href="/tp-locks">TP Lock JSON</a></footer>
+<script>
+setTimeout(()=>location.reload(),60000);
+${equityData.length >= 2 ? `
+const ctx=document.getElementById("eqChart").getContext("2d");
+new Chart(ctx,{
+  type:"line",
+  data:{
+    labels:${JSON.stringify(equityData.map(s=>new Date(s.ts).toLocaleTimeString("nl-BE",{hour:"2-digit",minute:"2-digit"})))},
+    datasets:[
+      {label:"Equity",data:${JSON.stringify(equityData.map(s=>s.equity))},borderColor:"#00c896",backgroundColor:"rgba(0,200,150,.08)",borderWidth:2,pointRadius:0,tension:.3,fill:true},
+      {label:"Balance",data:${JSON.stringify(equityData.map(s=>s.balance))},borderColor:"#6366f1",backgroundColor:"transparent",borderWidth:1.5,pointRadius:0,borderDash:[4,4],tension:.3}
+    ]
+  },
+  options:{
+    responsive:true,maintainAspectRatio:true,
+    plugins:{legend:{labels:{color:"#94a3b8",font:{size:11}}}},
+    scales:{
+      x:{ticks:{color:"#475569",font:{size:10}},grid:{color:"#1e2433"}},
+      y:{ticks:{color:"#475569",font:{size:10}},grid:{color:"#1e2433"}}
+    }
+  }
+});` : ""}
+</script>
+</body>
+</html>`;
+  res.send(html);
+});
+
 // ── START ─────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 
@@ -1205,9 +1726,23 @@ async function startServer() {
   closedTrades.push(...valid);
   console.log(`📂 ${valid.length} gesloten trades geladen uit Postgres`);
 
+  // ── TP Lock: laad bestaande configs uit Postgres ──
+  try {
+    const savedLocks = await loadTPConfig();
+    Object.assign(tpLocks, savedLocks);
+    console.log(`🔒 ${Object.keys(tpLocks).length} TP locks geladen`);
+  } catch (e) { console.warn("⚠️ TP config laden mislukt:", e.message); }
+
+  // ── TP Lock engine: draai voor alle symbolen met genoeg data ──
+  const symSet = [...new Set(valid.map(t => t.symbol).filter(Boolean))];
+  for (const sym of symSet) {
+    await runTPLockEngine(sym).catch(() => {});
+  }
+  console.log(`🔒 TP Lock engine klaar — ${Object.keys(tpLocks).length} symbolen gelockt`);
+
   const server = app.listen(PORT, () =>
     console.log([
-      `🚀 FTMO Webhook v3.8 — poort ${PORT}`,
+      `🚀 FTMO Webhook v3.8.1 — poort ${PORT}`,
       `💰 Balance: €${ACCOUNT_BALANCE}`,
       `📈 Risico | Index:€${RISK.index} Forex:€${RISK.forex} Gold:€${RISK.gold} Crypto:€${RISK.crypto}`,
       `🕐 Venster: 02:00–20:00 GMT+1 | Aandelen: 15:30–20:00`,
