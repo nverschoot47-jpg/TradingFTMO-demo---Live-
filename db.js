@@ -50,6 +50,29 @@ async function initDB() {
     ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS ghost_stop_reason  TEXT;
     ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS ghost_finalized_at TIMESTAMPTZ;
 
+    -- TP configuratie per symbool (auto-lock na 10 trades, update elke 10)
+    CREATE TABLE IF NOT EXISTS tp_config (
+      symbol          TEXT        PRIMARY KEY,
+      locked_rr       NUMERIC     NOT NULL,
+      locked_at       TIMESTAMPTZ DEFAULT NOW(),
+      locked_trades   INTEGER     NOT NULL,
+      prev_rr         NUMERIC,
+      prev_locked_at  TIMESTAMPTZ,
+      ev_at_lock      NUMERIC,
+      auto_updated    BOOLEAN     DEFAULT TRUE
+    );
+
+    CREATE TABLE IF NOT EXISTS tp_update_log (
+      id          SERIAL PRIMARY KEY,
+      symbol      TEXT        NOT NULL,
+      old_rr      NUMERIC,
+      new_rr      NUMERIC,
+      trades      INTEGER,
+      ev          NUMERIC,
+      reason      TEXT,
+      ts          TIMESTAMPTZ DEFAULT NOW()
+    );
+
     CREATE TABLE IF NOT EXISTS equity_snapshots (
       id            SERIAL PRIMARY KEY,
       ts            TIMESTAMPTZ DEFAULT NOW(),
@@ -188,4 +211,67 @@ async function loadSnapshots(hours = 24) {
   return res.rows;
 }
 
-module.exports = { initDB, saveTrade, loadAllTrades, saveSnapshot, loadSnapshots };
+module.exports = { initDB, saveTrade, loadAllTrades, saveSnapshot, loadSnapshots, loadTPConfig, saveTPConfig, logTPUpdate, loadTPUpdateLog };
+
+// ── TP CONFIG ─────────────────────────────────────────────────
+async function loadTPConfig() {
+  try {
+    const res = await pool.query(`SELECT * FROM tp_config ORDER BY symbol`);
+    const map = {};
+    for (const r of res.rows) {
+      map[r.symbol] = {
+        lockedRR:     parseFloat(r.locked_rr),
+        lockedAt:     r.locked_at,
+        lockedTrades: r.locked_trades,
+        prevRR:       r.prev_rr ? parseFloat(r.prev_rr) : null,
+        prevLockedAt: r.prev_locked_at,
+        evAtLock:     r.ev_at_lock ? parseFloat(r.ev_at_lock) : null,
+      };
+    }
+    console.log(`📊 [DB] ${res.rows.length} TP configs geladen`);
+    return map;
+  } catch (e) {
+    console.warn("⚠️ loadTPConfig:", e.message);
+    return {};
+  }
+}
+
+async function saveTPConfig(symbol, lockedRR, lockedTrades, evAtLock, prevRR, prevLockedAt) {
+  await pool.query(`
+    INSERT INTO tp_config (symbol, locked_rr, locked_trades, ev_at_lock, prev_rr, prev_locked_at, locked_at)
+    VALUES ($1, $2, $3, $4, $5, $6, NOW())
+    ON CONFLICT (symbol) DO UPDATE SET
+      prev_rr        = tp_config.locked_rr,
+      prev_locked_at = tp_config.locked_at,
+      locked_rr      = EXCLUDED.locked_rr,
+      locked_trades  = EXCLUDED.locked_trades,
+      ev_at_lock     = EXCLUDED.ev_at_lock,
+      locked_at      = NOW()
+  `, [symbol, lockedRR, lockedTrades, evAtLock ?? null, prevRR ?? null, prevLockedAt ?? null]);
+}
+
+async function logTPUpdate(symbol, oldRR, newRR, trades, ev, reason) {
+  await pool.query(`
+    INSERT INTO tp_update_log (symbol, old_rr, new_rr, trades, ev, reason)
+    VALUES ($1, $2, $3, $4, $5, $6)
+  `, [symbol, oldRR ?? null, newRR, trades, ev ?? null, reason]);
+  console.log(`📝 [DB] TP log: ${symbol} ${oldRR ?? "nieuw"}R → ${newRR}R (${reason})`);
+}
+
+async function loadTPUpdateLog(limit = 50) {
+  try {
+    const res = await pool.query(`
+      SELECT symbol,
+             CAST(old_rr AS FLOAT) AS "oldRR",
+             CAST(new_rr AS FLOAT) AS "newRR",
+             trades,
+             CAST(ev AS FLOAT) AS ev,
+             reason, ts
+      FROM tp_update_log ORDER BY ts DESC LIMIT $1
+    `, [limit]);
+    return res.rows;
+  } catch (e) {
+    console.warn("⚠️ loadTPUpdateLog:", e.message);
+    return [];
+  }
+}
