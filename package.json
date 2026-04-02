@@ -1,7 +1,7 @@
 {
   "name": "nv-tradingview-webhook",
-  "version": "3.8.0",
-  "description": "TradingView → MetaApi REST → FTMO MT5 | NV v3.8 — geen auto-TP, ghost tracker (24u)",
+  "version": "4.1.0",
+  "description": "TradingView → MetaApi REST → FTMO MT5 | NV v4.1 — Sub-1R TP, Stock risk boost, Forex anti-consolidatie, SL direction engine, Spread guard",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
