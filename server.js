@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════
-// TradingView → MetaApi REST → MT5  |  FTMO Webhook Server v4.1
+// TradingView → MetaApi REST → MT5  |  FTMO Webhook Server v4.2
 // Account : Nick Verschoot — FTMO Demo
 // MetaApi : 7cb566c1-be02-415b-ab95-495368f3885c
 // ───────────────────────────────────────────────────────────────
@@ -8,20 +8,14 @@
 //   london    → 08:00–15:30
 //   ny        → 15:30–20:00
 //
-// WIJZIGINGEN v4.1:
-//  ✅ MIN_STOP — elk symbool apart gedefinieerd
-//       GER40.cash: 10pt | UK100.cash: 5pt | US100.cash: 10pt
-//       US30.cash: 10pt  | US500.cash: 5pt  | XAUUSD (gold): 1pt
-//       Alle forex apart | Alle stocks: dynamisch 0.1% van entry
-//  ✅ TP Optimizer — sub-1R niveaus (0.2/0.4/0.6/0.8) toegevoegd
-//  ✅ Risk ×4 — nu ook op stocks bij bewezen TP lock + EV>0
-//  ✅ Stock SL — ×1.5 spread buffer (bescherming vs 5min candle spread)
-//  ✅ Spread guard — aandelen: spread mag max 50% van entry-SL afstand
-//  ✅ Forex anti-consolidatie — max 3 trades zelfde richting+pair → blokkeer
-//  ✅ SL engine (ghost-driven) — bepaalt ook of SL groter/kleiner moet
-//       op basis van EV/WR/RR analyse → direction: "up"/"down"/"unchanged"
-//  ✅ SL read-only — ghost tracker triggert ook SL direction analyse
-//  ✅ Dashboard — sub-1R TP, SL direction, anti-consolidatie status
+// WIJZIGINGEN v4.2 (t.o.v. v4.1):
+//  ✅ Indices nu ook tijdens Asia sessie (02:00–08:00)
+//  ✅ Min lot cap ×4 bij bewezen TP lock (€60 → €240)
+//  ✅ MIN_STOP: AUS200/US2000/SPN35/NL25 → 5 punten minimum
+//  ✅ Schone stocklijst (44 symbolen) — aliassen verwijderd
+//  ✅ GOOGL → GOOG (MT5), NIKE → NKE (MT5)
+//  ✅ Nieuwe stocks toegevoegd: GM, JNJ, LMT, MSTR, QCOM, RACE,
+//       SBUX, SNOW, T, ZM, ASML, AVGO
 // ═══════════════════════════════════════════════════════════════
 
 "use strict";
@@ -193,97 +187,50 @@ const SYMBOL_MAP = {
   "BTCUSD":      { mt5: "BTCUSD",      type: "crypto" },
   "ETHUSD":      { mt5: "ETHUSD",      type: "crypto" },
 
-  // ── Aandelen ─────────────────────────────────────────────
-  "AAPL":        { mt5: "AAPL",   type: "stock" },
-  "TSLA":        { mt5: "TSLA",   type: "stock" },
-  "NVDA":        { mt5: "NVDA",   type: "stock" },
-  "MSFT":        { mt5: "MSFT",   type: "stock" },
-  "PLTR":        { mt5: "PLTR",   type: "stock" },
-  "NFLX":        { mt5: "NFLX",   type: "stock" },
-  "AMZN":        { mt5: "AMZN",   type: "stock" },
-  "GOOGL":       { mt5: "GOOGL",  type: "stock" },
-  "META":        { mt5: "META",   type: "stock" },
-  "AMD":         { mt5: "AMD",    type: "stock" },
-  "COIN":        { mt5: "COIN",   type: "stock" },
-  "PYPL":        { mt5: "PYPL",   type: "stock" },
-  "SQ":          { mt5: "SQ",     type: "stock" },
-  "SHOP":        { mt5: "SHOP",   type: "stock" },
-  "UBER":        { mt5: "UBER",   type: "stock" },
-  "LYFT":        { mt5: "LYFT",   type: "stock" },
-  "SNAP":        { mt5: "SNAP",   type: "stock" },
-  "TWTR":        { mt5: "TWTR",   type: "stock" },
-  "SPOT":        { mt5: "SPOT",   type: "stock" },
-  "ABNB":        { mt5: "ABNB",   type: "stock" },
-  "RBLX":        { mt5: "RBLX",   type: "stock" },
-  "HOOD":        { mt5: "HOOD",   type: "stock" },
-  "SOFI":        { mt5: "SOFI",   type: "stock" },
-  "RIVN":        { mt5: "RIVN",   type: "stock" },
-  "LCID":        { mt5: "LCID",   type: "stock" },
-  "NIO":         { mt5: "NIO",    type: "stock" },
-  "XPEV":        { mt5: "XPEV",   type: "stock" },
-  "LI":          { mt5: "LI",     type: "stock" },
-  "BAC":         { mt5: "BAC",    type: "stock" },
-  "JPM":         { mt5: "JPM",    type: "stock" },
-  "GS":          { mt5: "GS",     type: "stock" },
-  "MS":          { mt5: "MS",     type: "stock" },
-  "C":           { mt5: "C",      type: "stock" },
-  "WFC":         { mt5: "WFC",    type: "stock" },
-  "CVX":         { mt5: "CVX",    type: "stock" },
-  "XOM":         { mt5: "XOM",    type: "stock" },
-  "MCD":         { mt5: "MCD",    type: "stock" },
-  "NKE":         { mt5: "NKE",    type: "stock" },
-  "PFE":         { mt5: "PFE",    type: "stock" },
-  "WMT":         { mt5: "WMT",    type: "stock" },
-  "CSCO":        { mt5: "CSCO",   type: "stock" },
-  "GE":          { mt5: "GE",     type: "stock" },
-  "GME":         { mt5: "GME",    type: "stock" },
-  "AMC":         { mt5: "AMC",    type: "stock" },
-  "BB":          { mt5: "BB",     type: "stock" },
-  "NOK":         { mt5: "NOK",    type: "stock" },
-  "TLRY":        { mt5: "TLRY",   type: "stock" },
-  "SNDL":        { mt5: "SNDL",   type: "stock" },
-  "WISH":        { mt5: "WISH",   type: "stock" },
-  "CLOV":        { mt5: "CLOV",   type: "stock" },
-  "WKHS":        { mt5: "WKHS",   type: "stock" },
-  "SPCE":        { mt5: "SPCE",   type: "stock" },
-  "ASTR":        { mt5: "ASTR",   type: "stock" },
-  "AZN":         { mt5: "AZN",    type: "stock" },
-  "BABA":        { mt5: "BABA",   type: "stock" },
-  "BRK.B":       { mt5: "BRK.B",  type: "stock" },
-  "BRKB":        { mt5: "BRK.B",  type: "stock" },
-  "BRK/B":       { mt5: "BRK.B",  type: "stock" },
-  "DIS":         { mt5: "DIS",    type: "stock" },
-  "INTC":        { mt5: "INTC",   type: "stock" },
-  "V":           { mt5: "V",      type: "stock" },
-  "IBM":         { mt5: "IBM",    type: "stock" },
-  "FDX":         { mt5: "FDX",    type: "stock" },
-  "KO":          { mt5: "KO",     type: "stock" },
-  "ARM":         { mt5: "ARM",    type: "stock" },
-  "BA":          { mt5: "BA",     type: "stock" },
-
-  // ── Aandelen — TradingView aliases → MT5 ─────────────────
-  "APC":         { mt5: "AAPL",   type: "stock" },
-  "TLO0":        { mt5: "TSLA",   type: "stock" },
-  "TLSO":        { mt5: "TSLA",   type: "stock" },
-  "NVD":         { mt5: "NVDA",   type: "stock" },
-  "MSF":         { mt5: "MSFT",   type: "stock" },
-  "NFC":         { mt5: "NFLX",   type: "stock" },
-  "AMZ":         { mt5: "AMZN",   type: "stock" },
-  "ABEA":        { mt5: "GOOGL",  type: "stock" },
-  "GOOG":        { mt5: "GOOGL",  type: "stock" },
-  "CHV":         { mt5: "CVX",    type: "stock" },
-  "MTA":         { mt5: "META",   type: "stock" },
-  "BAC1":        { mt5: "BAC",    type: "stock" },
-  "MCDS":        { mt5: "MCD",    type: "stock" },
-  "NKI":         { mt5: "NKE",    type: "stock" },
-  "PFF":         { mt5: "PFE",    type: "stock" },
-  "WLMT":        { mt5: "WMT",    type: "stock" },
-  "EXXON":       { mt5: "XOM",    type: "stock" },
-  "DISN":        { mt5: "DIS",    type: "stock" },
-  "INTL":        { mt5: "INTC",   type: "stock" },
-  "VISA":        { mt5: "V",      type: "stock" },
-  "KOKA":        { mt5: "KO",     type: "stock" },
-  "BOEIG":       { mt5: "BA",     type: "stock" },
+  // ── Aandelen (v4.2 — schone lijst, 44 symbolen) ───────────
+  // TV ticker = MT5 ticker, behalve GOOGL→GOOG en NIKE→NKE
+  "AAPL":  { mt5: "AAPL",  type: "stock" },
+  "TSLA":  { mt5: "TSLA",  type: "stock" },
+  "MSFT":  { mt5: "MSFT",  type: "stock" },
+  "NVDA":  { mt5: "NVDA",  type: "stock" },
+  "AMD":   { mt5: "AMD",   type: "stock" },
+  "NFLX":  { mt5: "NFLX",  type: "stock" },
+  "AMZN":  { mt5: "AMZN",  type: "stock" },
+  "GOOGL": { mt5: "GOOG",  type: "stock" },  // TV: GOOGL → MT5: GOOG
+  "PLTR":  { mt5: "PLTR",  type: "stock" },
+  "CVX":   { mt5: "CVX",   type: "stock" },
+  "ASML":  { mt5: "ASML",  type: "stock" },
+  "AVGO":  { mt5: "AVGO",  type: "stock" },
+  "AZN":   { mt5: "AZN",   type: "stock" },
+  "BA":    { mt5: "BA",    type: "stock" },
+  "BABA":  { mt5: "BABA",  type: "stock" },
+  "DIS":   { mt5: "DIS",   type: "stock" },
+  "INTC":  { mt5: "INTC",  type: "stock" },
+  "V":     { mt5: "V",     type: "stock" },
+  "IBM":   { mt5: "IBM",   type: "stock" },
+  "FDX":   { mt5: "FDX",   type: "stock" },
+  "KO":    { mt5: "KO",    type: "stock" },
+  "BAC":   { mt5: "BAC",   type: "stock" },
+  "CSCO":  { mt5: "CSCO",  type: "stock" },
+  "GE":    { mt5: "GE",    type: "stock" },
+  "GM":    { mt5: "GM",    type: "stock" },
+  "GME":   { mt5: "GME",   type: "stock" },
+  "JNJ":   { mt5: "JNJ",   type: "stock" },
+  "JPM":   { mt5: "JPM",   type: "stock" },
+  "LMT":   { mt5: "LMT",   type: "stock" },
+  "MCD":   { mt5: "MCD",   type: "stock" },
+  "META":  { mt5: "META",  type: "stock" },
+  "MSTR":  { mt5: "MSTR",  type: "stock" },
+  "NIKE":  { mt5: "NKE",   type: "stock" },  // TV: NIKE → MT5: NKE
+  "PFE":   { mt5: "PFE",   type: "stock" },
+  "QCOM":  { mt5: "QCOM",  type: "stock" },
+  "RACE":  { mt5: "RACE",  type: "stock" },
+  "SBUX":  { mt5: "SBUX",  type: "stock" },
+  "SNOW":  { mt5: "SNOW",  type: "stock" },
+  "T":     { mt5: "T",     type: "stock" },
+  "WMT":   { mt5: "WMT",   type: "stock" },
+  "XOM":   { mt5: "XOM",   type: "stock" },
+  "ZM":    { mt5: "ZM",    type: "stock" },
 
   // ── Forex ─────────────────────────────────────────────────
   "EURUSD": { mt5: "EURUSD", type: "forex" },
@@ -318,27 +265,27 @@ const SYMBOL_MAP = {
 const LOT_VALUE = { index:20, gold:100, brent:10, wti:10, crypto:1, stock:1, forex:10 };
 const MAX_LOTS  = { index:10, gold:1,   brent:5,  wti:5,  crypto:1, stock:50, forex:0.25 };
 
-// ── MIN_STOP — elk symbool apart ──────────────────────────────
+// ── MIN_STOP — elk symbool apart (v4.2) ───────────────────────
 // Indices (punten)
 const MIN_STOP_INDEX = {
-  "GER40.cash":  10,   // GER40: 10 punten minimum
-  "UK100.cash":   5,   // UK100:  5 punten minimum
-  "US100.cash":  10,   // NAS100: 10 punten minimum
-  "US30.cash":   10,   // US30:   10 punten minimum
-  "US500.cash":   5,   // S&P500:  5 punten minimum
-  "JP225.cash":  10,   // Nikkei: 10 punten minimum
-  "AUS200.cash":  3,   // ASX200:  3 punten minimum
+  "GER40.cash":  10,   // GER40:    10 punten minimum
+  "UK100.cash":   5,   // UK100:     5 punten minimum
+  "US100.cash":  10,   // NAS100:   10 punten minimum
+  "US30.cash":   10,   // US30:     10 punten minimum
+  "US500.cash":   5,   // S&P500:    5 punten minimum
+  "JP225.cash":  10,   // Nikkei:   10 punten minimum
+  "AUS200.cash":  5,   // ASX200:    5 punten minimum  (was 3)
   "EU50.cash":    5,   // EuroStoxx: 5 punten minimum
-  "FRA40.cash":   5,   // CAC40:   5 punten minimum
+  "FRA40.cash":   5,   // CAC40:     5 punten minimum
   "HK50.cash":   10,   // HangSeng: 10 punten minimum
-  "US2000.cash":  1,   // Russell: 1 punt minimum
-  "SPN35.cash":   2,   // IBEX:    2 punten minimum
-  "NL25.cash":    1,   // AEX:     1 punt minimum
+  "US2000.cash":  5,   // Russell:   5 punten minimum  (was 1)
+  "SPN35.cash":   5,   // IBEX:      5 punten minimum  (was 2)
+  "NL25.cash":    5,   // AEX:       5 punten minimum  (was 1)
 };
 
 // Grondstoffen (prijs)
 const MIN_STOP_COMMODITY = {
-  "XAUUSD":      1.0,  // Gold: 1 punt minimum
+  "XAUUSD":      1.0,  // Gold:  1 punt minimum
   "UKOIL.cash":  0.05, // Brent: 5 cent minimum
   "USOIL.cash":  0.05, // WTI:   5 cent minimum
   "BTCUSD":    100.0,  // BTC:   $100 minimum
@@ -377,7 +324,6 @@ const MIN_STOP_FOREX = {
 };
 
 // Stocks — dynamisch: 0.1% van entry price (berekend bij gebruik)
-// Aparte baseline fallbacks per stock voor extreme gevallen
 const MIN_STOP_STOCK_PCT = 0.001; // 0.1% van entry price
 
 /**
@@ -391,15 +337,14 @@ const MIN_STOP_STOCK_PCT = 0.001; // 0.1% van entry price
  */
 function getMinStop(mt5Symbol, type, entryPrice = 0) {
   if (type === "stock") {
-    // Dynamisch: 0.1% van entry price, minimum 0.01
     return Math.max(0.01, entryPrice * MIN_STOP_STOCK_PCT);
   }
-  if (type === "index")  return MIN_STOP_INDEX[mt5Symbol]   ?? 5;
+  if (type === "index")  return MIN_STOP_INDEX[mt5Symbol]     ?? 5;
   if (type === "gold")   return MIN_STOP_COMMODITY[mt5Symbol] ?? 1.0;
   if (type === "brent")  return MIN_STOP_COMMODITY[mt5Symbol] ?? 0.05;
   if (type === "wti")    return MIN_STOP_COMMODITY[mt5Symbol] ?? 0.05;
   if (type === "crypto") return MIN_STOP_COMMODITY[mt5Symbol] ?? 100;
-  if (type === "forex")  return MIN_STOP_FOREX[mt5Symbol]    ?? 0.0005;
+  if (type === "forex")  return MIN_STOP_FOREX[mt5Symbol]     ?? 0.0005;
   return 0.01;
 }
 
@@ -495,9 +440,6 @@ cron.schedule("50 20 * * *", async () => {
  * Controleer of een forex trade geblokkeerd moet worden wegens consolidatie.
  * Blokkeer als er al FOREX_MAX_SAME_DIR of meer open trades zijn
  * met dezelfde richting voor hetzelfde pair.
- * @param {string} symbol - TV symbol
- * @param {string} direction - "buy" | "sell"
- * @returns {{ blocked: boolean, count: number }}
  */
 function checkForexConsolidation(symbol, direction) {
   const mt5Sym = getMT5Symbol(symbol);
@@ -513,15 +455,10 @@ function checkForexConsolidation(symbol, direction) {
 
 // ── SPREAD GUARD — aandelen ───────────────────────────────────
 /**
- * Controleer of spread acceptabel is voor een aandelentrade.
  * Spread mag max 50% van de entry-SL afstand zijn.
- * @param {number} spread - huidige spread (ask - bid)
- * @param {number} entryNum - entry prijs
- * @param {number} slNum - stoploss prijs
- * @returns {{ ok: boolean, spreadPct: number, maxAllowed: number }}
  */
 function checkSpreadGuard(spread, entryNum, slNum) {
-  const slDist   = Math.abs(entryNum - slNum);
+  const slDist    = Math.abs(entryNum - slNum);
   const maxSpread = slDist * STOCK_MAX_SPREAD_FRACTION;
   return {
     ok:         spread <= maxSpread,
@@ -536,7 +473,7 @@ function checkSpreadGuard(spread, entryNum, slNum) {
 /**
  * Berekent het effectieve risico voor een order.
  * Risk ×4 als er een bewezen TP lock bestaat voor het HUIDIGE sessie-moment.
- * Nu ook voor stocks!
+ * Nu ook voor stocks.
  */
 function getEffectiveRisk(symbol, direction) {
   const key    = `${symbol}_${direction}`;
@@ -544,7 +481,6 @@ function getEffectiveRisk(symbol, direction) {
   const base   = RISK[getSymbolType(symbol)] || 30;
   let risk     = Math.max(base * 0.10, base / Math.pow(2, count));
 
-  // Sessie-aware TP lock: ×4 ook voor stocks bij bewezen EV
   const curSess = getSessionGMT1();
   const lockKey = `${symbol}__${curSess}`;
   const lock    = tpLocks[lockKey];
@@ -566,7 +502,6 @@ function validateSL(dir, entry, sl, mt5Sym, type) {
   const minD = getMinStop(mt5Sym, type, entry);
   let dist   = Math.abs(entry - sl);
 
-  // Stock: vergroot SL afstand met spread buffer (×1.5)
   if (type === "stock") {
     const requiredDist = Math.max(dist, minD) * STOCK_SL_SPREAD_MULT;
     const newSl = dir === "buy" ? entry - requiredDist : entry + requiredDist;
@@ -582,6 +517,10 @@ function validateSL(dir, entry, sl, mt5Sym, type) {
   return sl;
 }
 
+/**
+ * Berekent lotsize.
+ * v4.2: min lot cap wordt ×4 bij bewezen TP lock (€60 → €240).
+ */
 function calcLots(symbol, entry, sl, risk) {
   const type    = getSymbolType(symbol);
   const lotVal  = LOT_VALUE[type]  || 1;
@@ -595,8 +534,16 @@ function calcLots(symbol, entry, sl, risk) {
   lots     = Math.max(lots, lotStep);
 
   const minCost = lots * dist * lotVal;
-  if (minCost > RISK_MINLOT_CAP) {
-    console.warn(`⚠️ Min lot kost €${minCost.toFixed(2)} > cap €${RISK_MINLOT_CAP} → skip`);
+
+  // ── v4.2: cap ×4 bij bewezen TP lock ────────────────────────
+  const baseRisk      = RISK[type] || 30;
+  const isTPLockRisk  = risk >= baseRisk * TP_LOCK_RISK_MULT;
+  const effectiveCap  = isTPLockRisk
+    ? RISK_MINLOT_CAP * TP_LOCK_RISK_MULT   // €60 × 4 = €240
+    : RISK_MINLOT_CAP;                       // €60 normaal
+
+  if (minCost > effectiveCap) {
+    console.warn(`⚠️ Min lot kost €${minCost.toFixed(2)} > cap €${effectiveCap} (${isTPLockRisk ? "TP lock ×4" : "normaal"}) → skip`);
     return null;
   }
   return parseFloat(lots.toFixed(2));
@@ -646,7 +593,6 @@ function buildSLAnalysis(trades) {
 
 /**
  * Bepaal de aanbevolen SL direction op basis van analyse.
- * Vergelijkt current (1.0×) EV met best gevonden multiplier.
  * @returns {"up"|"down"|"unchanged"}
  */
 function getSLDirection(analysis) {
@@ -750,7 +696,6 @@ async function _runTPLockForSession(symbol, session) {
   const existing = tpLocks[lockKey];
   if (existing && (n - existing.lockedTrades) < TP_UPDATE_INTERVAL) return;
 
-  // Sub-1R niveaus inbegrepen via RR_LEVELS
   const evTable = RR_LEVELS.map(rr => {
     const wins = trades.filter(t => getBestRR(t) >= rr).length;
     const wr   = wins / n;
@@ -803,10 +748,6 @@ async function _runTPLockForSession(symbol, session) {
 
 // ══════════════════════════════════════════════════════════════
 // SL LOCK ENGINE (v4.1 — ghost-driven direction + READONLY)
-// ──────────────────────────────────────────────────────────────
-// Ghost tracker triggert dit na elke trueMaxRR update.
-// Bepaalt: huidige SL optimaal? Groter of kleiner voor betere EV?
-// Slaat direction op: "up" | "down" | "unchanged"
 // ══════════════════════════════════════════════════════════════
 async function runSLLockEngine(symbol) {
   const trades = closedTrades.filter(t => t.symbol === symbol && t.sl && t.entry);
@@ -816,9 +757,9 @@ async function runSLLockEngine(symbol) {
   const existing = slLocks[symbol];
   if (existing && (n - existing.lockedTrades) < SL_UPDATE_INTERVAL) return;
 
-  const analysis = buildSLAnalysis(trades);
-  const best     = analysis.reduce((a,b) => b.bestEV > a.bestEV ? b : a);
-  const current  = analysis.find(a => a.slMultiple === 1.0);
+  const analysis  = buildSLAnalysis(trades);
+  const best      = analysis.reduce((a,b) => b.bestEV > a.bestEV ? b : a);
+  const current   = analysis.find(a => a.slMultiple === 1.0);
   const direction = getSLDirection(analysis);
 
   if (best.bestEV <= 0) {
@@ -966,7 +907,7 @@ function learnFromError(symbol, code, msg) {
   if (m.includes("volume") || m.includes("lot"))
     learnedPatches[symbol].lotStepOverride = (learnedPatches[symbol]?.lotStepOverride || 0.01) * 10;
   if (m.includes("stop") || code==="TRADE_RETCODE_INVALID_STOPS") {
-    const mt5 = getMT5Symbol(symbol);
+    const mt5  = getMT5Symbol(symbol);
     const type = getSymbolType(symbol);
     if (type === "index") {
       MIN_STOP_INDEX[mt5] = (MIN_STOP_INDEX[mt5] || 5) * 2;
@@ -981,7 +922,6 @@ async function placeOrder(dir, symbol, entry, sl, lots, session) {
   const type      = getSymbolType(symbol);
   const slPrice   = validateSL(dir, entry, sl, mt5Symbol, type);
 
-  // TP op basis van sessie-specifieke lock
   const lockKey = `${symbol}__${session}`;
   const tpLock  = tpLocks[lockKey];
   const tpPrice = tpLock ? calcTPPrice(dir, entry, slPrice, tpLock.lockedRR) : null;
@@ -1047,10 +987,7 @@ app.post("/webhook", async (req, res) => {
       }
     }
 
-    // ── SL aanpassing — REGELS v4.1 ──────────────────────────
-    // ✅ Enkel 0.5× als TP lock BEWEZEN is voor dit symbool + sessie
-    // ✅ Nu ook van toepassing op stocks (SL multiplier uit engine)
-    // ✅ Stock SL krijgt ×1.5 spread buffer via validateSL
+    // ── SL aanpassing ─────────────────────────────────────────
     const tpLockKey = `${symbol}__${curSession}`;
     const tpLockNow = tpLocks[tpLockKey];
     const tpProven  = tpLockNow && (tpLockNow.evAtLock ?? 0) > 0;
@@ -1069,7 +1006,6 @@ app.post("/webhook", async (req, res) => {
     // ── Spread guard voor aandelen ────────────────────────────
     let spreadGuard = false;
     if (symType === "stock") {
-      // Probeer live spread op te halen
       const priceData = await fetchCurrentPrice(mt5Sym).catch(() => null);
       if (priceData && priceData.spread > 0) {
         const sg = checkSpreadGuard(priceData.spread, entryNum, slApplied);
@@ -1079,7 +1015,6 @@ app.post("/webhook", async (req, res) => {
           addWebhookHistory({ type:"SPREAD_GUARD_BLOCKED", symbol, spreadPct: sg.spreadPct });
           return res.status(200).json({ status:"SKIP", reason:`Spread te groot: ${reason}` });
         }
-        spreadGuard = !sg.ok; // false hier, maar gelogd als check passed
         console.log(`✅ [Spread Guard] ${symbol}: spread ${sg.spreadPct}% OK (< ${STOCK_MAX_SPREAD_FRACTION*100}%)`);
       }
     }
@@ -1092,7 +1027,7 @@ app.post("/webhook", async (req, res) => {
     }
 
     const lots = calcLots(symbol, entryNum, slApplied, risk);
-    if (lots===null) return res.status(200).json({ status:"SKIP", reason:`Min lot > cap €${RISK_MINLOT_CAP}` });
+    if (lots===null) return res.status(200).json({ status:"SKIP", reason:`Min lot > cap` });
 
     const slDist = Math.abs(entryNum - slApplied).toFixed(5);
     console.log(`📊 ${direction.toUpperCase()} ${symbol}/${curSession} | Entry:${entryNum} SL:${slApplied} Lots:${lots} Risk:€${risk.toFixed(2)}`);
@@ -1121,9 +1056,9 @@ app.post("/webhook", async (req, res) => {
     registerFtmoLoss(risk);
     incrementTracker(symbol, direction);
 
-    const posId        = String(result?.positionId || result?.orderId || Date.now());
-    const tpLockActive = tpLocks[tpLockKey];
-    const tpUsed       = tpLockActive ? calcTPPrice(direction, entryNum, slPrice, tpLockActive.lockedRR) : null;
+    const posId         = String(result?.positionId || result?.orderId || Date.now());
+    const tpLockActive  = tpLocks[tpLockKey];
+    const tpUsed        = tpLockActive ? calcTPPrice(direction, entryNum, slPrice, tpLockActive.lockedRR) : null;
     const slMultApplied = tpProven ? SL_PROVEN_MULT : (symType === "stock" ? STOCK_SL_SPREAD_MULT : 1.0);
 
     openPositions[posId] = {
@@ -1148,7 +1083,7 @@ app.post("/webhook", async (req, res) => {
 
     res.json({
       status:         "OK",
-      versie:         "v4.1",
+      versie:         "v4.2",
       direction,
       tvSymbol:       symbol,
       mt5Symbol,
@@ -1159,7 +1094,7 @@ app.post("/webhook", async (req, res) => {
       sl:             slPrice,
       slOriginal:     slNum,
       slMultiplier:   slMultApplied,
-      slLockInfo:     slLockInfo ?? (tpProven ? "" : `geen — TP lock niet bewezen voor ${curSession}`),
+      slLockInfo:     slLockInfo ?? `geen — TP lock niet bewezen voor ${curSession}`,
       stockSlBuffer:  symType === "stock" ? `×${STOCK_SL_SPREAD_MULT} spread buffer toegepast` : null,
       tp:             tpUsed,
       tpRR:           tpLockActive?.lockedRR ?? null,
@@ -1203,20 +1138,22 @@ app.get("/", (req, res) => {
   }
   res.json({
     status:  "online",
-    versie:  "ftmo-v4.1",
+    versie:  "ftmo-v4.2",
     timezone: "Europe/Brussels (auto CET/CEST)",
     tradingVenster:      "02:00–20:00",
+    indicesVenster:      "02:00–20:00 (ook Asia sessie)",
     aandelenVenster:     "15:30–20:00",
     autoClose:           "20:50 (elke dag)",
     weekendTrading:      "Alleen BTC/ETH (02:00–20:00)",
     ghostTracker:        "✅ 24u post-close → trueMaxRR + triggert SL direction engine",
     tpLock:              `✅ sessie-aware — risk ×${TP_LOCK_RISK_MULT} ook op stocks bij EV>0`,
     tpSubRR:             "✅ Sub-1R niveaus (0.2/0.4/0.6/0.8) in TP optimizer",
-    slLogic:             `✅ 0.5× bij bewezen TP lock — nu ook stocks`,
+    slLogic:             `✅ 0.5× bij bewezen TP lock — ook stocks`,
     slEngine:            "📐 ghost-driven direction analyse (up/down/unchanged) — READONLY",
     stockSlBuffer:       `✅ Stock SL ×${STOCK_SL_SPREAD_MULT} spread buffer`,
     spreadGuard:         `✅ Aandelen: spread max ${STOCK_MAX_SPREAD_FRACTION*100}% van SL-afstand`,
     forexConsolidatie:   `✅ Max ${FOREX_MAX_SAME_DIR} trades zelfde richting+pair → geblokkeerd`,
+    minLotCap:           `€${RISK_MINLOT_CAP} normaal | €${RISK_MINLOT_CAP * TP_LOCK_RISK_MULT} bij bewezen TP lock (×${TP_LOCK_RISK_MULT})`,
     minStopIndex:        MIN_STOP_INDEX,
     minStopCommodity:    MIN_STOP_COMMODITY,
     minStopForex:        MIN_STOP_FOREX,
@@ -1369,7 +1306,7 @@ app.get("/analysis/sessions", (req, res) => {
   });
 });
 
-// ── TP OPTIMIZER (v4.1 — incl. sub-1R) ───────────────────────
+// ── TP OPTIMIZER ──────────────────────────────────────────────
 function buildTPOptimizerResults(minTrades=3) {
   const bySymbol={};
   for (const t of closedTrades) {
@@ -1381,7 +1318,6 @@ function buildTPOptimizerResults(minTrades=3) {
   for (const [symbol,trades] of Object.entries(bySymbol)) {
     if (trades.length<minTrades){results.push({symbol,trades:trades.length,note:`Te weinig data (min ${minTrades})`,bestTP:null,bestEV:null});continue;}
     const ghostPending=trades.filter(t=>t.trueMaxRR===null).length;
-    // RR_LEVELS bevat nu sub-1R niveaus (0.2, 0.4, 0.6, 0.8)
     const evTable=RR_LEVELS.map(rr=>{
       const wins=trades.filter(t=>getBestRR(t)>=rr).length,wr=wins/trades.length;
       return{rr,wins,total:trades.length,winrate:`${(wr*100).toFixed(1)}%`,ev:parseFloat((wr*rr-(1-wr)).toFixed(3))};
@@ -1414,7 +1350,7 @@ app.get("/research/tp-optimizer", (req,res) => {
     ghostPending:closedTrades.filter(t=>t.trueMaxRR===null).length,
     rrLevels,
     info:"EV per RR niveau inclusief sub-1R (0.2/0.4/0.6/0.8). trueMaxRR indien beschikbaar.",
-    subRRNote:"Sub-1R niveaus kunnen profitable zijn bij hoge winrate. Altijd verifiëren met voldoende trades.",
+    subRRNote:"Sub-1R niveaus kunnen profitable zijn bij hoge winrate.",
     bySymbol:results,
   });
 });
@@ -1454,7 +1390,7 @@ app.get("/research/tp-optimizer/sessie", (req,res) => {
     bySymbol:Object.fromEntries(Object.entries(result).sort((a,b)=>b[1].totalTrades-a[1].totalTrades))});
 });
 
-// ── SL OPTIMIZER (v4.1 — direction + READONLY) ───────────────
+// ── SL OPTIMIZER ─────────────────────────────────────────────
 app.get("/research/sl-optimizer", (req,res) => {
   const {symbol}=req.query;
   let trades=closedTrades.filter(t=>t.sl&&t.entry);
@@ -1474,7 +1410,6 @@ app.get("/research/sl-optimizer", (req,res) => {
       const lk = tpLocks[`${sym}__${sess}`];
       return lk && (lk.evAtLock ?? 0) > 0;
     });
-    const stockType = getSymbolType(sym) === "stock";
     results.push({
       symbol:sym, trades:st.length,
       huidigEV:current?.bestEV, huidigBestTP:current?.bestTP,
@@ -1493,7 +1428,7 @@ app.get("/research/sl-optimizer", (req,res) => {
   res.json({
     generated:new Date().toISOString(), totalTrades:trades.length,
     warning:"⚠️ READONLY — direction advies (up/down/unchanged)",
-    regel:"SL 0.5× bij bewezen TP lock (EV>0) — nu ook voor stocks",
+    regel:"SL 0.5× bij bewezen TP lock (EV>0) — ook voor stocks",
     rrBron:"trueMaxRR indien beschikbaar",
     slMultiples:SL_MULTIPLES, rrLevels:RR_LEVELS,
     filters:{symbol:symbol||"alle"}, bySymbol:results,
@@ -1564,35 +1499,29 @@ app.get("/tp-locks", (req,res) => {
     bySym[sym][sess] = lock;
   }
   res.json({
-    generated:new Date().toISOString(), versie:"v4.1-sessie-aware",
+    generated:new Date().toISOString(), versie:"v4.2-sessie-aware",
     threshold:TP_LOCK_THRESHOLD, updateInterval:TP_UPDATE_INTERVAL,
     riskMultiplier:`×${TP_LOCK_RISK_MULT} per sessie (ook stocks)`,
-    info:"Sleutel = SYMBOL__sessie. Risk ×4 voor alle types bij bewezen lock.",
+    minLotCap:`€${RISK_MINLOT_CAP} normaal | €${RISK_MINLOT_CAP*TP_LOCK_RISK_MULT} bij TP lock`,
     totalLocks:Object.keys(tpLocks).length,
     locksBySessie:{ asia:Object.keys(tpLocks).filter(k=>k.endsWith("__asia")).length, london:Object.keys(tpLocks).filter(k=>k.endsWith("__london")).length, ny:Object.keys(tpLocks).filter(k=>k.endsWith("__ny")).length },
     locksBySymbol:bySym,
   });
 });
 
-// ── SL LOCK API (v4.1 — direction) ───────────────────────────
+// ── SL LOCK API ───────────────────────────────────────────────
 app.get("/sl-locks", (req,res) => {
   res.json({
-    generated:new Date().toISOString(), versie:"v4.1-direction",
+    generated:new Date().toISOString(), versie:"v4.2-direction",
     note:"READONLY — SL direction engine op basis van ghost tracker + EV analyse",
-    regel:"SL 0.5× bij bewezen TP lock — nu ook stocks. Direction = aanbeveling voor SL aanpassing.",
+    regel:"SL 0.5× bij bewezen TP lock — ook stocks. Direction = aanbeveling.",
     totalAnalyses:Object.keys(slLocks).length,
     analyses:Object.entries(slLocks).map(([sym,lock])=>({
-      symbol:sym,
-      multiplier:lock.multiplier,
-      direction:lock.direction,
-      directionLabel:lock.directionLabel,
-      evAtLock:lock.evAtLock,
-      bestTPRR:lock.bestTPRR,
-      lockedTrades:lock.lockedTrades,
-      lockedAt:lock.lockedAt,
-      prevMultiplier:lock.prevMultiplier,
-      currentEV:lock.currentEV,
-      note:lock.note,
+      symbol:sym, multiplier:lock.multiplier, direction:lock.direction,
+      directionLabel:lock.directionLabel, evAtLock:lock.evAtLock,
+      bestTPRR:lock.bestTPRR, lockedTrades:lock.lockedTrades,
+      lockedAt:lock.lockedAt, prevMultiplier:lock.prevMultiplier,
+      currentEV:lock.currentEV, note:lock.note,
     })),
   });
 });
@@ -1621,7 +1550,7 @@ app.delete("/sl-locks/:symbol", (req,res) => {
 });
 
 // ══════════════════════════════════════════════════════════════
-// DASHBOARD (v4.1)
+// DASHBOARD (v4.2)
 // ══════════════════════════════════════════════════════════════
 app.get("/dashboard", (req,res) => {
   const bySymbol={};
@@ -1654,7 +1583,7 @@ app.get("/dashboard", (req,res) => {
       const subRRBest=evTable.filter(e=>e.rr<1).reduce((a,b)=>b.ev>a.ev?b:a,{rr:null,ev:-Infinity});
       const tpLockProven=sessTPLock&&(sessTPLock.evAtLock??0)>0;
       const isStock=getSymbolType(sym)==="stock";
-      const slWouldApply=tpLockProven; // nu ook stocks
+      const slWouldApply=tpLockProven;
       const slDirection=slLockForSess?.direction||"unchanged";
       const slDirLabel=slDirection==="up"?"🔼 Vergroot SL":slDirection==="down"?"🔽 Verklein SL":"✅ Huidig optimaal";
       const slAdvies=slWouldApply?`✅ SL 0.5× actief${isStock?" (ook aandeel)":""}`:`${slDirLabel} (ghost engine)`;
@@ -1706,9 +1635,8 @@ app.get("/dashboard", (req,res) => {
   const lockedTPCount = Object.keys(tpLocks).length;
   const lockedSLCount = Object.keys(slLocks).length;
 
-  // Forex consolidatie status
   const forexConsolStatus = {};
-  for (const [key, pos] of Object.entries(openPositions)) {
+  for (const [, pos] of Object.entries(openPositions)) {
     if (getSymbolType(pos.symbol) === "forex") {
       const k = `${getMT5Symbol(pos.symbol)}_${pos.direction}`;
       forexConsolStatus[k] = (forexConsolStatus[k] || 0) + 1;
@@ -1720,7 +1648,7 @@ app.get("/dashboard", (req,res) => {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>FTMO Dashboard — NV v4.1</title>
+<title>FTMO Dashboard — NV v4.2</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
 :root{--bg:#0d0f14;--card:#161920;--border:#252a35;--green:#00c896;--orange:#f59e0b;--red:#ef4444;--blue:#3b82f6;--purple:#a855f7;--teal:#06b6d4;--text:#e2e8f0;--muted:#64748b;--accent:#6366f1;--yellow:#eab308}
@@ -1752,16 +1680,12 @@ main{max-width:1400px;margin:0 auto;padding:24px 20px}
 .lock-pending{padding:14px 16px;border-right:1px solid var(--border);border-bottom:1px solid var(--border);opacity:.6}
 .lock-sym{font-size:15px;font-weight:700;margin-bottom:4px}
 .lock-val{font-size:18px;font-weight:800;margin-bottom:4px}
-.tp-color{color:var(--purple)}
-.sl-color{color:var(--teal)}
-.sl-up{color:var(--orange)}
-.sl-down{color:var(--blue)}
+.tp-color{color:var(--purple)}.sl-color{color:var(--teal)}.sl-up{color:var(--orange)}.sl-down{color:var(--blue)}
 .lock-meta{font-size:11px;color:var(--muted);line-height:1.5}
 .lock-badge{display:inline-block;font-size:10px;padding:2px 7px;border-radius:4px;margin-top:5px}
 .new-tp{background:#1e1035;color:var(--purple);border:1px solid var(--purple)}
 .upd-tp{background:#2a1a05;color:var(--orange);border:1px solid var(--orange)}
 .new-sl{background:#091a1f;color:var(--teal);border:1px solid var(--teal)}
-.upd-sl{background:#2a1a05;color:var(--orange);border:1px solid var(--orange)}
 .sl-dir-up{background:#1a1205;color:var(--orange);border:1px solid var(--orange)}
 .sl-dir-down{background:#050e1a;color:var(--blue);border:1px solid var(--blue)}
 .sl-dir-ok{background:#051a10;color:var(--green);border:1px solid var(--green)}
@@ -1783,7 +1707,6 @@ main{max-width:1400px;margin:0 auto;padding:24px 20px}
 .badge-inline.tp-active{background:#1e1035;border:1px solid var(--purple);color:var(--purple)}
 .badge-inline.sl-active{background:#0a1f20;border:1px solid var(--teal);color:var(--teal)}
 .badge-inline.no-lock{background:#1a1f2e;border:1px solid var(--border);color:var(--muted)}
-.badge-inline.diff{background:#2a1a05;border:1px solid var(--orange);color:var(--orange)}
 .badge-inline.stock-badge{background:#1a1a2e;border:1px solid var(--blue);color:var(--blue)}
 .badge-inline.sub-rr{background:#1a1500;border:1px solid var(--yellow);color:var(--yellow)}
 .global-advies{padding:10px 20px;border-bottom:1px solid var(--border);display:flex;flex-wrap:wrap;gap:6px}
@@ -1821,10 +1744,10 @@ a{color:var(--muted);text-decoration:none}
 <body>
 <header>
   <h1>⚡ FTMO Dashboard</h1>
-  <span style="color:var(--muted);font-size:12px">NV v4.1</span>
+  <span style="color:var(--muted);font-size:12px">NV v4.2</span>
   <span class="badge live">● Live</span>
   <span class="badge">${getBrusselsDateStr()}</span>
-  ${lockedTPCount?`<span class="badge tp">🔒 ${lockedTPCount} TP locks (sessie)</span>`:""}
+  ${lockedTPCount?`<span class="badge tp">🔒 ${lockedTPCount} TP locks</span>`:""}
   ${lockedSLCount?`<span class="badge sl">📐 ${lockedSLCount} SL analyses</span>`:""}
   ${activeGhosts.length?`<span class="badge warn">👻 ${activeGhosts.length} ghost</span>`:""}
 </header>
@@ -1845,33 +1768,28 @@ ${equityData.length>=2?`
 <p class="section-title">Equity Curve</p>
 <div class="chart-wrap"><canvas id="eqChart" height="70"></canvas></div>`:""}
 
-<!-- FOREX ANTI-CONSOLIDATIE STATUS -->
 ${Object.keys(forexConsolStatus).length>0?`
 <p class="section-title">Forex Consolidatie Monitor</p>
 <div class="lock-panel">
   <div class="lock-panel-header forex">
     <span style="font-size:18px">🔄</span>
     <h3>Open forex posities per pair + richting</h3>
-    <span style="color:var(--muted);font-size:12px;margin-left:auto">Blokkeert bij ≥${FOREX_MAX_SAME_DIR} trades zelfde richting</span>
+    <span style="color:var(--muted);font-size:12px;margin-left:auto">Blokkeert bij ≥${FOREX_MAX_SAME_DIR}</span>
   </div>
   <div style="padding:14px 20px">
     ${Object.entries(forexConsolStatus).map(([k,count])=>{
       const blocked=count>=FOREX_MAX_SAME_DIR;
-      return`<div class="consol-row">
-        <span style="font-weight:600">${k}</span>
-        <span class="${blocked?"consol-blocked":"consol-count"}">${count}/${FOREX_MAX_SAME_DIR} ${blocked?"🚫 GEBLOKKEERD":"✅ OK"}</span>
-      </div>`;
+      return`<div class="consol-row"><span style="font-weight:600">${k}</span><span class="${blocked?"consol-blocked":"consol-count"}">${count}/${FOREX_MAX_SAME_DIR} ${blocked?"🚫 GEBLOKKEERD":"✅ OK"}</span></div>`;
     }).join("")}
   </div>
 </div>`:""}
 
-<!-- TP LOCK PANEL -->
-<p class="section-title">TP Lock — Sessie-Aware (Risk ×${TP_LOCK_RISK_MULT} ook stocks)</p>
+<p class="section-title">TP Lock — Sessie-Aware (Risk ×${TP_LOCK_RISK_MULT} | Min lot cap ×${TP_LOCK_RISK_MULT} bij lock)</p>
 <div class="lock-panel">
   <div class="lock-panel-header tp">
     <span style="font-size:18px">🔒</span>
     <h3>Gelockte TP niveaus per symbool per sessie</h3>
-    <span style="color:var(--muted);font-size:12px;margin-left:auto">Sub-1R niveaus (0.2–0.8R) inbegrepen · Lock na ${TP_LOCK_THRESHOLD} trades</span>
+    <span style="color:var(--muted);font-size:12px;margin-left:auto">Sub-1R (0.2–0.8R) · Lock na ${TP_LOCK_THRESHOLD} trades · Min lot €${RISK_MINLOT_CAP}→€${RISK_MINLOT_CAP*TP_LOCK_RISK_MULT}</span>
   </div>
   <div class="lock-grid">
     ${symbolCards.map(c=>{
@@ -1881,7 +1799,7 @@ ${Object.keys(forexConsolStatus).length>0?`
           const diffClass=lock.prevRR?(lock.lockedRR>lock.prevRR?"arr-up":lock.lockedRR<lock.prevRR?"arr-dn":"arr-eq"):"";
           const isSubRR=lock.lockedRR<1;
           return`<div class="lock-cell">
-  <div class="lock-sym">${c.sym}${isSubRR?` <span style="color:var(--yellow);font-size:10px">⚡sub-1R</span>`:`</span>`}</div>
+  <div class="lock-sym">${c.sym}${isSubRR?` <span style="color:var(--yellow);font-size:10px">⚡sub-1R</span>`:""}</div>
   <div style="font-size:10px;color:var(--muted);margin-bottom:3px">${SESSION_LABELS[sess]||sess}</div>
   <div class="lock-val tp-color">${lock.lockedRR}R TP</div>
   <div class="lock-meta">EV: +${lock.evAtLock??"-"}R · ${lock.lockedTrades} trades<br>
@@ -1900,13 +1818,12 @@ ${Object.keys(forexConsolStatus).length>0?`
   </div>
 </div>
 
-<!-- SL DIRECTION ENGINE PANEL -->
 <p class="section-title">SL Direction Engine (Ghost-driven — READONLY)</p>
 <div class="lock-panel">
   <div class="lock-panel-header sl">
     <span style="font-size:18px">📐</span>
-    <h3>SL advies per symbool — groter / kleiner / optimaal</h3>
-    <span style="color:var(--muted);font-size:12px;margin-left:auto">SL 0.5× bij bewezen TP lock · Stocks: ×${STOCK_SL_SPREAD_MULT} spread buffer</span>
+    <h3>SL advies per symbool</h3>
+    <span style="color:var(--muted);font-size:12px;margin-left:auto">SL 0.5× bij bewezen TP lock · Stocks ×${STOCK_SL_SPREAD_MULT} spread buffer</span>
   </div>
   <div class="lock-grid">
     ${symbolCards.map(c=>{
@@ -1919,33 +1836,32 @@ ${Object.keys(forexConsolStatus).length>0?`
   <div class="lock-sym">${c.sym}</div>
   ${anyProven?`<div class="lock-val sl-color">0.5× actief</div><div class="lock-meta">✅ TP lock bewezen${c.isStock?" (stock ✅)":""}</div>`
     :`<div class="lock-val" style="color:var(--muted)">Geen 0.5×</div><div class="lock-meta">⏳ TP lock niet bewezen</div>`}
-  ${slLock?`<div class="lock-meta" style="margin-top:4px">Multiplier analyse: ${slLock.multiplier}× · EV +${slLock.evAtLock}R</div>
-  <span class="lock-badge ${dirBadgeClass}">${dirLabel}</span>
-  `:`<div class="lock-meta" style="margin-top:4px;color:var(--muted)">⏳ Nog geen ghost data</div>`}
+  ${slLock?`<div class="lock-meta" style="margin-top:4px">Multiplier: ${slLock.multiplier}× · EV +${slLock.evAtLock}R</div>
+  <span class="lock-badge ${dirBadgeClass}">${dirLabel}</span>`
+    :`<div class="lock-meta" style="margin-top:4px;color:var(--muted)">⏳ Nog geen ghost data</div>`}
 </div>`;
     }).join("")}
   </div>
 </div>
 
-<!-- LOCK LOG -->
 ${recentTPLog.length||recentSLLog.length?`
-<p class="section-title">Lock Wijzigingen — Historiek</p>
+<p class="section-title">Lock Wijzigingen</p>
 <div class="lock-panel">
   <table class="log-table">
-    <thead><tr><th>Tijdstip</th><th>Type</th><th>Symbool</th><th>Sessie</th><th>Oud</th><th></th><th>Nieuw</th><th>Trades</th><th>EV</th><th>Dir/Reden</th></tr></thead>
+    <thead><tr><th>Tijdstip</th><th>Type</th><th>Symbool</th><th>Sessie</th><th>Oud</th><th></th><th>Nieuw</th><th>Trades</th><th>EV</th><th>Reden</th></tr></thead>
     <tbody>
       ${[...recentTPLog.map(l=>({...l,type:"TP"})),...recentSLLog.map(l=>({...l,type:"SL",oldRR:l.oldMultiplier,newRR:l.newMultiplier}))].sort((a,b)=>new Date(b.ts)-new Date(a.ts)).slice(0,15).map(l=>{
         const arrow=l.oldRR===null?"🆕":l.newRR>l.oldRR?`<span class="arr-up">▲</span>`:l.newRR<l.oldRR?`<span class="arr-dn">▼</span>`:`<span class="arr-eq">=</span>`;
-        const unitSuffix=l.type==="TP"?"R":"×";
+        const unit=l.type==="TP"?"R":"×";
         const dirInfo=l.type==="SL"&&l.direction?` <span style="font-size:10px;color:var(--muted)">[${l.direction}]</span>`:"";
         return`<tr>
           <td>${new Date(l.ts).toLocaleString("nl-BE",{timeZone:"Europe/Brussels",day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit"})}</td>
           <td><span style="color:${l.type==="TP"?"var(--purple)":"var(--teal)"};font-weight:600">${l.type}</span></td>
           <td style="font-weight:600">${l.symbol}</td>
           <td style="color:var(--muted);font-size:11px">${l.session||"–"}</td>
-          <td style="color:var(--muted)">${l.oldRR!==null?l.oldRR+unitSuffix:"–"}</td>
+          <td style="color:var(--muted)">${l.oldRR!==null?l.oldRR+unit:"–"}</td>
           <td>${arrow}</td>
-          <td style="font-weight:700;color:${l.type==="TP"?"var(--purple)":"var(--teal)"}">${l.newRR}${unitSuffix}${dirInfo}</td>
+          <td style="font-weight:700;color:${l.type==="TP"?"var(--purple)":"var(--teal)"}">${l.newRR}${unit}${dirInfo}</td>
           <td>${l.trades}</td>
           <td style="color:${(l.ev||0)>0?"var(--green)":"var(--red)"}">${l.ev!=null?(l.ev>0?"+":"")+l.ev+"R":"–"}</td>
           <td style="color:var(--muted);font-size:11px">${l.reason}</td>
@@ -1955,13 +1871,12 @@ ${recentTPLog.length||recentSLLog.length?`
   </table>
 </div>`:""}
 
-<!-- SYMBOOL ANALYSE -->
 <p class="section-title">Analyse per symbool &amp; sessie</p>
 ${symbolCards.length===0?`<p style="color:var(--muted)">Nog geen gesloten trades.</p>`:symbolCards.map(c=>{
   const evCls=c.bestGlobalEV>0.3?"ev-pos":c.bestGlobalEV>0?"ev-mid":"ev-neg";
   const bestTPLock=c.tpLock;
   const tpBadge=bestTPLock
-    ?`<span class="badge-inline tp-active${c.lockDiffers?" diff":""}">🔒 TP ${bestTPLock.lockedRR}R${bestTPLock.evAtLock?(` EV+${bestTPLock.evAtLock}R`):""} (${c.tpSessionLocks.length} sess.)</span>`
+    ?`<span class="badge-inline tp-active${c.lockDiffers?" diff":""}">🔒 TP ${bestTPLock.lockedRR}R${bestTPLock.evAtLock?(` EV+${bestTPLock.evAtLock}R`):""}</span>`
     :`<span class="badge-inline no-lock">⏳ TP ${c.n}/${TP_LOCK_THRESHOLD}</span>`;
   const isStockBadge=c.isStock?`<span class="badge-inline stock-badge">📊 aandeel ×${STOCK_SL_SPREAD_MULT}SL</span>`:"";
   const subRRBadge=c.subRRGlobal&&c.subRRGlobal.rr!==null&&c.subRRGlobal.ev>0?`<span class="badge-inline sub-rr">⚡ sub-1R: ${c.subRRGlobal.rr}R (+${c.subRRGlobal.ev}R)</span>`:"";
@@ -1989,7 +1904,7 @@ ${symbolCards.length===0?`<p style="color:var(--muted)">Nog geen gesloten trades
       const slDirBadgeClass=s.slDirection==="up"?"sl-dir-up":s.slDirection==="down"?"sl-dir-down":"sl-dir-ok";
       return`<div class="sessie-col">
   <div class="sessie-label ${s.sessieKleur}">${s.label}</div>
-  ${s.tpLock?`<div class="tp-sessie-badge">🔒 TP ${s.tpLock.lockedRR}R · EV +${s.tpLock.evAtLock}R${s.tpLock.lockedRR<1?" ⚡":""}}</div>`:`<div style="font-size:11px;color:var(--muted);margin-bottom:6px">⏳ geen TP lock</div>`}
+  ${s.tpLock?`<div class="tp-sessie-badge">🔒 TP ${s.tpLock.lockedRR}R · EV +${s.tpLock.evAtLock}R${s.tpLock.lockedRR<1?" ⚡":""}</div>`:`<div style="font-size:11px;color:var(--muted);margin-bottom:6px">⏳ geen TP lock</div>`}
   <div class="sessie-stat"><span class="k">Trades</span><span class="v">${s.trades}</span></div>
   <div class="sessie-stat"><span class="k">Gem. best RR</span><span class="v">${s.avgRR}R</span></div>
   <div class="sessie-stat"><span class="k">Beste TP</span><span class="v">${s.bestTP}R${s.bestTP<1?" ⚡":""}</span></div>
@@ -2016,7 +1931,7 @@ ${activeGhosts.length?`
 </div>`:""}
 
 </main>
-<footer>FTMO NV v4.1 · Auto-refresh 60s · CET/CEST auto · <a href="/">API</a> · <a href="/tp-locks">TP Locks</a> · <a href="/sl-locks">SL Engine</a></footer>
+<footer>FTMO NV v4.2 · Auto-refresh 60s · CET/CEST auto · <a href="/">API</a> · <a href="/tp-locks">TP Locks</a> · <a href="/sl-locks">SL Engine</a></footer>
 <script>
 setTimeout(()=>location.reload(),60000);
 ${equityData.length>=2?`
@@ -2077,20 +1992,22 @@ async function startServer() {
 
   const server = app.listen(PORT, () =>
     console.log([
-      `🚀 FTMO Webhook v4.1 — poort ${PORT}`,
+      `🚀 FTMO Webhook v4.2 — poort ${PORT}`,
       `🌍 Timezone: Europe/Brussels (auto CET/CEST)`,
       `💰 Balance: €${ACCOUNT_BALANCE}`,
       `📈 Risico | Index:€${RISK.index} Forex:€${RISK.forex} Gold:€${RISK.gold} Crypto:€${RISK.crypto} Stock:€${RISK.stock}`,
+      `📊 Indices: 02:00–20:00 (ook Asia sessie) | Stocks: 15:30–20:00`,
       `🔒 TP Lock: sessie-aware | Risk ×${TP_LOCK_RISK_MULT} ook stocks bij EV>0`,
+      `💰 Min lot cap: €${RISK_MINLOT_CAP} normaal → €${RISK_MINLOT_CAP*TP_LOCK_RISK_MULT} bij TP lock (×${TP_LOCK_RISK_MULT})`,
       `📐 SL Regel: 0.5× bij bewezen TP lock — ook stocks`,
       `🔧 SL Engine: ghost-driven direction (up/down/unchanged) — READONLY`,
       `📊 Stock SL: ×${STOCK_SL_SPREAD_MULT} spread buffer | Spread guard: max ${STOCK_MAX_SPREAD_FRACTION*100}% van SL-afstand`,
       `🔄 Forex anti-consolidatie: max ${FOREX_MAX_SAME_DIR} trades zelfde richting+pair`,
       `⚡ Sub-1R TP levels: 0.2/0.4/0.6/0.8R inbegrepen in optimizer`,
-      `🕐 Venster: 02:00–20:00 | Aandelen: 15:30–20:00`,
       `⏰ Auto-close: 20:50 elke dag`,
       `🌙 Weekend: BTC/ETH (02:00–20:00)`,
       `👻 Ghost tracker: 24u post-close → trueMaxRR + SL direction`,
+      `🗺️  Symbolen: ${Object.keys(SYMBOL_MAP).length} (indices/forex/gold/crypto/stocks)`,
     ].join("\n"))
   );
 
