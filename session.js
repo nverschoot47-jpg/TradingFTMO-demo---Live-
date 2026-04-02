@@ -1,8 +1,12 @@
 // ═══════════════════════════════════════════════════════════════
-// session.js — Timezone + Sessie helpers  |  v4.1
+// session.js — Timezone + Sessie helpers  |  v4.2
 // Automatische zomer/wintertijd via Intl API (geen hardcoded +1h)
 //   Winter → CET  = UTC+1
 //   Zomer  → CEST = UTC+2
+//
+// Wijzigingen v4.2:
+//  ✅ Indices toegestaan tijdens Asia sessie (02:00–08:00)
+//  ✅ Stocks blijven beperkt tot NY venster (15:30–20:00)
 // ═══════════════════════════════════════════════════════════════
 
 "use strict";
@@ -81,6 +85,12 @@ function getSessionGMT1(dateOrStr) {
 
 /**
  * Controleert of de markt open is voor het opgegeven instrument type.
+ *
+ * Vensters (Brussels tijd):
+ *   - Alle types behalve stock: 02:00–20:00 (ma–vr), incl. indices tijdens Asia
+ *   - Stocks: alleen 15:30–20:00 (NY venster)
+ *   - Crypto: ook weekend 02:00–20:00
+ *
  * @param {"index"|"forex"|"gold"|"stock"|"crypto"|"brent"|"wti"} type
  * @param {string} symbol
  * @param {function(string): boolean} isCryptoWeekendFn
@@ -102,12 +112,17 @@ function isMarketOpen(type, symbol, isCryptoWeekendFn) {
     return true;
   }
 
-  if (hhmm < 200)   { console.warn(`🚫 Voor 02:00 (${hhmm})`);        return false; }
-  if (hhmm >= 2000) { console.warn(`🚫 Na 20:00 (${hhmm})`);          return false; }
+  // Algemeen dagvenster: 02:00–20:00
+  if (hhmm < 200)   { console.warn(`🚫 Voor 02:00 (${hhmm})`);   return false; }
+  if (hhmm >= 2000) { console.warn(`🚫 Na 20:00 (${hhmm})`);     return false; }
+
+  // Stocks: alleen NY venster 15:30–20:00
   if (type === "stock" && hhmm < 1530) {
     console.warn(`🚫 Aandelen buiten 15:30–20:00 (${hhmm})`);
     return false;
   }
+
+  // Indices, forex, gold, brent, wti, crypto → 02:00–20:00 ✅
   return true;
 }
 
