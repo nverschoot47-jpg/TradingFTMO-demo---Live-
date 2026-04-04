@@ -1,10 +1,10 @@
 {
   "name": "nv-tradingview-webhook",
-  "version": "4.3.0",
+  "version": "4.4.0",
   "description": "TradingView → MetaApi REST → FTMO MT5 | NV v4.3 — Cap fix (baseRisk), Restart recovery, Forex half risk bij consolidatie",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
+    "start": "node --omit=dev server.js",
     "dev": "nodemon server.js"
   },
   "dependencies": {
