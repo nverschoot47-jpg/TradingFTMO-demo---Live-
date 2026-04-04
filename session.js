@@ -1,15 +1,12 @@
 // ═══════════════════════════════════════════════════════════════
-// session.js — Timezone + Sessie helpers  |  v4.4
+// session.js — Timezone + Sessie helpers  |  v4.2
 // Automatische zomer/wintertijd via Intl API (geen hardcoded +1h)
 //   Winter → CET  = UTC+1
 //   Zomer  → CEST = UTC+2
 //
-// Wijzigingen v4.4:
-//  ✅ Intl formatter gecacht — niet opnieuw aanmaken per aanroep
-//  ✅ getSession: ongeldige datum-input gevangen + gelogd
-//  ✅ getBrusselsComponents: graceful fallback bij invalid Date
+// Wijzigingen v4.2:
 //  ✅ Indices toegestaan tijdens Asia sessie (02:00–08:00)
-//  ✅ Stocks beperkt tot NY venster (15:30–20:00)
+//  ✅ Stocks blijven beperkt tot NY venster (15:30–20:00)
 // ═══════════════════════════════════════════════════════════════
 
 "use strict";
@@ -21,30 +18,26 @@ const DAYS_MAP = {
   Thursday: 4, Friday: 5, Saturday: 6,
 };
 
-// ── Gecachte formatter — één instantie, hergebruikt bij elke aanroep
-//    Aanmaken kost overhead; bij syncPositions (30s) + ghost ticks (60s)
-//    scheelt dit significant.
-const _partsFormatter = new Intl.DateTimeFormat("en-US", {
-  timeZone: TIMEZONE,
-  weekday:  "long",
-  hour:     "2-digit",
-  minute:   "2-digit",
-  hour12:   false,
-});
-
 /**
  * Geeft { day, hhmm, hour, minute } in Brussels lokale tijd terug.
  * Verwerkt CET (winter, UTC+1) en CEST (zomer, UTC+2) automatisch.
- * Valt terug op new Date() als de invoer geen geldige Date is.
  */
 function getBrusselsComponents(date) {
-  const d = (date instanceof Date && !isNaN(date.getTime())) ? date : new Date();
+  const d = (date instanceof Date) ? date : new Date();
 
-  const parts = _partsFormatter.formatToParts(d);
-  const get   = (type) => parts.find(p => p.type === type)?.value ?? "0";
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: TIMEZONE,
+    weekday:  "long",
+    hour:     "2-digit",
+    minute:   "2-digit",
+    hour12:   false,
+  }).formatToParts(d);
 
-  let hour     = parseInt(get("hour"),   10);
+  const get = (type) => parts.find(p => p.type === type)?.value ?? "0";
+
+  let hour   = parseInt(get("hour"),   10);
   const minute = parseInt(get("minute"), 10);
+
   if (hour === 24) hour = 0;
 
   const weekday = get("weekday");
@@ -72,25 +65,10 @@ const SESSION_LABELS = {
 };
 
 /**
- * Geeft de handelssessie terug voor een gegeven datum/tijdstip.
- * Vangt ongeldige datumstrings op — retourneert "buiten_venster" met waarschuwing.
- * Naam "GMT1" behouden voor backward-compat; Brussels is CET(UTC+1)/CEST(UTC+2).
+ * Geeft de huidige of historische handelssessie terug.
  */
 function getSessionGMT1(dateOrStr) {
-  let d;
-  if (!dateOrStr) {
-    d = new Date();
-  } else if (dateOrStr instanceof Date) {
-    d = dateOrStr;
-  } else {
-    d = new Date(dateOrStr);
-  }
-
-  if (isNaN(d.getTime())) {
-    console.warn(`⚠️ [Session] Ongeldige datum: "${dateOrStr}" — buiten_venster teruggegeven`);
-    return "buiten_venster";
-  }
-
+  const d = dateOrStr ? new Date(dateOrStr) : new Date();
   const { hhmm } = getBrusselsComponents(d);
   if (hhmm >= 200  && hhmm < 800)  return "asia";
   if (hhmm >= 800  && hhmm < 1530) return "london";
