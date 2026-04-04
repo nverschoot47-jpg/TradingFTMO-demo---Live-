@@ -1,12 +1,13 @@
 // ═══════════════════════════════════════════════════════════════
-// session.js — Timezone + Sessie helpers  |  v4.2
+// session.js — Timezone + Sessie helpers  |  v5.0
 // Automatische zomer/wintertijd via Intl API (geen hardcoded +1h)
 //   Winter → CET  = UTC+1
 //   Zomer  → CEST = UTC+2
 //
-// Wijzigingen v4.2:
+// Wijzigingen v5.0:
+//  ✅ Geen logica wijzigingen — sessie definitie zelfde
 //  ✅ Indices toegestaan tijdens Asia sessie (02:00–08:00)
-//  ✅ Stocks blijven beperkt tot NY venster (15:30–20:00)
+//  ✅ Stocks beperkt tot NY venster (15:30–20:00)
 // ═══════════════════════════════════════════════════════════════
 
 "use strict";
@@ -20,7 +21,6 @@ const DAYS_MAP = {
 
 /**
  * Geeft { day, hhmm, hour, minute } in Brussels lokale tijd terug.
- * Verwerkt CET (winter, UTC+1) en CEST (zomer, UTC+2) automatisch.
  */
 function getBrusselsComponents(date) {
   const d = (date instanceof Date) ? date : new Date();
@@ -35,9 +35,8 @@ function getBrusselsComponents(date) {
 
   const get = (type) => parts.find(p => p.type === type)?.value ?? "0";
 
-  let hour   = parseInt(get("hour"),   10);
+  let hour     = parseInt(get("hour"),   10);
   const minute = parseInt(get("minute"), 10);
-
   if (hour === 24) hour = 0;
 
   const weekday = get("weekday");
@@ -47,7 +46,7 @@ function getBrusselsComponents(date) {
 }
 
 /**
- * Geeft de huidige tijd terug als leesbare string in Brussels tijdzone.
+ * Leesbare datum/tijd string in Brussels tijdzone.
  */
 function getBrusselsDateStr() {
   return new Intl.DateTimeFormat("nl-BE", {
@@ -65,7 +64,7 @@ const SESSION_LABELS = {
 };
 
 /**
- * Geeft de huidige of historische handelssessie terug.
+ * Geeft de handelssessie op basis van een tijdstip (of nu).
  */
 function getSessionGMT1(dateOrStr) {
   const d = dateOrStr ? new Date(dateOrStr) : new Date();
@@ -80,7 +79,7 @@ function getSessionGMT1(dateOrStr) {
  * Controleert of de markt open is voor het opgegeven instrument type.
  *
  * Vensters (Brussels tijd):
- *   - Alle types behalve stock: 02:00–20:00 (ma–vr), incl. indices tijdens Asia
+ *   - Alle types behalve stock: 02:00–20:00 (ma–vr)
  *   - Stocks: alleen 15:30–20:00 (NY venster)
  *   - Crypto: ook weekend 02:00–20:00
  */
