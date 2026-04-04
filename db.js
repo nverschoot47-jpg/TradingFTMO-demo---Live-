@@ -1,13 +1,13 @@
 // ═══════════════════════════════════════════════════════════════
-// db.js — PostgreSQL persistence layer  |  v4.4
+// db.js — PostgreSQL persistence layer  |  v4.1
 // Railway: voeg Postgres plugin toe → DATABASE_URL wordt auto-gezet
 //
-// Wijzigingen v4.4 t.o.v. v4.1:
-//  ✅ Pool config: max verbindingen, idle/connection timeouts
-//  ✅ loadSnapshots: SQL injectie opgelost (geparametriseerde INTERVAL)
-//  ✅ learned_patches tabel: MT5 overrides + lot steps + min stops
-//  ✅ endPool() geëxporteerd voor graceful shutdown
-//  ✅ initDB: elke migratie apart gelogd voor betere debugbaarheid
+// Wijzigingen t.o.v. v4.0:
+//  ✅ tp_config — sub-1R niveaus (0.2/0.4/0.6/0.8) opgeslagen
+//  ✅ closed_trades — spread_guard kolom toegevoegd
+//  ✅ closed_trades — sl_multiplier_applied kolom toegevoegd
+//  ✅ forex_consolidation_log tabel toegevoegd
+//  ✅ sl_config — direction kolom (up/down/unchanged) voor advies
 // ═══════════════════════════════════════════════════════════════
 
 "use strict";
@@ -15,32 +15,12 @@
 const { Pool } = require("pg");
 
 const pool = new Pool({
-  connectionString:    process.env.DATABASE_URL,
-  ssl:                 { rejectUnauthorized: false },
-  max:                 10,                // max verbindingen in pool
-  idleTimeoutMillis:   30_000,            // sluit idle verbinding na 30s
-  connectionTimeoutMillis: 5_000,         // faal snel als DB onbereikbaar is
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
 });
-
-pool.on("error", (err) => {
-  console.error("❌ [DB] Onverwachte pool fout:", err.message);
-});
-
-// ── Schema migraties ──────────────────────────────────────────
-async function _migrate(label, sql) {
-  try {
-    await pool.query(sql);
-    console.log(`✅ [DB] Migratie OK: ${label}`);
-  } catch (e) {
-    console.error(`❌ [DB] Migratie MISLUKT (${label}):`, e.message);
-    throw e;
-  }
-}
 
 async function initDB() {
-
-  // ── Tabel: closed_trades
-  await _migrate("closed_trades CREATE", `
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS closed_trades (
       id                  SERIAL PRIMARY KEY,
       position_id         TEXT        UNIQUE,
@@ -64,21 +44,16 @@ async function initDB() {
       created_at          TIMESTAMPTZ DEFAULT NOW(),
       spread_guard        BOOLEAN     DEFAULT FALSE,
       sl_multiplier       NUMERIC     DEFAULT 1.0
-    )
-  `);
+    );
 
-  await _migrate("closed_trades ALTER cols", `
     ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS position_id        TEXT        UNIQUE;
     ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS true_max_rr        NUMERIC;
     ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS true_max_price     NUMERIC;
     ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS ghost_stop_reason  TEXT;
     ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS ghost_finalized_at TIMESTAMPTZ;
     ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS spread_guard       BOOLEAN     DEFAULT FALSE;
-    ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS sl_multiplier      NUMERIC     DEFAULT 1.0
-  `);
+    ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS sl_multiplier      NUMERIC     DEFAULT 1.0;
 
-  // ── Tabel: tp_config
-  await _migrate("tp_config CREATE", `
     CREATE TABLE IF NOT EXISTS tp_config (
       symbol          TEXT        NOT NULL,
       session         TEXT        NOT NULL DEFAULT 'all',
@@ -90,11 +65,11 @@ async function initDB() {
       ev_at_lock      NUMERIC,
       auto_updated    BOOLEAN     DEFAULT TRUE
     );
-    ALTER TABLE tp_config ADD COLUMN IF NOT EXISTS session TEXT NOT NULL DEFAULT 'all'
+
+    ALTER TABLE tp_config ADD COLUMN IF NOT EXISTS session TEXT NOT NULL DEFAULT 'all';
   `);
 
-  // ── Primary key tp_config (idempotent via DO block)
-  await _migrate("tp_config PK", `
+  await pool.query(`
     DO $$
     BEGIN
       IF NOT EXISTS (
@@ -112,11 +87,10 @@ async function initDB() {
         EXCEPTION WHEN others THEN NULL;
         END;
       END IF;
-    END $$
+    END $$;
   `);
 
-  // ── Tabel: tp_update_log
-  await _migrate("tp_update_log CREATE", `
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS tp_update_log (
       id          SERIAL PRIMARY KEY,
       symbol      TEXT        NOT NULL,
@@ -128,11 +102,9 @@ async function initDB() {
       reason      TEXT,
       ts          TIMESTAMPTZ DEFAULT NOW()
     );
-    ALTER TABLE tp_update_log ADD COLUMN IF NOT EXISTS session TEXT NOT NULL DEFAULT 'all'
-  `);
 
-  // ── Tabel: sl_config
-  await _migrate("sl_config CREATE", `
+    ALTER TABLE tp_update_log ADD COLUMN IF NOT EXISTS session TEXT NOT NULL DEFAULT 'all';
+
     CREATE TABLE IF NOT EXISTS sl_config (
       symbol            TEXT        PRIMARY KEY,
       multiplier        NUMERIC     NOT NULL,
@@ -144,11 +116,9 @@ async function initDB() {
       prev_multiplier   NUMERIC,
       prev_locked_at    TIMESTAMPTZ
     );
-    ALTER TABLE sl_config ADD COLUMN IF NOT EXISTS direction TEXT DEFAULT 'unchanged'
-  `);
 
-  // ── Tabel: sl_update_log
-  await _migrate("sl_update_log CREATE", `
+    ALTER TABLE sl_config ADD COLUMN IF NOT EXISTS direction TEXT DEFAULT 'unchanged';
+
     CREATE TABLE IF NOT EXISTS sl_update_log (
       id              SERIAL PRIMARY KEY,
       symbol          TEXT        NOT NULL,
@@ -160,11 +130,9 @@ async function initDB() {
       reason          TEXT,
       ts              TIMESTAMPTZ DEFAULT NOW()
     );
-    ALTER TABLE sl_update_log ADD COLUMN IF NOT EXISTS direction TEXT
-  `);
 
-  // ── Tabel: forex_consolidation_log
-  await _migrate("forex_consolidation_log CREATE", `
+    ALTER TABLE sl_update_log ADD COLUMN IF NOT EXISTS direction TEXT;
+
     CREATE TABLE IF NOT EXISTS forex_consolidation_log (
       id          SERIAL PRIMARY KEY,
       symbol      TEXT        NOT NULL,
@@ -172,11 +140,8 @@ async function initDB() {
       blocked_at  TIMESTAMPTZ DEFAULT NOW(),
       count       INTEGER     NOT NULL,
       reason      TEXT
-    )
-  `);
+    );
 
-  // ── Tabel: equity_snapshots
-  await _migrate("equity_snapshots CREATE", `
     CREATE TABLE IF NOT EXISTS equity_snapshots (
       id            SERIAL PRIMARY KEY,
       ts            TIMESTAMPTZ DEFAULT NOW(),
@@ -185,41 +150,21 @@ async function initDB() {
       floating_pl   NUMERIC,
       margin        NUMERIC,
       free_margin   NUMERIC
-    )
-  `);
+    );
 
-  // ── Tabel: learned_patches (v4.4 nieuw)
-  //    Slaat dynamisch geleerde MT5-overrides, lot steps en min stops op.
-  //    Voorheen ging dit verloren bij Railway herstart.
-  await _migrate("learned_patches CREATE", `
-    CREATE TABLE IF NOT EXISTS learned_patches (
-      symbol        TEXT        PRIMARY KEY,
-      mt5_override  TEXT,
-      lot_step      NUMERIC,
-      min_stop      NUMERIC,
-      extra         JSONB,
-      updated_at    TIMESTAMPTZ DEFAULT NOW()
-    )
-  `);
-
-  // ── Indexen
-  await _migrate("indexen", `
     CREATE INDEX IF NOT EXISTS idx_trades_symbol      ON closed_trades(symbol);
     CREATE INDEX IF NOT EXISTS idx_trades_closed      ON closed_trades(closed_at);
     CREATE INDEX IF NOT EXISTS idx_trades_session     ON closed_trades(session);
     CREATE INDEX IF NOT EXISTS idx_trades_position_id ON closed_trades(position_id);
-    CREATE INDEX IF NOT EXISTS idx_trades_spread      ON closed_trades(spread_guard);
     CREATE INDEX IF NOT EXISTS idx_equity_ts          ON equity_snapshots(ts);
     CREATE INDEX IF NOT EXISTS idx_sl_log_symbol      ON sl_update_log(symbol);
     CREATE INDEX IF NOT EXISTS idx_tp_log_symbol      ON tp_update_log(symbol);
     CREATE INDEX IF NOT EXISTS idx_tp_log_session     ON tp_update_log(session);
-    CREATE INDEX IF NOT EXISTS idx_forex_cons_symbol  ON forex_consolidation_log(symbol)
+    CREATE INDEX IF NOT EXISTS idx_forex_cons_symbol  ON forex_consolidation_log(symbol);
   `);
 
-  console.log("✅ [DB] Schema klaar (v4.4 — learned_patches, spread index, pool config)");
+  console.log("✅ [DB] Schema klaar (v4.1 — sub-1R TP, spread guard, forex consolidatie)");
 }
-
-// ── TRADES ────────────────────────────────────────────────────
 
 async function saveTrade(trade) {
   const q = `
@@ -264,7 +209,7 @@ async function saveTrade(trade) {
   const isGhost = trade.trueMaxRR !== null && trade.trueMaxRR !== undefined;
   console.log(
     isGhost
-      ? `👻 [DB] Ghost: id=${res.rows[0].id} ${trade.symbol} trueMaxRR=${trade.trueMaxRR}`
+      ? `👻 [DB] Ghost update: id=${res.rows[0].id} ${trade.symbol} trueMaxRR=${trade.trueMaxRR}`
       : `💾 [DB] Trade: id=${res.rows[0].id} ${trade.symbol} maxRR=${trade.maxRR}`
   );
   return res.rows[0].id;
@@ -291,16 +236,14 @@ async function loadAllTrades() {
       session,
       opened_at           AS "openedAt",
       closed_at           AS "closedAt",
-      COALESCE(spread_guard, FALSE)                        AS "spreadGuard",
-      COALESCE(CAST(sl_multiplier AS FLOAT), 1.0)         AS "slMultiplier"
+      COALESCE(spread_guard, FALSE) AS "spreadGuard",
+      COALESCE(CAST(sl_multiplier AS FLOAT), 1.0) AS "slMultiplier"
     FROM closed_trades
     ORDER BY closed_at ASC
   `);
   console.log(`📂 [DB] ${res.rows.length} trades geladen`);
   return res.rows;
 }
-
-// ── SNAPSHOTS ─────────────────────────────────────────────────
 
 let lastSnapshotSave = 0;
 const SNAPSHOT_INTERVAL_MS = 5 * 60 * 1000;
@@ -317,7 +260,6 @@ async function saveSnapshot(snap) {
 }
 
 async function loadSnapshots(hours = 24) {
-  // v4.4 FIX: geparametriseerde INTERVAL — geen SQL-injectie risico meer
   const res = await pool.query(`
     SELECT ts,
       CAST(balance     AS FLOAT) AS balance,
@@ -326,13 +268,11 @@ async function loadSnapshots(hours = 24) {
       CAST(margin      AS FLOAT) AS margin,
       CAST(free_margin AS FLOAT) AS "freeMargin"
     FROM equity_snapshots
-    WHERE ts > NOW() - ($1 * INTERVAL '1 hour')
+    WHERE ts > NOW() - INTERVAL '${hours} hours'
     ORDER BY ts ASC
-  `, [hours]);
+  `);
   return res.rows;
 }
-
-// ── TP CONFIG ─────────────────────────────────────────────────
 
 async function loadTPConfig() {
   try {
@@ -394,8 +334,6 @@ async function loadTPUpdateLog(limit = 50) {
   } catch (e) { console.warn("⚠️ loadTPUpdateLog:", e.message); return []; }
 }
 
-// ── SL CONFIG ─────────────────────────────────────────────────
-
 async function loadSLConfig() {
   try {
     const res = await pool.query(`SELECT * FROM sl_config ORDER BY symbol`);
@@ -456,8 +394,6 @@ async function loadSLUpdateLog(limit = 50) {
   } catch (e) { console.warn("⚠️ loadSLUpdateLog:", e.message); return []; }
 }
 
-// ── FOREX CONSOLIDATION LOG ───────────────────────────────────
-
 async function logForexConsolidation(symbol, direction, count, reason) {
   try {
     await pool.query(`
@@ -467,64 +403,6 @@ async function logForexConsolidation(symbol, direction, count, reason) {
   } catch (e) { console.warn("⚠️ logForexConsolidation:", e.message); }
 }
 
-// ── LEARNED PATCHES (v4.4 nieuw) ──────────────────────────────
-//    Persisteert geleerde MT5-overrides, lot steps, min stops.
-//    Was voorheen in-memory only → verloren bij Railway herstart.
-
-async function saveLearnedPatch(symbol, patch) {
-  try {
-    await pool.query(`
-      INSERT INTO learned_patches (symbol, mt5_override, lot_step, min_stop, extra, updated_at)
-      VALUES ($1, $2, $3, $4, $5, NOW())
-      ON CONFLICT (symbol) DO UPDATE SET
-        mt5_override = EXCLUDED.mt5_override,
-        lot_step     = EXCLUDED.lot_step,
-        min_stop     = EXCLUDED.min_stop,
-        extra        = EXCLUDED.extra,
-        updated_at   = NOW()
-    `, [
-      symbol,
-      patch.mt5Override     ?? null,
-      patch.lotStepOverride ?? null,
-      patch.minStopOverride ?? null,
-      JSON.stringify(patch),
-    ]);
-  } catch (e) { console.warn("⚠️ saveLearnedPatch:", e.message); }
-}
-
-async function loadLearnedPatches() {
-  try {
-    const res = await pool.query(`SELECT * FROM learned_patches`);
-    const map = {};
-    for (const r of res.rows) {
-      map[r.symbol] = {
-        ...(r.extra ? JSON.parse(r.extra) : {}),
-        mt5Override:     r.mt5_override  || undefined,
-        lotStepOverride: r.lot_step      ? parseFloat(r.lot_step) : undefined,
-        minStopOverride: r.min_stop      ? parseFloat(r.min_stop) : undefined,
-      };
-    }
-    console.log(`🧠 [DB] ${res.rows.length} learned patches geladen`);
-    return map;
-  } catch (e) {
-    console.warn("⚠️ loadLearnedPatches:", e.message);
-    return {};
-  }
-}
-
-// ── POOL SHUTDOWN ─────────────────────────────────────────────
-
-async function endPool() {
-  try {
-    await pool.end();
-    console.log("🔌 [DB] Pool verbindingen gesloten");
-  } catch (e) {
-    console.warn("⚠️ [DB] Pool sluiten mislukt:", e.message);
-  }
-}
-
-// ── EXPORTS ───────────────────────────────────────────────────
-
 module.exports = {
   initDB,
   saveTrade, loadAllTrades,
@@ -532,6 +410,4 @@ module.exports = {
   loadTPConfig, saveTPConfig, logTPUpdate, loadTPUpdateLog,
   loadSLConfig, saveSLConfig, logSLUpdate, loadSLUpdateLog,
   logForexConsolidation,
-  saveLearnedPatch, loadLearnedPatches,
-  endPool,
 };
