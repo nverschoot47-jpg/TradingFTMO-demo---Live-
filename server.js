@@ -1481,156 +1481,986 @@ app.delete("/sl-locks/:symbol", (req,res) => {
 });
 
 // ── DASHBOARD ─────────────────────────────────────────────────
-app.get("/dashboard", (req,res) => {
-  const secret = WEBHOOK_SECRET;
-  const pos    = Object.values(openPositions);
-  const ghosts = closedTrades.filter(t=>t.trueMaxRR===null).length;
-
-  const html = `<!DOCTYPE html>
+app.get("/dashboard", (req, res) => {
+  const SECRET = WEBHOOK_SECRET;
+  res.setHeader("Content-Type","text/html; charset=utf-8");
+  res.send(`<!DOCTYPE html>
 <html lang="nl">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>FTMO Dashboard v4.4</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FTMO Pro Dashboard</title>
 <style>
-  *{box-sizing:border-box;margin:0;padding:0}
-  body{font-family:'Segoe UI',sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh}
-  header{background:linear-gradient(135deg,#1a1f2e,#2d3748);padding:20px 30px;border-bottom:1px solid #2d3748;display:flex;align-items:center;justify-content:space-between}
-  header h1{font-size:1.4rem;font-weight:700;color:#63b3ed}
-  header span{font-size:.8rem;color:#718096;background:#1a202c;padding:4px 10px;border-radius:20px}
-  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:16px;padding:24px 30px 0}
-  .card{background:#1a1f2e;border:1px solid #2d3748;border-radius:10px;padding:18px;text-align:center}
-  .card .val{font-size:2rem;font-weight:800;color:#63b3ed}
-  .card .lbl{font-size:.75rem;color:#718096;margin-top:4px;text-transform:uppercase;letter-spacing:.05em}
-  .card.warn .val{color:#f6ad55}
-  .card.ok  .val{color:#68d391}
-  section{margin:24px 30px 0}
-  section h2{font-size:.85rem;text-transform:uppercase;letter-spacing:.08em;color:#718096;margin-bottom:12px;border-bottom:1px solid #2d3748;padding-bottom:8px}
-  table{width:100%;border-collapse:collapse;font-size:.83rem}
-  th{text-align:left;padding:8px 12px;color:#718096;font-weight:600;border-bottom:1px solid #2d3748}
-  td{padding:8px 12px;border-bottom:1px solid #1e2535}
-  tr:hover td{background:#1e2535}
-  .badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:.72rem;font-weight:600}
-  .buy{background:#1c3a2a;color:#68d391}.sell{background:#3a1c1c;color:#fc8181}
-  .tag-half{background:#3a2a1c;color:#f6ad55}.tag-ok{background:#1c2e1c;color:#68d391}
-  .links{display:flex;flex-wrap:wrap;gap:10px;padding:24px 30px}
-  .links a{display:inline-block;padding:9px 18px;background:#2d3748;border:1px solid #4a5568;border-radius:8px;color:#63b3ed;text-decoration:none;font-size:.82rem;transition:background .2s}
-  .links a:hover{background:#3a4a5e}
-  .links a.post{border-color:#c05621;color:#f6ad55}
-  .links a.danger{border-color:#9b2c2c;color:#fc8181}
-  footer{padding:20px 30px;color:#4a5568;font-size:.75rem;border-top:1px solid #1e2535;margin-top:24px}
-  .no-data{color:#4a5568;font-style:italic;padding:16px 12px}
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#07090d;--bg1:#0c1018;--bg2:#111820;--bg3:#18212d;
+  --b:#1c2a38;--b2:#243342;
+  --t:#c9d8e8;--t2:#6a8098;--t3:#374d5e;
+  --acc:#2dd4f4;--acc2:#0e7fa0;
+  --g:#22d18b;--g2:#0b4e33;
+  --r:#f26b62;--r2:#4f1c18;
+  --o:#f0a050;--o2:#4e2c0a;
+  --pu:#b88ff0;--pu2:#2e1c50;
+  --ye:#e3b341;
+  --mono:'JetBrains Mono',monospace;
+  --sans:'Segoe UI',system-ui,sans-serif;
+}
+html,body{height:100%;overflow:hidden}
+body{font-family:var(--mono);background:var(--bg);color:var(--t);font-size:12.5px;display:flex;flex-direction:column}
+::-webkit-scrollbar{width:5px;height:5px}
+::-webkit-scrollbar-track{background:var(--bg1)}
+::-webkit-scrollbar-thumb{background:var(--b2);border-radius:3px}
+
+/* TOPBAR */
+.topbar{flex-shrink:0;display:flex;align-items:center;justify-content:space-between;padding:0 20px;height:48px;background:var(--bg1);border-bottom:1px solid var(--b);z-index:50}
+.logo{font-family:var(--sans);font-weight:800;font-size:14px;color:var(--acc);letter-spacing:-.02em;display:flex;align-items:center;gap:8px}
+.logo-dot{width:7px;height:7px;border-radius:50%;background:var(--g);box-shadow:0 0 6px var(--g);animation:blink 2s infinite}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
+.topbar-mid{display:flex;gap:4px}
+.topbar-right{display:flex;align-items:center;gap:10px;font-size:11px;color:var(--t3)}
+.clock{font-size:11px;color:var(--t2);background:var(--bg2);padding:3px 9px;border-radius:4px;border:1px solid var(--b)}
+.btn{font-family:var(--mono);font-size:11px;cursor:pointer;padding:4px 12px;border-radius:4px;border:1px solid var(--b2);background:var(--bg3);color:var(--acc);transition:.15s;white-space:nowrap}
+.btn:hover{background:var(--acc2);color:#fff;border-color:var(--acc)}
+.btn.danger{color:var(--r);border-color:var(--r2)}
+.btn.danger:hover{background:var(--r2);color:var(--r)}
+
+/* TABS */
+.tabs{flex-shrink:0;display:flex;background:var(--bg1);border-bottom:1px solid var(--b);padding:0 20px;overflow-x:auto}
+.tab{font-family:var(--sans);font-size:11px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;padding:9px 16px;cursor:pointer;color:var(--t3);border-bottom:2px solid transparent;white-space:nowrap;transition:.15s}
+.tab:hover{color:var(--t)}
+.tab.on{color:var(--acc);border-bottom-color:var(--acc)}
+
+/* PANELS */
+.panels{flex:1;overflow:hidden;position:relative}
+.panel{position:absolute;inset:0;overflow-y:auto;padding:18px 20px;display:none}
+.panel.on{display:block}
+
+/* STAT ROW */
+.stats{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px}
+.sc{flex:1 1 130px;background:var(--bg1);border:1px solid var(--b);border-radius:7px;padding:12px 14px}
+.sc .v{font-family:var(--sans);font-size:24px;font-weight:800;line-height:1;margin-bottom:3px}
+.sc .l{font-size:10px;color:var(--t3);text-transform:uppercase;letter-spacing:.06em}
+.sc .s{font-size:10px;color:var(--t2);margin-top:2px}
+.g{color:var(--g)}.r{color:var(--r)}.o{color:var(--o)}.a{color:var(--acc)}.pu{color:var(--pu)}.ye{color:var(--ye)}
+
+/* SECTION */
+.sh{display:flex;align-items:center;gap:8px;margin:14px 0 8px;color:var(--t2);font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.07em}
+.sh::before{content:'';width:3px;height:12px;background:var(--acc);border-radius:2px}
+
+/* TABLE */
+.tw{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{padding:5px 9px;color:var(--t3);font-size:10px;text-transform:uppercase;letter-spacing:.05em;border-bottom:1px solid var(--b);font-weight:600;white-space:nowrap;text-align:left}
+td{padding:5px 9px;border-bottom:1px solid rgba(255,255,255,.03);vertical-align:middle}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:rgba(255,255,255,.015)}
+.tr{text-align:right}.tc{text-align:center}
+.mono{font-family:var(--mono)}
+.bold{font-weight:700}
+.dim{color:var(--t3)}
+
+/* BADGES */
+.bd{display:inline-block;padding:2px 7px;border-radius:3px;font-size:10px;font-weight:600;white-space:nowrap}
+.bd.buy{background:#0c2b1d;color:var(--g);border:1px solid #154030}
+.bd.sell{background:#2b0c0c;color:var(--r);border:1px solid #401515}
+.bd.info{background:var(--bg3);color:var(--t2);border:1px solid var(--b)}
+.bd.acc{background:#091e28;color:var(--acc);border:1px solid #103040}
+.bd.warn{background:var(--o2);color:var(--o);border:1px solid #6e3a0a}
+.bd.pu{background:var(--pu2);color:var(--pu);border:1px solid #3e2470}
+.bd.good{background:var(--g2);color:var(--g);border:1px solid #155038}
+.bd.bad{background:var(--r2);color:var(--r);border:1px solid #601818}
+.bd.ye{background:#2e2800;color:var(--ye);border:1px solid #504200}
+
+/* PAIR ACCORDION */
+.pairs{display:flex;flex-direction:column;gap:8px}
+.pc{background:var(--bg1);border:1px solid var(--b);border-radius:7px;overflow:hidden}
+.ph{display:flex;align-items:center;gap:10px;padding:10px 14px;cursor:pointer;background:var(--bg2);transition:.15s}
+.ph:hover{background:var(--bg3)}
+.psym{font-family:var(--sans);font-size:13px;font-weight:800;min-width:85px;color:var(--t)}
+.pbadges{display:flex;gap:5px;flex-wrap:wrap}
+.pstats{display:flex;gap:18px;margin-left:auto;align-items:center}
+.ps .v{font-size:13px;font-weight:700;text-align:right}
+.ps .l{font-size:9px;color:var(--t3);text-align:right}
+.chev{color:var(--t3);font-size:11px;transition:.2s;flex-shrink:0}
+.ph.open .chev{transform:rotate(180deg)}
+.pb{display:none;padding:14px}
+.pb.open{display:block}
+
+/* INNER TABS */
+.it{display:flex;gap:0;border-bottom:1px solid var(--b);margin-bottom:12px;overflow-x:auto}
+.itb{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;padding:6px 12px;cursor:pointer;color:var(--t3);border-bottom:2px solid transparent;white-space:nowrap;transition:.15s}
+.itb:hover{color:var(--t)}
+.itb.on{color:var(--acc);border-bottom-color:var(--acc)}
+.itp{display:none}
+.itp.on{display:block}
+
+/* EV TABLE */
+tr.best td{background:rgba(34,209,139,.04)}
+tr.best td:first-child{border-left:2px solid var(--g);padding-left:7px}
+.evbar{width:70px;height:3px;background:var(--b);border-radius:2px;overflow:hidden;display:inline-block;vertical-align:middle}
+.evbf{height:100%;border-radius:2px}
+
+/* SESSION CARDS */
+.sg{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px;margin-bottom:10px}
+.scard{background:var(--bg2);border:1px solid var(--b);border-radius:6px;padding:10px 12px}
+.scard-name{font-family:var(--sans);font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:.06em;color:var(--t2);margin-bottom:7px}
+.srow{display:flex;justify-content:space-between;font-size:11px;margin:2px 0}
+.srow .k{color:var(--t3)}.srow .v{font-weight:600}
+
+/* ADVICE */
+.adv{background:var(--bg2);border:1px solid var(--b2);border-radius:6px;padding:10px 12px;margin-bottom:10px}
+.advr{display:flex;align-items:flex-start;gap:7px;font-size:11.5px;margin:3px 0}
+.advr .icon{flex-shrink:0;font-size:13px;margin-top:1px}
+strong.acc{color:var(--acc)}strong.g{color:var(--g)}strong.r{color:var(--r)}strong.o{color:var(--o)}
+
+/* GHOST */
+.ghost-row{background:var(--bg2);border:1px solid var(--b);border-radius:6px;padding:10px 14px;margin-bottom:6px;display:grid;grid-template-columns:110px 1fr auto;gap:12px;align-items:center}
+.ghost-sym{font-family:var(--sans);font-size:13px;font-weight:800}
+.ghost-bar{height:5px;background:var(--b);border-radius:3px;overflow:hidden;margin-top:4px}
+.ghost-bf{height:100%;border-radius:3px;background:linear-gradient(90deg,var(--pu),var(--acc))}
+.ghost-lbl{font-size:10px;color:var(--t3);margin-bottom:2px}
+.ghost-rr{text-align:right}
+.ghost-rr .big{font-size:18px;font-weight:800}
+.ghost-rr .small{font-size:10px;color:var(--t3)}
+
+/* FILTER */
+.fr{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;align-items:center}
+.fr label{font-size:10px;color:var(--t3)}
+.fr select,.fr input{font-family:var(--mono);font-size:11px;background:var(--bg2);border:1px solid var(--b);color:var(--t);padding:4px 9px;border-radius:4px;outline:none}
+.fr select:focus,.fr input:focus{border-color:var(--acc2)}
+
+/* EMPTY / LOADING */
+.empty{padding:28px;text-align:center;color:var(--t3);font-size:12px}
+.empty div{font-size:24px;margin-bottom:6px}
+.spin{display:inline-block;width:18px;height:18px;border:2px solid var(--b);border-top-color:var(--acc);border-radius:50%;animation:sp .7s linear infinite}
+@keyframes sp{to{transform:rotate(360deg)}}
+.loading{padding:32px;text-align:center;color:var(--t3)}
+
+/* LOCK CARDS */
+.lc{background:var(--bg2);border:1px solid var(--b);border-radius:6px;padding:10px 13px;margin-bottom:6px}
+.lc-hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
+.lc-sym{font-family:var(--sans);font-weight:800;font-size:13px}
+.lc-sub{display:flex;gap:12px;flex-wrap:wrap}
+.lc-item{font-size:11px}.lc-item .k{color:var(--t3)}.lc-item .v{font-weight:600;margin-left:4px}
+
+@media(max-width:700px){.topbar-mid{display:none}.pstats{display:none}.panels{overflow:auto}}
 </style>
 </head>
 <body>
-<header>
-  <h1>🚀 FTMO Webhook Dashboard</h1>
-  <span>v4.4 — FTMO limiet uitgeschakeld</span>
-</header>
 
-<div class="grid">
-  <div class="card ok"><div class="val">${pos.length}</div><div class="lbl">Open Posities</div></div>
-  <div class="card"><div class="val">${closedTrades.length}</div><div class="lbl">Gesloten Trades</div></div>
-  <div class="card"><div class="val">${Object.keys(tpLocks).length}</div><div class="lbl">TP Locks</div></div>
-  <div class="card"><div class="val">${Object.keys(slLocks).length}</div><div class="lbl">SL Analyses</div></div>
-  <div class="card ${ghosts>0?"warn":"ok"}"><div class="val">${ghosts}</div><div class="lbl">Ghost Pending</div></div>
+<!-- TOPBAR -->
+<div class="topbar">
+  <div class="logo"><div class="logo-dot"></div>FTMO PRO</div>
+  <div class="topbar-mid">
+    <button class="btn" onclick="loadAll()">↻ Refresh</button>
+    <button class="btn danger" onclick="confirmReset()">🗑 Reset TP Locks</button>
+  </div>
+  <div class="topbar-right">
+    <span id="last-update" style="font-size:10px;color:var(--t3)"></span>
+    <div class="clock" id="clk">--:--:--</div>
+  </div>
 </div>
 
-<section>
-  <h2>Open Posities</h2>
-  ${pos.length===0 ? '<p class="no-data">Geen open posities</p>' : `
-  <table>
-    <thead><tr><th>Symbool</th><th>Richting</th><th>Lots</th><th>Risk €</th><th>Sessie</th><th>Entry</th><th>SL</th><th>TP</th><th>Flags</th></tr></thead>
-    <tbody>
-    ${pos.map(p=>`<tr>
-      <td><strong>${p.symbol}</strong></td>
-      <td><span class="badge ${p.direction}">${p.direction.toUpperCase()}</span></td>
-      <td>${p.lots}</td>
-      <td>€${(p.riskEUR||0).toFixed(2)}</td>
-      <td>${p.sessionLabel||p.session||"—"}</td>
-      <td>${p.entry||"—"}</td>
-      <td>${p.sl||"—"}</td>
-      <td>${p.tp||"—"}</td>
-      <td>${p.forexHalfRisk?'<span class="badge tag-half">½ risk</span>':''} ${p.restoredAfterRestart?'<span class="badge tag-ok">restored</span>':''}</td>
-    </tr>`).join("")}
-    </tbody>
-  </table>`}
-</section>
-
-<section>
-  <h2>Recente Webhook History (laatste 15)</h2>
-  ${webhookHistory.length===0 ? '<p class="no-data">Nog geen history</p>' : `
-  <table>
-    <thead><tr><th>Tijd</th><th>Type</th><th>Symbool</th><th>Richting</th><th>Lots</th><th>Risk €</th><th>Sessie</th><th>TP</th></tr></thead>
-    <tbody>
-    ${webhookHistory.slice(0,15).map(h=>`<tr>
-      <td style="color:#718096;font-size:.75rem">${h.ts?.slice(11,19)||"—"}</td>
-      <td><span class="badge ${h.type==="SUCCESS"?"ok":h.type==="ERROR"?"sell":"tag-half"}">${h.type}</span></td>
-      <td>${h.symbol||"—"}</td>
-      <td>${h.direction?`<span class="badge ${h.direction}">${h.direction.toUpperCase()}</span>`:"—"}</td>
-      <td>${h.lots||"—"}</td>
-      <td>${h.riskEUR?`€${h.riskEUR}`:"—"}</td>
-      <td>${h.session||"—"}</td>
-      <td>${h.tp||"—"}</td>
-    </tr>`).join("")}
-    </tbody>
-  </table>`}
-</section>
-
-<section>
-  <h2>Navigatie &amp; API Links</h2>
-</section>
-<div class="links">
-  <a href="/live/positions">📍 Live Posities</a>
-  <a href="/live/ghosts">👻 Ghost Trackers</a>
-  <a href="/analysis/rr">📊 MaxRR Analyse</a>
-  <a href="/analysis/sessions">📅 Sessie Analyse</a>
-  <a href="/analysis/equity-curve">📈 Equity Curve</a>
-  <a href="/research/tp-optimizer">🎯 TP Optimizer</a>
-  <a href="/research/tp-optimizer/sessie">🎯 TP Optimizer / Sessie</a>
-  <a href="/research/sl-optimizer">📐 SL Optimizer</a>
-  <a href="/tp-locks">🔒 TP Locks</a>
-  <a href="/sl-locks">📐 SL Analyses</a>
-  <a href="/history">📋 Webhook History</a>
-  <a href="/status">⚙️ Status</a>
-  <a href="/" >🏠 Health Check</a>
-  <a href="/analysis/equity-curve?hours=168">📈 Equity (7d)</a>
+<!-- TABS -->
+<div class="tabs">
+  <div class="tab on"  onclick="tab('ov')">📊 Overview</div>
+  <div class="tab"     onclick="tab('pairs')">📈 Per Pair</div>
+  <div class="tab"     onclick="tab('ghosts')">👻 Ghost Tracker</div>
+  <div class="tab"     onclick="tab('arch')">🗃 Archief</div>
+  <div class="tab"     onclick="tab('hist')">📋 Webhook Log</div>
+  <div class="tab"     onclick="tab('locks')">🔒 Locks</div>
+  <div class="tab"     onclick="tab('equity')">📈 Equity</div>
 </div>
 
-<section style="margin-top:8px">
-  <h2>POST Acties (met secret)</h2>
-</section>
-<div class="links">
-  <a class="post" href="#" onclick="testWebhook();return false">🧪 Test Webhook (GER40 BUY)</a>
-  <a class="danger" href="#" onclick="if(confirm('Alle TP locks resetten?')) deleteTPLocks()">🗑️ Reset Alle TP Locks</a>
-</div>
+<!-- PANELS -->
+<div class="panels">
 
-<footer>
-  FTMO Webhook Server v4.4 — Nick Verschoot | Account: ${process.env.META_ACCOUNT_ID||"—"} | FTMO dagelijkse verlies-limiet: <strong style="color:#68d391">UITGESCHAKELD</strong>
-</footer>
+  <!-- OVERVIEW -->
+  <div class="panel on" id="p-ov">
+    <div class="stats" id="ov-stats"><div class="loading"><div class="spin"></div></div></div>
+    <div id="ov-body"></div>
+  </div>
+
+  <!-- PAIRS -->
+  <div class="panel" id="p-pairs">
+    <div class="sh" style="margin-top:0">Analyse per Pair — klik om uit te klappen</div>
+    <div class="pairs" id="pairs-grid"><div class="loading"><div class="spin"></div></div></div>
+  </div>
+
+  <!-- GHOSTS -->
+  <div class="panel" id="p-ghosts">
+    <div class="sh" style="margin-top:0">Actieve Ghost Trackers</div>
+    <div id="ghost-active"></div>
+    <div class="sh">Gesloten Trades — Ghost Nog Pending</div>
+    <div class="tw"><table>
+      <thead><tr><th>Pair</th><th>Dir</th><th>Sessie</th><th class="tr">MaxRR</th><th class="tr">Entry</th><th>Open</th><th>Gesloten</th></tr></thead>
+      <tbody id="ghost-pending"></tbody>
+    </table></div>
+  </div>
+
+  <!-- ARCHIVE -->
+  <div class="panel" id="p-arch">
+    <div class="fr">
+      <label>Pair</label><select id="af-sym" onchange="renderArch()"><option value="">Alle</option></select>
+      <label>Sessie</label>
+      <select id="af-sess" onchange="renderArch()">
+        <option value="">Alle</option><option value="asia">Asia</option>
+        <option value="london">London</option><option value="ny">New York</option>
+      </select>
+      <label>Richting</label>
+      <select id="af-dir" onchange="renderArch()">
+        <option value="">Alle</option><option value="buy">Buy</option><option value="sell">Sell</option>
+      </select>
+      <label>Min RR</label>
+      <input type="number" id="af-rr" placeholder="0" style="width:70px" onchange="renderArch()">
+      <span id="af-info" style="font-size:10px;color:var(--t3);margin-left:4px"></span>
+    </div>
+    <div class="tw" style="max-height:calc(100vh - 160px);overflow-y:auto">
+      <table>
+        <thead><tr>
+          <th>#</th><th>Pair</th><th>Dir</th><th>Sessie</th>
+          <th class="tr">Entry</th><th class="tr">SL</th><th class="tr">MaxRR</th><th class="tr">TrueMaxRR</th>
+          <th class="tr">Risk€</th><th class="tr">Lots</th><th>Ghost</th><th>Open</th><th>Gesloten</th>
+        </tr></thead>
+        <tbody id="arch-body"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- HISTORY -->
+  <div class="panel" id="p-hist">
+    <div class="sh" style="margin-top:0">Webhook Log — laatste 100 events</div>
+    <div class="tw" style="max-height:calc(100vh - 100px);overflow-y:auto">
+      <table>
+        <thead><tr>
+          <th>Tijd</th><th>Type</th><th>Pair</th><th>Dir</th><th>Sessie</th>
+          <th class="tr">Lots</th><th class="tr">Risk€</th><th>TP</th><th>SL aanp.</th><th>Boost</th>
+        </tr></thead>
+        <tbody id="hist-body"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- LOCKS -->
+  <div class="panel" id="p-locks">
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+      <div>
+        <div class="sh" style="margin-top:0">TP Locks per Sessie</div>
+        <div id="tp-locks"></div>
+      </div>
+      <div>
+        <div class="sh" style="margin-top:0">SL Analyses</div>
+        <div id="sl-locks"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- EQUITY -->
+  <div class="panel" id="p-equity">
+    <div class="sh" style="margin-top:0">Equity Curve — laatste 24u</div>
+    <canvas id="eq-canvas" style="width:100%;max-height:320px"></canvas>
+    <div id="eq-stats" class="stats" style="margin-top:14px"></div>
+  </div>
+
+</div><!-- /panels -->
 
 <script>
-const SECRET = "${secret}";
-async function testWebhook(){
-  const r = await fetch("/webhook?secret="+SECRET,{method:"POST",headers:{"Content-Type":"application/json","x-secret":SECRET},body:JSON.stringify({symbol:"GER40",action:"buy",entry:"21000",sl:"20950"})});
-  const d = await r.json();
-  alert(JSON.stringify(d,null,2));
+const S = '${SECRET}';
+const SESS = ['asia','london','ny'];
+const SL = {asia:'Asia 02–08',london:'London 08–15:30',ny:'NY 15:30–20',buiten_venster:'Buiten venster'};
+const RR = [0.2,0.4,0.6,0.8,1,1.5,2,2.5,3,4,5,6,7,8,10,12,15,20,25];
+
+let D = {pos:[],closed:[],tpL:{},slL:{},ghosts:[],hist:[],equity:[]};
+let openedPairs = new Set();
+let activeTab = 'ov';
+
+// CLOCK
+setInterval(()=>{
+  document.getElementById('clk').textContent =
+    new Date().toLocaleTimeString('nl-BE',{timeZone:'Europe/Brussels',hour12:false});
+},1000);
+
+// TAB SWITCH
+function tab(name){
+  activeTab = name;
+  document.querySelectorAll('.tab').forEach((t,i)=>{
+    t.classList.toggle('on',['ov','pairs','ghosts','arch','hist','locks','equity'][i]===name);
+  });
+  document.querySelectorAll('.panel').forEach(p=>p.classList.toggle('on',p.id==='p-'+name));
+  if(name==='arch') renderArch();
 }
-async function deleteTPLocks(){
-  const syms = ${JSON.stringify([...new Set(Object.keys(tpLocks).map(k=>k.split("__")[0]))])};
-  for(const s of syms){
-    await fetch("/tp-locks/"+s,{method:"DELETE",headers:{"x-secret":SECRET}});
+
+// API
+async function api(url){
+  try{const r=await fetch(url,{headers:{'x-secret':S}});return r.ok?r.json():null}
+  catch{return null}
+}
+
+// LOAD ALL
+async function loadAll(){
+  document.getElementById('last-update').textContent='Laden...';
+  const [pos,rr,tpLocks,slLocks,ghosts,hist,equity] = await Promise.all([
+    api('/live/positions'),
+    api('/analysis/rr'),
+    api('/tp-locks'),
+    api('/sl-locks'),
+    api('/live/ghosts'),
+    api('/history?limit=100'),
+    api('/analysis/equity-curve?hours=24'),
+  ]);
+  if(pos)    D.pos = pos.positions||[];
+  if(tpLocks)D.tpL = tpLocks.locksBySymbol||{};
+  if(slLocks)D.slL = (slLocks.analyses||[]).reduce((a,x)=>({...a,[x.symbol]:x}),{});
+  if(ghosts) D.ghosts = ghosts.ghosts||[];
+  if(hist)   D.hist = hist.history||[];
+  if(equity) D.equity = equity.snapshots||[];
+
+  // flatten closed trades
+  D.closed=[];
+  if(rr?.bySymbol){
+    for(const [sym,g] of Object.entries(rr.bySymbol)){
+      for(const t of (g.details||[])) D.closed.push({...t,symbol:sym});
+    }
   }
-  alert("TP locks gereset. Herlaad de pagina.");
-  location.reload();
+  D.closed.sort((a,b)=>new Date(b.closedAt||0)-new Date(a.closedAt||0));
+
+  document.getElementById('last-update').textContent =
+    'Update: '+new Date().toLocaleTimeString('nl-BE',{timeZone:'Europe/Brussels',hour12:false});
+
+  renderAll();
 }
-// Auto-refresh elke 30s
-setTimeout(()=>location.reload(), 30000);
+
+function renderAll(){
+  renderOv(); renderPairs(); renderGhosts();
+  renderHist(); renderLocks(); renderEquity();
+  populateArchFilter();
+}
+
+// ── HELPERS ─────────────────────────────────────────────────────
+function fmtRR(v){
+  if(v==null||v===undefined)return '<span class="dim">—</span>';
+  const n=parseFloat(v);
+  const cls=n>=2?'g':n>=1?'a':n>=0?'o':'r';
+  return '<span class="'+cls+'">'+n.toFixed(2)+'R</span>';
+}
+function fmtDate(s){
+  if(!s)return'<span class="dim">—</span>';
+  return new Date(s).toLocaleString('nl-BE',{timeZone:'Europe/Brussels',dateStyle:'short',timeStyle:'short'});
+}
+function evColor(ev){return ev>0.5?'var(--g)':ev>0?'var(--a)':ev>-0.3?'var(--o)':'var(--r)'}
+
+function calcEV(trades){
+  return RR.map(rr=>{
+    const best=trades.filter(t=>(t.trueMaxRR??t.maxRR??0)>=rr).length;
+    const wr=trades.length?best/trades.length:0;
+    const ev=parseFloat((wr*rr-(1-wr)).toFixed(3));
+    return{rr,wins:best,total:trades.length,wr,ev};
+  });
+}
+
+// ── OVERVIEW ────────────────────────────────────────────────────
+function renderOv(){
+  const {pos,closed,ghosts,tpL,slL}=D;
+  const total=closed.length;
+  const wins=closed.filter(t=>(t.trueMaxRR??t.maxRR??0)>=1).length;
+  const wr=total?(wins/total*100).toFixed(1):'—';
+  const avgRR=total?(closed.reduce((a,t)=>a+(t.maxRR||0),0)/total).toFixed(2):'—';
+  const tTrue=closed.filter(t=>t.trueMaxRR!=null);
+  const avgTrue=tTrue.length?(tTrue.reduce((a,t)=>a+t.trueMaxRR,0)/tTrue.length).toFixed(2):'—';
+  const gPend=closed.filter(t=>t.trueMaxRR===null).length;
+  const syms=[...new Set(closed.map(t=>t.symbol))].length;
+  const tpCnt=Object.values(tpL).reduce((a,s)=>a+Object.keys(s).length,0);
+  const slCnt=Object.keys(slL).length;
+  const evAll=calcEV(closed);
+  const bestEV=evAll.reduce((a,b)=>b.ev>a.ev?b:a,{ev:-99,rr:0});
+
+  document.getElementById('ov-stats').innerHTML=\`
+    <div class="sc"><div class="v a">\${pos.length}</div><div class="l">Open Posities</div></div>
+    <div class="sc"><div class="v">\${total}</div><div class="l">Gesloten Trades</div></div>
+    <div class="sc"><div class="v \${parseFloat(wr)>=50?'g':'r'}">\${wr}%</div><div class="l">Winrate ≥1R</div></div>
+    <div class="sc"><div class="v">\${avgRR}R</div><div class="l">Gem. MaxRR</div></div>
+    <div class="sc"><div class="v a">\${avgTrue}R</div><div class="l">Gem. TrueMaxRR</div><div class="s">\${tTrue.length} afgerond</div></div>
+    <div class="sc"><div class="v o">\${gPend}</div><div class="l">Ghost Pending</div><div class="s">\${ghosts.length} actief</div></div>
+    <div class="sc"><div class="v">\${syms}</div><div class="l">Pairs</div></div>
+    <div class="sc"><div class="v a">\${tpCnt}</div><div class="l">TP Locks</div><div class="s">\${slCnt} SL analyses</div></div>
+    <div class="sc"><div class="v \${bestEV.ev>0?'g':'r'}">\${bestEV.ev>0?'+'+bestEV.ev+'R':'—'}</div><div class="l">Beste Globale EV</div><div class="s">\${bestEV.ev>0?'Target: '+bestEV.rr+'R':''}</div></div>
+    <div class="sc"><div class="v g">✓ UIT</div><div class="l">FTMO Dagcap</div></div>
+  \`;
+
+  // session summary
+  const sessHtml=SESS.map(s=>{
+    const tr=closed.filter(t=>t.session===s);
+    if(!tr.length)return'';
+    const w=tr.filter(t=>(t.trueMaxRR??t.maxRR??0)>=1).length;
+    const wr=(w/tr.length*100).toFixed(1);
+    const avg=(tr.reduce((a,t)=>a+(t.maxRR||0),0)/tr.length).toFixed(2);
+    const ev=calcEV(tr);
+    const best=ev.reduce((a,b)=>b.ev>a.ev?b:a,{ev:-99,rr:0});
+    return \`<div class="scard">
+      <div class="scard-name">\${SL[s]}</div>
+      <div class="srow"><span class="k">Trades</span><span class="v">\${tr.length}</span></div>
+      <div class="srow"><span class="k">Winrate ≥1R</span><span class="v \${parseFloat(wr)>=50?'g':'r'}">\${wr}%</span></div>
+      <div class="srow"><span class="k">Gem. MaxRR</span><span class="v">\${avg}R</span></div>
+      <div class="srow"><span class="k">Beste TP</span><span class="v \${best.ev>0?'g':'r'}">\${best.ev>0?best.rr+'R (EV +'+best.ev+'R)':'—'}</span></div>
+    </div>\`;
+  }).join('');
+
+  // open positions
+  const posHtml=pos.length===0
+    ?'<div class="empty"><div>📭</div>Geen open posities</div>'
+    :\`<div class="tw"><table>
+      <thead><tr><th>Pair</th><th>Dir</th><th class="tr">Lots</th><th class="tr">Risk€</th><th>Sessie</th><th class="tr">Entry</th><th class="tr">SL</th><th class="tr">TP</th><th>Flags</th></tr></thead>
+      <tbody>\${pos.map(p=>\`<tr>
+        <td class="bold">\${p.symbol}</td>
+        <td><span class="bd \${p.direction}">\${p.direction.toUpperCase()}</span></td>
+        <td class="tr">\${p.lots}</td>
+        <td class="tr">\${(p.riskEUR||0).toFixed(2)}</td>
+        <td><span class="bd info">\${p.sessionLabel||p.session||'—'}</span></td>
+        <td class="tr mono">\${p.entry||'—'}</td>
+        <td class="tr mono r">\${p.sl||'—'}</td>
+        <td class="tr mono g">\${p.tp||'—'}</td>
+        <td>\${p.forexHalfRisk?'<span class="bd warn">½R</span> ':''}\${p.restoredAfterRestart?'<span class="bd pu">RST</span>':''}</td>
+      </tr>\`).join('')}</tbody></table></div>\`;
+
+  document.getElementById('ov-body').innerHTML=\`
+    <div class="sh">Open Posities</div>\${posHtml}
+    <div class="sh">Per Sessie</div>
+    <div class="sg">\${sessHtml}</div>
+  \`;
+}
+
+// ── PAIRS ────────────────────────────────────────────────────────
+function renderPairs(){
+  const syms=[...new Set(D.closed.map(t=>t.symbol))].sort();
+  if(!syms.length){
+    document.getElementById('pairs-grid').innerHTML='<div class="empty"><div>📊</div>Geen trades</div>';
+    return;
+  }
+  document.getElementById('pairs-grid').innerHTML=syms.map(sym=>buildPairCard(sym)).join('');
+}
+
+function buildPairCard(sym){
+  const trades=D.closed.filter(t=>t.symbol===sym);
+  const op=D.pos.filter(p=>p.symbol===sym);
+  const tp=D.tpL[sym]||{};
+  const sl=D.slL[sym]||null;
+  const gh=D.ghosts.filter(g=>g.symbol===sym);
+  const wins=trades.filter(t=>(t.trueMaxRR??t.maxRR??0)>=1).length;
+  const wr=trades.length?(wins/trades.length*100).toFixed(1):0;
+  const avgRR=trades.length?(trades.reduce((a,t)=>a+(t.maxRR||0),0)/trades.length).toFixed(2):0;
+  const isOpen=openedPairs.has(sym);
+  return \`<div class="pc">
+    <div class="ph \${isOpen?'open':''}" onclick="togglePair('\${sym}')">
+      <div class="psym">\${sym}</div>
+      <div class="pbadges">
+        \${op.length?'<span class="bd acc">'+op.length+' open</span>':''}
+        \${gh.length?'<span class="bd pu">'+gh.length+' ghost</span>':''}
+        \${sl?.direction==='up'?'<span class="bd good">SL ↑</span>':sl?.direction==='down'?'<span class="bd bad">SL ↓</span>':''}
+        \${Object.keys(tp).length?'<span class="bd ye">TP locked</span>':''}
+      </div>
+      <div class="pstats">
+        <div class="ps"><div class="v \${parseFloat(wr)>=50?'g':'r'}">\${wr}%</div><div class="l">WR</div></div>
+        <div class="ps"><div class="v">\${trades.length}</div><div class="l">Trades</div></div>
+        <div class="ps"><div class="v a">\${avgRR}R</div><div class="l">AvgRR</div></div>
+      </div>
+      <div class="chev">▼</div>
+    </div>
+    <div class="pb \${isOpen?'open':''}" id="pb-\${sym}">
+      \${isOpen?buildPairBody(sym,trades,op,tp,sl,gh):''}
+    </div>
+  </div>\`;
+}
+
+function togglePair(sym){
+  const isOpen=openedPairs.has(sym);
+  if(isOpen) openedPairs.delete(sym); else openedPairs.add(sym);
+  const ph=document.querySelector(\`#pb-\${sym}\`).previousElementSibling;
+  ph.classList.toggle('open',!isOpen);
+  const pb=document.getElementById('pb-'+sym);
+  pb.classList.toggle('open',!isOpen);
+  if(!isOpen&&!pb.dataset.loaded){
+    const trades=D.closed.filter(t=>t.symbol===sym);
+    const op=D.pos.filter(p=>p.symbol===sym);
+    const tp=D.tpL[sym]||{};
+    const sl=D.slL[sym]||null;
+    const gh=D.ghosts.filter(g=>g.symbol===sym);
+    pb.innerHTML=buildPairBody(sym,trades,op,tp,sl,gh);
+    pb.dataset.loaded='1';
+  }
+}
+
+function buildPairBody(sym,trades,op,tp,sl,gh){
+  const tabs=['analyse','sessions','tp','sl','trades'];
+  if(op.length)tabs.push('open');
+  return \`
+    <div class="it" id="it-\${sym}">
+      \${tabs.map((t,i)=>\`<div class="itb \${i===0?'on':''}" onclick="innerTab('\${sym}','\${t}')">\${{analyse:'📊 Analyse',sessions:'⏱ Sessies',tp:'🎯 TP Opt.',sl:'📐 SL Opt.',trades:'📋 Trades',open:'🟢 Open'}[t]}</div>\`).join('')}
+    </div>
+    \${tabs.map((t,i)=>\`<div class="itp \${i===0?'on':''}" id="itp-\${sym}-\${t}">
+      \${{
+        analyse:()=>buildAnalyse(sym,trades,tp,sl),
+        sessions:()=>buildSessions(sym,trades),
+        tp:()=>buildTP(sym,trades,tp),
+        sl:()=>buildSL(sym,trades,sl),
+        trades:()=>buildTrades(sym,trades),
+        open:()=>buildOpen(op),
+      }[t]()}
+    </div>\`).join('')}
+  \`;
+}
+
+function innerTab(sym,name){
+  document.querySelectorAll(\`#it-\${sym} .itb\`).forEach(t=>t.classList.remove('on'));
+  document.querySelectorAll(\`[id^="itp-\${sym}-"]\`).forEach(p=>p.classList.remove('on'));
+  const tEl=[...document.querySelectorAll(\`#it-\${sym} .itb\`)].find(t=>t.textContent.includes({analyse:'Analyse',sessions:'Sessies',tp:'TP',sl:'SL',trades:'Trades',open:'Open'}[name]));
+  if(tEl)tEl.classList.add('on');
+  document.getElementById(\`itp-\${sym}-\${name}\`)?.classList.add('on');
+}
+
+// ANALYSE TAB
+function buildAnalyse(sym,trades,tp,sl){
+  if(!trades.length)return'<div class="empty">Geen data</div>';
+  const ev=calcEV(trades);
+  const best=ev.reduce((a,b)=>b.ev>a.ev?b:a,{ev:-99,rr:0});
+  const wins=trades.filter(t=>(t.trueMaxRR??t.maxRR??0)>=1).length;
+  const wr=(wins/trades.length*100).toFixed(1);
+  const avgRR=(trades.reduce((a,t)=>a+(t.maxRR||0),0)/trades.length).toFixed(2);
+  const tTrue=trades.filter(t=>t.trueMaxRR!=null);
+  const avgTrue=tTrue.length?(tTrue.reduce((a,t)=>a+t.trueMaxRR,0)/tTrue.length).toFixed(2):'—';
+  const gPend=trades.filter(t=>t.trueMaxRR===null).length;
+
+  // Adviezen
+  let advices='';
+  if(best.ev>0) advices+=\`<div class="advr"><span class="icon">🎯</span><span>Beste TP: <strong class="g">\${best.rr}R</strong> — EV <strong class="g">+\${best.ev}R</strong>/trade (WR \${(best.wr*100).toFixed(1)}%, \${best.wins}/\${best.total} wins)</span></div>\`;
+  else advices+=\`<div class="advr"><span class="icon">⚠️</span><span>Geen positief EV gevonden — te weinig data of negatief systeem</span></div>\`;
+  const tpKeys=Object.keys(tp);
+  if(tpKeys.length){
+    tpKeys.forEach(sess=>{const l=tp[sess];advices+=\`<div class="advr"><span class="icon">🔒</span><span>TP Lock <strong class="a">\${sess}</strong>: \${l.lockedRR}R — EV +\${l.evAtLock}R (\${l.lockedTrades} trades)</span></div>\`;});
+  }
+  if(sl){
+    const dir=sl.direction==='up'?'📈 Groter':'sl.direction==="down"?'📉 Kleiner':'✅ Huidig optimaal';
+    advices+=\`<div class="advr"><span class="icon">\${sl.direction==='up'?'📈':sl.direction==='down'?'📉':'✅'}</span><span>SL Advies: <strong class="\${sl.direction==='up'?'g':sl.direction==='down'?'r':'a'}">\${sl.direction==='up'?'Groter':sl.direction==='down'?'Kleiner':'Huidig optimaal'}</strong> (\${sl.multiplier}×) — EV \${sl.evAtLock}R</span></div>\`;
+  }
+  if(gPend>0) advices+=\`<div class="advr"><span class="icon">👻</span><span><strong class="pu">\${gPend}</strong> trades wachten op Ghost finalisatie (TrueMaxRR nog onbekend)</span></div>\`;
+
+  const maxEVabs=Math.max(...ev.map(e=>Math.abs(e.ev)),0.01);
+  const evRows=ev.map(e=>{
+    const isBest=e.rr===best.rr&&best.ev>0;
+    const pct=Math.max(0,(e.ev/maxEVabs)*100);
+    const clr=evColor(e.ev);
+    return \`<tr class="\${isBest?'best':''}">
+      <td>\${e.rr}R\${isBest?' <span class="bd good">BEST</span>':''}</td>
+      <td class="tr">\${e.wins}/\${e.total}</td>
+      <td class="tr">\${(e.wr*100).toFixed(1)}%</td>
+      <td class="tr" style="color:\${clr}">\${e.ev>0?'+':''}\${e.ev}R</td>
+      <td><span class="evbar"><span class="evbf" style="width:\${pct}%;background:\${clr}"></span></span></td>
+    </tr>\`;
+  }).join('');
+
+  return \`
+    <div class="stats" style="margin-bottom:10px">
+      <div class="sc"><div class="v \${parseFloat(wr)>=50?'g':'r'}">\${wr}%</div><div class="l">Winrate ≥1R</div></div>
+      <div class="sc"><div class="v">\${trades.length}</div><div class="l">Trades</div></div>
+      <div class="sc"><div class="v">\${avgRR}R</div><div class="l">Avg MaxRR</div></div>
+      <div class="sc"><div class="v a">\${avgTrue}R</div><div class="l">Avg TrueMaxRR</div></div>
+      <div class="sc"><div class="v o">\${gPend}</div><div class="l">Ghost Pending</div></div>
+    </div>
+    <div class="adv">\${advices}</div>
+    <div class="tw"><table>
+      <thead><tr><th>TP Level</th><th class="tr">W/T</th><th class="tr">Winrate</th><th class="tr">EV/trade</th><th>Bar</th></tr></thead>
+      <tbody>\${evRows}</tbody>
+    </table></div>
+  \`;
+}
+
+// SESSIONS TAB
+function buildSessions(sym,trades){
+  if(!trades.length)return'<div class="empty">Geen data</div>';
+  return SESS.map(s=>{
+    const tr=trades.filter(t=>t.session===s);
+    if(!tr.length)return\`<div class="scard-name" style="color:var(--t3);font-size:11px;margin:6px 0">\${SL[s]} — geen trades</div>\`;
+    const w=tr.filter(t=>(t.trueMaxRR??t.maxRR??0)>=1).length;
+    const wr=(w/tr.length*100).toFixed(1);
+    const avg=(tr.reduce((a,t)=>a+(t.maxRR||0),0)/tr.length).toFixed(2);
+    const ev=calcEV(tr);
+    const best=ev.reduce((a,b)=>b.ev>a.ev?b:a,{ev:-99,rr:0});
+    const maxEV=Math.max(...ev.map(e=>Math.abs(e.ev)),0.01);
+    const rows=ev.filter(e=>e.ev>-1||e.rr<=3).map(e=>{
+      const isBest=e.rr===best.rr&&best.ev>0;
+      const pct=Math.max(0,(e.ev/maxEV)*100);
+      const clr=evColor(e.ev);
+      return \`<tr class="\${isBest?'best':''}">
+        <td>\${e.rr}R\${isBest?' <span class="bd good">★</span>':''}</td>
+        <td class="tr">\${e.wins}/\${e.total}</td>
+        <td class="tr">\${(e.wr*100).toFixed(1)}%</td>
+        <td class="tr" style="color:\${clr}">\${e.ev>0?'+':''}\${e.ev}R</td>
+        <td><span class="evbar"><span class="evbf" style="width:\${pct}%;background:\${clr}"></span></span></td>
+      </tr>\`;
+    }).join('');
+    return \`<div style="margin-bottom:14px">
+      <div class="sh" style="margin-top:0">\${SL[s]} — \${tr.length} trades | WR: \${wr}% | Avg: \${avg}R | Beste TP: \${best.ev>0?best.rr+'R (EV +'+best.ev+'R)':'—'}</div>
+      <div class="tw"><table>
+        <thead><tr><th>TP</th><th class="tr">W/T</th><th class="tr">WR%</th><th class="tr">EV</th><th>Bar</th></tr></thead>
+        <tbody>\${rows}</tbody>
+      </table></div>
+    </div>\`;
+  }).join('');
+}
+
+// TP OPTIMIZER TAB
+function buildTP(sym,trades,tpLock){
+  if(!trades.length)return'<div class="empty">Geen data</div>';
+  const ev=calcEV(trades);
+  const best=ev.reduce((a,b)=>b.ev>a.ev?b:a,{ev:-99,rr:0});
+  const current=tpLock&&Object.keys(tpLock).length?Object.entries(tpLock).sort((a,b)=>(b[1].evAtLock||0)-(a[1].evAtLock||0))[0]:null;
+
+  let topHtml=\`<div class="adv">\`;
+  if(best.ev>0){
+    topHtml+=\`<div class="advr"><span class="icon">🎯</span><span>Globaal beste TP: <strong class="g">\${best.rr}R</strong> — EV <strong class="g">+\${best.ev}R</strong>/trade (WR \${(best.wr*100).toFixed(1)}%)</span></div>\`;
+    if(current&&current[1].lockedRR!==best.rr){
+      topHtml+=\`<div class="advr"><span class="icon">🔄</span><span>Huidig lock: \${current[0]} \${current[1].lockedRR}R — overweeg update naar \${best.rr}R</span></div>\`;
+    } else if(current){
+      topHtml+=\`<div class="advr"><span class="icon">✅</span><span>Lock (\${current[0]}) is al op optimaal niveau \${current[1].lockedRR}R</span></div>\`;
+    } else {
+      topHtml+=\`<div class="advr"><span class="icon">💡</span><span>Nog geen TP lock — wacht op voldoende data (min 10 trades)</span></div>\`;
+    }
+  } else {
+    topHtml+=\`<div class="advr"><span class="icon">⚠️</span><span>Geen positief EV — onvoldoende data of systeem niet winstgevend</span></div>\`;
+  }
+  topHtml+=\`</div>\`;
+
+  // Per sessie
+  const sessHtml=SESS.map(s=>{
+    const tr=trades.filter(t=>t.session===s);
+    if(!tr.length)return'';
+    const ev=calcEV(tr);
+    const b=ev.reduce((a,e)=>e.ev>a.ev?e:a,{ev:-99,rr:0});
+    const lock=tpLock[s];
+    return \`<div class="scard">
+      <div class="scard-name">\${SL[s]}</div>
+      <div class="srow"><span class="k">Trades</span><span class="v">\${tr.length}</span></div>
+      <div class="srow"><span class="k">Beste TP</span><span class="v \${b.ev>0?'g':'r'}">\${b.ev>0?b.rr+'R':'—'}</span></div>
+      <div class="srow"><span class="k">EV</span><span class="v \${b.ev>0?'g':'r'}">\${b.ev>0?'+'+b.ev+'R':'—'}</span></div>
+      <div class="srow"><span class="k">WR</span><span class="v">\${b.ev>0?(b.wr*100).toFixed(1)+'%':'—'}</span></div>
+      <div class="srow"><span class="k">Lock actief</span><span class="v \${lock?'ye':'dim'}">\${lock?lock.lockedRR+'R ✓':'nee'}</span></div>
+    </div>\`;
+  }).join('');
+
+  const maxEV=Math.max(...ev.map(e=>Math.abs(e.ev)),0.01);
+  const rows=ev.map(e=>{
+    const isBest=e.rr===best.rr&&best.ev>0;
+    const pct=Math.max(0,(e.ev/maxEV)*100);
+    const clr=evColor(e.ev);
+    return \`<tr class="\${isBest?'best':''}">
+      <td>\${e.rr}R\${isBest?' <span class="bd good">BEST</span>':''}</td>
+      <td class="tr">\${e.wins}/\${e.total}</td>
+      <td class="tr">\${(e.wr*100).toFixed(1)}%</td>
+      <td class="tr" style="color:\${clr}">\${e.ev>0?'+':''}\${e.ev}R</td>
+      <td><span class="evbar"><span class="evbf" style="width:\${pct}%;background:\${clr}"></span></span></td>
+    </tr>\`;
+  }).join('');
+
+  return \`\${topHtml}
+    <div class="sg">\${sessHtml}</div>
+    <div class="sh">Volledige EV Tabel (globaal)</div>
+    <div class="tw"><table>
+      <thead><tr><th>TP Level</th><th class="tr">Wins/Total</th><th class="tr">Winrate</th><th class="tr">EV/trade</th><th>Bar</th></tr></thead>
+      <tbody>\${rows}</tbody>
+    </table></div>\`;
+}
+
+// SL OPTIMIZER TAB
+function buildSL(sym,trades,slLock){
+  if(!trades.length)return'<div class="empty">Geen data</div>';
+  const MULTS=[0.5,0.6,0.75,0.85,1.0,1.25,1.5,2.0,2.5,3.0];
+  const rows=MULTS.map(mult=>{
+    // Simulate SL scaled trades: a tighter SL → proportionally larger maxRR
+    const sim=trades.map(t=>{
+      const scaledMaxRR=(t.trueMaxRR??t.maxRR??0)/mult;
+      return{...t,simRR:scaledMaxRR};
+    });
+    const ev=calcEV(sim.map(t=>({...t,maxRR:t.simRR,trueMaxRR:t.simRR})));
+    const best=ev.reduce((a,b)=>b.ev>a.ev?b:a,{ev:-99,rr:0});
+    const isCur=mult===1.0;
+    const isAdv=slLock&&Math.abs(slLock.multiplier-mult)<0.01;
+    return{mult,best,isCur,isAdv,sim};
+  });
+  const bestMult=rows.reduce((a,b)=>b.best.ev>a.best.ev?b:a,{best:{ev:-99}});
+  const advDir=bestMult.mult<1.0?'Kleiner (dichter bij entry)':bestMult.mult>1.0?'Groter (verder van entry)':'Huidig optimaal';
+  const advIcon=bestMult.mult<1.0?'📉':bestMult.mult>1.0?'📈':'✅';
+  const advCls=bestMult.mult<1.0?'r':bestMult.mult>1.0?'g':'a';
+
+  let advice=\`<div class="adv">
+    <div class="advr"><span class="icon">\${advIcon}</span><span>SL Advies: <strong class="\${advCls}">\${advDir}</strong> (\${bestMult.mult}×) — beste EV: \${bestMult.best.ev>0?'+'+bestMult.best.ev+'R bij '+bestMult.best.rr+'R TP':'—'}</span></div>\`;
+  if(slLock){
+    advice+=\`<div class="advr"><span class="icon">🔒</span><span>Huidig lock: \${slLock.multiplier}× (\${slLock.direction}) — EV \${slLock.evAtLock}R bij \${slLock.lockedTrades} trades</span></div>\`;
+  }
+  advice+=\`</div>\`;
+
+  const tableRows=rows.map(r=>{
+    const cls=r.mult===bestMult.mult?'best':'';
+    return \`<tr class="\${cls}">
+      <td>\${r.mult}× \${r.mult===1.0?'<span class="bd info">huidig</span>':''} \${r.mult===bestMult.mult?'<span class="bd good">BEST</span>':''}  \${r.isAdv?'<span class="bd ye">lock</span>':''}</td>
+      <td class="tr">\${r.best.ev>0?r.best.rr+'R':'—'}</td>
+      <td class="tr \${r.best.ev>0?'g':'r'}">\${r.best.ev>0?'+'+r.best.ev+'R':'—'}</td>
+      <td class="tr">\${r.best.ev>0?(r.best.wr*100).toFixed(1)+'%':'—'}</td>
+    </tr>\`;
+  }).join('');
+
+  return \`\${advice}
+    <div class="sh">SL Multiplier Vergelijking</div>
+    <div style="font-size:10px;color:var(--t3);margin-bottom:8px">⚠️ Simulatie: SL groter = kleinere relatieve MaxRR. Advies is indicatief.</div>
+    <div class="tw"><table>
+      <thead><tr><th>SL Multiplier</th><th class="tr">Beste TP</th><th class="tr">EV</th><th class="tr">Winrate</th></tr></thead>
+      <tbody>\${tableRows}</tbody>
+    </table></div>\`;
+}
+
+// TRADES TAB
+function buildTrades(sym,trades){
+  if(!trades.length)return'<div class="empty">Geen trades</div>';
+  const rows=trades.slice(0,50).map((t,i)=>\`<tr>
+    <td class="dim">\${i+1}</td>
+    <td><span class="bd \${t.direction}">\${t.direction?.toUpperCase()}</span></td>
+    <td><span class="bd info">\${SL[t.session]||t.session||'—'}</span></td>
+    <td class="tr mono">\${t.entry?.toFixed(4)||'—'}</td>
+    <td class="tr mono r">\${t.sl?.toFixed(4)||'—'}</td>
+    <td class="tr">\${fmtRR(t.maxRR)}</td>
+    <td class="tr">\${fmtRR(t.trueMaxRR)}</td>
+    <td class="dim" style="font-size:10px">\${t.trueMaxRR!=null?'<span class="bd good">✓</span>':'<span class="bd pu">👻</span>'}</td>
+    <td style="font-size:10px">\${fmtDate(t.openedAt)}</td>
+    <td style="font-size:10px">\${fmtDate(t.closedAt)}</td>
+  </tr>\`).join('');
+  return \`<div class="tw" style="max-height:400px;overflow-y:auto"><table>
+    <thead><tr><th>#</th><th>Dir</th><th>Sessie</th><th class="tr">Entry</th><th class="tr">SL</th><th class="tr">MaxRR</th><th class="tr">TrueMaxRR</th><th>Ghost</th><th>Open</th><th>Gesloten</th></tr></thead>
+    <tbody>\${rows}</tbody>
+  </table></div>\${trades.length>50?'<div class="dim" style="font-size:10px;margin-top:6px">Toon 50/'+trades.length+' — zie Archief voor alles</div>':''}\`;
+}
+
+// OPEN TAB
+function buildOpen(op){
+  if(!op.length)return'<div class="empty">Geen open posities</div>';
+  return \`<div class="tw"><table>
+    <thead><tr><th>Dir</th><th>Sessie</th><th class="tr">Lots</th><th class="tr">Risk€</th><th class="tr">Entry</th><th class="tr">SL</th><th class="tr">TP</th><th>Flags</th></tr></thead>
+    <tbody>\${op.map(p=>\`<tr>
+      <td><span class="bd \${p.direction}">\${p.direction?.toUpperCase()}</span></td>
+      <td><span class="bd info">\${p.sessionLabel||p.session||'—'}</span></td>
+      <td class="tr">\${p.lots}</td>
+      <td class="tr">\${(p.riskEUR||0).toFixed(2)}</td>
+      <td class="tr mono">\${p.entry||'—'}</td>
+      <td class="tr mono r">\${p.sl||'—'}</td>
+      <td class="tr mono g">\${p.tp||'—'}</td>
+      <td>\${p.forexHalfRisk?'<span class="bd warn">½R</span> ':''}\${p.restoredAfterRestart?'<span class="bd pu">RST</span>':''}</td>
+    </tr>\`).join('')}</tbody>
+  </table></div>\`;
+}
+
+// ── GHOSTS ───────────────────────────────────────────────────────
+function renderGhosts(){
+  const gh=D.ghosts;
+  if(!gh.length){
+    document.getElementById('ghost-active').innerHTML='<div class="empty"><div>👻</div>Geen actieve ghost trackers</div>';
+  } else {
+    document.getElementById('ghost-active').innerHTML=gh.map(g=>{
+      const pct=Math.min(100,(g.elapsedMin/1440)*100);
+      return \`<div class="ghost-row">
+        <div><div class="ghost-sym">\${g.symbol}</div>
+          <span class="bd \${g.direction}">\${g.direction?.toUpperCase()}</span>
+          <span class="bd info" style="margin-left:4px">\${SL[g.session]||'—'}</span></div>
+        <div>
+          <div class="ghost-lbl">Tijd verstreken: \${g.elapsedMin}min / \${Math.round(g.remainingMin)}min resterend</div>
+          <div class="ghost-bar"><div class="ghost-bf" style="width:\${pct}%"></div></div>
+          <div style="font-size:10px;color:var(--t2);margin-top:3px">Entry: \${g.entry} | SL: \${g.sl} | MaxRR bij sluiting: \${g.maxRRAtClose}R</div>
+        </div>
+        <div class="ghost-rr"><div class="big pu">\${parseFloat(g.currentBestRR||0).toFixed(2)}R</div><div class="small">CurrentBest</div></div>
+      </div>\`;
+    }).join('');
+  }
+
+  const pending=D.closed.filter(t=>t.trueMaxRR===null);
+  if(!pending.length){
+    document.getElementById('ghost-pending').innerHTML='<div class="empty">Geen pending ghost trades</div>';
+  } else {
+    document.getElementById('ghost-pending').innerHTML=pending.slice(0,100).map(t=>\`<tr>
+      <td class="bold">\${t.symbol}</td>
+      <td><span class="bd \${t.direction}">\${t.direction?.toUpperCase()}</span></td>
+      <td><span class="bd info">\${SL[t.session]||t.session||'—'}</span></td>
+      <td class="tr">\${fmtRR(t.maxRR)}</td>
+      <td class="tr mono">\${t.entry?.toFixed(4)||'—'}</td>
+      <td style="font-size:10px">\${fmtDate(t.openedAt)}</td>
+      <td style="font-size:10px">\${fmtDate(t.closedAt)}</td>
+    </tr>\`).join('');
+  }
+}
+
+// ── ARCHIVE ──────────────────────────────────────────────────────
+function populateArchFilter(){
+  const syms=[...new Set(D.closed.map(t=>t.symbol))].sort();
+  const sel=document.getElementById('af-sym');
+  const cur=sel.value;
+  sel.innerHTML='<option value="">Alle</option>'+syms.map(s=>\`<option value="\${s}" \${s===cur?'selected':''}>\${s}</option>\`).join('');
+  renderArch();
+}
+
+function renderArch(){
+  let tr=[...D.closed];
+  const sym=document.getElementById('af-sym')?.value;
+  const sess=document.getElementById('af-sess')?.value;
+  const dir=document.getElementById('af-dir')?.value;
+  const minRR=parseFloat(document.getElementById('af-rr')?.value)||0;
+  if(sym)  tr=tr.filter(t=>t.symbol===sym);
+  if(sess) tr=tr.filter(t=>t.session===sess);
+  if(dir)  tr=tr.filter(t=>t.direction===dir);
+  if(minRR)tr=tr.filter(t=>(t.trueMaxRR??t.maxRR??0)>=minRR);
+  document.getElementById('af-info').textContent=tr.length+' trades';
+  document.getElementById('arch-body').innerHTML=tr.slice(0,500).map((t,i)=>\`<tr>
+    <td class="dim">\${i+1}</td>
+    <td class="bold">\${t.symbol}</td>
+    <td><span class="bd \${t.direction}">\${t.direction?.toUpperCase()}</span></td>
+    <td><span class="bd info">\${SL[t.session]||t.session||'—'}</span></td>
+    <td class="tr mono">\${t.entry?.toFixed(4)||'—'}</td>
+    <td class="tr mono r">\${t.sl?.toFixed(4)||'—'}</td>
+    <td class="tr">\${fmtRR(t.maxRR)}</td>
+    <td class="tr">\${fmtRR(t.trueMaxRR)}</td>
+    <td class="tr">\${t.riskEUR?.toFixed(2)||'—'}</td>
+    <td class="tr">\${t.lots||'—'}</td>
+    <td class="tc">\${t.trueMaxRR!=null?'<span class="bd good">✓</span>':'<span class="bd pu">👻</span>'}</td>
+    <td style="font-size:10px">\${fmtDate(t.openedAt)}</td>
+    <td style="font-size:10px">\${fmtDate(t.closedAt)}</td>
+  </tr>\`).join('');
+}
+
+// ── HISTORY ──────────────────────────────────────────────────────
+function renderHist(){
+  const rows=D.hist.map(h=>\`<tr>
+    <td style="font-size:10px;color:var(--t3)">\${h.ts?.slice(0,19).replace('T',' ')||'—'}</td>
+    <td><span class="bd \${h.type==='SUCCESS'?'good':h.type==='ERROR'?'bad':'info'}">\${h.type}</span></td>
+    <td class="bold">\${h.symbol||'—'}</td>
+    <td>\${h.direction?'<span class="bd '+h.direction+'">'+h.direction.toUpperCase()+'</span>':'—'}</td>
+    <td><span class="bd info">\${h.session||'—'}</span></td>
+    <td class="tr">\${h.lots||'—'}</td>
+    <td class="tr">\${h.riskEUR?'€'+h.riskEUR:'—'}</td>
+    <td>\${h.tp||'—'}</td>
+    <td style="font-size:10px">\${h.slAanpassing||'—'}</td>
+    <td style="font-size:10px">\${h.riskBoost||'—'}</td>
+  </tr>\`).join('');
+  document.getElementById('hist-body').innerHTML=rows||'<tr><td colspan="10" class="empty">Geen data</td></tr>';
+}
+
+// ── LOCKS ────────────────────────────────────────────────────────
+function renderLocks(){
+  // TP locks
+  const tpHtml=Object.entries(D.tpL).length===0
+    ?'<div class="empty">Geen TP locks</div>'
+    :Object.entries(D.tpL).map(([sym,sessions])=>\`
+      <div class="lc">
+        <div class="lc-hdr"><div class="lc-sym">\${sym}</div></div>
+        <div class="lc-sub">
+          \${Object.entries(sessions).map(([sess,l])=>\`
+            <div class="lc-item"><span class="k">\${sess}:</span><span class="v a">\${l.lockedRR}R</span> <span style="font-size:10px;color:var(--t3)">EV +\${l.evAtLock}R | \${l.lockedTrades} trades</span></div>
+          \`).join('')}
+        </div>
+      </div>
+    \`).join('');
+
+  // SL locks
+  const slHtml=Object.entries(D.slL).length===0
+    ?'<div class="empty">Geen SL analyses</div>'
+    :Object.entries(D.slL).map(([sym,l])=>\`
+      <div class="lc">
+        <div class="lc-hdr">
+          <div class="lc-sym">\${sym}</div>
+          <span class="bd \${l.direction==='up'?'good':l.direction==='down'?'bad':'info'}">\${l.direction==='up'?'↑ Groter':l.direction==='down'?'↓ Kleiner':'= Huidig'}</span>
+        </div>
+        <div class="lc-sub">
+          <div class="lc-item"><span class="k">Mult:</span><span class="v">\${l.multiplier}×</span></div>
+          <div class="lc-item"><span class="k">EV:</span><span class="v \${l.evAtLock>0?'g':'r'}">\${l.evAtLock}R</span></div>
+          <div class="lc-item"><span class="k">Trades:</span><span class="v">\${l.lockedTrades}</span></div>
+        </div>
+      </div>
+    \`).join('');
+
+  document.getElementById('tp-locks').innerHTML=tpHtml;
+  document.getElementById('sl-locks').innerHTML=slHtml;
+}
+
+// ── EQUITY ───────────────────────────────────────────────────────
+function renderEquity(){
+  const snaps=D.equity;
+  const canvas=document.getElementById('eq-canvas');
+  if(!canvas)return;
+  if(!snaps.length){canvas.style.display='none';return;}
+  canvas.style.display='block';
+  canvas.width=canvas.offsetWidth||800;
+  canvas.height=300;
+  const ctx=canvas.getContext('2d');
+  const bal=snaps.map(s=>s.equity??s.balance??0);
+  const mn=Math.min(...bal),mx=Math.max(...bal);
+  const pad={t:20,r:20,b:30,l:70};
+  const W=canvas.width-pad.l-pad.r,H=canvas.height-pad.t-pad.b;
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  ctx.fillStyle='#0c1018';ctx.fillRect(0,0,canvas.width,canvas.height);
+  // grid
+  ctx.strokeStyle='#1c2a38';ctx.lineWidth=1;
+  for(let i=0;i<=4;i++){
+    const y=pad.t+H*(1-i/4);
+    ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(pad.l+W,y);ctx.stroke();
+    const v=mn+(mx-mn)*i/4;
+    ctx.fillStyle='#4a6070';ctx.font='10px monospace';ctx.textAlign='right';
+    ctx.fillText(v.toFixed(0),pad.l-6,y+4);
+  }
+  // line
+  const range=mx-mn||1;
+  ctx.beginPath();ctx.strokeStyle='#2dd4f4';ctx.lineWidth=2;
+  snaps.forEach((s,i)=>{
+    const x=pad.l+W*i/(snaps.length-1);
+    const y=pad.t+H*(1-(((s.equity??s.balance??0)-mn)/range));
+    i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);
+  });
+  ctx.stroke();
+  // fill
+  ctx.beginPath();
+  snaps.forEach((s,i)=>{
+    const x=pad.l+W*i/(snaps.length-1);
+    const y=pad.t+H*(1-(((s.equity??s.balance??0)-mn)/range));
+    i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);
+  });
+  ctx.lineTo(pad.l+W,pad.t+H);ctx.lineTo(pad.l,pad.t+H);ctx.closePath();
+  const grad=ctx.createLinearGradient(0,pad.t,0,pad.t+H);
+  grad.addColorStop(0,'rgba(45,212,244,.2)');grad.addColorStop(1,'rgba(45,212,244,0)');
+  ctx.fillStyle=grad;ctx.fill();
+
+  const last=snaps[snaps.length-1];
+  const first=snaps[0];
+  const diff=((last.equity??last.balance??0)-(first.equity??first.balance??0)).toFixed(2);
+  document.getElementById('eq-stats').innerHTML=\`
+    <div class="sc"><div class="v">\${(last.balance||0).toFixed(0)}</div><div class="l">Balance</div></div>
+    <div class="sc"><div class="v a">\${(last.equity||0).toFixed(0)}</div><div class="l">Equity</div></div>
+    <div class="sc"><div class="v \${parseFloat(diff)>=0?'g':'r'}">\${parseFloat(diff)>=0?'+':''}\${diff}</div><div class="l">Change 24u</div></div>
+    <div class="sc"><div class="v">\${(last.floatingPL||0).toFixed(2)}</div><div class="l">Floating P/L</div></div>
+    <div class="sc"><div class="v">\${snaps.length}</div><div class="l">Snapshots</div></div>
+  \`;
+}
+
+// ── ACTIONS ──────────────────────────────────────────────────────
+async function confirmReset(){
+  if(!confirm('Alle TP locks resetten? Dit kan niet ongedaan worden gemaakt.'))return;
+  const syms=[...new Set(Object.values(D.tpL).flatMap(()=>Object.keys(D.tpL)))];
+  for(const s of Object.keys(D.tpL)){
+    await fetch('/tp-locks/'+s,{method:'DELETE',headers:{'x-secret':S}});
+  }
+  alert('TP locks gereset.');
+  loadAll();
+}
+
+// AUTO-REFRESH
+loadAll();
+setInterval(loadAll, 30000);
 </script>
 </body>
-</html>`;
-  res.send(html);
+</html>`);
 });
+
 
 // ══════════════════════════════════════════════════════════════
 // START
