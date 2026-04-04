@@ -2522,8 +2522,8 @@ async function startServer() {
     console.log(`📐 ${Object.keys(slLocks).length} SL analyses geladen`);
   } catch (e) { console.warn("⚠️ SL config laden:", e.message); }
 
-  // Run engines voor alle symbolen
-  const symSet = [...new Set(valid.map(t => t.symbol).filter(Boolean))];
+  // Run engines voor alle symbolen (gebruik closedTrades want valid is lokaal)
+  const symSet = [...new Set(closedTrades.map(t => t.symbol).filter(Boolean))];
   for (const sym of symSet) {
     await runTPLockEngine(sym).catch(() => {});
     await runSLLockEngine(sym).catch(() => {});
