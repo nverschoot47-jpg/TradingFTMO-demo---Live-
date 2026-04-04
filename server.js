@@ -333,9 +333,14 @@ function isMarketOpen(type, symbol) {
 const META_BASE = `https://mt-client-api-v1.london.agiliumtrade.ai/users/current/accounts/${META_ACCOUNT_ID}`;
 
 async function fetchOpenPositions() {
-  const r = await fetch(`${META_BASE}/positions`, { headers: {"auth-token": META_API_TOKEN} });
-  if (!r.ok) throw new Error(`positions ${r.status}`);
-  return r.json();
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 8000);
+  try {
+    const r = await fetch(`${META_BASE}/positions`, { headers: {"auth-token": META_API_TOKEN}, signal: ctrl.signal });
+    clearTimeout(t);
+    if (!r.ok) throw new Error(`positions ${r.status}`);
+    return r.json();
+  } catch(e) { clearTimeout(t); throw e; }
 }
 
 async function fetchAccountInfo() {
@@ -2477,29 +2482,42 @@ setInterval(loadAll, 30000);
 const PORT = process.env.PORT || 3000;
 
 async function startServer() {
-  await initDB();
+  // DB init + data laden met timeout — server start altijd, ook als DB traag is
+  const DB_TIMEOUT = 8000;
+  function withTimeout(promise, ms, label) {
+    return Promise.race([
+      promise,
+      new Promise((_, rej) => setTimeout(() => rej(new Error(`${label} timeout na ${ms}ms`)), ms))
+    ]);
+  }
+
+  try {
+    await withTimeout(initDB(), DB_TIMEOUT, "initDB");
+  } catch (e) { console.warn("⚠️ initDB mislukt, verder zonder DB:", e.message); }
 
   // Laad gesloten trades
-  const hist  = await loadAllTrades();
-  const valid = hist.filter(t => t.closed_at || t.closedAt);
-  // v4.3: herbereken sessie voor trades zonder sessie op basis van openedAt
-  for (const t of valid) {
-    if (!t.session && t.openedAt) {
-      t.session = getSessionGMT1(t.openedAt);
+  try {
+    const hist  = await withTimeout(loadAllTrades(), DB_TIMEOUT, "loadAllTrades");
+    const valid = hist.filter(t => t.closed_at || t.closedAt);
+    // v4.3: herbereken sessie voor trades zonder sessie op basis van openedAt
+    for (const t of valid) {
+      if (!t.session && t.openedAt) {
+        t.session = getSessionGMT1(t.openedAt);
+      }
     }
-  }
-  closedTrades.push(...valid);
-  console.log(`📂 ${valid.length} gesloten trades geladen`);
+    closedTrades.push(...valid);
+    console.log(`📂 ${valid.length} gesloten trades geladen`);
+  } catch (e) { console.warn("⚠️ loadAllTrades mislukt, verder met lege trades:", e.message); }
 
   // Laad TP / SL configs
   try {
-    const saved = await loadTPConfig();
+    const saved = await withTimeout(loadTPConfig(), DB_TIMEOUT, "loadTPConfig");
     Object.assign(tpLocks, saved);
     console.log(`🔒 ${Object.keys(tpLocks).length} TP sessie-locks geladen`);
   } catch (e) { console.warn("⚠️ TP config laden:", e.message); }
 
   try {
-    const saved = await loadSLConfig();
+    const saved = await withTimeout(loadSLConfig(), DB_TIMEOUT, "loadSLConfig");
     Object.assign(slLocks, saved);
     console.log(`📐 ${Object.keys(slLocks).length} SL analyses geladen`);
   } catch (e) { console.warn("⚠️ SL config laden:", e.message); }
@@ -2513,7 +2531,9 @@ async function startServer() {
   console.log(`🔒 TP sessie-locks: ${Object.keys(tpLocks).length} | 📐 SL analyses: ${Object.keys(slLocks).length}`);
 
   // [FIX v4.3] Herstel open posities vanuit MT5 na restart
-  await restoreOpenPositionsFromMT5();
+  try {
+    await withTimeout(restoreOpenPositionsFromMT5(), DB_TIMEOUT, "restoreOpenPositions");
+  } catch(e) { console.warn("⚠️ MT5 restore mislukt, verder zonder open posities:", e.message); }
 
   const server = app.listen(PORT, () =>
     console.log([
