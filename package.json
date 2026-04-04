@@ -1,7 +1,7 @@
 {
   "name": "nv-tradingview-webhook",
-  "version": "4.4.0",
-  "description": "TradingView → MetaApi REST → FTMO MT5 | NV v4.3 — Cap fix (baseRisk), Restart recovery, Forex half risk bij consolidatie",
+  "version": "5.0.0",
+  "description": "TradingView → MetaApi REST → FTMO MT5 | NV v5.0 — TP auto per sessie EV+, SL auto na 50 trades, Ghost analyse, PnL log, Dashboard ingebouwd",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
