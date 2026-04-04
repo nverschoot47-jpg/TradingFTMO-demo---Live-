@@ -1435,7 +1435,11 @@ app.get("/research/sl-optimizer", (req,res) => {
 // ── EQUITY CURVE ──────────────────────────────────────────────
 app.get("/analysis/equity-curve", async (req,res) => {
   const hours=parseInt(req.query.hours)||24;
-  try { const db=await loadSnapshots(hours); if (db.length) return res.json({hours,count:db.length,source:"postgres",snapshots:db}); } catch(e){}
+  try {
+    const timeout = new Promise((_,rej) => setTimeout(() => rej(new Error("timeout")), 4000));
+    const db = await Promise.race([loadSnapshots(hours), timeout]);
+    if (db.length) return res.json({hours,count:db.length,source:"postgres",snapshots:db});
+  } catch(e) { console.warn("⚠️ equity-curve DB fallback:", e.message); }
   const cutoff=new Date(Date.now()-hours*3600000).toISOString();
   const snaps=accountSnapshots.filter(s=>s.ts>=cutoff);
   res.json({hours,count:snaps.length,source:"memory",snapshots:snaps});
