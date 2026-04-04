@@ -13,13 +13,12 @@
 //           → /dashboard geeft nu echte UI ipv JSON stub
 //  ✅ [FIX] FTMO dagelijkse verlies-limiet UITGESCHAKELD
 //           → Alle trades worden doorgelaten, geen dagcap blokkering
+//  ✅ [FIX] app.listen() toegevoegd — server bindt nu aan PORT
+//           → Railway "Application failed to respond" opgelost
 // WIJZIGINGEN v4.3 (t.o.v. v4.2):
 //  ✅ [FIX] Min lot cap = baseRisk per type, niet vaste €60
-//           → Indices buiten Asia worden niet langer fout geblokkeerd
 //  ✅ [FIX] Restart recovery: openPositions her-initialiseren vanuit MT5
-//           → Weesposities na Railway restart worden niet meer gemist
 //  ✅ [FEAT] Forex consolidatie: half risk bij 1–2 open, blok bij ≥3
-//           → Zelfde pair + richting: trades 2 en 3 aan 50% risk
 //  ✅ Spread guard: max 1/3 van SL-afstand (was 1/2)
 //  ✅ Ghost tracker: prioriteit batching (recent 60s, oud >6u = 5min)
 //  ✅ DB sessie fix: trades zonder sessie herberekend op openedAt
@@ -54,22 +53,20 @@ const WEBHOOK_SECRET  = process.env.WEBHOOK_SECRET || "FtmoNV2025";
 const ACCOUNT_BALANCE = parseFloat(process.env.ACCOUNT_BALANCE || "10000");
 
 const GHOST_DURATION_MS        = 24 * 3600 * 1000;
-const GHOST_INTERVAL_RECENT_MS = 60 * 1000;       // < 6u: elke 60s
-const GHOST_INTERVAL_OLD_MS    = 5 * 60 * 1000;   // ≥ 6u: elke 5min
-const GHOST_OLD_THRESHOLD_MS   = 6 * 3600 * 1000; // 6u grens
+const GHOST_INTERVAL_RECENT_MS = 60 * 1000;
+const GHOST_INTERVAL_OLD_MS    = 5 * 60 * 1000;
+const GHOST_OLD_THRESHOLD_MS   = 6 * 3600 * 1000;
 
 // ── RR / SL LEVELS ────────────────────────────────────────────
 const RR_LEVELS    = [0.2, 0.4, 0.6, 0.8, 1, 1.5, 2, 2.5, 3, 4, 5, 6, 7, 8, 10, 12, 15, 20, 25];
 const SL_MULTIPLES = [0.5, 0.6, 0.75, 0.85, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0];
 
-const SL_PROVEN_MULT           = 0.5;
-const STOCK_SL_SPREAD_MULT     = 1.5;
-// v4.3: spread max 1/3 van SL-afstand (was 1/2)
+const SL_PROVEN_MULT            = 0.5;
+const STOCK_SL_SPREAD_MULT      = 1.5;
 const STOCK_MAX_SPREAD_FRACTION = 0.333;
 
-// Forex anti-consolidatie
-const FOREX_MAX_SAME_DIR        = 3;   // ≥ 3 = blok
-const FOREX_HALF_RISK_THRESHOLD = 1;   // ≥ 1 = half risk (nieuw v4.3)
+const FOREX_MAX_SAME_DIR        = 3;
+const FOREX_HALF_RISK_THRESHOLD = 1;
 
 // ── RISICO PER TYPE ───────────────────────────────────────────
 const RISK = {
@@ -85,7 +82,7 @@ const RISK = {
 const RISK_MINLOT_CAP   = parseFloat(process.env.RISK_MINLOT_CAP || "60");
 const TP_LOCK_RISK_MULT = 4;
 
-// [v4.4] FTMO dagelijkse verlies-limiet UITGESCHAKELD — alle trades worden doorgelaten
+// [v4.4] FTMO dagelijkse verlies-limiet UITGESCHAKELD
 function resetDailyLossIfNewDay() {}
 function ftmoSafetyCheck(_r) { return { ok: true }; }
 function registerFtmoLoss(_r) {}
@@ -124,7 +121,7 @@ function addWebhookHistory(entry) {
 const learnedPatches = {};
 
 // ══════════════════════════════════════════════════════════════
-// SYMBOL MAP — TV-naam → MT5-symbool + type
+// SYMBOL MAP
 // ══════════════════════════════════════════════════════════════
 const SYMBOL_MAP = {
   // ── Indices ──────────────────────────────────────────────
@@ -291,12 +288,11 @@ const MIN_STOP_FOREX = {
   "GBPCHF": 0.0005, "AUDCAD": 0.0005, "AUDCHF": 0.0005,
   "AUDNZD": 0.0005, "CADCHF": 0.0005, "NZDCAD": 0.0005,
   "NZDCHF": 0.0005,
-  // JPY pairs
   "USDJPY": 0.05, "EURJPY": 0.05, "GBPJPY": 0.05,
   "AUDJPY": 0.05, "CADJPY": 0.05, "NZDJPY": 0.05, "CHFJPY": 0.05,
 };
 
-const MIN_STOP_STOCK_PCT = 0.001; // 0.1% van entry
+const MIN_STOP_STOCK_PCT = 0.001;
 
 function getMinStop(mt5Symbol, type, entryPrice = 0) {
   if (type === "stock")  return Math.max(0.01, entryPrice * MIN_STOP_STOCK_PCT);
@@ -402,13 +398,19 @@ cron.schedule("50 20 * * *", async () => {
 }, { timezone: "Europe/Brussels" });
 
 // ══════════════════════════════════════════════════════════════
-// [FIX v4.3] RESTART RECOVERY — openPositions her-initialiseren
-// ── Na Railway restart is openPositions{} leeg.
-//    Posities die vóór de restart open stonden op MT5 worden nooit
-//    herkend als gesloten → "weesposities".
-//    Deze functie laadt alle live MT5 posities bij startup en
-//    registreert ze als minimale placeholders zodat syncPositions()
-//    hun close wél detecteert.
+// NIGHTLY TP OPTIMIZER — 03:00 Brussels
+// ══════════════════════════════════════════════════════════════
+cron.schedule("0 3 * * *", async () => {
+  console.log("🌙 03:00 Brussels — nightly TP optimizer...");
+  const symbols = [...new Set(closedTrades.map(t => t.symbol).filter(Boolean))];
+  for (const sym of symbols) {
+    await runTPLockEngine(sym).catch(e => console.error(`❌ [TP nightly] ${sym}:`, e.message));
+  }
+  console.log(`✅ Nightly TP optimizer klaar — ${symbols.length} symbolen verwerkt`);
+}, { timezone: "Europe/Brussels" });
+
+// ══════════════════════════════════════════════════════════════
+// RESTART RECOVERY
 // ══════════════════════════════════════════════════════════════
 async function restoreOpenPositionsFromMT5() {
   try {
@@ -420,10 +422,9 @@ async function restoreOpenPositionsFromMT5() {
     let restored = 0;
     for (const pos of live) {
       const id = String(pos.id);
-      if (openPositions[id]) continue; // al geregistreerd
+      if (openPositions[id]) continue;
 
-      // Zoek TV-symbool op basis van MT5-symbool
-      const tvSym = Object.keys(SYMBOL_MAP).find(k => SYMBOL_MAP[k].mt5 === pos.symbol) || pos.symbol;
+      const tvSym   = Object.keys(SYMBOL_MAP).find(k => SYMBOL_MAP[k].mt5 === pos.symbol) || pos.symbol;
       const direction = pos.type === "POSITION_TYPE_BUY" ? "buy" : "sell";
       const entry     = pos.openPrice ?? pos.currentPrice ?? 0;
       const sl        = pos.stopLoss  ?? 0;
@@ -451,7 +452,7 @@ async function restoreOpenPositionsFromMT5() {
         lastSync:   null,
         slMultiplierApplied: 1.0,
         spreadGuard: false,
-        restoredAfterRestart: true, // markering voor debugging
+        restoredAfterRestart: true,
       };
 
       incrementTracker(tvSym, direction);
@@ -465,14 +466,8 @@ async function restoreOpenPositionsFromMT5() {
 }
 
 // ══════════════════════════════════════════════════════════════
-// FOREX ANTI-CONSOLIDATIE (v4.3 — half risk bij count 1–2)
+// FOREX ANTI-CONSOLIDATIE
 // ══════════════════════════════════════════════════════════════
-/**
- * Controleert forex consolidatie voor een pair+richting.
- * @returns {{ blocked: boolean, halfRisk: boolean, count: number }}
- *   blocked:  true als count >= FOREX_MAX_SAME_DIR (3)  → SKIP
- *   halfRisk: true als count >= FOREX_HALF_RISK_THRESHOLD (1) → 50% risk
- */
 function checkForexConsolidation(symbol, direction) {
   const mt5Sym = getMT5Symbol(symbol);
   let count = 0;
@@ -489,7 +484,7 @@ function checkForexConsolidation(symbol, direction) {
   };
 }
 
-// ── SPREAD GUARD — aandelen ───────────────────────────────────
+// ── SPREAD GUARD ──────────────────────────────────────────────
 function checkSpreadGuard(spread, entryNum, slNum) {
   const slDist    = Math.abs(entryNum - slNum);
   const maxSpread = slDist * STOCK_MAX_SPREAD_FRACTION;
@@ -502,7 +497,6 @@ function checkSpreadGuard(spread, entryNum, slNum) {
 }
 
 // ── HELPERS ───────────────────────────────────────────────────
-
 function getEffectiveRisk(symbol, direction) {
   const key    = `${symbol}_${direction}`;
   const count  = openTradeTracker[key] || 0;
@@ -541,21 +535,6 @@ function validateSL(dir, entry, sl, mt5Sym, type) {
   return sl;
 }
 
-/**
- * [FIX v4.3] Lotsize berekening — cap = baseRisk per type.
- *
- * PROBLEEM (v4.2): effectiveCap was altijd RISK_MINLOT_CAP (€60) buiten Asia.
- *   → Index buiten Asia: risk=€200, lots=1, minCost=€200 > €60 → SKIP. FOUT.
- *
- * FIX: cap = baseRisk van dat type. Voor index = €200. Voor forex = €15.
- *   Dit garandeert dat een order met exact het geconfigureerde risico
- *   altijd door de cap komt, ongeacht sessie of type.
- *
- * TP lock ×4:
- *   - Bij bewezen TP lock: risk = base×4 → cap = base×4 (consistent)
- *   - Index normaal: cap €200 | Index TP lock: cap €800
- *   - Forex normaal: cap €15  | Forex TP lock: cap €60
- */
 function calcLots(symbol, entry, sl, risk) {
   const type    = getSymbolType(symbol);
   const lotVal  = LOT_VALUE[type]  || 1;
@@ -570,12 +549,11 @@ function calcLots(symbol, entry, sl, risk) {
 
   const minCost = lots * dist * lotVal;
 
-  // [FIX v4.3] Cap = baseRisk van dat type, niet de vaste €60
   const baseRisk      = RISK[type] || 30;
   const isTPLockRisk  = risk >= baseRisk * TP_LOCK_RISK_MULT;
   const effectiveCap  = isTPLockRisk
-    ? baseRisk * TP_LOCK_RISK_MULT   // bijv. index: €800, forex: €60
-    : baseRisk;                       // bijv. index: €200, forex: €15
+    ? baseRisk * TP_LOCK_RISK_MULT
+    : baseRisk;
 
   if (minCost > effectiveCap) {
     console.warn(`⚠️ Min lot kost €${minCost.toFixed(2)} > cap €${effectiveCap} (${type} ${isTPLockRisk ? "TP lock ×4" : "normaal"}) → skip`);
@@ -635,8 +613,7 @@ function getSLDirection(analysis) {
 }
 
 // ══════════════════════════════════════════════════════════════
-// GHOST TRACKER — post-close prijsvolging (24u)
-// v4.3: prioriteit batching — recent < 6u → 60s, oud ≥ 6u → 5min
+// GHOST TRACKER
 // ══════════════════════════════════════════════════════════════
 function startGhostTracker(closedTrade) {
   const ghostId   = `ghost_${closedTrade.id}_${Date.now()}`;
@@ -677,7 +654,6 @@ function startGhostTracker(closedTrade) {
         return;
       }
 
-      // Kies interval op basis van leeftijd
       const interval = elapsed < GHOST_OLD_THRESHOLD_MS
         ? GHOST_INTERVAL_RECENT_MS
         : GHOST_INTERVAL_OLD_MS;
@@ -689,7 +665,6 @@ function startGhostTracker(closedTrade) {
   currentTimer = setTimeout(tick, GHOST_INTERVAL_RECENT_MS);
   ghostTrackers[ghostId] = { trade: closedTrade, timer: currentTimer, startedAt, bestPrice };
 
-  // Failsafe
   setTimeout(() => {
     if (ghostTrackers[ghostId])
       finaliseGhost(ghostId, closedTrade, ghostTrackers[ghostId].bestPrice, "failsafe");
@@ -718,7 +693,7 @@ function finaliseGhost(ghostId, trade, bestPrice, reason) {
 }
 
 // ══════════════════════════════════════════════════════════════
-// TP LOCK ENGINE (sessie-aware + sub-1R)
+// TP LOCK ENGINE
 // ══════════════════════════════════════════════════════════════
 async function runTPLockEngine(symbol) {
   for (const session of TRADING_SESSIONS) {
@@ -791,7 +766,7 @@ async function _runTPLockForSession(symbol, session) {
 }
 
 // ══════════════════════════════════════════════════════════════
-// SL LOCK ENGINE (ghost-driven direction + READONLY)
+// SL LOCK ENGINE (READONLY)
 // ══════════════════════════════════════════════════════════════
 async function runSLLockEngine(symbol) {
   const trades = closedTrades.filter(t => t.symbol === symbol && t.sl && t.entry);
@@ -1019,7 +994,6 @@ app.post("/webhook", async (req, res) => {
       return res.status(200).json({ status:"SKIP", reason:`Markt gesloten voor ${symbol}` });
     }
 
-    // ── [v4.3] Forex consolidatie — half risk bij 1–2 open, blok bij ≥3
     let forexHalfRisk = false;
     if (symType === "forex") {
       const consol = checkForexConsolidation(symbol, direction);
@@ -1036,7 +1010,6 @@ app.post("/webhook", async (req, res) => {
       }
     }
 
-    // ── SL aanpassing ─────────────────────────────────────────
     const tpLockKey = `${symbol}__${curSession}`;
     const tpLockNow = tpLocks[tpLockKey];
     const tpProven  = tpLockNow && (tpLockNow.evAtLock ?? 0) > 0;
@@ -1052,7 +1025,6 @@ app.post("/webhook", async (req, res) => {
       console.log(`ℹ️ [SL] ${symbol}/${curSession}: geen bewezen TP lock — originele SL behouden`);
     }
 
-    // ── Spread guard voor aandelen ────────────────────────────
     let spreadGuard = false;
     if (symType === "stock") {
       const priceData = await fetchCurrentPrice(mt5Sym).catch(() => null);
@@ -1070,8 +1042,6 @@ app.post("/webhook", async (req, res) => {
 
     let risk = getEffectiveRisk(symbol, direction);
 
-    // [v4.3] Forex half risk — pas toe na TP lock boost zodat
-    // de boost niet verloren gaat maar wél gehalveerd wordt
     if (forexHalfRisk) {
       risk = risk * 0.5;
       console.log(`⚡ [Forex Half Risk] ${symbol}: risico gehalveerd → €${risk.toFixed(2)}`);
@@ -1200,14 +1170,12 @@ app.get("/", (req, res) => {
     status:  "online",
     versie:  "ftmo-v4.4",
     fixes: {
-      capFix:          "✅ Min lot cap = baseRisk per type (niet vaste €60) — indices buiten Asia werken nu",
-      restartRecovery: "✅ openPositions her-initialiseren vanuit MT5 bij startup — geen weesposities meer",
+      appListen:       "✅ app.listen() toegevoegd — Railway crash opgelost",
+      capFix:          "✅ Min lot cap = baseRisk per type",
+      restartRecovery: "✅ openPositions her-initialiseren vanuit MT5 bij startup",
       forexHalfRisk:   `✅ Forex consolidatie: 50% risk bij 1–${FOREX_MAX_SAME_DIR-1} open, blok bij ≥${FOREX_MAX_SAME_DIR}`,
     },
     capPerType: Object.fromEntries(Object.entries(RISK).map(([t,v]) => [t, `€${v} normaal | €${v*TP_LOCK_RISK_MULT} bij TP lock`])),
-    forexConsolidatie: `max ${FOREX_MAX_SAME_DIR} trades (1–${FOREX_MAX_SAME_DIR-1}: half risk | ≥${FOREX_MAX_SAME_DIR}: geblokkeerd)`,
-    minLotCap:         `per type (bijv. index €${RISK.index} normaal → €${RISK.index*TP_LOCK_RISK_MULT} bij TP lock)`,
-    tpLock:            `sessie-aware — risk ×${TP_LOCK_RISK_MULT} ook stocks`,
     tracking: {
       openPositions: Object.keys(openPositions).length,
       closedTrades:  closedTrades.length,
@@ -1222,9 +1190,9 @@ app.get("/", (req, res) => {
       "GET  /analysis/rr":                  "MaxRR + trueMaxRR",
       "GET  /analysis/sessions":            "EV per sessie",
       "GET  /analysis/equity-curve":        "Equity history",
-      "GET  /research/tp-optimizer":        "TP optimizer (globaal, incl. sub-1R)",
+      "GET  /research/tp-optimizer":        "TP optimizer (globaal)",
       "GET  /research/tp-optimizer/sessie": "TP optimizer per sessie",
-      "GET  /research/sl-optimizer":        "SL optimizer (direction + READONLY)",
+      "GET  /research/sl-optimizer":        "SL optimizer (READONLY)",
       "GET  /tp-locks":                     "TP lock status",
       "GET  /sl-locks":                     "SL analyse status",
       "GET  /history":                      "Webhook log",
@@ -1366,10 +1334,8 @@ function buildTPOptimizerResults(minTrades=3) {
     results.push({
       symbol, trades:trades.length, ghostPending,
       bestTP:`${best.rr}R`, bestEV:best.ev, bestWinrate:best.winrate,
-      subRRBest: subRRBest.rr!==null&&subRRBest.ev>0
-        ? {rr:`${subRRBest.rr}R`,ev:subRRBest.ev} : null,
-      recommendation: best.ev>0
-        ? `Target: ${best.rr}R (EV: +${best.ev}R/trade)` : "EV negatief",
+      subRRBest: subRRBest.rr!==null&&subRRBest.ev>0 ? {rr:`${subRRBest.rr}R`,ev:subRRBest.ev} : null,
+      recommendation: best.ev>0 ? `Target: ${best.rr}R (EV: +${best.ev}R/trade)` : "EV negatief",
       evTable,
     });
   }
@@ -1489,42 +1455,40 @@ app.delete("/sl-locks/:symbol", (req,res) => {
   res.json({status:"OK",removed:existed?1:0,symbol:sym});
 });
 
-// ── GET VIEWS VOOR DELETE ROUTES ─────────────────────────────
 app.get("/tp-locks/:symbol", (req,res) => {
   const sym = req.params.symbol.toUpperCase();
   const locks = {};
   for (const [key, lock] of Object.entries(tpLocks)) {
     if (key.startsWith(sym+"__")) locks[key] = lock;
   }
-  if (!Object.keys(locks).length) return res.json({info:`Geen TP locks voor ${sym}`, tip:"Gebruik DELETE om te resetten"});
-  res.json({symbol:sym, locks, tip:"Gebruik DELETE /tp-locks/"+sym+" om te resetten"});
+  if (!Object.keys(locks).length) return res.json({info:`Geen TP locks voor ${sym}`});
+  res.json({symbol:sym, locks});
 });
 
 app.get("/tp-locks/:symbol/:session", (req,res) => {
   const key = `${req.params.symbol.toUpperCase()}__${req.params.session}`;
   const lock = tpLocks[key];
-  if (!lock) return res.json({info:`Geen TP lock voor ${key}`, tip:"Gebruik DELETE om te resetten"});
-  res.json({key, lock, tip:"Gebruik DELETE /tp-locks/"+req.params.symbol+"/"+req.params.session+" om te resetten"});
+  if (!lock) return res.json({info:`Geen TP lock voor ${key}`});
+  res.json({key, lock});
 });
 
 app.get("/sl-locks/:symbol", (req,res) => {
   const sym = req.params.symbol.toUpperCase();
   const lock = slLocks[sym];
-  if (!lock) return res.json({info:`Geen SL lock voor ${sym}`, tip:"Gebruik DELETE om te resetten"});
-  res.json({symbol:sym, lock, tip:"Gebruik DELETE /sl-locks/"+sym+" om te resetten"});
+  if (!lock) return res.json({info:`Geen SL lock voor ${sym}`});
+  res.json({symbol:sym, lock});
 });
 
 app.get("/webhook", (req,res) => {
-  res.json({info:"Dit is een POST endpoint", gebruik:"Stuur POST /webhook met TradingView alert JSON + x-secret header", status:"online"});
+  res.json({info:"POST endpoint", gebruik:"POST /webhook + x-secret header", status:"online"});
 });
 
 app.get("/close", (req,res) => {
-  res.json({info:"Dit is een POST endpoint", gebruik:"Stuur POST /close met {positionId} + x-secret header", status:"online"});
+  res.json({info:"POST endpoint", gebruik:"POST /close + {positionId} + x-secret header", status:"online"});
 });
 
-// ── DASHBOARD (server-side rendered — werkt altijd) ────────────
+// ── DASHBOARD ─────────────────────────────────────────────────
 app.get("/dashboard", (req, res) => {
-  // ── helpers ────────────────────────────────────────────────
   function rrColor(v) {
     if (v === null || v === undefined) return "#6a8098";
     if (v >= 2)   return "#22d18b";
@@ -1548,12 +1512,10 @@ app.get("/dashboard", (req, res) => {
     return {asia:"🌏 Asia",london:"🇬🇧 London",ny:"🗽 NY",buiten_venster:"🌙 Buiten"}[s] || s || "—";
   }
 
-  // ── data ophalen ───────────────────────────────────────────
   const now = new Date();
   const brusselsTime = now.toLocaleTimeString("nl-BE", {timeZone:"Europe/Brussels", hour12:false});
   const brusselsDate = now.toLocaleDateString("nl-BE", {timeZone:"Europe/Brussels", weekday:"long", year:"numeric", month:"long", day:"numeric"});
 
-  // Closed trades analyse per pair
   const byPair = {};
   for (const t of closedTrades) {
     const sym = t.symbol || "UNKNOWN";
@@ -1564,12 +1526,11 @@ app.get("/dashboard", (req, res) => {
     byPair[sym].sessions[sess].push(t);
   }
 
-  // Bereken EV per pair per sessie
-  const RR_LEVELS = [0.2, 0.4, 0.6, 0.8, 1, 1.5, 2, 2.5, 3, 4, 5];
+  const DASH_RR_LEVELS = [0.2, 0.4, 0.6, 0.8, 1, 1.5, 2, 2.5, 3, 4, 5];
   function bestTP(trades) {
     if (!trades || trades.length < 3) return null;
     let best = { ev: -Infinity, rr: null, wr: null };
-    for (const rr of RR_LEVELS) {
+    for (const rr of DASH_RR_LEVELS) {
       const wins = trades.filter(t => (t.trueMaxRR ?? t.maxRR ?? 0) >= rr).length;
       const wr   = wins / trades.length;
       const ev   = parseFloat((wr * rr - (1 - wr)).toFixed(3));
@@ -1578,7 +1539,6 @@ app.get("/dashboard", (req, res) => {
     return best;
   }
 
-  // Sorteer pairs op beste EV
   const pairStats = Object.entries(byPair).map(([sym, d]) => {
     const total = d.trades.length;
     const avgMaxRR = total ? d.trades.reduce((s,t) => s + (t.maxRR||0), 0) / total : 0;
@@ -1597,10 +1557,7 @@ app.get("/dashboard", (req, res) => {
     return { sym, total, avgMaxRR, globalBest, tpLock, slLock, sessionBreakdown, ghostCount };
   }).sort((a,b) => (b.globalBest?.ev ?? -99) - (a.globalBest?.ev ?? -99));
 
-  // Open posities
   const openPos = Object.values(openPositions);
-
-  // Ghost trackers
   const activeGhosts = Object.entries(ghostTrackers).map(([id, g]) => ({
     id, sym: g.trade.symbol, dir: g.trade.direction,
     entry: g.trade.entry, sl: g.trade.sl,
@@ -1610,123 +1567,94 @@ app.get("/dashboard", (req, res) => {
     remainMin:  Math.round(((24*3600000) - (Date.now() - g.startedAt)) / 60000),
     session: g.trade.session,
   }));
-
-  // Webhook log (laatste 20)
   const recentWebhooks = webhookHistory.slice(0, 20);
 
-  // ── CSS ────────────────────────────────────────────────────
+  const totalTrades = closedTrades.length;
+  const totalGhosts = activeGhosts.length;
+  const totalOpen   = openPos.length;
+  const totalPairs  = pairStats.length;
+  const avgEV = pairStats.filter(p => p.globalBest?.ev != null)
+    .reduce((s,p) => s + p.globalBest.ev, 0) /
+    (pairStats.filter(p => p.globalBest?.ev != null).length || 1);
+  const posEVPairs = pairStats.filter(p => (p.globalBest?.ev ?? -1) > 0).length;
+
   const css = `
     *{box-sizing:border-box;margin:0;padding:0}
-    :root{
-      --bg:#07090d;--bg1:#0c1018;--bg2:#111820;--bg3:#18212d;
-      --b:#1c2a38;--b2:#243342;
-      --t:#c9d8e8;--t2:#8aa0b4;--t3:#4a6070;
-      --acc:#2dd4f4;--g:#22d18b;--r:#f26b62;--o:#f0a050;--pu:#b88ff0;--ye:#e3b341;
-      --mono:'JetBrains Mono','Courier New',monospace;
-      --sans:'Segoe UI',system-ui,sans-serif;
-    }
+    :root{--bg:#07090d;--bg1:#0c1018;--bg2:#111820;--bg3:#18212d;--b:#1c2a38;--b2:#243342;
+          --t:#c9d8e8;--t2:#8aa0b4;--t3:#4a6070;--acc:#2dd4f4;--g:#22d18b;--r:#f26b62;
+          --o:#f0a050;--pu:#b88ff0;--ye:#e3b341;--mono:'JetBrains Mono','Courier New',monospace;
+          --sans:'Segoe UI',system-ui,sans-serif}
     html{scroll-behavior:smooth}
     body{font-family:var(--mono);background:var(--bg);color:var(--t);font-size:13px;line-height:1.5}
     a{color:var(--acc);text-decoration:none}
-    /* TOPBAR */
     .top{position:sticky;top:0;z-index:100;background:var(--bg1);border-bottom:1px solid var(--b);
          display:flex;align-items:center;justify-content:space-between;padding:0 24px;height:52px}
     .logo{font-family:var(--sans);font-weight:800;font-size:15px;color:var(--acc);display:flex;align-items:center;gap:8px}
     .dot{width:8px;height:8px;border-radius:50%;background:var(--g);box-shadow:0 0 8px var(--g);animation:blink 2s infinite}
     @keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
-    .time{font-size:12px;color:var(--t3);font-family:var(--mono)}
-    /* NAV */
+    .time{font-size:12px;color:var(--t3)}
     .nav{background:var(--bg1);border-bottom:1px solid var(--b);display:flex;gap:0;overflow-x:auto;padding:0 16px}
     .nav a{display:flex;align-items:center;gap:6px;padding:12px 16px;font-size:12px;color:var(--t2);
            border-bottom:2px solid transparent;white-space:nowrap;transition:all .15s}
     .nav a:hover{color:var(--t);border-color:var(--b2)}
-    /* LAYOUT */
     .page{max-width:1400px;margin:0 auto;padding:24px 20px}
-    /* SECTION */
     .sec{margin-bottom:32px}
     .sec-title{font-family:var(--sans);font-size:16px;font-weight:700;color:var(--t);
                margin-bottom:16px;padding-bottom:8px;border-bottom:1px solid var(--b);
                display:flex;align-items:center;gap:8px}
-    /* STAT CARDS */
     .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:24px}
     .card{background:var(--bg1);border:1px solid var(--b);border-radius:8px;padding:16px}
     .card .v{font-family:var(--sans);font-size:26px;font-weight:800;line-height:1;margin-bottom:4px}
     .card .l{font-size:10px;color:var(--t3);text-transform:uppercase;letter-spacing:.08em}
     .card .s{font-size:11px;color:var(--t2);margin-top:4px}
-    /* PAIR TABLE */
     .pair-grid{display:flex;flex-direction:column;gap:12px}
     .pair-card{background:var(--bg1);border:1px solid var(--b);border-radius:8px;overflow:hidden}
-    .pair-hdr{display:flex;align-items:center;gap:12px;padding:12px 16px;background:var(--bg2);border-bottom:1px solid var(--b)}
+    .pair-hdr{display:flex;align-items:center;gap:12px;padding:12px 16px;background:var(--bg2);border-bottom:1px solid var(--b);flex-wrap:wrap}
     .pair-sym{font-family:var(--sans);font-weight:800;font-size:15px;color:var(--acc)}
     .pair-rank{font-size:10px;color:var(--t3);background:var(--bg3);border-radius:4px;padding:2px 6px}
     .badge{font-size:10px;padding:2px 7px;border-radius:10px;font-weight:600}
-    .badge-g{background:#0b4e33;color:var(--g)}
-    .badge-r{background:#4f1c18;color:var(--r)}
-    .badge-o{background:#4e2c0a;color:var(--o)}
-    .badge-b{background:#0e2a38;color:var(--acc)}
+    .badge-g{background:#0b4e33;color:var(--g)}.badge-r{background:#4f1c18;color:var(--r)}
+    .badge-o{background:#4e2c0a;color:var(--o)}.badge-b{background:#0e2a38;color:var(--acc)}
     .pair-body{padding:16px;display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px}
     @media(max-width:700px){.pair-body{grid-template-columns:1fr}}
     .pair-section h4{font-size:10px;color:var(--t3);text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px}
     .kv{display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid var(--b);font-size:12px}
-    .kv:last-child{border-bottom:none}
-    .kv .k{color:var(--t2)}
-    .kv .v{font-weight:600}
+    .kv:last-child{border-bottom:none}.kv .k{color:var(--t2)}.kv .v{font-weight:600}
     .sess-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:4px}
     .sess-box{background:var(--bg3);border-radius:6px;padding:8px;border:1px solid var(--b)}
     .sess-box .sname{font-size:10px;color:var(--t3);margin-bottom:4px}
     .sess-box .sev{font-size:14px;font-weight:800;font-family:var(--sans)}
-    .sess-box .srr{font-size:10px;color:var(--t2)}
-    .locked{border-color:var(--ye) !important}
-    /* TABLE */
+    .sess-box .srr{font-size:10px;color:var(--t2)}.locked{border-color:var(--ye) !important}
     table{width:100%;border-collapse:collapse;font-size:12px}
     th{text-align:left;padding:8px 10px;color:var(--t3);font-size:10px;text-transform:uppercase;
        letter-spacing:.06em;border-bottom:1px solid var(--b);font-weight:600}
     td{padding:8px 10px;border-bottom:1px solid var(--b)}
-    tr:last-child td{border-bottom:none}
-    tr:hover td{background:var(--bg2)}
-    /* GHOST */
-    .ghost-bar{height:4px;background:var(--b);border-radius:2px;margin-top:4px}
-    .ghost-fill{height:100%;border-radius:2px;background:linear-gradient(90deg,var(--pu),var(--acc))}
-    /* EMPTY */
+    tr:last-child td{border-bottom:none}tr:hover td{background:var(--bg2)}
     .empty{color:var(--t3);font-size:12px;padding:24px;text-align:center}
-    /* SCROLLTOP */
     .sticker{position:fixed;bottom:20px;right:20px;background:var(--acc);color:#000;
              border-radius:50%;width:36px;height:36px;display:flex;align-items:center;
-             justify-content:center;font-size:16px;text-decoration:none;box-shadow:0 2px 8px rgba(0,0,0,.4)}
+             justify-content:center;font-size:16px;box-shadow:0 2px 8px rgba(0,0,0,.4)}
     .update-info{font-size:11px;color:var(--t3);padding:8px 24px;background:var(--bg2);
                  border-bottom:1px solid var(--b);text-align:right}
   `;
 
-  // ── OVERVIEW STATS ─────────────────────────────────────────
-  const totalTrades   = closedTrades.length;
-  const totalGhosts   = activeGhosts.length;
-  const totalOpen     = openPos.length;
-  const totalPairs    = pairStats.length;
-  const avgEV         = pairStats.filter(p => p.globalBest?.ev != null)
-                          .reduce((s,p) => s + p.globalBest.ev, 0) /
-                        (pairStats.filter(p => p.globalBest?.ev != null).length || 1);
-  const posEVPairs    = pairStats.filter(p => (p.globalBest?.ev ?? -1) > 0).length;
-
-  // ── RENDER PAIRS ───────────────────────────────────────────
   function renderPair(p, rank) {
-    const ev     = p.globalBest?.ev;
-    const evStr  = ev != null ? (ev > 0 ? "+" : "") + fmt(ev, 3) + "R/trade" : "Te weinig data";
+    const ev = p.globalBest?.ev;
+    const evStr = ev != null ? (ev > 0 ? "+" : "") + fmt(ev, 3) + "R/trade" : "Te weinig data";
     const evBadge = ev == null ? "badge-o" : ev > 0 ? "badge-g" : "badge-r";
-    const slDir  = p.slLock?.direction;
+    const slDir = p.slLock?.direction;
     const slBadge = slDir === "up" ? "badge-g" : slDir === "down" ? "badge-r" : "badge-b";
-    const slText  = slDir === "up" ? "↑ SL Groter" : slDir === "down" ? "↓ SL Kleiner" : "= SL Huidig";
-
+    const slText = slDir === "up" ? "↑ SL Groter" : slDir === "down" ? "↓ SL Kleiner" : "= SL Huidig";
     const sessHtml = ["asia","london","ny"].map(sess => {
       const sd = p.sessionBreakdown.find(s => s.sess === sess);
-      const ev = sd?.best?.ev;
+      const sev = sd?.best?.ev;
       const locked = sd?.lock;
       return `<div class="sess-box${locked ? " locked" : ""}">
         <div class="sname">${sessionLabel(sess)}${locked ? " 🔒" : ""}</div>
-        <div class="sev" style="color:${evColor(ev)}">${ev != null ? (ev>0?"+":"")+fmt(ev,2)+"R" : "—"}</div>
+        <div class="sev" style="color:${evColor(sev)}">${sev != null ? (sev>0?"+":"")+fmt(sev,2)+"R" : "—"}</div>
         <div class="srr">${sd?.trades || 0} trades · ${sd?.best?.rr != null ? "TP "+sd.best.rr+"R" : "—"}${locked ? "<br>Lock: "+locked.lockedRR+"R" : ""}</div>
       </div>`;
     }).join("");
-
     return `<div class="pair-card">
       <div class="pair-hdr">
         <span class="pair-rank">#${rank}</span>
@@ -1764,129 +1692,94 @@ app.get("/dashboard", (req, res) => {
     </div>`;
   }
 
-  // ── RENDER GHOSTS ──────────────────────────────────────────
-  function renderGhosts() {
-    if (!activeGhosts.length) return `<div class="empty">Geen actieve ghost trackers</div>`;
-    return `<table>
-      <tr><th>Pair</th><th>Dir</th><th>Sessie</th><th>MaxRR bij close</th><th>Beste RR nu</th><th>Elapsed</th><th>Resterend</th></tr>
-      ${activeGhosts.map(g => {
-        const pct = Math.min(100, (g.elapsedMin / 1440) * 100);
-        return `<tr>
-          <td style="color:var(--acc);font-weight:700">${g.sym}</td>
-          <td><span class="badge ${g.dir==="buy"?"badge-g":"badge-r"}">${g.dir.toUpperCase()}</span></td>
-          <td>${sessionLabel(g.session)}</td>
-          <td style="color:${rrColor(g.maxRRAtClose)}">${fmtRR(g.maxRRAtClose)}</td>
-          <td style="color:${rrColor(g.bestRR)}">${fmtRR(g.bestRR)}</td>
-          <td>${g.elapsedMin}m</td>
-          <td>${g.remainMin > 0 ? g.remainMin+"m" : "Verlopen"}</td>
-        </tr>`;
-      }).join("")}
-    </table>`;
-  }
-
-  // ── RENDER OPEN POSITIES ───────────────────────────────────
-  function renderOpen() {
-    if (!openPos.length) return `<div class="empty">Geen open posities</div>`;
-    return `<table>
-      <tr><th>Pair</th><th>Dir</th><th>Sessie</th><th>Entry</th><th>SL</th><th>Risk €</th><th>Lots</th><th>MaxRR</th><th>Geopend</th></tr>
-      ${openPos.map(p => `<tr>
-        <td style="color:var(--acc);font-weight:700">${p.symbol}</td>
-        <td><span class="badge ${p.direction==="buy"?"badge-g":"badge-r"}">${p.direction.toUpperCase()}</span></td>
-        <td>${sessionLabel(p.session)}</td>
-        <td>${fmt(p.entry, 4)}</td>
-        <td>${fmt(p.sl, 4)}</td>
-        <td style="color:var(--o)">€${fmt(p.riskEUR, 0)}</td>
-        <td>${fmt(p.lots, 2)}</td>
-        <td style="color:${rrColor(p.maxRR)}">${fmtRR(p.maxRR)}</td>
-        <td>${timeAgo(p.openedAt)}</td>
-      </tr>`).join("")}
-    </table>`;
-  }
-
-  // ── RENDER WEBHOOK LOG ─────────────────────────────────────
-  function renderLog() {
-    if (!recentWebhooks.length) return `<div class="empty">Geen webhook events</div>`;
-    return `<table>
-      <tr><th>Tijd</th><th>Type</th><th>Pair</th><th>Dir</th><th>Sessie</th><th>Risk €</th><th>Lots</th></tr>
-      ${recentWebhooks.map(h => `<tr>
-        <td style="color:var(--t3)">${timeAgo(h.ts)}</td>
-        <td><span class="badge ${h.type==="open"?"badge-g":h.type==="close"?"badge-r":"badge-b"}">${h.type||"?"}</span></td>
-        <td style="color:var(--acc)">${h.symbol||"—"}</td>
-        <td>${h.direction||"—"}</td>
-        <td>${sessionLabel(h.session)}</td>
-        <td>${h.riskEUR != null ? "€"+fmt(h.riskEUR,0) : "—"}</td>
-        <td>${h.lots != null ? fmt(h.lots,2) : "—"}</td>
-      </tr>`).join("")}
-    </table>`;
-  }
-
-  // ── RENDER HTML ────────────────────────────────────────────
   const html = `<!DOCTYPE html>
 <html lang="nl">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="refresh" content="60">
-<title>FTMO PRO Dashboard</title>
+<title>FTMO PRO Dashboard v4.4</title>
 <style>${css}</style>
 </head>
 <body>
 <div class="top">
-  <div class="logo"><div class="dot"></div>FTMO PRO</div>
-  <div class="time">📅 ${brusselsDate} &nbsp;⏰ ${brusselsTime} &nbsp;·&nbsp; 🔄 auto-refresh 60s</div>
+  <div class="logo"><div class="dot"></div>FTMO PRO v4.4</div>
+  <div class="time">📅 ${brusselsDate} &nbsp;⏰ ${brusselsTime} &nbsp;·&nbsp; 🔄 60s</div>
 </div>
 <div class="nav">
   <a href="#overview">📊 Overview</a>
-  <a href="#pairs">📈 Per Pair (${pairStats.length})</a>
+  <a href="#pairs">📈 Pairs (${pairStats.length})</a>
   <a href="#open">🟢 Open (${totalOpen})</a>
   <a href="#ghosts">👻 Ghosts (${totalGhosts})</a>
-  <a href="#log">📋 Webhook Log</a>
+  <a href="#log">📋 Log</a>
 </div>
-<div class="update-info">Laatste server-render: ${brusselsTime} &nbsp;·&nbsp; ${totalTrades} trades in DB &nbsp;·&nbsp; Auto-refresh elke 60s</div>
-
+<div class="update-info">Render: ${brusselsTime} &nbsp;·&nbsp; ${totalTrades} trades &nbsp;·&nbsp; auto-refresh 60s</div>
 <div class="page">
-
-  <!-- OVERVIEW -->
   <div class="sec" id="overview">
     <div class="sec-title">📊 Overview</div>
     <div class="cards">
       <div class="card"><div class="v" style="color:var(--acc)">${totalTrades}</div><div class="l">Trades in DB</div></div>
-      <div class="card"><div class="v" style="color:var(--t)">${totalPairs}</div><div class="l">Pairs</div></div>
-      <div class="card"><div class="v" style="color:var(--g)">${posEVPairs}</div><div class="l">Positieve EV pairs</div><div class="s">van ${totalPairs}</div></div>
+      <div class="card"><div class="v">${totalPairs}</div><div class="l">Pairs</div></div>
+      <div class="card"><div class="v" style="color:var(--g)">${posEVPairs}</div><div class="l">Positieve EV</div><div class="s">van ${totalPairs} pairs</div></div>
       <div class="card"><div class="v" style="color:${avgEV>0?"var(--g)":"var(--r)"}">${avgEV>0?"+":""}${fmt(avgEV,3)}R</div><div class="l">Gemiddelde EV</div></div>
       <div class="card"><div class="v" style="color:var(--o)">${totalOpen}</div><div class="l">Open posities</div></div>
       <div class="card"><div class="v" style="color:var(--pu)">${totalGhosts}</div><div class="l">Ghost trackers</div></div>
     </div>
   </div>
-
-  <!-- PER PAIR -->
   <div class="sec" id="pairs">
     <div class="sec-title">📈 Analyse per Pair — gesorteerd op EV</div>
     <div class="pair-grid">
       ${pairStats.length ? pairStats.map((p,i) => renderPair(p, i+1)).join("") : `<div class="empty">Geen trade data beschikbaar</div>`}
     </div>
   </div>
-
-  <!-- OPEN POSITIES -->
   <div class="sec" id="open">
     <div class="sec-title">🟢 Open Posities</div>
-    ${renderOpen()}
+    ${openPos.length ? `<table>
+      <tr><th>Pair</th><th>Dir</th><th>Sessie</th><th>Entry</th><th>SL</th><th>Risk €</th><th>Lots</th><th>MaxRR</th><th>Geopend</th></tr>
+      ${openPos.map(p => `<tr>
+        <td style="color:var(--acc);font-weight:700">${p.symbol}</td>
+        <td><span class="badge ${p.direction==="buy"?"badge-g":"badge-r"}">${p.direction.toUpperCase()}</span></td>
+        <td>${sessionLabel(p.session)}</td>
+        <td>${fmt(p.entry, 4)}</td><td>${fmt(p.sl, 4)}</td>
+        <td style="color:var(--o)">€${fmt(p.riskEUR, 0)}</td>
+        <td>${fmt(p.lots, 2)}</td>
+        <td style="color:${rrColor(p.maxRR)}">${fmtRR(p.maxRR)}</td>
+        <td>${timeAgo(p.openedAt)}</td>
+      </tr>`).join("")}
+    </table>` : `<div class="empty">Geen open posities</div>`}
   </div>
-
-  <!-- GHOST TRACKERS -->
   <div class="sec" id="ghosts">
     <div class="sec-title">👻 Actieve Ghost Trackers</div>
-    ${renderGhosts()}
+    ${activeGhosts.length ? `<table>
+      <tr><th>Pair</th><th>Dir</th><th>Sessie</th><th>MaxRR bij close</th><th>Beste RR nu</th><th>Elapsed</th><th>Resterend</th></tr>
+      ${activeGhosts.map(g => `<tr>
+        <td style="color:var(--acc);font-weight:700">${g.sym}</td>
+        <td><span class="badge ${g.dir==="buy"?"badge-g":"badge-r"}">${g.dir.toUpperCase()}</span></td>
+        <td>${sessionLabel(g.session)}</td>
+        <td style="color:${rrColor(g.maxRRAtClose)}">${fmtRR(g.maxRRAtClose)}</td>
+        <td style="color:${rrColor(g.bestRR)}">${fmtRR(g.bestRR)}</td>
+        <td>${g.elapsedMin}m</td>
+        <td>${g.remainMin > 0 ? g.remainMin+"m" : "Verlopen"}</td>
+      </tr>`).join("")}
+    </table>` : `<div class="empty">Geen actieve ghost trackers</div>`}
   </div>
-
-  <!-- WEBHOOK LOG -->
   <div class="sec" id="log">
     <div class="sec-title">📋 Recente Webhook Events (laatste 20)</div>
-    ${renderLog()}
+    ${recentWebhooks.length ? `<table>
+      <tr><th>Tijd</th><th>Type</th><th>Pair</th><th>Dir</th><th>Sessie</th><th>Risk €</th><th>Lots</th></tr>
+      ${recentWebhooks.map(h => `<tr>
+        <td style="color:var(--t3)">${timeAgo(h.ts)}</td>
+        <td><span class="badge ${h.type==="SUCCESS"?"badge-g":h.type==="ERROR"?"badge-r":"badge-b"}">${h.type||"?"}</span></td>
+        <td style="color:var(--acc)">${h.symbol||"—"}</td>
+        <td>${h.direction||"—"}</td>
+        <td>${sessionLabel(h.session)}</td>
+        <td>${h.riskEUR != null ? "€"+fmt(h.riskEUR,0) : "—"}</td>
+        <td>${h.lots != null ? fmt(h.lots,2) : "—"}</td>
+      </tr>`).join("")}
+    </table>` : `<div class="empty">Geen webhook events</div>`}
   </div>
-
 </div>
-<a href="#" class="sticker" title="Naar boven">↑</a>
+<a href="#" class="sticker">↑</a>
 </body>
 </html>`;
 
@@ -1894,30 +1787,73 @@ app.get("/dashboard", (req, res) => {
   res.send(html);
 });
 
-// ── CATCH-ALL: onbekende routes ───────────────────────────────
+// ── CATCH-ALL ─────────────────────────────────────────────────
 app.use((req, res) => {
   const BASE = req.protocol+"://"+req.get("host");
   res.status(404).json({
     error: "Route niet gevonden",
     geprobeerd: req.method+" "+req.originalUrl,
     beschikbare_routes: {
-      "GET  /":                            BASE+"/",
-      "GET  /dashboard":                   BASE+"/dashboard",
-      "GET  /status":                      BASE+"/status",
-      "GET  /live/positions":              BASE+"/live/positions",
-      "GET  /live/ghosts":                 BASE+"/live/ghosts",
-      "GET  /analysis/rr":                 BASE+"/analysis/rr",
-      "GET  /analysis/sessions":           BASE+"/analysis/sessions",
-      "GET  /analysis/equity-curve":       BASE+"/analysis/equity-curve?hours=24",
-      "GET  /history":                     BASE+"/history?limit=100",
-      "GET  /tp-locks":                    BASE+"/tp-locks",
-      "GET  /sl-locks":                    BASE+"/sl-locks",
-      "GET  /research/tp-optimizer":       BASE+"/research/tp-optimizer",
-      "GET  /research/tp-optimizer/sessie":BASE+"/research/tp-optimizer/sessie",
-      "GET  /research/sl-optimizer":       BASE+"/research/sl-optimizer",
-      "POST /webhook":                     "TradingView alert → MT5",
-      "POST /close":                       "Positie manueel sluiten",
+      "GET  /":                             BASE+"/",
+      "GET  /dashboard":                    BASE+"/dashboard",
+      "GET  /status":                       BASE+"/status",
+      "GET  /live/positions":               BASE+"/live/positions",
+      "GET  /live/ghosts":                  BASE+"/live/ghosts",
+      "GET  /analysis/rr":                  BASE+"/analysis/rr",
+      "GET  /analysis/sessions":            BASE+"/analysis/sessions",
+      "GET  /analysis/equity-curve":        BASE+"/analysis/equity-curve?hours=24",
+      "GET  /history":                      BASE+"/history?limit=100",
+      "GET  /tp-locks":                     BASE+"/tp-locks",
+      "GET  /sl-locks":                     BASE+"/sl-locks",
+      "GET  /research/tp-optimizer":        BASE+"/research/tp-optimizer",
+      "GET  /research/tp-optimizer/sessie": BASE+"/research/tp-optimizer/sessie",
+      "GET  /research/sl-optimizer":        BASE+"/research/sl-optimizer",
+      "POST /webhook":                      "TradingView alert → MT5",
+      "POST /close":                        "Positie manueel sluiten",
     }
   });
 });
 
+// ══════════════════════════════════════════════════════════════
+// STARTUP  ← [FIX v4.4] app.listen() was volledig afwezig
+//            → oorzaak van "Application failed to respond" op Railway
+// ══════════════════════════════════════════════════════════════
+const PORT = process.env.PORT || 3000;
+
+async function start() {
+  try {
+    console.log("🚀 FTMO Webhook Server v4.4 — opstarten...");
+
+    // 1. DB schema
+    await initDB();
+
+    // 2. Trade history laden
+    const dbTrades = await loadAllTrades();
+    closedTrades.push(...dbTrades);
+    console.log(`📂 ${dbTrades.length} trades geladen uit Postgres`);
+
+    // 3. TP/SL configs laden
+    const savedTP = await loadTPConfig();
+    Object.assign(tpLocks, savedTP);
+    console.log(`🔒 ${Object.keys(savedTP).length} TP locks geladen`);
+
+    const savedSL = await loadSLConfig();
+    Object.assign(slLocks, savedSL);
+    console.log(`📐 ${Object.keys(savedSL).length} SL configs geladen`);
+
+    // 4. Open posities herstellen na Railway restart
+    await restoreOpenPositionsFromMT5();
+
+    // 5. Server binden aan PORT
+    app.listen(PORT, () => {
+      console.log(`✅ Server luistert op port ${PORT}`);
+      console.log(`📊 Dashboard: /dashboard`);
+    });
+
+  } catch (err) {
+    console.error("❌ Startup mislukt:", err.message);
+    process.exit(1);
+  }
+}
+
+start();
