@@ -19,10 +19,8 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-// ── Schema init — veilig (IF NOT EXISTS + migraties) ──────────
 async function initDB() {
   await pool.query(`
-    -- ── Gesloten trades ──────────────────────────────────────
     CREATE TABLE IF NOT EXISTS closed_trades (
       id                  SERIAL PRIMARY KEY,
       position_id         TEXT        UNIQUE,
@@ -56,7 +54,6 @@ async function initDB() {
     ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS spread_guard       BOOLEAN     DEFAULT FALSE;
     ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS sl_multiplier      NUMERIC     DEFAULT 1.0;
 
-    -- ── TP configuratie (v4.1 — sessie-aware + sub-1R) ────────
     CREATE TABLE IF NOT EXISTS tp_config (
       symbol          TEXT        NOT NULL,
       session         TEXT        NOT NULL DEFAULT 'all',
@@ -69,11 +66,9 @@ async function initDB() {
       auto_updated    BOOLEAN     DEFAULT TRUE
     );
 
-    -- Migratie: session kolom toevoegen als die nog niet bestaat
     ALTER TABLE tp_config ADD COLUMN IF NOT EXISTS session TEXT NOT NULL DEFAULT 'all';
   `);
 
-  // Migratie: primary key upgraden naar (symbol, session)
   await pool.query(`
     DO $$
     BEGIN
@@ -110,7 +105,6 @@ async function initDB() {
 
     ALTER TABLE tp_update_log ADD COLUMN IF NOT EXISTS session TEXT NOT NULL DEFAULT 'all';
 
-    -- ── SL configuratie (v4.1 — with direction advice) ────────
     CREATE TABLE IF NOT EXISTS sl_config (
       symbol            TEXT        PRIMARY KEY,
       multiplier        NUMERIC     NOT NULL,
@@ -139,7 +133,6 @@ async function initDB() {
 
     ALTER TABLE sl_update_log ADD COLUMN IF NOT EXISTS direction TEXT;
 
-    -- ── Forex consolidatie log ─────────────────────────────────
     CREATE TABLE IF NOT EXISTS forex_consolidation_log (
       id          SERIAL PRIMARY KEY,
       symbol      TEXT        NOT NULL,
@@ -149,7 +142,6 @@ async function initDB() {
       reason      TEXT
     );
 
-    -- ── Equity snapshots ──────────────────────────────────────
     CREATE TABLE IF NOT EXISTS equity_snapshots (
       id            SERIAL PRIMARY KEY,
       ts            TIMESTAMPTZ DEFAULT NOW(),
@@ -160,7 +152,6 @@ async function initDB() {
       free_margin   NUMERIC
     );
 
-    -- ── Indexen ───────────────────────────────────────────────
     CREATE INDEX IF NOT EXISTS idx_trades_symbol      ON closed_trades(symbol);
     CREATE INDEX IF NOT EXISTS idx_trades_closed      ON closed_trades(closed_at);
     CREATE INDEX IF NOT EXISTS idx_trades_session     ON closed_trades(session);
@@ -175,7 +166,6 @@ async function initDB() {
   console.log("✅ [DB] Schema klaar (v4.1 — sub-1R TP, spread guard, forex consolidatie)");
 }
 
-// ── TRADES ────────────────────────────────────────────────────
 async function saveTrade(trade) {
   const q = `
     INSERT INTO closed_trades
@@ -255,7 +245,6 @@ async function loadAllTrades() {
   return res.rows;
 }
 
-// ── EQUITY SNAPSHOTS ──────────────────────────────────────────
 let lastSnapshotSave = 0;
 const SNAPSHOT_INTERVAL_MS = 5 * 60 * 1000;
 
@@ -266,20 +255,13 @@ async function saveSnapshot(snap) {
   await pool.query(`
     INSERT INTO equity_snapshots (ts, balance, equity, floating_pl, margin, free_margin)
     VALUES ($1,$2,$3,$4,$5,$6)
-  `, [
-    snap.ts,
-    snap.balance    ?? null,
-    snap.equity     ?? null,
-    snap.floatingPL ?? null,
-    snap.margin     ?? null,
-    snap.freeMargin ?? null,
-  ]);
+  `, [snap.ts, snap.balance ?? null, snap.equity ?? null,
+      snap.floatingPL ?? null, snap.margin ?? null, snap.freeMargin ?? null]);
 }
 
 async function loadSnapshots(hours = 24) {
   const res = await pool.query(`
-    SELECT
-      ts,
+    SELECT ts,
       CAST(balance     AS FLOAT) AS balance,
       CAST(equity      AS FLOAT) AS equity,
       CAST(floating_pl AS FLOAT) AS "floatingPL",
@@ -292,7 +274,6 @@ async function loadSnapshots(hours = 24) {
   return res.rows;
 }
 
-// ── TP CONFIG (v4.1 — sessie-aware) ───────────────────────────
 async function loadTPConfig() {
   try {
     const res = await pool.query(`SELECT * FROM tp_config ORDER BY symbol, session`);
@@ -310,7 +291,7 @@ async function loadTPConfig() {
         evAtLock:     r.ev_at_lock    ? parseFloat(r.ev_at_lock) : null,
       };
     }
-    console.log(`📊 [DB] ${res.rows.length} TP configs geladen (sessie-aware + sub-1R)`);
+    console.log(`📊 [DB] ${res.rows.length} TP configs geladen`);
     return map;
   } catch (e) {
     console.warn("⚠️ loadTPConfig:", e.message);
@@ -343,23 +324,16 @@ async function logTPUpdate(symbol, session, oldRR, newRR, trades, ev, reason) {
 async function loadTPUpdateLog(limit = 50) {
   try {
     const res = await pool.query(`
-      SELECT symbol,
-             session,
+      SELECT symbol, session,
              CAST(old_rr AS FLOAT) AS "oldRR",
              CAST(new_rr AS FLOAT) AS "newRR",
-             trades,
-             CAST(ev AS FLOAT) AS ev,
-             reason, ts
+             trades, CAST(ev AS FLOAT) AS ev, reason, ts
       FROM tp_update_log ORDER BY ts DESC LIMIT $1
     `, [limit]);
     return res.rows;
-  } catch (e) {
-    console.warn("⚠️ loadTPUpdateLog:", e.message);
-    return [];
-  }
+  } catch (e) { console.warn("⚠️ loadTPUpdateLog:", e.message); return []; }
 }
 
-// ── SL CONFIG (v4.1 — met direction advies) ──────────────────
 async function loadSLConfig() {
   try {
     const res = await pool.query(`SELECT * FROM sl_config ORDER BY symbol`);
@@ -376,12 +350,9 @@ async function loadSLConfig() {
         prevLockedAt:   r.prev_locked_at  ?? null,
       };
     }
-    console.log(`📐 [DB] ${res.rows.length} SL configs geladen (v4.1 — direction aware)`);
+    console.log(`📐 [DB] ${res.rows.length} SL configs geladen`);
     return map;
-  } catch (e) {
-    console.warn("⚠️ loadSLConfig:", e.message);
-    return {};
-  }
+  } catch (e) { console.warn("⚠️ loadSLConfig:", e.message); return {}; }
 }
 
 async function saveSLConfig(symbol, multiplier, direction, lockedTrades, evAtLock, bestTPRR, prevMultiplier, prevLockedAt) {
@@ -416,29 +387,20 @@ async function loadSLUpdateLog(limit = 50) {
       SELECT symbol,
              CAST(old_multiplier AS FLOAT) AS "oldMultiplier",
              CAST(new_multiplier AS FLOAT) AS "newMultiplier",
-             direction,
-             trades,
-             CAST(ev AS FLOAT) AS ev,
-             reason, ts
+             direction, trades, CAST(ev AS FLOAT) AS ev, reason, ts
       FROM sl_update_log ORDER BY ts DESC LIMIT $1
     `, [limit]);
     return res.rows;
-  } catch (e) {
-    console.warn("⚠️ loadSLUpdateLog:", e.message);
-    return [];
-  }
+  } catch (e) { console.warn("⚠️ loadSLUpdateLog:", e.message); return []; }
 }
 
-// ── FOREX CONSOLIDATIE LOG ────────────────────────────────────
 async function logForexConsolidation(symbol, direction, count, reason) {
   try {
     await pool.query(`
       INSERT INTO forex_consolidation_log (symbol, direction, count, reason)
       VALUES ($1, $2, $3, $4)
     `, [symbol, direction, count, reason]);
-  } catch (e) {
-    console.warn("⚠️ logForexConsolidation:", e.message);
-  }
+  } catch (e) { console.warn("⚠️ logForexConsolidation:", e.message); }
 }
 
 module.exports = {
