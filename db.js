@@ -1,7 +1,12 @@
 // ═══════════════════════════════════════════════════════════════
-// db.js — PostgreSQL persistence layer  |  v4.1
+// db.js — PostgreSQL persistence layer  |  v4.2
 // Railway: voeg Postgres plugin toe → DATABASE_URL wordt auto-gezet
 //
+// Wijzigingen t.o.v. v4.1:
+//  ✅ [FIX] Pool: connectionTimeoutMillis + statement_timeout toegevoegd
+//           → Hangende DB-queries blokkeren dashboard niet meer
+//  ✅ [FIX] loadSnapshots: interne 4s timeout via Promise.race
+//           → equity-curve endpoint geeft altijd antwoord terug
 // Wijzigingen t.o.v. v4.0:
 //  ✅ tp_config — sub-1R niveaus (0.2/0.4/0.6/0.8) opgeslagen
 //  ✅ closed_trades — spread_guard kolom toegevoegd
@@ -15,8 +20,11 @@
 const { Pool } = require("pg");
 
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
+  connectionString:        process.env.DATABASE_URL,
+  ssl:                     { rejectUnauthorized: false },
+  connectionTimeoutMillis: 5000,   // geef op na 5s als verbinding mislukt
+  idleTimeoutMillis:       10000,  // sluit idle verbindingen na 10s
+  statement_timeout:       5000,   // query-level timeout: max 5s per query
 });
 
 async function initDB() {
@@ -260,7 +268,7 @@ async function saveSnapshot(snap) {
 }
 
 async function loadSnapshots(hours = 24) {
-  const res = await pool.query(`
+  const query = pool.query(`
     SELECT ts,
       CAST(balance     AS FLOAT) AS balance,
       CAST(equity      AS FLOAT) AS equity,
@@ -271,6 +279,10 @@ async function loadSnapshots(hours = 24) {
     WHERE ts > NOW() - INTERVAL '${hours} hours'
     ORDER BY ts ASC
   `);
+  const timeout = new Promise((_, rej) =>
+    setTimeout(() => rej(new Error("loadSnapshots timeout")), 4000)
+  );
+  const res = await Promise.race([query, timeout]);
   return res.rows;
 }
 
