@@ -1794,10 +1794,15 @@ function tab(name){
   if(name==='arch') renderArch();
 }
 
-// API
+// API — 6s timeout per call zodat dashboard nooit blijft hangen
 async function api(url){
-  try{const r=await fetch(url,{headers:{'x-secret':S}});return r.ok?r.json():null}
-  catch{return null}
+  try{
+    const ctrl=new AbortController();
+    const t=setTimeout(()=>ctrl.abort(),6000);
+    const r=await fetch(url,{headers:{'x-secret':S},signal:ctrl.signal});
+    clearTimeout(t);
+    return r.ok?r.json():null;
+  }catch{return null}
 }
 
 // LOAD ALL
