@@ -1522,33 +1522,6 @@ app.get("/close", (req,res) => {
   res.json({info:"Dit is een POST endpoint", gebruik:"Stuur POST /close met {positionId} + x-secret header", status:"online"});
 });
 
-// ── CATCH-ALL: onbekende routes ───────────────────────────────
-app.use((req, res) => {
-  const BASE = req.protocol+"://"+req.get("host");
-  res.status(404).json({
-    error: "Route niet gevonden",
-    geprobeerd: req.method+" "+req.originalUrl,
-    beschikbare_routes: {
-      "GET  /":                            BASE+"/",
-      "GET  /dashboard":                   BASE+"/dashboard",
-      "GET  /status":                      BASE+"/status",
-      "GET  /live/positions":              BASE+"/live/positions",
-      "GET  /live/ghosts":                 BASE+"/live/ghosts",
-      "GET  /analysis/rr":                 BASE+"/analysis/rr",
-      "GET  /analysis/sessions":           BASE+"/analysis/sessions",
-      "GET  /analysis/equity-curve":       BASE+"/analysis/equity-curve?hours=24",
-      "GET  /history":                     BASE+"/history?limit=100",
-      "GET  /tp-locks":                    BASE+"/tp-locks",
-      "GET  /sl-locks":                    BASE+"/sl-locks",
-      "GET  /research/tp-optimizer":       BASE+"/research/tp-optimizer",
-      "GET  /research/tp-optimizer/sessie":BASE+"/research/tp-optimizer/sessie",
-      "GET  /research/sl-optimizer":       BASE+"/research/sl-optimizer",
-      "POST /webhook":                     "TradingView alert → MT5",
-      "POST /close":                       "Positie manueel sluiten",
-    }
-  });
-});
-
 // ── DASHBOARD ─────────────────────────────────────────────────
 app.get("/dashboard", (req, res) => {
   const SECRET = WEBHOOK_SECRET;
@@ -2621,3 +2594,30 @@ async function startServer() {
 }
 
 startServer().catch(err => { console.error("❌", err.message); process.exit(1); });
+// ── CATCH-ALL: onbekende routes ───────────────────────────────
+app.use((req, res) => {
+  const BASE = req.protocol+"://"+req.get("host");
+  res.status(404).json({
+    error: "Route niet gevonden",
+    geprobeerd: req.method+" "+req.originalUrl,
+    beschikbare_routes: {
+      "GET  /":                            BASE+"/",
+      "GET  /dashboard":                   BASE+"/dashboard",
+      "GET  /status":                      BASE+"/status",
+      "GET  /live/positions":              BASE+"/live/positions",
+      "GET  /live/ghosts":                 BASE+"/live/ghosts",
+      "GET  /analysis/rr":                 BASE+"/analysis/rr",
+      "GET  /analysis/sessions":           BASE+"/analysis/sessions",
+      "GET  /analysis/equity-curve":       BASE+"/analysis/equity-curve?hours=24",
+      "GET  /history":                     BASE+"/history?limit=100",
+      "GET  /tp-locks":                    BASE+"/tp-locks",
+      "GET  /sl-locks":                    BASE+"/sl-locks",
+      "GET  /research/tp-optimizer":       BASE+"/research/tp-optimizer",
+      "GET  /research/tp-optimizer/sessie":BASE+"/research/tp-optimizer/sessie",
+      "GET  /research/sl-optimizer":       BASE+"/research/sl-optimizer",
+      "POST /webhook":                     "TradingView alert → MT5",
+      "POST /close":                       "Positie manueel sluiten",
+    }
+  });
+});
+
