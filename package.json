@@ -1,7 +1,7 @@
 {
   "name": "nv-tradingview-webhook",
-  "version": "4.1.0",
-  "description": "TradingView → MetaApi REST → FTMO MT5 | NV v4.1 — Sub-1R TP, Stock risk boost, Forex anti-consolidatie, SL direction engine, Spread guard",
+  "version": "4.4.0",
+  "description": "TradingView → MetaApi REST → FTMO MT5 | NV v4.4 — HTML dashboard (EV-sorted), forex max 2 trades, ghost running max, TP daily reset, SL 50 trades, forex min 0.0003",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
