@@ -4,7 +4,7 @@
   "description": "TradingView → MetaApi REST → FTMO MT5 | NV v4.3 — Cap fix (baseRisk), Restart recovery, Forex half risk bij consolidatie",
   "main": "server.js",
   "scripts": {
-    "start": "node --omit=dev server.js",
+    "start": "node server.js",
     "dev": "nodemon server.js"
   },
   "dependencies": {
