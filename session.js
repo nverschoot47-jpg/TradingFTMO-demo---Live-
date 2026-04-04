@@ -21,8 +21,6 @@ const DAYS_MAP = {
 /**
  * Geeft { day, hhmm, hour, minute } in Brussels lokale tijd terug.
  * Verwerkt CET (winter, UTC+1) en CEST (zomer, UTC+2) automatisch.
- * @param {Date|null} date  – standaard new Date()
- * @returns {{ day: number, hhmm: number, hour: number, minute: number }}
  */
 function getBrusselsComponents(date) {
   const d = (date instanceof Date) ? date : new Date();
@@ -40,7 +38,6 @@ function getBrusselsComponents(date) {
   let hour   = parseInt(get("hour"),   10);
   const minute = parseInt(get("minute"), 10);
 
-  // Sommige Intl-implementaties geven 24 terug voor middernacht – normaliseer
   if (hour === 24) hour = 0;
 
   const weekday = get("weekday");
@@ -51,7 +48,6 @@ function getBrusselsComponents(date) {
 
 /**
  * Geeft de huidige tijd terug als leesbare string in Brussels tijdzone.
- * @returns {string}  bijv. "02/04/2026 09:31:15"
  */
 function getBrusselsDateStr() {
   return new Intl.DateTimeFormat("nl-BE", {
@@ -61,7 +57,6 @@ function getBrusselsDateStr() {
   }).format(new Date());
 }
 
-// ── Sessie labels ──────────────────────────────────────────────
 const SESSION_LABELS = {
   asia:           "Asia (02:00–08:00)",
   london:         "London (08:00–15:30)",
@@ -71,8 +66,6 @@ const SESSION_LABELS = {
 
 /**
  * Geeft de huidige of historische handelssessie terug.
- * @param {Date|string|null} dateOrStr
- * @returns {"asia"|"london"|"ny"|"buiten_venster"}
  */
 function getSessionGMT1(dateOrStr) {
   const d = dateOrStr ? new Date(dateOrStr) : new Date();
@@ -90,11 +83,6 @@ function getSessionGMT1(dateOrStr) {
  *   - Alle types behalve stock: 02:00–20:00 (ma–vr), incl. indices tijdens Asia
  *   - Stocks: alleen 15:30–20:00 (NY venster)
  *   - Crypto: ook weekend 02:00–20:00
- *
- * @param {"index"|"forex"|"gold"|"stock"|"crypto"|"brent"|"wti"} type
- * @param {string} symbol
- * @param {function(string): boolean} isCryptoWeekendFn
- * @returns {boolean}
  */
 function isMarketOpen(type, symbol, isCryptoWeekendFn) {
   const { day, hhmm } = getBrusselsComponents();
@@ -112,17 +100,14 @@ function isMarketOpen(type, symbol, isCryptoWeekendFn) {
     return true;
   }
 
-  // Algemeen dagvenster: 02:00–20:00
   if (hhmm < 200)   { console.warn(`🚫 Voor 02:00 (${hhmm})`);   return false; }
   if (hhmm >= 2000) { console.warn(`🚫 Na 20:00 (${hhmm})`);     return false; }
 
-  // Stocks: alleen NY venster 15:30–20:00
   if (type === "stock" && hhmm < 1530) {
     console.warn(`🚫 Aandelen buiten 15:30–20:00 (${hhmm})`);
     return false;
   }
 
-  // Indices, forex, gold, brent, wti, crypto → 02:00–20:00 ✅
   return true;
 }
 
