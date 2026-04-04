@@ -1489,6 +1489,66 @@ app.delete("/sl-locks/:symbol", (req,res) => {
   res.json({status:"OK",removed:existed?1:0,symbol:sym});
 });
 
+// ── GET VIEWS VOOR DELETE ROUTES ─────────────────────────────
+app.get("/tp-locks/:symbol", (req,res) => {
+  const sym = req.params.symbol.toUpperCase();
+  const locks = {};
+  for (const [key, lock] of Object.entries(tpLocks)) {
+    if (key.startsWith(sym+"__")) locks[key] = lock;
+  }
+  if (!Object.keys(locks).length) return res.json({info:`Geen TP locks voor ${sym}`, tip:"Gebruik DELETE om te resetten"});
+  res.json({symbol:sym, locks, tip:"Gebruik DELETE /tp-locks/"+sym+" om te resetten"});
+});
+
+app.get("/tp-locks/:symbol/:session", (req,res) => {
+  const key = `${req.params.symbol.toUpperCase()}__${req.params.session}`;
+  const lock = tpLocks[key];
+  if (!lock) return res.json({info:`Geen TP lock voor ${key}`, tip:"Gebruik DELETE om te resetten"});
+  res.json({key, lock, tip:"Gebruik DELETE /tp-locks/"+req.params.symbol+"/"+req.params.session+" om te resetten"});
+});
+
+app.get("/sl-locks/:symbol", (req,res) => {
+  const sym = req.params.symbol.toUpperCase();
+  const lock = slLocks[sym];
+  if (!lock) return res.json({info:`Geen SL lock voor ${sym}`, tip:"Gebruik DELETE om te resetten"});
+  res.json({symbol:sym, lock, tip:"Gebruik DELETE /sl-locks/"+sym+" om te resetten"});
+});
+
+app.get("/webhook", (req,res) => {
+  res.json({info:"Dit is een POST endpoint", gebruik:"Stuur POST /webhook met TradingView alert JSON + x-secret header", status:"online"});
+});
+
+app.get("/close", (req,res) => {
+  res.json({info:"Dit is een POST endpoint", gebruik:"Stuur POST /close met {positionId} + x-secret header", status:"online"});
+});
+
+// ── CATCH-ALL: onbekende routes ───────────────────────────────
+app.use((req, res) => {
+  const BASE = req.protocol+"://"+req.get("host");
+  res.status(404).json({
+    error: "Route niet gevonden",
+    geprobeerd: req.method+" "+req.originalUrl,
+    beschikbare_routes: {
+      "GET  /":                            BASE+"/",
+      "GET  /dashboard":                   BASE+"/dashboard",
+      "GET  /status":                      BASE+"/status",
+      "GET  /live/positions":              BASE+"/live/positions",
+      "GET  /live/ghosts":                 BASE+"/live/ghosts",
+      "GET  /analysis/rr":                 BASE+"/analysis/rr",
+      "GET  /analysis/sessions":           BASE+"/analysis/sessions",
+      "GET  /analysis/equity-curve":       BASE+"/analysis/equity-curve?hours=24",
+      "GET  /history":                     BASE+"/history?limit=100",
+      "GET  /tp-locks":                    BASE+"/tp-locks",
+      "GET  /sl-locks":                    BASE+"/sl-locks",
+      "GET  /research/tp-optimizer":       BASE+"/research/tp-optimizer",
+      "GET  /research/tp-optimizer/sessie":BASE+"/research/tp-optimizer/sessie",
+      "GET  /research/sl-optimizer":       BASE+"/research/sl-optimizer",
+      "POST /webhook":                     "TradingView alert → MT5",
+      "POST /close":                       "Positie manueel sluiten",
+    }
+  });
+});
+
 // ── DASHBOARD ─────────────────────────────────────────────────
 app.get("/dashboard", (req, res) => {
   const SECRET = WEBHOOK_SECRET;
