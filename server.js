@@ -1436,6 +1436,618 @@ app.get("/analysis/extremes", (req, res) => {
     worstTrades: [...withPnl].sort((a,b)=>a.realizedPnlEUR-b.realizedPnlEUR).slice(0,n).map(t=>({symbol:t.symbol,session:t.session,maxRR:t.maxRR,pnl:t.realizedPnlEUR})),
   });
 });
+// ══════════════════════════════════════════════════════════════
+// DASHBOARD v7.0 — voeg toe VOOR de 404 handler onderaan server.js
+// ══════════════════════════════════════════════════════════════
+app.get("/dashboard", (req, res) => {
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FTMO Dashboard — Nick Verschoot</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;700;800&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg:       #080c10;
+    --panel:    #0d1117;
+    --border:   #1a2233;
+    --accent:   #00ffe0;
+    --accent2:  #7b61ff;
+    --gold:     #f5c842;
+    --red:      #ff4560;
+    --green:    #00e396;
+    --muted:    #3a4a5c;
+    --text:     #c8d8e8;
+    --dim:      #556070;
+    --font-ui:  'Space Mono', monospace;
+    --font-hd:  'Syne', sans-serif;
+  }
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { background: var(--bg); color: var(--text); font-family: var(--font-ui); font-size: 13px; min-height: 100vh; }
+
+  /* ── HEADER ─────────────────────────────────────────── */
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 18px 32px; border-bottom: 1px solid var(--border);
+    background: linear-gradient(90deg, #0d1117 0%, #080c10 100%);
+    position: sticky; top: 0; z-index: 100;
+  }
+  .logo { font-family: var(--font-hd); font-size: 20px; font-weight: 800; color: var(--accent); letter-spacing: -0.5px; }
+  .logo span { color: var(--text); font-weight: 400; font-size: 13px; margin-left: 12px; opacity: 0.6; }
+  .header-right { display: flex; gap: 16px; align-items: center; }
+  .pill { background: var(--panel); border: 1px solid var(--border); border-radius: 20px; padding: 4px 14px; font-size: 11px; color: var(--dim); }
+  .pill.live { border-color: var(--green); color: var(--green); }
+  #clock { font-size: 11px; color: var(--dim); font-family: var(--font-ui); }
+  .refresh-btn {
+    background: none; border: 1px solid var(--accent); color: var(--accent);
+    padding: 5px 14px; border-radius: 4px; cursor: pointer; font-family: var(--font-ui); font-size: 11px;
+    transition: background 0.15s;
+  }
+  .refresh-btn:hover { background: rgba(0,255,224,0.08); }
+
+  /* ── LAYOUT ─────────────────────────────────────────── */
+  main { max-width: 1600px; margin: 0 auto; padding: 28px 24px 60px; }
+
+  /* ── SUMMARY STRIP ───────────────────────────────────── */
+  .summary-strip {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(160px,1fr));
+    gap: 12px; margin-bottom: 28px;
+  }
+  .stat-card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+    padding: 16px 18px;
+  }
+  .stat-card .label { font-size: 10px; color: var(--dim); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 6px; }
+  .stat-card .value { font-size: 22px; font-family: var(--font-hd); font-weight: 800; color: var(--accent); }
+  .stat-card .sub   { font-size: 10px; color: var(--dim); margin-top: 3px; }
+
+  /* ── SESSION FILTER ──────────────────────────────────── */
+  .filter-bar { display: flex; gap: 8px; margin-bottom: 18px; align-items: center; flex-wrap: wrap; }
+  .filter-btn {
+    background: var(--panel); border: 1px solid var(--border); color: var(--dim);
+    padding: 5px 16px; border-radius: 20px; cursor: pointer; font-family: var(--font-ui); font-size: 11px;
+    transition: all 0.15s;
+  }
+  .filter-btn.active { border-color: var(--accent); color: var(--accent); background: rgba(0,255,224,0.06); }
+  .filter-label { font-size: 10px; color: var(--dim); text-transform: uppercase; letter-spacing: 1px; margin-right: 4px; }
+  .search-box {
+    background: var(--panel); border: 1px solid var(--border); color: var(--text);
+    padding: 5px 14px; border-radius: 4px; font-family: var(--font-ui); font-size: 11px;
+    outline: none; width: 160px;
+  }
+  .search-box:focus { border-color: var(--accent); }
+
+  /* ── MAIN TABLE ─────────────────────────────────────── */
+  .table-wrap {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    overflow: auto; margin-bottom: 32px;
+  }
+  table { width: 100%; border-collapse: collapse; }
+  thead th {
+    background: #0b0f15; padding: 10px 14px; text-align: left;
+    font-size: 10px; text-transform: uppercase; letter-spacing: 1px;
+    color: var(--dim); border-bottom: 1px solid var(--border);
+    white-space: nowrap; cursor: pointer; user-select: none;
+  }
+  thead th:hover { color: var(--accent); }
+  thead th.sort-asc::after  { content: " ▲"; color: var(--accent); }
+  thead th.sort-desc::after { content: " ▼"; color: var(--accent); }
+  tbody tr {
+    border-bottom: 1px solid rgba(26,34,51,0.5);
+    transition: background 0.12s;
+    cursor: pointer;
+  }
+  tbody tr:hover { background: rgba(0,255,224,0.03); }
+  tbody tr.expanded { background: rgba(123,97,255,0.05); }
+  td { padding: 10px 14px; white-space: nowrap; vertical-align: middle; }
+
+  /* badges */
+  .badge {
+    display: inline-block; padding: 2px 8px; border-radius: 3px;
+    font-size: 10px; font-weight: 700; letter-spacing: 0.5px;
+  }
+  .badge-asia    { background: rgba(123,97,255,0.2);  color: var(--accent2); border: 1px solid rgba(123,97,255,0.4); }
+  .badge-london  { background: rgba(0,255,224,0.1);   color: var(--accent);  border: 1px solid rgba(0,255,224,0.3); }
+  .badge-ny      { background: rgba(245,200,66,0.12); color: var(--gold);    border: 1px solid rgba(245,200,66,0.4); }
+  .badge-all     { background: rgba(58,74,92,0.3);    color: var(--dim);     border: 1px solid var(--border); }
+
+  .ev-pos  { color: var(--green); }
+  .ev-neg  { color: var(--red); }
+  .ev-zero { color: var(--dim); }
+
+  .mult-up   { color: var(--gold); }
+  .mult-down { color: var(--accent2); }
+  .mult-ok   { color: var(--green); }
+
+  .dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; margin-right: 5px; }
+  .dot-green { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .dot-red   { background: var(--red);   box-shadow: 0 0 6px var(--red); }
+  .dot-gold  { background: var(--gold);  box-shadow: 0 0 6px var(--gold); }
+  .dot-dim   { background: var(--muted); }
+
+  /* ── EXPANDED DETAIL ROW ────────────────────────────── */
+  .detail-row td { padding: 0; background: #0a0f18; }
+  .detail-panel {
+    padding: 20px 24px; display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 16px; border-top: 1px solid var(--border);
+  }
+  .detail-section { }
+  .detail-section h4 {
+    font-size: 10px; text-transform: uppercase; letter-spacing: 1px;
+    color: var(--dim); margin-bottom: 10px; border-bottom: 1px solid var(--border); padding-bottom: 6px;
+  }
+  .kv-row { display: flex; justify-content: space-between; margin-bottom: 5px; font-size: 11px; }
+  .kv-row .k { color: var(--dim); }
+  .kv-row .v { color: var(--text); font-weight: 700; }
+  .kv-row .v.accent { color: var(--accent); }
+  .kv-row .v.gold   { color: var(--gold); }
+  .kv-row .v.green  { color: var(--green); }
+  .kv-row .v.red    { color: var(--red); }
+  .kv-row .v.purple { color: var(--accent2); }
+
+  /* ── EV TABLE (mini) ─────────────────────────────────── */
+  .ev-mini-table { width: 100%; border-collapse: collapse; font-size: 10px; }
+  .ev-mini-table th { color: var(--dim); padding: 3px 6px; text-align: left; border-bottom: 1px solid var(--border); }
+  .ev-mini-table td { padding: 3px 6px; border-bottom: 1px solid rgba(26,34,51,0.4); }
+  .ev-mini-table tr.best-row td { color: var(--green); font-weight: 700; }
+  .ev-mini-table tr.current-row td { color: var(--accent); }
+
+  /* ── BOTTOM PANELS ───────────────────────────────────── */
+  .bottom-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 12px; }
+  @media (max-width: 900px) { .bottom-grid { grid-template-columns: 1fr; } }
+  .panel {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 20px;
+  }
+  .panel h3 { font-family: var(--font-hd); font-size: 14px; font-weight: 700; color: var(--text); margin-bottom: 14px; }
+  .panel h3 .sub { font-size: 11px; color: var(--dim); font-family: var(--font-ui); font-weight: 400; margin-left: 8px; }
+
+  /* log list */
+  .log-list { display: flex; flex-direction: column; gap: 6px; max-height: 300px; overflow-y: auto; }
+  .log-item {
+    display: flex; justify-content: space-between; align-items: center;
+    background: #0b0f15; border: 1px solid var(--border); border-radius: 5px; padding: 8px 12px;
+    font-size: 10px;
+  }
+  .log-item .log-sym { color: var(--accent); font-weight: 700; margin-right: 8px; }
+  .log-item .log-ts  { color: var(--muted); }
+  .log-item .log-val { font-weight: 700; }
+
+  /* no data */
+  .no-data { color: var(--muted); text-align: center; padding: 32px; font-size: 12px; }
+
+  /* loading */
+  .loading {
+    display: flex; align-items: center; justify-content: center;
+    height: 200px; color: var(--dim); font-size: 12px;
+    animation: pulse 1.2s infinite;
+  }
+  @keyframes pulse { 0%,100%{opacity:0.4} 50%{opacity:1} }
+
+  /* scrollbar */
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: var(--panel); }
+  ::-webkit-scrollbar-thumb { background: var(--muted); border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">FTMO<span>Nick Verschoot — Demo Account</span></div>
+  <div class="header-right">
+    <div id="clock">--:--:--</div>
+    <div class="pill live">● LIVE</div>
+    <button class="refresh-btn" onclick="loadAll()">↺ Refresh</button>
+  </div>
+</header>
+
+<main>
+
+  <!-- SUMMARY STRIP -->
+  <div class="summary-strip" id="summary-strip">
+    <div class="stat-card"><div class="label">Symbols tracked</div><div class="value" id="s-symbols">—</div><div class="sub">with optimizer data</div></div>
+    <div class="stat-card"><div class="label">TP Ghost locks</div><div class="value" id="s-tp">—</div><div class="sub">active sessions</div></div>
+    <div class="stat-card"><div class="label">SL Shadow locks</div><div class="value" id="s-sl">—</div><div class="sub">auto-applied</div></div>
+    <div class="stat-card"><div class="label">Avg Ghost Extra RR</div><div class="value" id="s-ghost-rr">—</div><div class="sub">across all symbols</div></div>
+    <div class="stat-card"><div class="label">TP EV positive</div><div class="value" id="s-ev-pos">—</div><div class="sub">sessions with +EV TP</div></div>
+    <div class="stat-card"><div class="label">Open positions</div><div class="value" id="s-open">—</div><div class="sub">live MT5 trades</div></div>
+  </div>
+
+  <!-- FILTER BAR -->
+  <div class="filter-bar">
+    <span class="filter-label">Session:</span>
+    <button class="filter-btn active" data-session="all" onclick="setSession('all',this)">All</button>
+    <button class="filter-btn" data-session="asia"   onclick="setSession('asia',this)">Asia</button>
+    <button class="filter-btn" data-session="london" onclick="setSession('london',this)">London</button>
+    <button class="filter-btn" data-session="ny"     onclick="setSession('ny',this)">New York</button>
+    <span style="flex:1"></span>
+    <input class="search-box" type="text" placeholder="Filter symbol..." oninput="filterSymbol(this.value)" id="sym-search">
+  </div>
+
+  <!-- MAIN TABLE -->
+  <div class="table-wrap">
+    <table id="main-table">
+      <thead>
+        <tr>
+          <th onclick="sortBy('symbol')">Symbol</th>
+          <th onclick="sortBy('session')">Session</th>
+          <th onclick="sortBy('tpRR')">TP Ghost RR</th>
+          <th onclick="sortBy('tpEV')">TP EV</th>
+          <th onclick="sortBy('tpTrades')">TP Trades</th>
+          <th onclick="sortBy('slMult')">SL Shadow Mult</th>
+          <th onclick="sortBy('slEV')">SL EV</th>
+          <th onclick="sortBy('slHitRate')">SL Hit Rate</th>
+          <th onclick="sortBy('slAuto')">Auto Applied</th>
+          <th onclick="sortBy('ghostExtra')">Ghost +RR</th>
+          <th onclick="sortBy('ghostTrades')">Ghost Trades</th>
+          <th onclick="sortBy('tpHitRate')">TP Hit%</th>
+        </tr>
+      </thead>
+      <tbody id="table-body">
+        <tr><td colspan="12" class="loading">Loading optimizer data...</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- BOTTOM PANELS -->
+  <div class="bottom-grid">
+    <div class="panel">
+      <h3>TP Ghost Update Log <span class="sub">last 20 changes</span></h3>
+      <div class="log-list" id="tp-log"></div>
+    </div>
+    <div class="panel">
+      <h3>SL Shadow Update Log <span class="sub">last 20 changes</span></h3>
+      <div class="log-list" id="sl-log"></div>
+    </div>
+  </div>
+
+</main>
+
+<script>
+// ── STATE ─────────────────────────────────────────────────────
+let allRows       = [];
+let sessionFilter = 'all';
+let symbolFilter  = '';
+let sortKey       = 'symbol';
+let sortDir       = 1;
+let expandedKey   = null;
+let detailCache   = {};
+
+// ── CLOCK ─────────────────────────────────────────────────────
+function updateClock() {
+  document.getElementById('clock').textContent =
+    new Date().toLocaleTimeString('en-GB', { timeZone: 'Europe/Brussels', hour12: false }) + ' BXL';
+}
+setInterval(updateClock, 1000);
+updateClock();
+
+// ── LOAD ALL ──────────────────────────────────────────────────
+async function loadAll() {
+  try {
+    const [tpRes, slRes, shadowRes, ghostRes, liveRes] = await Promise.all([
+      fetch('/tp-locks').then(r=>r.json()).catch(()=>({locksBySymbol:{}})),
+      fetch('/sl-locks').then(r=>r.json()).catch(()=>({analyses:[]})),
+      fetch('/sl-shadow').then(r=>r.json()).catch(()=>({results:{}})),
+      fetch('/analysis/ghost-deep').then(r=>r.json()).catch(()=>({bySymbolSession:[]})),
+      fetch('/live/positions').then(r=>r.json()).catch(()=>({count:0})),
+    ]);
+
+    buildRows(tpRes, slRes, shadowRes, ghostRes);
+    updateSummary(tpRes, slRes, shadowRes, ghostRes, liveRes);
+    renderTable();
+    loadLogs();
+  } catch(e) {
+    console.error('loadAll error:', e);
+    document.getElementById('table-body').innerHTML =
+      '<tr><td colspan="12" class="no-data">Failed to load data — ' + e.message + '</td></tr>';
+  }
+}
+
+// ── BUILD ROWS ────────────────────────────────────────────────
+function buildRows(tpRes, slRes, shadowRes, ghostRes) {
+  const rows = [];
+  const tpBySymbol    = tpRes.locksBySymbol || {};
+  const slBySymbol    = {};
+  for (const a of (slRes.analyses||[])) slBySymbol[a.symbol] = a;
+  const shadowResults = shadowRes.results || {};
+  const ghostBySS     = {};
+  for (const g of (ghostRes.bySymbolSession||[])) {
+    ghostBySS[(g.symbol||'') + '__' + (g.session||'')] = g;
+  }
+
+  // Collect all symbol+session combos
+  const keys = new Set();
+
+  // from TP locks
+  for (const [sym, sessions] of Object.entries(tpBySymbol)) {
+    for (const sess of Object.keys(sessions)) keys.add(sym + '__' + sess);
+  }
+  // from ghost
+  for (const k of Object.keys(ghostBySS)) keys.add(k);
+  // from SL (symbol-level, add for each existing session or 'all')
+  for (const sym of Object.keys(slBySymbol)) {
+    const hasSessions = [...keys].some(k => k.startsWith(sym + '__'));
+    if (!hasSessions) keys.add(sym + '__all');
+  }
+
+  for (const key of keys) {
+    const [sym, sess] = key.split('__');
+    const tpSess  = tpBySymbol[sym]?.[sess] || null;
+    const slData  = slBySymbol[sym] || null;
+    const shadow  = shadowResults[sym] || null;
+    const ghost   = ghostBySS[key] || null;
+
+    rows.push({
+      symbol:     sym,
+      session:    sess,
+      key,
+      // TP Ghost
+      tpRR:       tpSess?.lockedRR ?? null,
+      tpEV:       tpSess?.evAtLock ?? null,
+      tpEvPos:    tpSess?.evPositive ?? false,
+      tpTrades:   tpSess?.lockedTrades ?? null,
+      tpPrevRR:   tpSess?.prevRR ?? null,
+      tpLockedAt: tpSess?.lockedAt ?? null,
+      // SL Shadow
+      slMult:     shadow?.best?.slMultiplier ?? slData?.multiplier ?? null,
+      slEV:       shadow?.best?.bestEV ?? slData?.evAtLock ?? null,
+      slHitRate:  shadow?.best?.slHitRate ?? null,
+      slAuto:     slData?.autoApplied ?? false,
+      slTrades:   shadow?.tradesUsed ?? slData?.lockedTrades ?? null,
+      slDir:      slData?.direction ?? null,
+      slBestRR:   shadow?.best?.bestRR ?? slData?.bestTPRR ?? null,
+      slWinrate:  shadow?.best?.bestWinrate ?? null,
+      slExclSL:   shadow?.tradesExcludedSL ?? null,
+      // Ghost
+      ghostExtra: ghost?.avgExtraRR ?? null,
+      ghostTrades:ghost?.trades ?? null,
+      tpHitRate:  ghost?.tpHitRate ?? null,
+      manualCount:ghost?.manualCount ?? null,
+      // raw refs for detail panel
+      _tpSess: tpSess,
+      _slData: slData,
+      _shadow: shadow,
+      _ghost:  ghost,
+    });
+  }
+
+  allRows = rows;
+}
+
+// ── SUMMARY ───────────────────────────────────────────────────
+function updateSummary(tpRes, slRes, shadowRes, ghostRes, liveRes) {
+  const uniqueSymbols = new Set(allRows.map(r=>r.symbol));
+  document.getElementById('s-symbols').textContent = uniqueSymbols.size;
+
+  const tpCount = Object.keys(tpRes.locksBySymbol || {}).reduce((s,k) =>
+    s + Object.keys(tpRes.locksBySymbol[k]).length, 0);
+  document.getElementById('s-tp').textContent = tpCount;
+
+  const slAuto = (slRes.analyses||[]).filter(a=>a.autoApplied).length;
+  document.getElementById('s-sl').textContent = slAuto + ' / ' + (slRes.analyses||[]).length;
+
+  const ghostItems = ghostRes.bySymbolSession || [];
+  const avgExtra = ghostItems.length
+    ? (ghostItems.reduce((s,g)=>s+g.avgExtraRR,0)/ghostItems.length).toFixed(2)
+    : '—';
+  document.getElementById('s-ghost-rr').textContent = avgExtra !== '—' ? '+' + avgExtra + 'R' : '—';
+
+  const evPos = allRows.filter(r=>r.tpEvPos).length;
+  document.getElementById('s-ev-pos').textContent = evPos;
+  document.getElementById('s-open').textContent = liveRes.count ?? '—';
+}
+
+// ── RENDER TABLE ──────────────────────────────────────────────
+function renderTable() {
+  let rows = allRows.filter(r => {
+    if (sessionFilter !== 'all' && r.session !== sessionFilter) return false;
+    if (symbolFilter && !r.symbol.toLowerCase().includes(symbolFilter.toLowerCase())) return false;
+    return true;
+  });
+
+  rows.sort((a,b) => {
+    const av = a[sortKey], bv = b[sortKey];
+    if (av === null && bv === null) return 0;
+    if (av === null) return 1;
+    if (bv === null) return -1;
+    if (typeof av === 'string') return av.localeCompare(bv) * sortDir;
+    return (av - bv) * sortDir;
+  });
+
+  const tbody = document.getElementById('table-body');
+  if (!rows.length) {
+    tbody.innerHTML = '<tr><td colspan="12" class="no-data">No data for current filters</td></tr>';
+    return;
+  }
+
+  let html = '';
+  for (const r of rows) {
+    const sessClass  = { asia:'badge-asia', london:'badge-london', ny:'badge-ny' }[r.session] || 'badge-all';
+    const tpEVClass  = r.tpEV === null ? 'ev-zero' : r.tpEV > 0 ? 'ev-pos' : 'ev-neg';
+    const slEVClass  = r.slEV === null ? 'ev-zero' : r.slEV > 0 ? 'ev-pos' : 'ev-neg';
+    const multClass  = !r.slMult ? 'ev-zero' : r.slMult > 1 ? 'mult-up' : r.slMult < 1 ? 'mult-down' : 'mult-ok';
+    const autoSign   = r.slAuto ? '<span class="dot dot-green"></span>YES' : '<span class="dot dot-dim"></span>—';
+    const ghostSign  = r.ghostExtra === null ? '<span class="ev-zero">—</span>'
+                     : r.ghostExtra > 0
+                       ? '<span class="ev-pos">+' + r.ghostExtra.toFixed(2) + 'R</span>'
+                       : '<span class="ev-neg">' + r.ghostExtra.toFixed(2) + 'R</span>';
+
+    const isExp = expandedKey === r.key;
+
+    html += \`<tr class="\${isExp?'expanded':''}" onclick="toggleDetail('\${r.key}')">
+      <td style="font-weight:700;color:var(--text)">\${r.symbol}</td>
+      <td><span class="badge \${sessClass}">\${r.session}</span></td>
+      <td style="color:var(--accent)">\${r.tpRR !== null ? r.tpRR + 'R' : '<span class="ev-zero">—</span>'}</td>
+      <td class="\${tpEVClass}">\${r.tpEV !== null ? r.tpEV.toFixed(3) : '—'}</td>
+      <td style="color:var(--dim)">\${r.tpTrades ?? '—'}</td>
+      <td class="\${multClass}">\${r.slMult !== null ? r.slMult + '×' : '—'}</td>
+      <td class="\${slEVClass}">\${r.slEV !== null ? r.slEV.toFixed(3) : '—'}</td>
+      <td>\${r.slHitRate !== null ? r.slHitRate + '%' : '<span class="ev-zero">—</span>'}</td>
+      <td>\${autoSign}</td>
+      <td>\${ghostSign}</td>
+      <td style="color:var(--dim)">\${r.ghostTrades ?? '—'}</td>
+      <td>\${r.tpHitRate !== null ? r.tpHitRate + '%' : '<span class="ev-zero">—</span>'}</td>
+    </tr>\`;
+
+    if (isExp) {
+      html += \`<tr class="detail-row"><td colspan="12">\${buildDetailPanel(r)}</td></tr>\`;
+    }
+  }
+
+  tbody.innerHTML = html;
+}
+
+// ── DETAIL PANEL ──────────────────────────────────────────────
+function buildDetailPanel(r) {
+  const tp  = r._tpSess;
+  const sl  = r._slData;
+  const sh  = r._shadow;
+  const gh  = r._ghost;
+
+  let html = '<div class="detail-panel">';
+
+  // TP Ghost
+  html += \`<div class="detail-section">
+    <h4>👻 TP Ghost — \${r.symbol} / \${r.session}</h4>
+    <div class="kv-row"><span class="k">Locked RR</span><span class="v accent">\${tp?.lockedRR ?? '—'}R</span></div>
+    <div class="kv-row"><span class="k">EV at lock</span><span class="v \${(tp?.evAtLock??0)>0?'green':'red'}">\${tp?.evAtLock?.toFixed(3) ?? '—'}</span></div>
+    <div class="kv-row"><span class="k">Trades used</span><span class="v">\${tp?.lockedTrades ?? '—'}</span></div>
+    <div class="kv-row"><span class="k">Prev RR</span><span class="v">\${tp?.prevRR ?? '—'}R</span></div>
+    <div class="kv-row"><span class="k">EV positive</span><span class="v \${tp?.evPositive?'green':'red'}">\${tp?.evPositive ? 'YES ✅' : 'NO ❌'}</span></div>
+    <div class="kv-row"><span class="k">Locked at</span><span class="v" style="color:var(--dim);font-size:10px">\${tp?.lockedAt ? new Date(tp.lockedAt).toLocaleString('en-GB') : '—'}</span></div>
+  </div>\`;
+
+  // SL Shadow
+  const bestMult  = sh?.best?.slMultiplier;
+  const multLabel = !bestMult ? '—' : bestMult > 1 ? \`🔼 \${bestMult}× (wider)\` : bestMult < 1 ? \`🔽 \${bestMult}× (tighter)\` : '✅ current optimal';
+  html += \`<div class="detail-section">
+    <h4>🌑 SL Shadow — \${r.symbol}</h4>
+    <div class="kv-row"><span class="k">Best multiplier</span><span class="v gold">\${multLabel}</span></div>
+    <div class="kv-row"><span class="k">Best EV</span><span class="v \${(sh?.best?.bestEV??0)>0?'green':'red'}">\${sh?.best?.bestEV?.toFixed(3) ?? '—'}</span></div>
+    <div class="kv-row"><span class="k">Best TP RR</span><span class="v">\${sh?.best?.bestRR ?? sl?.bestTPRR ?? '—'}R</span></div>
+    <div class="kv-row"><span class="k">Winrate at best</span><span class="v">\${sh?.best?.bestWinrate ?? '—'}%</span></div>
+    <div class="kv-row"><span class="k">SL hit rate</span><span class="v">\${sh?.best?.slHitRate ?? '—'}%</span></div>
+    <div class="kv-row"><span class="k">Trades used</span><span class="v">\${sh?.tradesUsed ?? '—'} <span style="color:var(--dim)">(excl. \${sh?.tradesExcludedSL??0} SL)</span></span></div>
+    <div class="kv-row"><span class="k">Auto applied</span><span class="v \${sl?.autoApplied?'green':'ev-zero'}">\${sl?.autoApplied ? 'YES ✅' : 'No'}</span></div>
+    <div class="kv-row"><span class="k">Direction</span><span class="v purple">\${sl?.direction ?? '—'}</span></div>
+    <div class="kv-row"><span class="k">Current mult</span><span class="v">\${sl?.multiplier ?? '—'}×</span></div>
+  </div>\`;
+
+  // Ghost stats
+  html += \`<div class="detail-section">
+    <h4>📊 Ghost Analytics — \${r.symbol} / \${r.session}</h4>
+    <div class="kv-row"><span class="k">Ghost trades</span><span class="v">\${gh?.trades ?? '—'}</span></div>
+    <div class="kv-row"><span class="k">Avg extra RR</span><span class="v \${(gh?.avgExtraRR??0)>0?'green':'red'}">\${gh?.avgExtraRR !== undefined ? (gh.avgExtraRR>=0?'+':'')+gh.avgExtraRR.toFixed(3)+'R' : '—'}</span></div>
+    <div class="kv-row"><span class="k">TP hit rate</span><span class="v">\${gh?.tpHitRate ?? '—'}%</span></div>
+    <div class="kv-row"><span class="k">Manual closes</span><span class="v gold">\${gh?.manualCount ?? '—'}</span></div>
+  </div>\`;
+
+  // SL Shadow EV table (mini)
+  if (sh?.analysis?.length) {
+    const bestEV  = Math.max(...sh.analysis.map(a=>a.ev));
+    const currRow = sh.analysis.find(a=>a.slMultiplier===1.0);
+    html += '<div class="detail-section"><h4>SL Shadow EV Table</h4>';
+    html += '<table class="ev-mini-table"><thead><tr><th>Mult</th><th>EV</th><th>Winrate</th><th>Best RR</th><th>SL Hit%</th></tr></thead><tbody>';
+    for (const row of sh.analysis) {
+      const isBest = Math.abs(row.ev - bestEV) < 0.0001;
+      const isCurr = row.slMultiplier === 1.0;
+      html += \`<tr class="\${isBest?'best-row':''}\${isCurr?' current-row':''}">
+        <td>\${row.slMultiplier}×\${isCurr?' ◀':''}</td>
+        <td>\${row.ev?.toFixed(3)??'—'}</td>
+        <td>\${row.winRate??'—'}%</td>
+        <td>\${row.bestRR??'—'}R</td>
+        <td>\${row.slHitRate??'—'}%</td>
+      </tr>\`;
+    }
+    html += '</tbody></table></div>';
+  }
+
+  html += '</div>';
+  return html;
+}
+
+// ── INTERACTIONS ──────────────────────────────────────────────
+function toggleDetail(key) {
+  expandedKey = expandedKey === key ? null : key;
+  renderTable();
+}
+
+function setSession(sess, btn) {
+  sessionFilter = sess;
+  document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  renderTable();
+}
+
+function filterSymbol(val) {
+  symbolFilter = val;
+  renderTable();
+}
+
+function sortBy(key) {
+  if (sortKey === key) { sortDir *= -1; }
+  else { sortKey = key; sortDir = 1; }
+  document.querySelectorAll('thead th').forEach(th => {
+    th.classList.remove('sort-asc', 'sort-desc');
+  });
+  const idx = ['symbol','session','tpRR','tpEV','tpTrades','slMult','slEV','slHitRate','slAuto','ghostExtra','ghostTrades','tpHitRate'].indexOf(key);
+  const ths = document.querySelectorAll('thead th');
+  if (ths[idx]) ths[idx].classList.add(sortDir === 1 ? 'sort-asc' : 'sort-desc');
+  renderTable();
+}
+
+// ── LOGS ──────────────────────────────────────────────────────
+async function loadLogs() {
+  // TP log
+  try {
+    const tpLog = await fetch('/tp-locks').then(r=>r.json());
+    // Build from locksBySymbol
+    const entries = [];
+    for (const [sym, sessions] of Object.entries(tpLog.locksBySymbol||{})) {
+      for (const [sess, lock] of Object.entries(sessions)) {
+        entries.push({ sym, sess, rr: lock.lockedRR, ev: lock.evAtLock, ts: lock.lockedAt, prev: lock.prevRR });
+      }
+    }
+    entries.sort((a,b) => (b.ts||'').localeCompare(a.ts||''));
+    const tpLogEl = document.getElementById('tp-log');
+    if (!entries.length) { tpLogEl.innerHTML = '<div class="no-data">No TP Ghost data yet</div>'; return; }
+    tpLogEl.innerHTML = entries.slice(0,20).map(e => \`
+      <div class="log-item">
+        <div><span class="log-sym">\${e.sym}</span><span style="color:var(--dim);\${e.sess==='asia'?'color:#7b61ff':e.sess==='london'?'color:#00ffe0':'color:#f5c842'}">\${e.sess}</span></div>
+        <div class="log-val" style="color:var(--accent)">\${e.prev ? e.prev+'R → ' : ''}\${e.rr}R</div>
+        <div style="color:\${(e.ev??0)>0?'var(--green)':'var(--red)'}">EV \${e.ev?.toFixed(3)??'—'}</div>
+        <div class="log-ts">\${e.ts ? new Date(e.ts).toLocaleDateString('en-GB') : ''}</div>
+      </div>\`).join('');
+  } catch(e) {}
+
+  // SL log
+  try {
+    const slLog = await fetch('/sl-locks').then(r=>r.json());
+    const entries = (slLog.analyses||[]).filter(a=>a.lockedAt);
+    entries.sort((a,b)=>(b.lockedAt||'').localeCompare(a.lockedAt||''));
+    const slLogEl = document.getElementById('sl-log');
+    if (!entries.length) { slLogEl.innerHTML = '<div class="no-data">No SL Shadow data yet</div>'; return; }
+    slLogEl.innerHTML = entries.slice(0,20).map(e => \`
+      <div class="log-item">
+        <div><span class="log-sym">\${e.symbol}</span><span style="color:var(--dim)">\${e.direction||'—'}</span></div>
+        <div class="log-val" style="color:\${e.multiplier>1?'var(--gold)':e.multiplier<1?'var(--accent2)':'var(--green)'}">\${e.multiplier}×</div>
+        <div style="color:\${(e.evAtLock??0)>0?'var(--green)':'var(--red)'}">EV \${e.evAtLock?.toFixed(3)??'—'}</div>
+        <div style="color:\${e.autoApplied?'var(--green)':'var(--dim)'}; font-size:10px">\${e.autoApplied?'AUTO':'READONLY'}</div>
+        <div class="log-ts">\${e.lockedAt ? new Date(e.lockedAt).toLocaleDateString('en-GB') : ''}</div>
+      </div>\`).join('');
+  } catch(e) {}
+}
+
+// ── INIT ──────────────────────────────────────────────────────
+loadAll();
+setInterval(loadAll, 30000); // auto-refresh every 30s
+</script>
+</body>
+</html>`);
+});
 
 app.use((req, res) => {
   res.status(404).json({ error:"Route niet gevonden", geprobeerd:req.method+" "+req.originalUrl });
