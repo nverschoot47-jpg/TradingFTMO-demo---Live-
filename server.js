@@ -1,16 +1,32 @@
 // ═══════════════════════════════════════════════════════════════
-// TradingView → MetaApi REST → MT5  |  FTMO Webhook Server v5.1
+// TradingView → MetaApi REST → MT5  |  FTMO Webhook Server v5.2
 // Account : Nick Verschoot — FTMO Demo
 // MetaApi : 7cb566c1-be02-415b-ab95-495368f3885c
 // ───────────────────────────────────────────────────────────────
-// WIJZIGINGEN v5.1 (t.o.v. v5.0):
-//  ✅ [FIX 3] Forex consolidatie telt herstelde posities niet mee
-//             → Na Railway restart worden restoredAfterRestart posities
-//               geskipt in checkForexConsolidation()
-//             → Geen onterechte blokkering na herstart
-//  ✅ [FIX 5] Webhook timeout bescherming via placeOrderWithTimeout()
-//             → MetaApi krijgt max 8s om te antwoorden
-//             → TradingView krijgt altijd een antwoord → geen dubbele orders
+// WIJZIGINGEN v5.2 (t.o.v. v5.1):
+//  ✅ [FEAT 1]  Forex uitgebreid — alle pairs behalve JPY & exotics
+//              EURNZD + GBPNZD toegevoegd; 7 JPY-pairs verwijderd
+//  ✅ [FEAT 2]  UK Index min SL: 5 → 2
+//  ✅ [FEAT 3]  Ghost Trading hard stop: 22:00 (was 20:00)
+//              Loopt door bij: manual close, TP close, TP lock,
+//              shadow optimisation. Stopt alleen bij SL phantom
+//              trigger of 22:00 hard stop.
+//  ✅ [FEAT 4]  Vast TP = Risk × 4R voor ALLE trades in sessie/pair
+//              (niet enkel eerste trade, niet afhankelijk van EV lock)
+//  ✅ [FEAT 5]  TP lock na 3 trades per pair per sessie (avondregel)
+//  ✅ [FEAT 6]  Daily Risk Scaling: positieve EV → Risk ×1.2 volgende
+//              dag; geen positieve EV → reset naar standaard
+//  ✅ [FEAT 7]  SL Shadow Optimizer trigger: 50 → 30 trades
+//  ✅ [FEAT 8]  Duplicate entry guard — zelfde pair+richting binnen
+//              60s volledig geblokkeerd
+//  ✅ [FEAT 9]  Hard tijdslimieten bijgewerkt:
+//              - Auto-close: 20:50 → 21:50
+//              - Ghost + Shadow stop cron: 22:00 (nieuw)
+//              - Reconnect cron: 02:00 (nieuw)
+//  ✅ [FEAT 10] Forex pyramiding: max 2× per pair per richting
+//              (was 3×). Trade 1 = vol risk, Trade 2 = 50% risk.
+//  ✅ [KEEP]   Fix 3 (forex consolidation restart) — ongewijzigd
+//  ✅ [KEEP]   Fix 5 (webhook timeout 8s) — ongewijzigd
 // ═══════════════════════════════════════════════════════════════
 
 "use strict";
@@ -27,6 +43,8 @@ const {
   saveGhostAnalysis, loadGhostAnalysis,
   savePnlLog, loadPnlStats,
   logForexConsolidation,
+  saveDailyRisk, loadLatestDailyRisk,
+  logDuplicateEntry,
 } = require("./db");
 
 const {
@@ -34,6 +52,8 @@ const {
   getBrusselsDateStr,
   getSessionGMT1,
   isMarketOpen: isMarketOpenFn,
+  isGhostActive,
+  isShadowActive,
   SESSION_LABELS,
 } = require("./session");
 
@@ -52,16 +72,23 @@ const GHOST_OLD_THRESHOLD_MS   = 6 * 3600 * 1000;
 const RR_LEVELS    = [0.2, 0.4, 0.6, 0.8, 1, 1.5, 2, 2.5, 3, 4, 5, 6, 7, 8, 10, 12, 15, 20, 25];
 const SL_MULTIPLES = [0.5, 0.6, 0.75, 0.85, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0];
 
-const SL_AUTO_APPLY_THRESHOLD  = 50;
+// [FEAT 7] SL shadow optimizer na 30 trades (was 50)
+const SL_AUTO_APPLY_THRESHOLD  = 30;
+
+// [FEAT 4] Vast TP = 4R voor alle trades
+const FIXED_TP_RR = 4;
 
 const STOCK_SL_SPREAD_MULT      = 1.5;
 const STOCK_MAX_SPREAD_FRACTION = 0.333;
 
-const FOREX_MAX_SAME_DIR        = 3;
-const FOREX_HALF_RISK_THRESHOLD = 1;
+// [FEAT 10] Forex pyramiding: max 2× per pair/richting
+const FOREX_MAX_SAME_DIR        = 2;  // was 3
+const FOREX_HALF_RISK_THRESHOLD = 1;  // trade 2 krijgt 50% risk
+
+const TP_LOCK_RISK_MULT = 4;
 
 // ── RISICO PER TYPE ───────────────────────────────────────────
-const RISK = {
+const BASE_RISK = {
   index:  parseFloat(process.env.RISK_INDEX  || "200"),
   forex:  parseFloat(process.env.RISK_FOREX  || "15"),
   gold:   parseFloat(process.env.RISK_GOLD   || "30"),
@@ -71,7 +98,13 @@ const RISK = {
   stock:  parseFloat(process.env.RISK_STOCK  || "30"),
 };
 
-const TP_LOCK_RISK_MULT = 4;
+// [FEAT 6] Daily risk multiplier — wordt bijgewerkt door dagelijkse EV check
+let dailyRiskMultiplier     = 1.0;   // actief voor vandaag
+let dailyRiskMultiplierNext = 1.0;   // berekend einde dag, toepassen morgen
+
+function getRisk(type) {
+  return (BASE_RISK[type] || 30) * dailyRiskMultiplier;
+}
 
 function resetDailyLossIfNewDay() {}
 function ftmoSafetyCheck(_r) { return { ok: true }; }
@@ -89,6 +122,10 @@ const slLocks          = {};
 const tpUpdateLog      = [];
 const slUpdateLog      = [];
 
+// [FEAT 8] Duplicate entry guard — key: "SYMBOL_direction", value: timestamp
+const recentOrderGuard = new Map();
+const DUPLICATE_GUARD_MS = 60 * 1000; // 60 seconden window
+
 const MAX_SNAPSHOTS = 86400;
 const MAX_HISTORY   = 200;
 const MAX_TP_LOG    = 100;
@@ -105,8 +142,11 @@ const learnedPatches = {};
 
 // ══════════════════════════════════════════════════════════════
 // SYMBOL MAP
+// [FEAT 1] JPY-pairs verwijderd. EURNZD + GBPNZD toegevoegd.
+// Alle resterende forex zijn major/minor zonder JPY/exotics.
 // ══════════════════════════════════════════════════════════════
 const SYMBOL_MAP = {
+  // ── Indices ──────────────────────────────────────────────
   "DE30EUR":     { mt5: "GER40.cash",  type: "index" },
   "UK100GBP":    { mt5: "UK100.cash",  type: "index" },
   "NAS100USD":   { mt5: "US100.cash",  type: "index" },
@@ -144,6 +184,7 @@ const SYMBOL_MAP = {
   "HK50.cash":   { mt5: "HK50.cash",   type: "index" },
   "US2000":      { mt5: "US2000.cash", type: "index" },
   "US2000.cash": { mt5: "US2000.cash", type: "index" },
+  // ── Commodities & Crypto ─────────────────────────────────
   "XAUUSD":      { mt5: "XAUUSD",      type: "gold"   },
   "GOLD":        { mt5: "XAUUSD",      type: "gold"   },
   "UKOIL":       { mt5: "UKOIL.cash",  type: "brent"  },
@@ -152,8 +193,11 @@ const SYMBOL_MAP = {
   "USOIL.cash":  { mt5: "USOIL.cash",  type: "wti"    },
   "BTCUSD":      { mt5: "BTCUSD",      type: "crypto" },
   "ETHUSD":      { mt5: "ETHUSD",      type: "crypto" },
+  // ── Stocks ───────────────────────────────────────────────
   "AAPL":  { mt5: "AAPL",  type: "stock" },
+  "APC":   { mt5: "AAPL",  type: "stock" }, // TradingView alias
   "TSLA":  { mt5: "TSLA",  type: "stock" },
+  "TLO":   { mt5: "TSLA",  type: "stock" }, // TradingView alias
   "MSFT":  { mt5: "MSFT",  type: "stock" },
   "NVDA":  { mt5: "NVDA",  type: "stock" },
   "AMD":   { mt5: "AMD",   type: "stock" },
@@ -194,32 +238,29 @@ const SYMBOL_MAP = {
   "WMT":   { mt5: "WMT",   type: "stock" },
   "XOM":   { mt5: "XOM",   type: "stock" },
   "ZM":    { mt5: "ZM",    type: "stock" },
+  // ── Forex — major/minor pairs (geen JPY, geen exotics) ───
+  // [FEAT 1] JPY-pairs (USDJPY/EURJPY/GBPJPY/AUDJPY/CADJPY/NZDJPY/CHFJPY) verwijderd
   "EURUSD": { mt5: "EURUSD", type: "forex" },
   "GBPUSD": { mt5: "GBPUSD", type: "forex" },
-  "USDJPY": { mt5: "USDJPY", type: "forex" },
   "USDCHF": { mt5: "USDCHF", type: "forex" },
   "USDCAD": { mt5: "USDCAD", type: "forex" },
   "AUDUSD": { mt5: "AUDUSD", type: "forex" },
   "NZDUSD": { mt5: "NZDUSD", type: "forex" },
   "EURGBP": { mt5: "EURGBP", type: "forex" },
-  "EURJPY": { mt5: "EURJPY", type: "forex" },
   "EURCHF": { mt5: "EURCHF", type: "forex" },
   "EURAUD": { mt5: "EURAUD", type: "forex" },
   "EURCAD": { mt5: "EURCAD", type: "forex" },
-  "GBPJPY": { mt5: "GBPJPY", type: "forex" },
+  "EURNZD": { mt5: "EURNZD", type: "forex" }, // nieuw
   "GBPCHF": { mt5: "GBPCHF", type: "forex" },
   "GBPAUD": { mt5: "GBPAUD", type: "forex" },
   "GBPCAD": { mt5: "GBPCAD", type: "forex" },
-  "AUDJPY": { mt5: "AUDJPY", type: "forex" },
+  "GBPNZD": { mt5: "GBPNZD", type: "forex" }, // nieuw
   "AUDCAD": { mt5: "AUDCAD", type: "forex" },
   "AUDCHF": { mt5: "AUDCHF", type: "forex" },
   "AUDNZD": { mt5: "AUDNZD", type: "forex" },
-  "CADJPY": { mt5: "CADJPY", type: "forex" },
   "CADCHF": { mt5: "CADCHF", type: "forex" },
-  "NZDJPY": { mt5: "NZDJPY", type: "forex" },
   "NZDCAD": { mt5: "NZDCAD", type: "forex" },
   "NZDCHF": { mt5: "NZDCHF", type: "forex" },
-  "CHFJPY": { mt5: "CHFJPY", type: "forex" },
 };
 
 // ── LOT / STOP CONFIG ─────────────────────────────────────────
@@ -227,21 +268,33 @@ const LOT_VALUE = { index:20, gold:100, brent:10, wti:10, crypto:1, stock:1, for
 const MAX_LOTS  = { index:10, gold:1,   brent:5,  wti:5,  crypto:1, stock:50, forex:0.25 };
 
 const MIN_STOP_INDEX = {
-  "GER40.cash":10, "UK100.cash":5, "US100.cash":10, "US30.cash":10,
-  "US500.cash":5,  "JP225.cash":10, "AUS200.cash":5, "EU50.cash":5,
-  "FRA40.cash":5,  "HK50.cash":10, "US2000.cash":5,
+  "GER40.cash":10,
+  "UK100.cash":2,    // [FEAT 2] was 5 → 2
+  "US100.cash":10,
+  "US30.cash":10,
+  "US500.cash":5,
+  "JP225.cash":10,
+  "AUS200.cash":5,
+  "EU50.cash":5,
+  "FRA40.cash":5,
+  "HK50.cash":10,
+  "US2000.cash":5,
 };
 const MIN_STOP_COMMODITY = {
   "XAUUSD":1.0, "UKOIL.cash":0.05, "USOIL.cash":0.05, "BTCUSD":100.0, "ETHUSD":5.0,
 };
+
+// [FEAT 1] Geen JPY pairs in min-stop map (worden niet getraded)
 const MIN_STOP_FOREX = {
   "EURUSD":0.0005, "GBPUSD":0.0005, "AUDUSD":0.0005, "NZDUSD":0.0005,
-  "USDCHF":0.0005, "USDCAD":0.0005, "EURGBP":0.0005, "EURAUD":0.0005,
-  "EURCAD":0.0005, "EURCHF":0.0005, "GBPAUD":0.0005, "GBPCAD":0.0005,
-  "GBPCHF":0.0005, "AUDCAD":0.0005, "AUDCHF":0.0005, "AUDNZD":0.0005,
-  "CADCHF":0.0005, "NZDCAD":0.0005, "NZDCHF":0.0005,
-  "USDJPY":0.05, "EURJPY":0.05, "GBPJPY":0.05, "AUDJPY":0.05,
-  "CADJPY":0.05, "NZDJPY":0.05, "CHFJPY":0.05,
+  "USDCHF":0.0005, "USDCAD":0.0005,
+  "EURGBP":0.0005, "EURAUD":0.0005, "EURCAD":0.0005, "EURCHF":0.0005,
+  "EURNZD":0.0005, // nieuw
+  "GBPAUD":0.0005, "GBPCAD":0.0005, "GBPCHF":0.0005,
+  "GBPNZD":0.0005, // nieuw
+  "AUDCAD":0.0005, "AUDCHF":0.0005, "AUDNZD":0.0005,
+  "CADCHF":0.0005,
+  "NZDCAD":0.0005, "NZDCHF":0.0005,
 };
 const MIN_STOP_STOCK_PCT = 0.001;
 
@@ -317,24 +370,65 @@ async function fetchCurrentPrice(mt5Symbol) {
   } catch(e) { console.warn(`⚠️ fetchCurrentPrice(${mt5Symbol}):`, e.message); return null; }
 }
 
-// ── AUTO-CLOSE 20:50 Brussels ─────────────────────────────────
-cron.schedule("50 20 * * *", async () => {
+// ── [FEAT 9] AUTO-CLOSE 21:50 Brussels (was 20:50) ───────────
+cron.schedule("50 21 * * *", async () => {
   const { day } = getBrusselsComponents();
   const isWE = day === 0 || day === 6;
-  console.log("🔔 20:50 Brussels — auto-close gestart...");
+  console.log("🔔 21:50 Brussels — auto-close gestart...");
   try {
     const positions = await fetchOpenPositions();
-    if (!Array.isArray(positions) || !positions.length) return;
-    for (const pos of positions) {
-      const tvSym = Object.keys(SYMBOL_MAP).find(k => SYMBOL_MAP[k].mt5 === pos.symbol) || pos.symbol;
-      if (isWE && getSymbolType(tvSym) === "crypto" && isCryptoWeekend(tvSym)) continue;
-      try {
-        await closePosition(pos.id);
-        console.log(`✅ Auto-close: ${pos.symbol}`);
-        addWebhookHistory({ type:"AUTOCLOSE_2050", symbol:pos.symbol, positionId:pos.id });
-      } catch(e) { console.error(`❌ Auto-close ${pos.symbol}:`, e.message); }
+    if (!Array.isArray(positions) || !positions.length) {
+      console.log("📭 Geen open posities bij auto-close.");
+    } else {
+      for (const pos of positions) {
+        const tvSym = Object.keys(SYMBOL_MAP).find(k => SYMBOL_MAP[k].mt5 === pos.symbol) || pos.symbol;
+        if (isWE && getSymbolType(tvSym) === "crypto" && isCryptoWeekend(tvSym)) continue;
+        try {
+          await closePosition(pos.id);
+          console.log(`✅ Auto-close 21:50: ${pos.symbol}`);
+          addWebhookHistory({ type:"AUTOCLOSE_2150", symbol:pos.symbol, positionId:pos.id });
+        } catch(e) { console.error(`❌ Auto-close ${pos.symbol}:`, e.message); }
+      }
     }
+    // [FEAT 6] Bereken dagelijkse EV na sluiting posities
+    await evaluateDailyRisk();
   } catch(e) { console.error("❌ Auto-close fout:", e.message); }
+}, { timezone: "Europe/Brussels" });
+
+// ── [FEAT 9] GHOST + SHADOW HARD STOP 22:00 ──────────────────
+cron.schedule("0 22 * * *", async () => {
+  console.log("🌙 22:00 Brussels — ghost & shadow hard stop...");
+
+  // Stop alle actieve ghost trackers
+  let ghostCount = 0;
+  for (const [ghostId, g] of Object.entries(ghostTrackers)) {
+    finaliseGhost(ghostId, g.trade, g.bestPrice, "day_end_22:00", g.startedAt);
+    ghostCount++;
+  }
+  console.log(`👻 ${ghostCount} ghost(s) gestopt om 22:00`);
+
+  // Consolideer sessie data
+  const todayTrades = closedTrades.filter(t => {
+    if (!t.closedAt) return false;
+    const d = new Date(t.closedAt);
+    const now = new Date();
+    return d.toDateString() === now.toDateString();
+  });
+  console.log(`📊 Sessie data: ${todayTrades.length} trades vandaag opgeslagen`);
+  addWebhookHistory({ type:"DAY_END_22:00", ghostsStopped: ghostCount, todayTrades: todayTrades.length });
+}, { timezone: "Europe/Brussels" });
+
+// ── [FEAT 9] RECONNECT 02:00 Brussels ────────────────────────
+cron.schedule("0 2 * * *", async () => {
+  console.log("🔄 02:00 Brussels — dagelijkse reconnect...");
+  // Pas risk multiplier toe voor nieuwe dag
+  dailyRiskMultiplier = dailyRiskMultiplierNext;
+  console.log(`💰 [Risk] Multiplier voor vandaag: ×${dailyRiskMultiplier.toFixed(2)}`);
+  // Herstel open posities van MT5
+  await restoreOpenPositionsFromMT5();
+  // Reset duplicate guard
+  recentOrderGuard.clear();
+  addWebhookHistory({ type:"RECONNECT_02:00", riskMultiplier: dailyRiskMultiplier });
 }, { timezone: "Europe/Brussels" });
 
 // ── NIGHTLY TP OPTIMIZER 03:00 Brussels ──────────────────────
@@ -347,6 +441,40 @@ cron.schedule("0 3 * * *", async () => {
   }
   console.log(`✅ Nightly optimizer klaar — ${symbols.length} symbolen`);
 }, { timezone: "Europe/Brussels" });
+
+// ── [FEAT 6] DAILY RISK SCALING ───────────────────────────────
+async function evaluateDailyRisk() {
+  try {
+    const today = new Date();
+    const todayStr = today.toISOString().split("T")[0];
+
+    const todayTrades = closedTrades.filter(t => {
+      if (!t.closedAt) return false;
+      return t.closedAt.startsWith(todayStr);
+    });
+
+    const totalPnl = todayTrades.reduce((sum, t) => sum + (t.realizedPnlEUR ?? 0), 0);
+    const evPositive = totalPnl > 0;
+
+    // Bepaal multiplier voor morgen
+    dailyRiskMultiplierNext = evPositive
+      ? parseFloat(Math.min(dailyRiskMultiplier * 1.2, 3.0).toFixed(2)) // max cap ×3
+      : 1.0; // reset naar standaard
+
+    console.log(
+      `📅 [Daily Risk] ${todayStr}: PnL=€${totalPnl.toFixed(2)} | EV=${evPositive?"✅":"❌"} | ` +
+      `Morgen mult=×${dailyRiskMultiplierNext}`
+    );
+
+    await saveDailyRisk(
+      todayStr,
+      totalPnl,
+      todayTrades.length,
+      dailyRiskMultiplier,
+      dailyRiskMultiplierNext
+    );
+  } catch(e) { console.warn("⚠️ evaluateDailyRisk:", e.message); }
+}
 
 // ── RESTART RECOVERY ──────────────────────────────────────────
 async function restoreOpenPositionsFromMT5() {
@@ -367,12 +495,12 @@ async function restoreOpenPositionsFromMT5() {
       openPositions[id] = {
         id, symbol: tvSym, mt5Symbol: pos.symbol, direction,
         entry, sl: pos.stopLoss ?? 0, tp: pos.takeProfit ?? null,
-        lots: pos.volume ?? 0.01, riskEUR: RISK[getSymbolType(tvSym)] ?? 30,
+        lots: pos.volume ?? 0.01, riskEUR: getRisk(getSymbolType(tvSym)),
         openedAt: pos.time ?? new Date().toISOString(),
         session, sessionLabel: SESSION_LABELS[session] || session,
         maxPrice: entry, maxRR: 0, currentPnL: pos.unrealizedProfit ?? 0,
         lastSync: null, slMultiplierApplied: 1.0, spreadGuard: false,
-        restoredAfterRestart: true, // [FIX 3] markering voor consolidatie check
+        restoredAfterRestart: true,
       };
       incrementTracker(tvSym, direction);
       restored++;
@@ -382,24 +510,19 @@ async function restoreOpenPositionsFromMT5() {
   } catch(e) { console.warn("⚠️ [Restart Recovery] Mislukt:", e.message); }
 }
 
-// ══════════════════════════════════════════════════════════════
-// [FIX 3] FOREX ANTI-CONSOLIDATIE
-// Herstelde posities (restoredAfterRestart) worden geskipt.
-// Reden: die posities waren al geteld vóór de restart.
-// Zonder deze fix worden ze dubbel geteld → onterechte blokkering.
-// ══════════════════════════════════════════════════════════════
+// ── [FIX 3] FOREX ANTI-CONSOLIDATIE ──────────────────────────
+// [FEAT 10] Aangepast: max 2× (was 3×), halfRisk bij count===1
 function checkForexConsolidation(symbol, direction) {
   const mt5Sym = getMT5Symbol(symbol);
   let count = 0;
   for (const pos of Object.values(openPositions)) {
-    // [FIX 3] Sla herstelde posities over — die waren al geteld vóór restart
     if (pos.restoredAfterRestart) continue;
     const posMt5 = getMT5Symbol(pos.symbol) || pos.mt5Symbol;
     if ((posMt5 === mt5Sym || pos.symbol === symbol) && pos.direction === direction) count++;
   }
   return {
-    blocked:  count >= FOREX_MAX_SAME_DIR,
-    halfRisk: count >= FOREX_HALF_RISK_THRESHOLD && count < FOREX_MAX_SAME_DIR,
+    blocked:  count >= FOREX_MAX_SAME_DIR,          // ≥2 → geblokkeerd
+    halfRisk: count >= FOREX_HALF_RISK_THRESHOLD && count < FOREX_MAX_SAME_DIR, // count===1 → 50%
     count,
   };
 }
@@ -415,11 +538,26 @@ function checkSpreadGuard(spread, entryNum, slNum) {
   };
 }
 
+// ── [FEAT 8] DUPLICATE ENTRY GUARD ───────────────────────────
+function isDuplicateOrder(symbol, direction) {
+  const key = `${symbol}_${direction}`;
+  const last = recentOrderGuard.get(key);
+  if (!last) return false;
+  return (Date.now() - last) < DUPLICATE_GUARD_MS;
+}
+
+function registerRecentOrder(symbol, direction) {
+  const key = `${symbol}_${direction}`;
+  recentOrderGuard.set(key, Date.now());
+  // Auto-cleanup na 2 minuten
+  setTimeout(() => recentOrderGuard.delete(key), DUPLICATE_GUARD_MS * 2);
+}
+
 // ── HELPERS ───────────────────────────────────────────────────
 function getEffectiveRisk(symbol, direction) {
   const key   = `${symbol}_${direction}`;
   const count = openTradeTracker[key] || 0;
-  const base  = RISK[getSymbolType(symbol)] || 30;
+  const base  = getRisk(getSymbolType(symbol)); // [FEAT 6] gebruikt dagelijkse multiplier
   let risk    = Math.max(base * 0.10, base / Math.pow(2, count));
 
   const curSess = getSessionGMT1();
@@ -464,7 +602,7 @@ function calcLots(symbol, entry, sl, risk) {
   lots = Math.min(lots, maxLots);
   lots = Math.max(lots, lotStep);
 
-  const baseRisk     = RISK[type] || 30;
+  const baseRisk     = getRisk(type);
   const isTPLockRisk = risk >= baseRisk * TP_LOCK_RISK_MULT;
   const effectiveCap = isTPLockRisk ? baseRisk * TP_LOCK_RISK_MULT : baseRisk;
   const minCost      = lots * dist * lotVal;
@@ -538,6 +676,8 @@ function getSLDirection(analysis) {
 
 // ══════════════════════════════════════════════════════════════
 // GHOST TRACKER
+// [FEAT 3] Loopt door tot 22:00 — stopt niet bij 20:00
+// Stopt enkel bij: SL phantom trigger of 22:00 hard stop
 // ══════════════════════════════════════════════════════════════
 function startGhostTracker(closedTrade) {
   const ghostId   = `ghost_${closedTrade.id}_${Date.now()}`;
@@ -549,9 +689,11 @@ function startGhostTracker(closedTrade) {
 
   async function tick() {
     try {
-      const { hhmm } = getBrusselsComponents();
+      // [FEAT 3] Gebruik isGhostActive() i.p.v. hhmm >= 2000
+      // Ghost stopt bij 22:00, niet bij 20:00
       const elapsed   = Date.now() - startedAt;
-      const shouldStop = elapsed >= GHOST_DURATION_MS || hhmm >= 2000 || hhmm < 200;
+      const ghostOk   = isGhostActive();
+      const shouldStop = elapsed >= GHOST_DURATION_MS || !ghostOk;
 
       const priceData = await fetchCurrentPrice(closedTrade.mt5Symbol);
       const price     = priceData?.mid ?? null;
@@ -561,19 +703,21 @@ function startGhostTracker(closedTrade) {
         if (better) bestPrice = price;
         if (ghostTrackers[ghostId]) ghostTrackers[ghostId].bestPrice = bestPrice;
 
+        // SL Phantom Trigger — stopt ghost onmiddellijk
         const slBreach = closedTrade.direction === "buy"
           ? price <= closedTrade.sl
           : price >= closedTrade.sl;
 
         if (slBreach) {
-          finaliseGhost(ghostId, closedTrade, bestPrice, "sl_breach", startedAt);
+          console.log(`💀 [Ghost] SL phantom trigger: ${closedTrade.symbol}`);
+          finaliseGhost(ghostId, closedTrade, bestPrice, "sl_phantom_trigger", startedAt);
           return;
         }
       }
 
       if (shouldStop) {
-        finaliseGhost(ghostId, closedTrade, bestPrice,
-          elapsed >= GHOST_DURATION_MS ? "timeout" : "market_closed", startedAt);
+        const reason = elapsed >= GHOST_DURATION_MS ? "timeout" : "day_end_22:00";
+        finaliseGhost(ghostId, closedTrade, bestPrice, reason, startedAt);
         return;
       }
 
@@ -632,6 +776,8 @@ function finaliseGhost(ghostId, trade, bestPrice, reason, startedAt) {
 
 // ══════════════════════════════════════════════════════════════
 // TP LOCK ENGINE
+// [FEAT 5] TP lock na 3 trades (ongewijzigd — was al correct)
+// [FEAT 4] FIXED_TP_RR = 4 als default wanneer geen EV-data
 // ══════════════════════════════════════════════════════════════
 async function runTPLockEngine(symbol) {
   for (const session of TRADING_SESSIONS) {
@@ -648,6 +794,7 @@ async function _runTPLockForSession(symbol, session) {
   const n       = trades.length;
   const lockKey = `${symbol}__${session}`;
 
+  // [FEAT 5] Lock na 3 trades
   if (n < 3) return;
 
   const existing = tpLocks[lockKey];
@@ -660,9 +807,12 @@ async function _runTPLockForSession(symbol, session) {
   const best       = evTable.reduce((a,b) => b.ev > a.ev ? b : a);
   const evPositive = best.ev > 0;
 
+  // [FEAT 4] Gebruik FIXED_TP_RR (4R) als basis; EV-optimaal als het beter is
+  const effectiveRR = evPositive ? best.rr : FIXED_TP_RR;
+
   const oldRR      = existing?.lockedRR ?? null;
   const isNew      = !existing;
-  const changed    = existing && existing.lockedRR !== best.rr;
+  const changed    = existing && existing.lockedRR !== effectiveRR;
   const needsUpdate = existing && (n - existing.lockedTrades) >= 5;
 
   if (!isNew && !changed && !needsUpdate) {
@@ -671,31 +821,39 @@ async function _runTPLockForSession(symbol, session) {
   }
 
   const reason = isNew
-    ? `eerste lock na ${n} trades [${session}]`
-    : `update na ${n} trades (${oldRR}R → ${best.rr}R) [${session}]`;
+    ? `eerste lock na ${n} trades [${session}] → ${effectiveRR}R`
+    : `update na ${n} trades (${oldRR}R → ${effectiveRR}R) [${session}]`;
 
   tpLocks[lockKey] = {
-    lockedRR: best.rr, lockedAt: new Date().toISOString(), lockedTrades: n,
+    lockedRR: effectiveRR, lockedAt: new Date().toISOString(), lockedTrades: n,
     session, prevRR: oldRR, prevLockedAt: existing?.lockedAt ?? null,
     evAtLock: best.ev, evPositive,
   };
 
-  const logEntry = { symbol, session, oldRR, newRR: best.rr, trades: n, ev: best.ev, reason, ts: new Date().toISOString() };
+  const logEntry = { symbol, session, oldRR, newRR: effectiveRR, trades: n, ev: best.ev, reason, ts: new Date().toISOString() };
   tpUpdateLog.unshift(logEntry);
   if (tpUpdateLog.length > MAX_TP_LOG) tpUpdateLog.length = MAX_TP_LOG;
 
   try {
-    await saveTPConfig(symbol, session, best.rr, n, best.ev, oldRR, existing?.lockedAt ?? null);
-    await logTPUpdate(symbol, session, oldRR, best.rr, n, best.ev, reason);
+    await saveTPConfig(symbol, session, effectiveRR, n, best.ev, oldRR, existing?.lockedAt ?? null);
+    await logTPUpdate(symbol, session, oldRR, effectiveRR, n, best.ev, reason);
   } catch(e) { console.error(`❌ [TP Lock] DB:`, e.message); }
 
-  console.log(`🔒 [TP Lock] ${symbol}/${session}: ${isNew?"NIEUW":"UPDATE"} → ${best.rr}R (EV ${best.ev}R | ${n} trades) [${evPositive?"✅":"❌ EV NEG"}]`);
+  console.log(`🔒 [TP Lock] ${symbol}/${session}: ${isNew?"NIEUW":"UPDATE"} → ${effectiveRR}R (EV ${best.ev}R | ${n} trades) [${evPositive?"✅":"⚠️ 4R default"}]`);
 }
 
 // ══════════════════════════════════════════════════════════════
 // SL LOCK ENGINE
+// [FEAT 7] Auto-apply na 30 trades (was 50)
+// [FEAT 3] Shadow optimizer check via isShadowActive()
 // ══════════════════════════════════════════════════════════════
 async function runSLLockEngine(symbol) {
+  // [FEAT 3] Shadow optimizer respecteert 22:00 stop
+  if (!isShadowActive()) {
+    console.log(`⏸️ [SL Shadow] ${symbol}: shadow optimizer gestopt (na 22:00)`);
+    return;
+  }
+
   const trades = closedTrades.filter(t => t.symbol === symbol && t.sl && t.entry);
   const n      = trades.length;
   if (n < 10) return;
@@ -705,7 +863,6 @@ async function runSLLockEngine(symbol) {
 
   const analysis  = buildSLAnalysis(trades);
   const best      = analysis.reduce((a,b) => b.bestEV > a.bestEV ? b : a);
-  const current   = analysis.find(a => a.slMultiple === 1.0);
   const direction = getSLDirection(analysis);
 
   if (best.bestEV <= 0) return;
@@ -713,6 +870,7 @@ async function runSLLockEngine(symbol) {
   const oldMult   = existing?.multiplier ?? null;
   const isNew     = !existing;
   const changed   = existing && (existing.multiplier !== best.slMultiple || existing.direction !== direction);
+  // [FEAT 7] Auto-apply na 30 trades (was SL_AUTO_APPLY_THRESHOLD = 50)
   const autoApply = n >= SL_AUTO_APPLY_THRESHOLD;
 
   if (!isNew && !changed) {
@@ -751,7 +909,7 @@ async function runSLLockEngine(symbol) {
     await logSLUpdate(symbol, oldMult, best.slMultiple, direction, n, best.bestEV, reason, autoApply);
   } catch(e) { console.error(`❌ [SL Analyse] DB:`, e.message); }
 
-  console.log(`📐 [SL ${autoApply?"AUTO":"ADVIES"}] ${symbol}: ${best.slMultiple}× (${direction}) EV +${best.bestEV}R | ${n} trades`);
+  console.log(`📐 [SL ${autoApply?"AUTO":"ADVIES"}] ${symbol}: ${best.slMultiple}× (${direction}) EV +${best.bestEV}R | ${n} trades | auto@${SL_AUTO_APPLY_THRESHOLD}`);
 }
 
 // ── SL MULTIPLIER BEPALEN ─────────────────────────────────────
@@ -779,7 +937,6 @@ function getEffectiveSLMultiplier(symbol, session, entryNum, slNum, direction) {
 }
 
 // ── POSITION SYNC (30s) ───────────────────────────────────────
-// [FIX 429] accountInfo alleen elke 5 minuten ophalen
 const ACCOUNT_SYNC_INTERVAL = 5 * 60 * 1000;
 let lastAccountSync = 0;
 
@@ -827,11 +984,11 @@ async function syncPositions() {
         if (trade.symbol && trade.direction) decrementTracker(trade.symbol, trade.direction);
         delete openPositions[id];
         console.log(`📦 ${trade.symbol} gesloten | MaxRR: ${maxRR}R | Sessie: ${session}`);
+        // [FEAT 3] Ghost start altijd — ook na TP of manual close
         startGhostTracker(closed);
       }
     }
 
-    // [FIX 429] accountInfo max 1x per 5 minuten
     if (Date.now() - lastAccountSync > ACCOUNT_SYNC_INTERVAL) {
       lastAccountSync = Date.now();
       try {
@@ -853,12 +1010,7 @@ async function syncPositions() {
 }
 setInterval(syncPositions, 30 * 1000);
 
-// ══════════════════════════════════════════════════════════════
-// [FIX 5] ORDER PLAATSEN MET TIMEOUT
-// placeOrderWithTimeout() wraps placeOrder() met een 8s deadline.
-// Als MetaApi niet antwoordt binnen 8s → error teruggeven.
-// TradingView krijgt altijd een antwoord → geen dubbele orders.
-// ══════════════════════════════════════════════════════════════
+// ── ORDER PLAATSEN MET TIMEOUT (Fix 5) ───────────────────────
 function learnFromError(symbol, code, msg) {
   const m = (msg||"").toLowerCase();
   if (!learnedPatches[symbol]) learnedPatches[symbol] = {};
@@ -879,24 +1031,26 @@ function learnFromError(symbol, code, msg) {
 }
 
 async function placeOrder(dir, symbol, entry, sl, lots, session) {
-  const mt5Symbol    = getMT5Symbol(symbol);
-  const type         = getSymbolType(symbol);
-  const slPrice      = validateSL(dir, entry, sl, mt5Symbol, type);
-  const lockKey      = `${symbol}__${session}`;
-  const tpLock       = tpLocks[lockKey];
-  const tpEvPositive = tpLock && tpLock.evPositive === true && (tpLock.evAtLock ?? 0) > 0;
-  const tpPrice      = tpEvPositive ? calcTPPrice(dir, entry, slPrice, tpLock.lockedRR) : null;
+  const mt5Symbol = getMT5Symbol(symbol);
+  const type      = getSymbolType(symbol);
+  const slPrice   = validateSL(dir, entry, sl, mt5Symbol, type);
 
-  if (tpPrice)
-    console.log(`🔒 [TP Auto] ${symbol}/${session} TP: ${tpPrice} (${tpLock.lockedRR}R)`);
+  // [FEAT 4] Vast TP = FIXED_TP_RR (4R) voor ALLE trades
+  // Override met TP lock waarde indien hoger EV beschikbaar
+  const lockKey   = `${symbol}__${session}`;
+  const tpLock    = tpLocks[lockKey];
+  const tpRR      = tpLock ? tpLock.lockedRR : FIXED_TP_RR;
+  const tpPrice   = calcTPPrice(dir, entry, slPrice, tpRR);
+
+  console.log(`🎯 [TP] ${symbol}/${session} TP: ${tpPrice} (${tpRR}R${tpLock ? " [lock]" : " [4R default]"})`);
 
   const body = {
     symbol:     mt5Symbol,
     volume:     lots,
     actionType: dir==="buy" ? "ORDER_TYPE_BUY" : "ORDER_TYPE_SELL",
     stopLoss:   slPrice,
-    comment:    `FTMO-NV-${dir.toUpperCase()}-${symbol}${tpEvPositive ? `-TP${tpLock.lockedRR}R-${session}` : ""}`,
-    ...(tpPrice ? { takeProfit: tpPrice } : {}),
+    takeProfit: tpPrice,
+    comment:    `FTMO-NV-${dir.toUpperCase()}-${symbol}-TP${tpRR}R-${session}`,
   };
 
   const r = await fetch(`${META_BASE}/trade`, {
@@ -904,10 +1058,9 @@ async function placeOrder(dir, symbol, entry, sl, lots, session) {
     headers: {"Content-Type":"application/json","auth-token":META_API_TOKEN},
     body:   JSON.stringify(body),
   });
-  return { result: await r.json(), mt5Symbol, slPrice, body, tpPrice, tpEvPositive };
+  return { result: await r.json(), mt5Symbol, slPrice, body, tpPrice, tpRR };
 }
 
-// [FIX 5] Wrapper met 8s timeout
 async function placeOrderWithTimeout(dir, symbol, entry, sl, lots, session) {
   const timeout = new Promise((_, rej) =>
     setTimeout(() => rej(new Error("MetaApi timeout — order niet bevestigd binnen 8s")), 8000)
@@ -920,6 +1073,8 @@ async function placeOrderWithTimeout(dir, symbol, entry, sl, lots, session) {
 
 // ══════════════════════════════════════════════════════════════
 // WEBHOOK
+// [FEAT 8] Duplicate entry guard toegevoegd
+// [FEAT 10] Forex pyramiding: max 2× per pair/richting
 // ══════════════════════════════════════════════════════════════
 app.post("/webhook", async (req, res) => {
   try {
@@ -940,6 +1095,15 @@ app.post("/webhook", async (req, res) => {
     if (direction==="buy"  && slNum>=entryNum) return res.status(400).json({ error:"SL onder entry voor BUY" });
     if (direction==="sell" && slNum<=entryNum) return res.status(400).json({ error:"SL boven entry voor SELL" });
 
+    // [FEAT 8] Duplicate entry check
+    if (isDuplicateOrder(symbol, direction)) {
+      const dupReason = `Duplicate geblokkeerd: ${symbol} ${direction} (binnen 60s)`;
+      logDuplicateEntry(symbol, direction, dupReason).catch(() => {});
+      addWebhookHistory({ type:"DUPLICATE_BLOCKED", symbol, direction });
+      console.warn(`🚫 [Duplicate] ${dupReason}`);
+      return res.status(200).json({ status:"SKIP", reason: dupReason });
+    }
+
     const symType    = getSymbolType(symbol);
     const mt5Sym     = getMT5Symbol(symbol);
     const curSession = getSessionGMT1();
@@ -953,12 +1117,17 @@ app.post("/webhook", async (req, res) => {
     if (symType === "forex") {
       const consol = checkForexConsolidation(symbol, direction);
       if (consol.blocked) {
-        const reason = `Anti-consolidatie: ${consol.count} open ${direction} trades voor ${symbol}`;
+        // [FEAT 10] Geblokkeerd na 2e trade
+        const reason = `Forex pyramiding max 2×: ${consol.count} open ${direction} trades voor ${symbol}`;
         logForexConsolidation(symbol, direction, consol.count, reason).catch(() => {});
-        addWebhookHistory({ type:"FOREX_CONSOLIDATION_BLOCKED", symbol, direction, count:consol.count });
+        addWebhookHistory({ type:"FOREX_PYRAMID_BLOCKED", symbol, direction, count:consol.count });
         return res.status(200).json({ status:"SKIP", reason });
       }
-      if (consol.halfRisk) { forexHalfRisk = true; }
+      if (consol.halfRisk) {
+        // [FEAT 10] Trade 2 = 50% risk
+        forexHalfRisk = true;
+        console.log(`⚡ [Forex Pyramiding] ${symbol} ${direction} trade #${consol.count+1} → 50% risk`);
+      }
     }
 
     const { multiplier: slMult, slApplied, info: slLockInfo } =
@@ -988,9 +1157,11 @@ app.post("/webhook", async (req, res) => {
     const lots = calcLots(symbol, entryNum, slApplied, risk);
     if (lots===null) return res.status(200).json({ status:"SKIP", reason:`Min lot > cap` });
 
-    console.log(`📊 ${direction.toUpperCase()} ${symbol}/${curSession} | Entry:${entryNum} SL:${slApplied} (${slMult}×) Lots:${lots} Risk:€${risk.toFixed(2)}`);
+    console.log(`📊 ${direction.toUpperCase()} ${symbol}/${curSession} | Entry:${entryNum} SL:${slApplied} (${slMult}×) Lots:${lots} Risk:€${risk.toFixed(2)} Mult:×${dailyRiskMultiplier}`);
 
-    // [FIX 5] placeOrderWithTimeout i.p.v. placeOrder
+    // Registreer order guard VOOR plaatsing
+    registerRecentOrder(symbol, direction);
+
     let orderResult;
     try {
       orderResult = await placeOrderWithTimeout(direction, symbol, entryNum, slApplied, lots, curSession);
@@ -1000,7 +1171,7 @@ app.post("/webhook", async (req, res) => {
       return res.status(200).json({ status:"TIMEOUT", reason: timeoutErr.message });
     }
 
-    let { result, mt5Symbol, slPrice, tpPrice, tpEvPositive } = orderResult;
+    let { result, mt5Symbol, slPrice, tpPrice, tpRR } = orderResult;
 
     const errCode = result?.error?.code || result?.retcode;
     const errMsg  = result?.error?.message || result?.comment || "";
@@ -1014,7 +1185,7 @@ app.post("/webhook", async (req, res) => {
           const retry  = await placeOrderWithTimeout(direction, symbol, entryNum, slApplied, rl, curSession);
           result       = retry.result;
           tpPrice      = retry.tpPrice;
-          tpEvPositive = retry.tpEvPositive;
+          tpRR         = retry.tpRR;
           const retryErr = retry.result?.error || (retry.result?.retcode && retry.result.retcode!==10009 && retry.result.retcode!=="TRADE_RETCODE_DONE");
           if (retryErr) {
             learnFromError(symbol, retry.result?.error?.code||retry.result?.retcode, retry.result?.error?.message||retry.result?.comment);
@@ -1032,8 +1203,7 @@ app.post("/webhook", async (req, res) => {
     registerFtmoLoss(risk);
     incrementTracker(symbol, direction);
 
-    const posId        = String(result?.positionId || result?.orderId || Date.now());
-    const tpLockActive = tpLocks[`${symbol}__${curSession}`];
+    const posId = String(result?.positionId || result?.orderId || Date.now());
 
     openPositions[posId] = {
       id: posId, symbol, mt5Symbol, direction,
@@ -1042,31 +1212,32 @@ app.post("/webhook", async (req, res) => {
       session: curSession, sessionLabel: SESSION_LABELS[curSession] || curSession,
       maxPrice: entryNum, maxRR: 0, currentPnL: 0, lastSync: null,
       slMultiplierApplied: slMult, spreadGuard, forexHalfRisk,
-      restoredAfterRestart: false, // nieuwe posities tellen altijd mee
+      restoredAfterRestart: false,
     };
 
     addWebhookHistory({
       type:"SUCCESS", symbol, mt5Symbol, direction, lots, posId,
       session: curSession, riskEUR: risk.toFixed(2),
       slAanpassing: slLockInfo,
-      tp: tpPrice ? `${tpLockActive?.lockedRR}R @ ${tpPrice}` : "geen",
+      tp: `${tpRR}R @ ${tpPrice}`,
       slAutoApplied: slMult !== 1.0,
+      dailyRiskMult: dailyRiskMultiplier,
+      forexPyramiding: forexHalfRisk ? "trade2_50pct" : null,
     });
 
     res.json({
-      status:"OK", versie:"v5.1",
+      status:"OK", versie:"v5.2",
       direction, tvSymbol:symbol, mt5Symbol, symType,
       session:curSession, sessionLabel:SESSION_LABELS[curSession],
       entry:entryNum, sl:slPrice, slOriginal:slNum,
       slMultiplier:slMult, slLockInfo,
       slAutoApplied: slLocks[symbol]?.autoApplied ?? false,
       slTradesUntilAuto: Math.max(0, SL_AUTO_APPLY_THRESHOLD - (closedTrades.filter(t=>t.symbol===symbol).length)),
-      tp: tpPrice, tpRR: tpLockActive?.lockedRR ?? null, tpEvPositive,
-      tpInfo: tpPrice
-        ? `✅ TP auto: ${tpLockActive.lockedRR}R [${curSession}] → ${tpPrice}`
-        : `ℹ️ Geen TP voor ${symbol}/${curSession} — ghost tracker actief`,
+      tp: tpPrice, tpRR, tpFixed: `${FIXED_TP_RR}R (vast)`,
+      tpInfo: `✅ TP: ${tpRR}R @ ${tpPrice} [${curSession}]${tpLocks[`${symbol}__${curSession}`] ? " [lock]" : " [4R default]"}`,
       lots, risicoEUR:risk.toFixed(2),
-      forexHalfRisk: forexHalfRisk ? "⚡ 50% risk" : null,
+      dailyRiskMultiplier, dailyRiskMultiplierNext,
+      forexHalfRisk: forexHalfRisk ? "⚡ 50% risk (trade 2/2)" : null,
       positionId:posId, metaApi:result,
     });
   } catch(err) {
@@ -1084,18 +1255,28 @@ app.post("/close", async (req, res) => {
   try {
     const result = await closePosition(positionId);
     if (symbol&&direction) decrementTracker(symbol, direction);
-    res.json({ status:"OK", result });
+    // Ghost blijft actief na manual close [FEAT 3]
+    res.json({ status:"OK", result, note:"Ghost tracker blijft actief na manual close" });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // ── ENDPOINTS ─────────────────────────────────────────────────
 app.get("/", (req, res) => {
+  const { hhmm } = getBrusselsComponents();
   res.json({
-    status:"online", versie:"ftmo-v5.1",
-    fixes: {
-      fix3: "✅ Forex consolidatie telt herstelde posities niet mee na restart",
-      fix5: "✅ Webhook timeout 8s — geen dubbele orders meer",
-      fix429: "✅ accountInfo max 1x per 5 minuten — geen rate limit meer",
+    status:"online", versie:"ftmo-v5.2",
+    time: getBrusselsDateStr(),
+    features: {
+      "feat1_forex": "✅ Uitgebreid (geen JPY/exotics) — 21 pairs",
+      "feat2_uk100": `✅ UK100 min SL: 2 (was 5)`,
+      "feat3_ghost": `✅ Ghost tot 22:00 | actief nu: ${isGhostActive()}`,
+      "feat4_tp4R":  `✅ Vast TP = ${FIXED_TP_RR}R voor alle trades`,
+      "feat5_tplock":"✅ TP lock na 3 trades per sessie",
+      "feat6_risksc":  `✅ Daily risk mult: ×${dailyRiskMultiplier} | morgen: ×${dailyRiskMultiplierNext}`,
+      "feat7_sl30":  `✅ SL shadow optimizer na ${SL_AUTO_APPLY_THRESHOLD} trades`,
+      "feat8_dup":   "✅ Duplicate guard 60s",
+      "feat9_times": "✅ Auto-close 21:50 | Ghost/Shadow stop 22:00 | Reconnect 02:00",
+      "feat10_pyr":  `✅ Forex pyramiding max 2× (50% risk op trade 2)`,
     },
     tracking: {
       openPositions: Object.keys(openPositions).length,
@@ -1103,12 +1284,20 @@ app.get("/", (req, res) => {
       tpLocks:       Object.keys(tpLocks).length,
       slAnalyses:    Object.keys(slLocks).length,
       ghostTrackers: Object.keys(ghostTrackers).length,
+      duplicateGuard: recentOrderGuard.size,
     },
   });
 });
 
 app.get("/status", (req, res) => {
-  res.json({ openTrades:openTradeTracker, learnedPatches, risicoPerType:RISK });
+  res.json({
+    openTrades: openTradeTracker,
+    learnedPatches,
+    risicoPerType: Object.fromEntries(
+      Object.entries(BASE_RISK).map(([k,v]) => [k, `€${(v * dailyRiskMultiplier).toFixed(2)} (base €${v} × ${dailyRiskMultiplier})`])
+    ),
+    dailyRisk: { multiplier: dailyRiskMultiplier, nextDay: dailyRiskMultiplierNext },
+  });
 });
 
 app.get("/live/positions", (req, res) => {
@@ -1116,11 +1305,12 @@ app.get("/live/positions", (req, res) => {
     count: Object.keys(openPositions).length,
     positions: Object.values(openPositions).map(p => ({
       id:p.id, symbol:p.symbol, direction:p.direction,
-      entry:p.entry, sl:p.sl, tp:p.tp, lots:p.lots,
+      entry:p.entry, sl:p.sl, tp:p.tp, tpRR: FIXED_TP_RR, lots:p.lots,
       riskEUR:p.riskEUR, openedAt:p.openedAt, session:p.session,
       currentPrice:p.currentPrice??null, currentPnL:p.currentPnL??0,
       maxRR:p.maxRR??0, slMultiplier:p.slMultiplierApplied??1.0,
       restoredAfterRestart:p.restoredAfterRestart??false,
+      forexHalfRisk:p.forexHalfRisk??false,
     })),
   });
 });
@@ -1132,8 +1322,9 @@ app.get("/live/ghosts", (req, res) => {
     currentBestRR: calcMaxRRFromPrice(g.trade, g.bestPrice),
     elapsedMin: Math.round((Date.now()-g.startedAt)/60000),
     remainingMin: Math.round((GHOST_DURATION_MS-(Date.now()-g.startedAt))/60000),
+    activeUntil: "22:00 Brussels",
   }));
-  res.json({ count:active.length, ghosts:active });
+  res.json({ count:active.length, ghosts:active, ghostActiveNow: isGhostActive() });
 });
 
 app.get("/tp-locks", (req,res) => {
@@ -1143,16 +1334,32 @@ app.get("/tp-locks", (req,res) => {
     if (!bySym[sym]) bySym[sym] = {};
     bySym[sym][sess] = lock;
   }
-  res.json({ generated:new Date().toISOString(), totalLocks:Object.keys(tpLocks).length, locksBySymbol:bySym });
+  res.json({ generated:new Date().toISOString(), fixedTpRR: FIXED_TP_RR, totalLocks:Object.keys(tpLocks).length, locksBySymbol:bySym });
 });
 
 app.get("/sl-locks", (req,res) => {
   res.json({
     generated: new Date().toISOString(),
-    note: `Auto-apply na ≥${SL_AUTO_APPLY_THRESHOLD} trades`,
+    note: `Auto-apply na ≥${SL_AUTO_APPLY_THRESHOLD} trades (shadow optimizer)`,
     totalAnalyses: Object.keys(slLocks).length,
+    shadowActiveNow: isShadowActive(),
     analyses: Object.entries(slLocks).map(([sym,lock]) => ({ symbol:sym, ...lock })),
   });
+});
+
+app.get("/daily-risk", async (req, res) => {
+  try {
+    const latest = await loadLatestDailyRisk();
+    res.json({
+      generated: new Date().toISOString(),
+      today: { multiplier: dailyRiskMultiplier },
+      tomorrow: { multiplier: dailyRiskMultiplierNext },
+      lastRecord: latest,
+      effectiveRisk: Object.fromEntries(
+        Object.entries(BASE_RISK).map(([k,v]) => [k, parseFloat((v * dailyRiskMultiplier).toFixed(2))])
+      ),
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 app.delete("/tp-locks/:symbol", (req,res) => {
@@ -1241,7 +1448,7 @@ const PORT = process.env.PORT || 3000;
 
 async function start() {
   try {
-    console.log("🚀 FTMO Webhook Server v5.1 — opstarten...");
+    console.log("🚀 FTMO Webhook Server v5.2 — opstarten...");
     await initDB();
 
     const dbTrades = await loadAllTrades();
@@ -1256,13 +1463,28 @@ async function start() {
     Object.assign(slLocks, savedSL);
     console.log(`📐 ${Object.keys(savedSL).length} SL configs geladen`);
 
+    // [FEAT 6] Laad dagelijkse risk multiplier bij startup
+    const dailyRisk = await loadLatestDailyRisk();
+    if (dailyRisk) {
+      dailyRiskMultiplier     = dailyRisk.riskMultNext ?? 1.0;
+      dailyRiskMultiplierNext = dailyRisk.riskMultNext ?? 1.0;
+      console.log(`📅 [Daily Risk] Geladen: ×${dailyRiskMultiplier} (${dailyRisk.evPositive?"✅ positief":"❌ reset"})`);
+    }
+
     await restoreOpenPositionsFromMT5();
 
     app.listen(PORT, () => {
       console.log(`✅ Server luistert op port ${PORT}`);
-      console.log(`🔒 Fix 3: forex consolidatie herstelde posities geskipt`);
-      console.log(`⏱️  Fix 5: webhook timeout 8s actief`);
-      console.log(`📉 Fix 429: accountInfo max 1x per 5 min`);
+      console.log(`📋 v5.2 actief:`);
+      console.log(`   🔹 Forex: 21 pairs (geen JPY/exotics)`);
+      console.log(`   🔹 UK100 min SL: 2`);
+      console.log(`   🔹 Ghost tot 22:00 | Shadow tot 22:00`);
+      console.log(`   🔹 Vast TP = ${FIXED_TP_RR}R | TP lock na 3 trades`);
+      console.log(`   🔹 Daily risk mult: ×${dailyRiskMultiplier}`);
+      console.log(`   🔹 SL shadow auto-apply na ${SL_AUTO_APPLY_THRESHOLD} trades`);
+      console.log(`   🔹 Duplicate guard: 60s`);
+      console.log(`   🔹 Auto-close 21:50 | Reconnect 02:00`);
+      console.log(`   🔹 Forex pyramiding: max 2× (50% op trade 2)`);
     });
   } catch(err) {
     console.error("❌ Startup mislukt:", err.message);
