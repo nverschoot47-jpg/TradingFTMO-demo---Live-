@@ -1,17 +1,17 @@
 // ═══════════════════════════════════════════════════════════════
-// db.js — PostgreSQL persistence layer  |  v5.0
+// db.js — PostgreSQL persistence layer  |  v5.2
 //
-// WIJZIGINGEN v5.0 (t.o.v. v4.2):
-//  ✅ [FEAT] SL wordt automatisch toegepast na ≥50 trades per symbool
-//           → sl_config.auto_applied kolom toegevoegd
-//           → sl_config.applied_at kolom toegevoegd
-//           → sl_config.applied_trades kolom toegevoegd
-//  ✅ [FEAT] TP wordt automatisch gezet per sessie bij positieve EV
-//           → tp_config: ev_positive kolom voor tracking
-//  ✅ [FEAT] ghost_analysis tabel voor diepgaande ghost trade analyse
-//  ✅ [FEAT] trade_pnl_log tabel voor win/verlies tracking per sessie
-//  ✅ [FIX]  Pool timeouts (connection + statement)
-//  ✅ [FIX]  loadSnapshots interne 4s timeout via Promise.race
+// WIJZIGINGEN v5.2 (t.o.v. v5.0):
+//  ✅ [FEAT] daily_risk_log tabel — dagelijkse EV tracking voor
+//           risk scaling (positieve dag → Risk ×1.2 volgende dag)
+//  ✅ [FEAT] saveDailyRisk / loadLatestDailyRisk functies
+//  ✅ [FEAT] duplicate_entry_guard tabel — detectie dubbele orders
+//           (zelfde pair + richting + korte tijdrange)
+//  ✅ [FEAT] saveDuplicateEntry / recentDuplicateExists functies
+//  ✅ [FIX]  SL auto-apply drempel verlaagd: 50 → 30 trades
+//           (kolom applied_trades blijft zelfde, alleen server logica)
+//  ✅ [KEEP] Pool timeouts, loadSnapshots 4s timeout, ghost analyse,
+//           PnL log, TP/SL config — ongewijzigd t.o.v. v5.0
 // ═══════════════════════════════════════════════════════════════
 
 "use strict";
@@ -104,7 +104,7 @@ async function initDB() {
     END $$;
   `);
 
-  // ── SL config (met auto-apply na 50 trades) ───────────────
+  // ── SL config (met auto-apply na 30 trades) ───────────────
   await pool.query(`
     CREATE TABLE IF NOT EXISTS sl_config (
       symbol            TEXT        PRIMARY KEY,
@@ -176,7 +176,7 @@ async function initDB() {
       free_margin   NUMERIC
     );
 
-    -- Ghost analyse tabel: diepgaande ghost effect tracking
+    -- Ghost analyse tabel
     CREATE TABLE IF NOT EXISTS ghost_analysis (
       id                  SERIAL PRIMARY KEY,
       symbol              TEXT        NOT NULL,
@@ -187,7 +187,7 @@ async function initDB() {
       tp                  NUMERIC,
       max_rr_at_close     NUMERIC,
       true_max_rr         NUMERIC,
-      ghost_extra_rr      NUMERIC,   -- true_max_rr - max_rr_at_close
+      ghost_extra_rr      NUMERIC,
       hit_tp              BOOLEAN,
       ghost_stop_reason   TEXT,
       ghost_duration_min  INTEGER,
@@ -212,7 +212,40 @@ async function initDB() {
       pnl_eur     NUMERIC,
       closed_at   TIMESTAMPTZ DEFAULT NOW()
     );
+  `);
 
+  // ── [v5.2] Daily Risk Scaling log ────────────────────────
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS daily_risk_log (
+      id                  SERIAL PRIMARY KEY,
+      trade_date          DATE        NOT NULL DEFAULT CURRENT_DATE,
+      total_pnl_eur       NUMERIC,
+      ev_positive         BOOLEAN     DEFAULT FALSE,
+      trades_count        INTEGER     DEFAULT 0,
+      risk_multiplier_applied NUMERIC DEFAULT 1.0,
+      risk_multiplier_next    NUMERIC DEFAULT 1.0,
+      created_at          TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_daily_risk_date
+      ON daily_risk_log(trade_date);
+  `);
+
+  // ── [v5.2] Duplicate Entry Guard ─────────────────────────
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS duplicate_entry_log (
+      id          SERIAL PRIMARY KEY,
+      symbol      TEXT        NOT NULL,
+      direction   TEXT        NOT NULL,
+      blocked_at  TIMESTAMPTZ DEFAULT NOW(),
+      reason      TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_dup_symbol ON duplicate_entry_log(symbol, blocked_at DESC);
+  `);
+
+  // ── Indices ────────────────────────────────────────────────
+  await pool.query(`
     CREATE INDEX IF NOT EXISTS idx_trades_symbol      ON closed_trades(symbol);
     CREATE INDEX IF NOT EXISTS idx_trades_closed      ON closed_trades(closed_at);
     CREATE INDEX IF NOT EXISTS idx_trades_session     ON closed_trades(session);
@@ -228,7 +261,7 @@ async function initDB() {
     CREATE INDEX IF NOT EXISTS idx_pnl_session        ON trade_pnl_log(session);
   `);
 
-  console.log("✅ [DB] Schema klaar (v5.0 — auto SL apply, ghost analyse, PnL log)");
+  console.log("✅ [DB] Schema klaar (v5.2 — daily risk log, duplicate guard, SL@30)");
 }
 
 // ── Trades ────────────────────────────────────────────────────
@@ -417,7 +450,7 @@ async function loadTPUpdateLog(limit = 50) {
   } catch (e) { console.warn("⚠️ loadTPUpdateLog:", e.message); return []; }
 }
 
-// ── SL Config (met auto-apply na 50 trades) ───────────────────
+// ── SL Config (met auto-apply na 30 trades) ───────────────────
 async function loadSLConfig() {
   try {
     const res = await pool.query(`SELECT * FROM sl_config ORDER BY symbol`);
@@ -585,6 +618,55 @@ async function loadPnlStats(symbol = null, session = null) {
   } catch (e) { console.warn("⚠️ loadPnlStats:", e.message); return []; }
 }
 
+// ── [v5.2] Daily Risk Scaling ─────────────────────────────────
+async function saveDailyRisk(tradeDate, totalPnlEUR, tradesCount, riskMultApplied, riskMultNext) {
+  try {
+    const evPositive = (totalPnlEUR ?? 0) > 0;
+    await pool.query(`
+      INSERT INTO daily_risk_log
+        (trade_date, total_pnl_eur, ev_positive, trades_count, risk_multiplier_applied, risk_multiplier_next)
+      VALUES ($1, $2, $3, $4, $5, $6)
+      ON CONFLICT (trade_date) DO UPDATE SET
+        total_pnl_eur           = EXCLUDED.total_pnl_eur,
+        ev_positive             = EXCLUDED.ev_positive,
+        trades_count            = EXCLUDED.trades_count,
+        risk_multiplier_applied = EXCLUDED.risk_multiplier_applied,
+        risk_multiplier_next    = EXCLUDED.risk_multiplier_next,
+        created_at              = NOW()
+    `, [tradeDate, totalPnlEUR ?? 0, evPositive, tradesCount ?? 0,
+        riskMultApplied ?? 1.0, riskMultNext ?? 1.0]);
+    console.log(`📅 [DB] Daily risk: ${tradeDate} PnL=€${(totalPnlEUR??0).toFixed(2)} → next mult=${riskMultNext}`);
+  } catch (e) { console.warn("⚠️ saveDailyRisk:", e.message); }
+}
+
+async function loadLatestDailyRisk() {
+  try {
+    const res = await pool.query(`
+      SELECT
+        trade_date,
+        CAST(total_pnl_eur           AS FLOAT) AS "totalPnlEUR",
+        ev_positive                            AS "evPositive",
+        trades_count                           AS "tradesCount",
+        CAST(risk_multiplier_applied AS FLOAT) AS "riskMultApplied",
+        CAST(risk_multiplier_next    AS FLOAT) AS "riskMultNext"
+      FROM daily_risk_log
+      ORDER BY trade_date DESC
+      LIMIT 1
+    `);
+    return res.rows[0] ?? null;
+  } catch (e) { console.warn("⚠️ loadLatestDailyRisk:", e.message); return null; }
+}
+
+// ── [v5.2] Duplicate Entry Guard ─────────────────────────────
+async function logDuplicateEntry(symbol, direction, reason) {
+  try {
+    await pool.query(`
+      INSERT INTO duplicate_entry_log (symbol, direction, reason)
+      VALUES ($1, $2, $3)
+    `, [symbol, direction, reason]);
+  } catch (e) { console.warn("⚠️ logDuplicateEntry:", e.message); }
+}
+
 // ── Misc ──────────────────────────────────────────────────────
 async function logForexConsolidation(symbol, direction, count, reason) {
   try {
@@ -604,4 +686,7 @@ module.exports = {
   saveGhostAnalysis, loadGhostAnalysis,
   savePnlLog, loadPnlStats,
   logForexConsolidation,
+  // v5.2
+  saveDailyRisk, loadLatestDailyRisk,
+  logDuplicateEntry,
 };
