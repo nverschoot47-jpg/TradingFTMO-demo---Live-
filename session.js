@@ -1,13 +1,14 @@
 // ═══════════════════════════════════════════════════════════════
-// session.js — Timezone + Sessie helpers  |  v5.0
+// session.js — Timezone + Sessie helpers  |  v5.2
 // Automatische zomer/wintertijd via Intl API (geen hardcoded +1h)
 //   Winter → CET  = UTC+1
 //   Zomer  → CEST = UTC+2
 //
-// Wijzigingen v5.0:
-//  ✅ Geen logica wijzigingen — sessie definitie zelfde
-//  ✅ Indices toegestaan tijdens Asia sessie (02:00–08:00)
-//  ✅ Stocks beperkt tot NY venster (15:30–20:00)
+// Wijzigingen v5.2 (t.o.v. v5.0):
+//  ✅ isGhostActive()  — ghost mag doorlopen tot 22:00 (niet 20:00)
+//  ✅ isShadowActive() — shadow optimizer ook tot 22:00
+//  ✅ Geen wijzigingen aan sessie-definities of isMarketOpen
+//     (nieuwe trades nog steeds geblokkeerd na 20:00)
 // ═══════════════════════════════════════════════════════════════
 
 "use strict";
@@ -76,7 +77,8 @@ function getSessionGMT1(dateOrStr) {
 }
 
 /**
- * Controleert of de markt open is voor het opgegeven instrument type.
+ * Controleert of de markt open is voor nieuwe TRADES (nieuwe orders).
+ * Geen nieuwe trades na 20:00 — geldt voor alle types behalve crypto weekend.
  *
  * Vensters (Brussels tijd):
  *   - Alle types behalve stock: 02:00–20:00 (ma–vr)
@@ -100,7 +102,7 @@ function isMarketOpen(type, symbol, isCryptoWeekendFn) {
   }
 
   if (hhmm < 200)   { console.warn(`🚫 Voor 02:00 (${hhmm})`);   return false; }
-  if (hhmm >= 2000) { console.warn(`🚫 Na 20:00 (${hhmm})`);     return false; }
+  if (hhmm >= 2000) { console.warn(`🚫 Na 20:00 — geen nieuwe trades (${hhmm})`); return false; }
 
   if (type === "stock" && hhmm < 1530) {
     console.warn(`🚫 Aandelen buiten 15:30–20:00 (${hhmm})`);
@@ -110,11 +112,36 @@ function isMarketOpen(type, symbol, isCryptoWeekendFn) {
   return true;
 }
 
+/**
+ * [v5.2] Controleert of ghost tracking nog actief mag zijn.
+ * Ghost trading loopt door tot 22:00 (na auto-close van 21:50).
+ * Stopt NIET bij 20:00 — alleen bij SL phantom trigger of 22:00.
+ */
+function isGhostActive(date) {
+  const d = date ? new Date(date) : new Date();
+  const { day, hhmm } = getBrusselsComponents(d);
+  const isWE = day === 0 || day === 6;
+  if (isWE) return false;               // geen ghost in weekend
+  if (hhmm < 200)  return false;        // voor dagstart
+  if (hhmm >= 2200) return false;       // na 22:00 hard stop
+  return true;
+}
+
+/**
+ * [v5.2] Controleert of shadow optimizer actief mag zijn.
+ * Zelfde tijdvenster als ghost: stopt om 22:00.
+ */
+function isShadowActive(date) {
+  return isGhostActive(date);
+}
+
 module.exports = {
   getBrusselsComponents,
   getBrusselsDateStr,
   getSessionGMT1,
   isMarketOpen,
+  isGhostActive,
+  isShadowActive,
   SESSION_LABELS,
   TIMEZONE,
 };
