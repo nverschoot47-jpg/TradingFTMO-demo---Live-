@@ -1,7 +1,7 @@
 {
   "name": "nv-tradingview-webhook",
-  "version": "5.0.0",
-  "description": "TradingView → MetaApi REST → FTMO MT5 | NV v5.0 — TP auto per sessie EV+, SL auto na 50 trades, Ghost analyse, PnL log, Dashboard ingebouwd",
+  "version": "5.2.0",
+  "description": "TradingView → MetaApi REST → FTMO MT5 | NV v5.2 — Forex expanded (no JPY/exotics), fixed TP=4R, TP lock @3 trades, daily risk scaling, SL shadow @30 trades, ghost to 22:00, duplicate guard, pyramiding 2×, auto-close 21:50",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
