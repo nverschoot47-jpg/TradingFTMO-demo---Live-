@@ -843,10 +843,13 @@ function getSLDirection(analysis) {
 //   3. 24h timeout
 //   4. server restart → restart_lost (orphan repair)
 // ══════════════════════════════════════════════════════════════
+// Ghost runs IDENTICALLY for every close reason: tp / sl / manual / auto
+// is_manual is metadata only — no behaviour difference whatsoever
+// Manual ghost trades count for ALL optimizers exactly like any other trade
 function startGhostTracker(closedTrade, isManual = false) {
   const ghostId      = `ghost_${closedTrade.id}_${Date.now()}`;
   const startedAt    = Date.now();
-  // [v7.0] trueMaxRR measured from ENTRY — start at maxRRAtClose
+  // trueMaxRR measured from ENTRY baseline (not close price)
   const maxRRAtClose = closedTrade.maxRR ?? 0;
   let bestPrice      = closedTrade.maxPrice ?? closedTrade.entry;
   let worstPrice     = closedTrade.entry; // for ghost_mae
@@ -855,7 +858,7 @@ function startGhostTracker(closedTrade, isManual = false) {
   console.log(
     `👻 Ghost gestart: ${closedTrade.symbol} | ` +
     `closeReason=${closedTrade.closeReason ?? "unknown"} | ` +
-    `maxRRAtClose=${maxRRAtClose}R | manual=${isManual}`
+    `maxRRAtClose=${maxRRAtClose}R | is_manual=${isManual} (metadata only)`
   );
 
   async function tick() {
@@ -1825,24 +1828,25 @@ app.get("/analysis/ghost-deep", async (req, res) => {
   for (const t of finished) {
     const sym = normalizeSymbol(t.symbol);
     const key = `${sym}__${t.session||"?"}`;
-    if (!bySymSess[key]) bySymSess[key] = { symbol:sym, session:t.session, trades:[], totalExtraRR:0, hitTP:0, manualCount:0 };
+    if (!bySymSess[key]) bySymSess[key] = {
+      symbol:sym, session:t.session,
+      count:0, totalExtraRR:0, totalMAE:0, maeCount:0, hitTP:0, manualCount:0
+    };
+    const g = bySymSess[key];
     const maxRRAtClose = t.maxRRAtClose ?? t.maxRR ?? 0;
-    const extraRR      = (t.trueMaxRR ?? 0) - maxRRAtClose;
-    bySymSess[key].trades.push({
-      extraRR, maxRRAtClose, trueMaxRR:t.trueMaxRR,
-      ghostStopReason:t.ghostStopReason,
-      ghostMAE: t.ghostMAE ?? null,
-      closeReason: t.closeReason ?? "unknown",
-      isManual: t.isManual ?? false,
-    });
-    bySymSess[key].totalExtraRR += extraRR;
-    if (t.hitTP) bySymSess[key].hitTP++;
-    if (t.closeReason === "manual" || t.isManual) bySymSess[key].manualCount++;
+    g.count++;
+    g.totalExtraRR += (t.trueMaxRR ?? 0) - maxRRAtClose;
+    if (t.ghostMAE != null) { g.totalMAE += t.ghostMAE; g.maeCount++; }
+    if (t.hitTP) g.hitTP++;
+    if (t.closeReason === "manual" || t.isManual) g.manualCount++;
   }
   const results = Object.values(bySymSess).map(g => ({
-    symbol:g.symbol, session:g.session, trades:g.trades.length,
-    avgExtraRR:  parseFloat((g.totalExtraRR/g.trades.length).toFixed(3)),
-    tpHitRate:   parseFloat(((g.hitTP/g.trades.length)*100).toFixed(1)),
+    symbol:      g.symbol,
+    session:     g.session,
+    trades:      g.count,
+    avgExtraRR:  parseFloat((g.totalExtraRR / g.count).toFixed(3)),
+    avgGhostMAE: g.maeCount ? parseFloat((g.totalMAE / g.maeCount).toFixed(3)) : null,
+    tpHitRate:   parseFloat(((g.hitTP / g.count) * 100).toFixed(1)),
     manualCount: g.manualCount,
   })).sort((a,b) => b.avgExtraRR - a.avgExtraRR);
   res.json({ generated:new Date().toISOString(), ghostFinished:finished.length, ghostPending:pending.length, bySymbolSession:results });
@@ -2089,16 +2093,28 @@ function updateClock(){
 }
 setInterval(updateClock,1000);updateClock();
 
+// Hardened fetch — one endpoint failing never kills the whole dashboard
+async function safeFetch(url, fallback){
+  try{
+    const r=await fetch(url);
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    return await r.json();
+  }catch(e){
+    console.warn('safeFetch failed:', url, e.message);
+    return fallback;
+  }
+}
+
 async function loadAll(){
   try{
     const[tpRes,slRes,shadowRes,ghostRes,liveRes,dailyRes,histRes]=await Promise.all([
-      fetch('/tp-locks').then(r=>r.json()).catch(()=>({locksBySymbol:{}})),
-      fetch('/sl-locks').then(r=>r.json()).catch(()=>({analyses:[]})),
-      fetch('/sl-shadow').then(r=>r.json()).catch(()=>({results:{}})),
-      fetch('/analysis/ghost-deep').then(r=>r.json()).catch(()=>({bySymbolSession:[]})),
-      fetch('/live/positions').then(r=>r.json()).catch(()=>({count:0})),
-      fetch('/daily-risk').then(r=>r.json()).catch(()=>null),
-      fetch('/history?limit=200').then(r=>r.json()).catch(()=>({history:[]})),
+      safeFetch('/tp-locks',            {locksBySymbol:{}}),
+      safeFetch('/sl-locks',            {analyses:[]}),
+      safeFetch('/sl-shadow',           {results:{}}),
+      safeFetch('/analysis/ghost-deep', {bySymbolSession:[],ghostFinished:0,ghostPending:0}),
+      safeFetch('/live/positions',      {count:0,positions:[]}),
+      safeFetch('/daily-risk',          null),
+      safeFetch('/history?limit=200',   {history:[]}),
     ]);
     buildRows(tpRes,slRes,shadowRes,ghostRes);
     updateSummary(tpRes,slRes,shadowRes,ghostRes,liveRes);
@@ -2107,7 +2123,8 @@ async function loadAll(){
     renderTable();
     loadLogs();
   }catch(e){
-    document.getElementById('table-body').innerHTML='<tr><td colspan="13" class="no-data">Failed: '+e.message+'</td></tr>';
+    console.error('loadAll crash:', e);
+    document.getElementById('table-body').innerHTML='<tr><td colspan="13" class="no-data">Dashboard error: '+e.message+' — check console</td></tr>';
   }
 }
 
@@ -2202,12 +2219,7 @@ function buildRows(tpRes,slRes,shadowRes,ghostRes){
       slTrades:shadow?.tradesUsed??slData?.lockedTrades??null,
       slDir:slData?.direction??null,
       ghostExtra:ghost?.avgExtraRR??null,
-      ghostMAE:ghost?.trades?.(()=>{
-        const t=ghost.trades;
-        if(!Array.isArray(t)||!t.length)return null;
-        const maeArr=t.map(x=>x.ghostMAE).filter(x=>x!=null);
-        return maeArr.length?(maeArr.reduce((s,v)=>s+v,0)/maeArr.length).toFixed(2):null;
-      })():null,
+      ghostMAE:ghost?.avgGhostMAE??null,
       ghostTrades:ghost?.trades??null,
       tpHitRate:ghost?.tpHitRate??null,
       manualCount:ghost?.manualCount??null,
@@ -2246,7 +2258,13 @@ function renderTable(){
     return(av-bv)*sortDir;
   });
   const tbody=document.getElementById('table-body');
-  if(!rows.length){tbody.innerHTML='<tr><td colspan="13" class="no-data">No data</td></tr>';return;}
+  if(!rows.length){
+    const msg=allRows.length===0
+      ? 'No optimizer data yet — trades will appear here after ghost finalization'
+      : 'No rows match current filters';
+    tbody.innerHTML='<tr><td colspan="13" class="no-data">'+msg+'</td></tr>';
+    return;
+  }
   let html='';
   for(const r of rows){
     const sessClass={asia:'badge-asia',london:'badge-london',ny:'badge-ny'}[r.session]||'badge-all';
