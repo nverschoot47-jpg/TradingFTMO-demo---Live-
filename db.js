@@ -1,17 +1,16 @@
 // ═══════════════════════════════════════════════════════════════
-// db.js — PostgreSQL persistence layer  |  v5.2
+// db.js — PostgreSQL persistence layer  |  v7.0
 //
-// WIJZIGINGEN v5.2 (t.o.v. v5.0):
-//  ✅ [FEAT] daily_risk_log tabel — dagelijkse EV tracking voor
-//           risk scaling (positieve dag → Risk ×1.2 volgende dag)
-//  ✅ [FEAT] saveDailyRisk / loadLatestDailyRisk functies
-//  ✅ [FEAT] duplicate_entry_guard tabel — detectie dubbele orders
-//           (zelfde pair + richting + korte tijdrange)
-//  ✅ [FEAT] saveDuplicateEntry / recentDuplicateExists functies
-//  ✅ [FIX]  SL auto-apply drempel verlaagd: 50 → 30 trades
-//           (kolom applied_trades blijft zelfde, alleen server logica)
-//  ✅ [KEEP] Pool timeouts, loadSnapshots 4s timeout, ghost analyse,
-//           PnL log, TP/SL config — ongewijzigd t.o.v. v5.0
+// Wijzigingen v7.0 (t.o.v. v5.2):
+//  ✅ ghost_analysis: nieuwe kolommen ghost_hit_sl, ghost_mae,
+//     ghost_time_to_sl, is_manual, close_reason
+//  ✅ closed_trades: nieuwe kolom close_reason
+//  ✅ shadow_sl_analysis + shadow_sl_log tabellen (item 10)
+//  ✅ DELETE tp_config WHERE session='all' op startup
+//  ✅ saveTrade accepteert close_reason
+//  ✅ saveGhostAnalysis accepteert alle nieuwe ghost velden
+//  ✅ saveShadowSLAnalysis + loadShadowSLAnalysis functies
+//  ✅ Alle v5.2 functies ongewijzigd bewaard
 // ═══════════════════════════════════════════════════════════════
 
 "use strict";
@@ -53,7 +52,8 @@ async function initDB() {
       spread_guard        BOOLEAN     DEFAULT FALSE,
       sl_multiplier       NUMERIC     DEFAULT 1.0,
       realized_pnl_eur    NUMERIC,
-      hit_tp              BOOLEAN     DEFAULT FALSE
+      hit_tp              BOOLEAN     DEFAULT FALSE,
+      close_reason        TEXT        DEFAULT 'unknown'
     );
 
     ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS position_id        TEXT        UNIQUE;
@@ -65,6 +65,7 @@ async function initDB() {
     ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS sl_multiplier      NUMERIC     DEFAULT 1.0;
     ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS realized_pnl_eur   NUMERIC;
     ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS hit_tp             BOOLEAN     DEFAULT FALSE;
+    ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS close_reason       TEXT        DEFAULT 'unknown';
   `);
 
   // ── TP config (per sessie) ─────────────────────────────────
@@ -103,6 +104,12 @@ async function initDB() {
       END IF;
     END $$;
   `);
+
+  // ── [v7.0] Verwijder 'all' sessie rijen uit tp_config ─────
+  const delResult = await pool.query(`DELETE FROM tp_config WHERE session = 'all'`);
+  if (delResult.rowCount > 0) {
+    console.log(`🧹 [DB] ${delResult.rowCount} 'all' sessie rijen verwijderd uit tp_config`);
+  }
 
   // ── SL config (met auto-apply na 30 trades) ───────────────
   await pool.query(`
@@ -197,9 +204,16 @@ async function initDB() {
       trade_position_id   TEXT
     );
 
-    ALTER TABLE ghost_analysis ADD COLUMN IF NOT EXISTS ghost_extra_rr     NUMERIC;
-    ALTER TABLE ghost_analysis ADD COLUMN IF NOT EXISTS ghost_duration_min  INTEGER;
-    ALTER TABLE ghost_analysis ADD COLUMN IF NOT EXISTS realized_pnl_eur   NUMERIC;
+    ALTER TABLE ghost_analysis ADD COLUMN IF NOT EXISTS ghost_extra_rr      NUMERIC;
+    ALTER TABLE ghost_analysis ADD COLUMN IF NOT EXISTS ghost_duration_min   INTEGER;
+    ALTER TABLE ghost_analysis ADD COLUMN IF NOT EXISTS realized_pnl_eur    NUMERIC;
+
+    -- [v7.0] Nieuwe ghost kolommen
+    ALTER TABLE ghost_analysis ADD COLUMN IF NOT EXISTS ghost_hit_sl        BOOLEAN  DEFAULT FALSE;
+    ALTER TABLE ghost_analysis ADD COLUMN IF NOT EXISTS ghost_mae           NUMERIC;
+    ALTER TABLE ghost_analysis ADD COLUMN IF NOT EXISTS ghost_time_to_sl    INTEGER;
+    ALTER TABLE ghost_analysis ADD COLUMN IF NOT EXISTS is_manual           BOOLEAN  DEFAULT FALSE;
+    ALTER TABLE ghost_analysis ADD COLUMN IF NOT EXISTS close_reason        TEXT     DEFAULT 'unknown';
 
     -- Win/verlies log per sessie per symbool
     CREATE TABLE IF NOT EXISTS trade_pnl_log (
@@ -217,14 +231,14 @@ async function initDB() {
   // ── [v5.2] Daily Risk Scaling log ────────────────────────
   await pool.query(`
     CREATE TABLE IF NOT EXISTS daily_risk_log (
-      id                  SERIAL PRIMARY KEY,
-      trade_date          DATE        NOT NULL DEFAULT CURRENT_DATE,
-      total_pnl_eur       NUMERIC,
-      ev_positive         BOOLEAN     DEFAULT FALSE,
-      trades_count        INTEGER     DEFAULT 0,
-      risk_multiplier_applied NUMERIC DEFAULT 1.0,
-      risk_multiplier_next    NUMERIC DEFAULT 1.0,
-      created_at          TIMESTAMPTZ DEFAULT NOW()
+      id                      SERIAL PRIMARY KEY,
+      trade_date              DATE        NOT NULL DEFAULT CURRENT_DATE,
+      total_pnl_eur           NUMERIC,
+      ev_positive             BOOLEAN     DEFAULT FALSE,
+      trades_count            INTEGER     DEFAULT 0,
+      risk_multiplier_applied NUMERIC     DEFAULT 1.0,
+      risk_multiplier_next    NUMERIC     DEFAULT 1.0,
+      created_at              TIMESTAMPTZ DEFAULT NOW()
     );
 
     CREATE UNIQUE INDEX IF NOT EXISTS idx_daily_risk_date
@@ -244,6 +258,36 @@ async function initDB() {
     CREATE INDEX IF NOT EXISTS idx_dup_symbol ON duplicate_entry_log(symbol, blocked_at DESC);
   `);
 
+  // ── [v7.0] SL Shadow Optimizer tabellen ──────────────────
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS shadow_sl_analysis (
+      id              SERIAL PRIMARY KEY,
+      symbol          TEXT        NOT NULL,
+      best_multiplier NUMERIC,
+      best_ev         NUMERIC,
+      best_rr         NUMERIC,
+      best_winrate    NUMERIC,
+      sl_hit_rate     NUMERIC,
+      trades_used     INTEGER,
+      computed_at     TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS shadow_sl_log (
+      id              SERIAL PRIMARY KEY,
+      symbol          TEXT        NOT NULL,
+      old_multiplier  NUMERIC,
+      new_multiplier  NUMERIC,
+      old_ev          NUMERIC,
+      new_ev          NUMERIC,
+      trades          INTEGER,
+      reason          TEXT,
+      ts              TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_shadow_sl_symbol ON shadow_sl_analysis(symbol);
+    CREATE INDEX IF NOT EXISTS idx_shadow_sl_log_sym ON shadow_sl_log(symbol);
+  `);
+
   // ── Indices ────────────────────────────────────────────────
   await pool.query(`
     CREATE INDEX IF NOT EXISTS idx_trades_symbol      ON closed_trades(symbol);
@@ -261,7 +305,7 @@ async function initDB() {
     CREATE INDEX IF NOT EXISTS idx_pnl_session        ON trade_pnl_log(session);
   `);
 
-  console.log("✅ [DB] Schema klaar (v5.2 — daily risk log, duplicate guard, SL@30)");
+  console.log("✅ [DB] Schema klaar (v7.0 — ghost MAE, shadow SL, close_reason, no-all-session)");
 }
 
 // ── Trades ────────────────────────────────────────────────────
@@ -272,8 +316,8 @@ async function saveTrade(trade) {
        max_price, max_rr, true_max_rr, true_max_price,
        ghost_stop_reason, ghost_finalized_at,
        session, opened_at, closed_at, spread_guard, sl_multiplier,
-       realized_pnl_eur, hit_tp)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+       realized_pnl_eur, hit_tp, close_reason)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
     ON CONFLICT (position_id) DO UPDATE SET
       max_price           = EXCLUDED.max_price,
       max_rr              = EXCLUDED.max_rr,
@@ -282,7 +326,8 @@ async function saveTrade(trade) {
       ghost_stop_reason   = EXCLUDED.ghost_stop_reason,
       ghost_finalized_at  = EXCLUDED.ghost_finalized_at,
       realized_pnl_eur    = EXCLUDED.realized_pnl_eur,
-      hit_tp              = EXCLUDED.hit_tp
+      hit_tp              = EXCLUDED.hit_tp,
+      close_reason        = EXCLUDED.close_reason
     RETURNING id
   `;
   const vals = [
@@ -308,6 +353,7 @@ async function saveTrade(trade) {
     trade.slMultiplier      ?? 1.0,
     trade.realizedPnlEUR    ?? null,
     trade.hitTP             ?? false,
+    trade.closeReason       ?? "unknown",
   ];
   const res = await pool.query(q, vals);
   const isGhost = trade.trueMaxRR !== null && trade.trueMaxRR !== undefined;
@@ -343,7 +389,8 @@ async function loadAllTrades() {
       COALESCE(spread_guard, FALSE) AS "spreadGuard",
       COALESCE(CAST(sl_multiplier AS FLOAT), 1.0) AS "slMultiplier",
       CAST(realized_pnl_eur AS FLOAT) AS "realizedPnlEUR",
-      COALESCE(hit_tp, FALSE) AS "hitTP"
+      COALESCE(hit_tp, FALSE) AS "hitTP",
+      COALESCE(close_reason, 'unknown') AS "closeReason"
     FROM closed_trades
     ORDER BY closed_at ASC
   `);
@@ -388,10 +435,16 @@ async function loadSnapshots(hours = 24) {
 // ── TP Config ─────────────────────────────────────────────────
 async function loadTPConfig() {
   try {
-    const res = await pool.query(`SELECT * FROM tp_config ORDER BY symbol, session`);
+    // [v7.0] Laad nooit 'all' sessie rijen
+    const res = await pool.query(`
+      SELECT * FROM tp_config
+      WHERE session != 'all'
+      ORDER BY symbol, session
+    `);
     const map = {};
     for (const r of res.rows) {
       const sess = r.session || "all";
+      if (sess === "all") continue; // extra guard
       const key  = `${r.symbol}__${sess}`;
       map[key] = {
         lockedRR:     parseFloat(r.locked_rr),
@@ -404,7 +457,7 @@ async function loadTPConfig() {
         evPositive:   r.ev_positive   ?? false,
       };
     }
-    console.log(`📊 [DB] ${res.rows.length} TP configs geladen`);
+    console.log(`📊 [DB] ${res.rows.length} TP configs geladen (geen 'all' sessie)`);
     return map;
   } catch (e) {
     console.warn("⚠️ loadTPConfig:", e.message);
@@ -413,6 +466,11 @@ async function loadTPConfig() {
 }
 
 async function saveTPConfig(symbol, session, lockedRR, lockedTrades, evAtLock, prevRR, prevLockedAt) {
+  // [v7.0] Nooit 'all' sessie opslaan
+  if (!session || session === "all") {
+    console.warn(`⚠️ [TP] saveTPConfig geblokkeerd voor session='all' (${symbol})`);
+    return;
+  }
   const evPositive = (evAtLock ?? 0) > 0;
   await pool.query(`
     INSERT INTO tp_config (symbol, session, locked_rr, locked_trades, ev_at_lock, ev_positive, prev_rr, prev_locked_at, locked_at)
@@ -425,15 +483,16 @@ async function saveTPConfig(symbol, session, lockedRR, lockedTrades, evAtLock, p
       ev_at_lock     = EXCLUDED.ev_at_lock,
       ev_positive    = EXCLUDED.ev_positive,
       locked_at      = NOW()
-  `, [symbol, session || "all", lockedRR, lockedTrades, evAtLock ?? null,
+  `, [symbol, session, lockedRR, lockedTrades, evAtLock ?? null,
       evPositive, prevRR ?? null, prevLockedAt ?? null]);
 }
 
 async function logTPUpdate(symbol, session, oldRR, newRR, trades, ev, reason) {
+  if (!session || session === "all") return; // [v7.0] guard
   await pool.query(`
     INSERT INTO tp_update_log (symbol, session, old_rr, new_rr, trades, ev, reason)
     VALUES ($1, $2, $3, $4, $5, $6, $7)
-  `, [symbol, session || "all", oldRR ?? null, newRR, trades, ev ?? null, reason]);
+  `, [symbol, session, oldRR ?? null, newRR, trades, ev ?? null, reason]);
   console.log(`📝 [DB] TP log: ${symbol}/${session} ${oldRR ?? "nieuw"}R → ${newRR}R`);
 }
 
@@ -444,7 +503,9 @@ async function loadTPUpdateLog(limit = 50) {
              CAST(old_rr AS FLOAT) AS "oldRR",
              CAST(new_rr AS FLOAT) AS "newRR",
              trades, CAST(ev AS FLOAT) AS ev, reason, ts
-      FROM tp_update_log ORDER BY ts DESC LIMIT $1
+      FROM tp_update_log
+      WHERE session != 'all'
+      ORDER BY ts DESC LIMIT $1
     `, [limit]);
     return res.rows;
   } catch (e) { console.warn("⚠️ loadTPUpdateLog:", e.message); return []; }
@@ -525,23 +586,32 @@ async function saveGhostAnalysis(data) {
   try {
     await pool.query(`
       INSERT INTO ghost_analysis
-        (symbol, session, direction, entry, sl, tp, max_rr_at_close, true_max_rr,
-         ghost_extra_rr, hit_tp, ghost_stop_reason, ghost_duration_min,
-         ghost_finalized_at, closed_at, realized_pnl_eur, trade_position_id)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+        (symbol, session, direction, entry, sl, tp,
+         max_rr_at_close, true_max_rr, ghost_extra_rr, hit_tp,
+         ghost_stop_reason, ghost_duration_min,
+         ghost_finalized_at, closed_at, realized_pnl_eur, trade_position_id,
+         ghost_hit_sl, ghost_mae, ghost_time_to_sl, is_manual, close_reason)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
       ON CONFLICT DO NOTHING
     `, [
-      data.symbol, data.session, data.direction,
-      data.entry, data.sl, data.tp ?? null,
-      data.maxRRAtClose ?? null, data.trueMaxRR ?? null,
-      data.ghostExtraRR ?? null,
-      data.hitTP ?? false,
-      data.ghostStopReason ?? null,
+      data.symbol,          data.session,         data.direction,
+      data.entry,           data.sl,              data.tp ?? null,
+      data.maxRRAtClose     ?? null,
+      data.trueMaxRR        ?? null,
+      data.ghostExtraRR     ?? null,
+      data.hitTP            ?? false,
+      data.ghostStopReason  ?? null,
       data.ghostDurationMin ?? null,
       data.ghostFinalizedAt ?? null,
-      data.closedAt ?? null,
-      data.realizedPnlEUR ?? null,
-      data.tradePositionId ?? null,
+      data.closedAt         ?? null,
+      data.realizedPnlEUR   ?? null,
+      data.tradePositionId  ?? null,
+      // [v7.0] nieuwe velden
+      data.ghostHitSL       ?? false,
+      data.ghostMAE         ?? null,
+      data.ghostTimeToSL    ?? null,
+      data.isManual         ?? false,
+      data.closeReason      ?? "unknown",
     ]);
   } catch (e) { console.warn("⚠️ saveGhostAnalysis:", e.message); }
 }
@@ -556,19 +626,24 @@ async function loadGhostAnalysis(symbol = null, session = null, limit = 200) {
     const res = await pool.query(`
       SELECT
         symbol, session, direction,
-        CAST(entry AS FLOAT) AS entry,
-        CAST(sl    AS FLOAT) AS sl,
-        CAST(tp    AS FLOAT) AS tp,
-        CAST(max_rr_at_close  AS FLOAT) AS "maxRRAtClose",
-        CAST(true_max_rr      AS FLOAT) AS "trueMaxRR",
-        CAST(ghost_extra_rr   AS FLOAT) AS "ghostExtraRR",
-        hit_tp                          AS "hitTP",
-        ghost_stop_reason               AS "ghostStopReason",
-        ghost_duration_min              AS "ghostDurationMin",
-        ghost_finalized_at              AS "ghostFinalizedAt",
-        closed_at                       AS "closedAt",
-        CAST(realized_pnl_eur AS FLOAT) AS "realizedPnlEUR",
-        trade_position_id               AS "tradePositionId"
+        CAST(entry AS FLOAT)              AS entry,
+        CAST(sl    AS FLOAT)              AS sl,
+        CAST(tp    AS FLOAT)              AS tp,
+        CAST(max_rr_at_close  AS FLOAT)   AS "maxRRAtClose",
+        CAST(true_max_rr      AS FLOAT)   AS "trueMaxRR",
+        CAST(ghost_extra_rr   AS FLOAT)   AS "ghostExtraRR",
+        hit_tp                            AS "hitTP",
+        ghost_stop_reason                 AS "ghostStopReason",
+        ghost_duration_min                AS "ghostDurationMin",
+        ghost_finalized_at                AS "ghostFinalizedAt",
+        closed_at                         AS "closedAt",
+        CAST(realized_pnl_eur AS FLOAT)   AS "realizedPnlEUR",
+        trade_position_id                 AS "tradePositionId",
+        COALESCE(ghost_hit_sl, FALSE)     AS "ghostHitSL",
+        CAST(ghost_mae AS FLOAT)          AS "ghostMAE",
+        ghost_time_to_sl                  AS "ghostTimeToSL",
+        COALESCE(is_manual, FALSE)        AS "isManual",
+        COALESCE(close_reason, 'unknown') AS "closeReason"
       FROM ghost_analysis
       ${where}
       ORDER BY ghost_finalized_at DESC NULLS LAST
@@ -598,17 +673,17 @@ async function loadPnlStats(symbol = null, session = null) {
     const res = await pool.query(`
       SELECT
         symbol, session,
-        COUNT(*)                            AS total,
-        SUM(CASE WHEN pnl_eur > 0 THEN 1 ELSE 0 END) AS wins,
-        SUM(CASE WHEN pnl_eur < 0 THEN 1 ELSE 0 END) AS losses,
-        CAST(SUM(pnl_eur)        AS FLOAT)  AS total_pnl,
-        CAST(MAX(pnl_eur)        AS FLOAT)  AS best_trade,
-        CAST(MIN(pnl_eur)        AS FLOAT)  AS worst_trade,
-        CAST(AVG(pnl_eur)        AS FLOAT)  AS avg_pnl,
-        CAST(AVG(rr_achieved)    AS FLOAT)  AS avg_rr,
-        CAST(MAX(rr_achieved)    AS FLOAT)  AS best_rr,
-        CAST(MIN(rr_achieved)    AS FLOAT)  AS worst_rr,
-        SUM(CASE WHEN hit_tp THEN 1 ELSE 0 END) AS tp_hits
+        COUNT(*)                                          AS total,
+        SUM(CASE WHEN pnl_eur > 0 THEN 1 ELSE 0 END)    AS wins,
+        SUM(CASE WHEN pnl_eur < 0 THEN 1 ELSE 0 END)    AS losses,
+        CAST(SUM(pnl_eur)        AS FLOAT)               AS total_pnl,
+        CAST(MAX(pnl_eur)        AS FLOAT)               AS best_trade,
+        CAST(MIN(pnl_eur)        AS FLOAT)               AS worst_trade,
+        CAST(AVG(pnl_eur)        AS FLOAT)               AS avg_pnl,
+        CAST(AVG(rr_achieved)    AS FLOAT)               AS avg_rr,
+        CAST(MAX(rr_achieved)    AS FLOAT)               AS best_rr,
+        CAST(MIN(rr_achieved)    AS FLOAT)               AS worst_rr,
+        SUM(CASE WHEN hit_tp THEN 1 ELSE 0 END)          AS tp_hits
       FROM trade_pnl_log
       ${where}
       GROUP BY symbol, session
@@ -635,7 +710,7 @@ async function saveDailyRisk(tradeDate, totalPnlEUR, tradesCount, riskMultApplie
         created_at              = NOW()
     `, [tradeDate, totalPnlEUR ?? 0, evPositive, tradesCount ?? 0,
         riskMultApplied ?? 1.0, riskMultNext ?? 1.0]);
-    console.log(`📅 [DB] Daily risk: ${tradeDate} PnL=€${(totalPnlEUR??0).toFixed(2)} → next mult=${riskMultNext}`);
+    console.log(`📅 [DB] Daily risk: ${tradeDate} PnL=€${(totalPnlEUR ?? 0).toFixed(2)} → next mult=${riskMultNext}`);
   } catch (e) { console.warn("⚠️ saveDailyRisk:", e.message); }
 }
 
@@ -667,6 +742,50 @@ async function logDuplicateEntry(symbol, direction, reason) {
   } catch (e) { console.warn("⚠️ logDuplicateEntry:", e.message); }
 }
 
+// ── [v7.0] SL Shadow Optimizer persistence ───────────────────
+async function saveShadowSLAnalysis(symbol, bestMultiplier, bestEV, bestRR, bestWinrate, slHitRate, tradesUsed) {
+  try {
+    await pool.query(`
+      INSERT INTO shadow_sl_analysis
+        (symbol, best_multiplier, best_ev, best_rr, best_winrate, sl_hit_rate, trades_used, computed_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+    `, [symbol, bestMultiplier ?? null, bestEV ?? null, bestRR ?? null,
+        bestWinrate ?? null, slHitRate ?? null, tradesUsed ?? null]);
+  } catch (e) { console.warn("⚠️ saveShadowSLAnalysis:", e.message); }
+}
+
+async function loadShadowSLAnalysis(symbol = null) {
+  try {
+    const vals = [];
+    let where = "";
+    if (symbol) { vals.push(symbol); where = "WHERE symbol = $1"; }
+    const res = await pool.query(`
+      SELECT DISTINCT ON (symbol)
+        symbol,
+        CAST(best_multiplier AS FLOAT) AS "bestMultiplier",
+        CAST(best_ev         AS FLOAT) AS "bestEV",
+        CAST(best_rr         AS FLOAT) AS "bestRR",
+        CAST(best_winrate    AS FLOAT) AS "bestWinrate",
+        CAST(sl_hit_rate     AS FLOAT) AS "slHitRate",
+        trades_used                    AS "tradesUsed",
+        computed_at                    AS "computedAt"
+      FROM shadow_sl_analysis
+      ${where}
+      ORDER BY symbol, computed_at DESC
+    `, vals);
+    return res.rows;
+  } catch (e) { console.warn("⚠️ loadShadowSLAnalysis:", e.message); return []; }
+}
+
+async function logShadowSLChange(symbol, oldMult, newMult, oldEV, newEV, trades, reason) {
+  try {
+    await pool.query(`
+      INSERT INTO shadow_sl_log (symbol, old_multiplier, new_multiplier, old_ev, new_ev, trades, reason)
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
+    `, [symbol, oldMult ?? null, newMult ?? null, oldEV ?? null, newEV ?? null, trades ?? null, reason ?? null]);
+  } catch (e) { console.warn("⚠️ logShadowSLChange:", e.message); }
+}
+
 // ── Misc ──────────────────────────────────────────────────────
 async function logForexConsolidation(symbol, direction, count, reason) {
   try {
@@ -689,4 +808,6 @@ module.exports = {
   // v5.2
   saveDailyRisk, loadLatestDailyRisk,
   logDuplicateEntry,
+  // v7.0
+  saveShadowSLAnalysis, loadShadowSLAnalysis, logShadowSLChange,
 };
