@@ -1,18 +1,14 @@
 // ═══════════════════════════════════════════════════════════════
-// TradingView → MetaApi REST → MT5  |  FTMO Webhook Server v7.1
+// TradingView → MetaApi REST → MT5  |  FTMO Webhook Server v7.2
 // Account : Nick Verschoot — FTMO Demo
 // MetaApi : 7cb566c1-be02-415b-ab95-495368f3885c
 // ───────────────────────────────────────────────────────────────
-// WIJZIGINGEN v7.1 (t.o.v. v7.0):
-//  ✅ Dashboard volledig herschreven — professioneel dark terminal UI
-//  ✅ Open posities: risk%/balance, SL afstand%, PnL% (nooit EUR)
-//  ✅ Actieve ghosts: delta (trueRR−maxRR@close), MAE, closeReason badge
-//  ✅ Tijd-tot-SL tabel: gem/snelste/traagste per pair×sessie
-//       beste push uur (cyaan), slechtste SL uur (rood)
-//  ✅ Sessie cards Asia/London/NY met alle key stats + SL timing
-//  ✅ Nieuwe endpoints: /analysis/rr, /analysis/sessions,
-//       /research/tp-optimizer, /research/tp-optimizer/sessie
-//  ✅ Dashboard volledig server-side rendered (geen external deps)
+// WIJZIGINGEN v7.2 (t.o.v. v7.1):
+//  ✅ Insta-SL ghost fix: geen ghost tracker voor maxRR ≤ 0.05 + closeReason sl
+//  ✅ close_reason "unknown" → "manual" (onbekend = manuele close)
+//  ✅ Risk display: alleen % van balance, nooit EUR voor instrumenten
+//  ✅ Sessie cards → 1 sorteerbare tabel (klik op header)
+//  ✅ Matrix tabel headers sorteerbaar
 // ═══════════════════════════════════════════════════════════════
 
 "use strict";
@@ -963,10 +959,11 @@ async function syncPositions() {
         const session        = getSessionGMT1(trade.openedAt);
         const realizedPnlEUR = trade.currentPnL ?? 0;
         const hitTP          = trade.tp != null && maxRR >= Math.abs((trade.direction==="buy" ? trade.tp-trade.entry : trade.entry-trade.tp) / Math.abs(trade.entry-trade.sl));
-        let closeReason      = trade._pendingCloseReason ?? "unknown";
-        if (closeReason === "unknown") {
+        let closeReason      = trade._pendingCloseReason ?? "manual";
+        if (closeReason === "manual" || closeReason === "unknown") {
           if (hitTP) closeReason = "tp";
           else if (maxRR <= 0.05) closeReason = "sl";
+          // [v7.2] Als niet TP/SL en geen pending reden → manual close
         }
         const closed = {
           ...trade, closedAt: new Date().toISOString(), maxRR, session,
@@ -980,7 +977,11 @@ async function syncPositions() {
         if (trade.symbol && trade.direction) decrementTracker(trade.symbol, trade.direction);
         delete openPositions[id];
         console.log(`📦 ${trade.symbol} gesloten | MaxRR: ${maxRR}R | closeReason: ${closeReason}`);
-        startGhostTracker(closed, closeReason === "manual");
+        // [v7.2] Geen ghost voor insta-SL (nooit bewogen, maxRR ≈ 0)
+        const isInstaSL = closeReason === "sl" && maxRR <= 0.05;
+        if (!isInstaSL) {
+          startGhostTracker(closed, closeReason === "manual");
+        }
       }
     }
     if (Date.now() - lastAccountSync > ACCOUNT_SYNC_INTERVAL) {
@@ -1736,7 +1737,7 @@ app.get("/dashboard", async (req, res) => {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>FTMO v7.1 — Nick Verschoot</title>
+<title>FTMO v7.2 — Nick Verschoot</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Barlow+Condensed:wght@400;600;700;900&display=swap" rel="stylesheet">
 <style>
@@ -2096,6 +2097,12 @@ td {
 #refresh-flash.on { opacity: 0.6; }
 
 /* ── SCROLL ── */
+/* ── SORTABLE HEADERS ── */
+th.sortable { cursor: pointer; user-select: none; white-space: nowrap; }
+th.sortable:hover { color: var(--c); background: var(--panel2); }
+th.sort-asc::after  { content: " ▲"; color: var(--c); font-size: 9px; }
+th.sort-desc::after { content: " ▼"; color: var(--c); font-size: 9px; }
+
 ::-webkit-scrollbar { width: 5px; height: 5px; }
 ::-webkit-scrollbar-track { background: var(--panel); }
 ::-webkit-scrollbar-thumb { background: var(--dim); border-radius: 3px; }
@@ -2111,7 +2118,7 @@ td {
 <div id="refresh-flash"></div>
 
 <header>
-  <div class="logo">FTMO <em>v7.1 — Nick Verschoot</em></div>
+  <div class="logo">FTMO <em>v7.2 — Nick Verschoot</em></div>
   <div class="header-mid">
     <div class="htag live">Live</div>
     <div class="htag">Demo Account</div>
@@ -2128,7 +2135,7 @@ td {
 <div class="top-strip" id="kpi-strip">
   <div class="kpi green">
     <div class="kpi-label">Balance</div>
-    <div class="kpi-value green" id="kpi-balance">${balance.toFixed(0)}%</div>
+    <div class="kpi-value green" id="kpi-balance">${balance.toFixed(0)}</div>
     <div class="kpi-sub">account balance</div>
   </div>
   <div class="kpi ${floatPct >= 0 ? 'green' : 'red'}">
@@ -2164,7 +2171,7 @@ td {
 </div>
 
 <!-- DAILY RISK -->
-<div class="sec-hd"><span>Daily Risk</span><small>multiplier + effective risk per type</small></div>
+<div class="sec-hd"><span>Daily Risk</span><small>multiplier + effectief risico % van balance per type</small></div>
 <div class="risk-strip" id="risk-strip">
   <div class="risk-card">
     <div class="rl">Vandaag mult</div>
@@ -2178,18 +2185,18 @@ td {
   </div>
   <div class="risk-card">
     <div class="rl">Forex risk</div>
-    <div class="rv c-green">€${(BASE_RISK.forex * dailyRiskMultiplier).toFixed(0)}</div>
-    <div class="rs">${((BASE_RISK.forex * dailyRiskMultiplier) / balance * 100).toFixed(2)}% balance</div>
+    <div class="rv c-green">${((BASE_RISK.forex * dailyRiskMultiplier) / balance * 100).toFixed(3)}%</div>
+    <div class="rs">van balance</div>
   </div>
   <div class="risk-card">
     <div class="rl">Index risk</div>
-    <div class="rv c-green">€${(BASE_RISK.index * dailyRiskMultiplier).toFixed(0)}</div>
-    <div class="rs">${((BASE_RISK.index * dailyRiskMultiplier) / balance * 100).toFixed(2)}% balance</div>
+    <div class="rv c-green">${((BASE_RISK.index * dailyRiskMultiplier) / balance * 100).toFixed(2)}%</div>
+    <div class="rs">van balance</div>
   </div>
   <div class="risk-card">
     <div class="rl">Gold / Stock</div>
-    <div class="rv c-green">€${(BASE_RISK.gold * dailyRiskMultiplier).toFixed(0)} / €${(BASE_RISK.stock * dailyRiskMultiplier).toFixed(0)}</div>
-    <div class="rs">gold / stock</div>
+    <div class="rv c-green">${((BASE_RISK.gold * dailyRiskMultiplier) / balance * 100).toFixed(2)}% / ${((BASE_RISK.stock * dailyRiskMultiplier) / balance * 100).toFixed(2)}%</div>
+    <div class="rs">van balance</div>
   </div>
 </div>
 
@@ -2286,60 +2293,45 @@ ${ghostArr.length === 0 ? `
 `}
 </div>
 
-<!-- SESSIE CARDS -->
-<div class="sec-hd"><span>Sessie Overzicht</span><small>Asia · London · New York — PnL% van balance</small></div>
-<div class="sess-grid" id="sess-grid">
+<!-- SESSIE OVERZICHT -->
+<div class="sec-hd"><span>Sessie Overzicht</span><small>Asia · London · New York — klik header om te sorteren</small></div>
+<div class="tbl-wrap fade-in">
+  <table id="sess-table">
+    <thead>
+      <tr>
+        <th onclick="sortSess('sess')"     class="sortable">Sessie ↕</th>
+        <th onclick="sortSess('n')"        class="sortable">Trades ↕</th>
+        <th onclick="sortSess('winrate')"  class="sortable">Winrate% ↕</th>
+        <th onclick="sortSess('slRate')"   class="sortable">SL hit% ↕</th>
+        <th onclick="sortSess('avgRR')"    class="sortable">Gem. RR ↕</th>
+        <th onclick="sortSess('bestRR')"   class="sortable">Best TP RR ↕</th>
+        <th onclick="sortSess('bestEV')"   class="sortable">Best EV ↕</th>
+        <th onclick="sortSess('tpLocks')"  class="sortable">TP Locks ↕</th>
+        <th onclick="sortSess('evLocks')"  class="sortable">+EV Locks ↕</th>
+        <th onclick="sortSess('pnl')"      class="sortable">PnL% ↕</th>
+      </tr>
+    </thead>
+    <tbody id="sess-tbody">
 ${['asia','london','ny'].map(sess => {
   const s = sessStats[sess];
   const icons = { asia: '🌏', london: '🇬🇧', ny: '🗽' };
-  const labels = { asia: '02:00 – 08:00', london: '08:00 – 15:30', ny: '15:30 – 20:00' };
+  const labels = { asia: '02:00–08:00', london: '08:00–15:30', ny: '15:30–20:00' };
   const pnlColor = s.totalPnlPct >= 0 ? 'var(--green)' : 'var(--red)';
-  const pnlPct = Math.min(Math.abs(s.totalPnlPct), 10);
-  const tpData = tpLocks[`${sess}__asia`] || Object.values(tpLocks).find(l=>l.session===sess);
-  return `
-  <div class="sess-card fade-in">
-    <div class="sess-card-hd">
-      <div class="sess-icon ${sess}">${icons[sess]}</div>
-      <div>
-        <div class="sess-name ${sess}">${sess.toUpperCase()}</div>
-        <div class="sess-time">${labels[sess]} BXL</div>
-      </div>
-      <div style="margin-left:auto;text-align:right">
-        <div style="font-family:var(--hd);font-size:20px;font-weight:700;color:${pnlColor}">${s.totalPnlPct >= 0 ? '+' : ''}${s.totalPnlPct}%</div>
-        <div style="font-size:9px;color:var(--muted)">total PnL%</div>
-      </div>
-    </div>
-    <div class="sess-pnl-bar" style="margin:0 16px 0">
-      <div class="sess-pnl-fill" style="width:${pnlPct * 10}%;background:${pnlColor}"></div>
-    </div>
-    <div class="sess-body">
-      <div class="sess-row">
-        <span class="k">Trades</span>
-        <span class="v">${s.n}</span>
-      </div>
-      <div class="sess-row">
-        <span class="k">Winrate</span>
-        <span class="v" style="color:${s.winrate >= 50 ? 'var(--green)' : 'var(--red)'}">${s.winrate}%</span>
-      </div>
-      <div class="sess-row">
-        <span class="k">SL hit rate</span>
-        <span class="v" style="color:${s.slRate > 60 ? 'var(--red)' : 'var(--textdim)'}">${s.slRate}%</span>
-      </div>
-      <div class="sess-row">
-        <span class="k">Gem. RR</span>
-        <span class="v c-c">${s.avgRR}R</span>
-      </div>
-      <div class="sess-row">
-        <span class="k">Best TP RR (EV)</span>
-        <span class="v c-gold">${s.bestRR}R <span style="color:var(--muted);font-weight:400;font-size:10px">(${s.bestEV})</span></span>
-      </div>
-      <div class="sess-row">
-        <span class="k">TP Locks</span>
-        <span class="v" style="color:var(--purple)">${s.tpLocks} <span style="color:var(--muted);font-weight:400;font-size:10px">(${s.evPositiveLocks} +EV)</span></span>
-      </div>
-    </div>
-  </div>`;
+  return `<tr data-sess="${sess}" data-n="${s.n}" data-winrate="${s.winrate}" data-slrate="${s.slRate}" data-avgrr="${s.avgRR}" data-bestrr="${s.bestRR}" data-bestev="${s.bestEV}" data-tplocks="${s.tpLocks}" data-evlocks="${s.evPositiveLocks}" data-pnl="${s.totalPnlPct}">
+    <td class="bold"><span class="badge b-${sess}">${icons[sess]} ${sess.toUpperCase()}</span> <span class="c-muted" style="font-size:10px">${labels[sess]}</span></td>
+    <td class="c-dim">${s.n}</td>
+    <td style="color:${s.winrate >= 50 ? 'var(--green)' : 'var(--red)'}">${s.winrate}%</td>
+    <td style="color:${s.slRate > 60 ? 'var(--red)' : 'var(--textdim)'}">${s.slRate}%</td>
+    <td class="c-c">${s.avgRR}R</td>
+    <td class="c-gold">${s.bestRR}R</td>
+    <td style="color:${parseFloat(s.bestEV) > 0 ? 'var(--green)' : 'var(--red)'}">${s.bestEV}</td>
+    <td style="color:var(--purple)">${s.tpLocks}</td>
+    <td style="color:var(--purple)">${s.evPositiveLocks}</td>
+    <td style="color:${pnlColor};font-weight:700">${s.totalPnlPct >= 0 ? '+' : ''}${s.totalPnlPct}%</td>
+  </tr>`;
 }).join('')}
+    </tbody>
+  </table>
 </div>
 
 <!-- TIJD TOT SL TABEL -->
@@ -2390,18 +2382,18 @@ ${slTimeRows.length === 0 ? `
     <table>
       <thead>
         <tr>
-          <th>Pair</th>
-          <th>Asia — RR</th>
-          <th>Asia — EV</th>
-          <th>Asia — #</th>
-          <th>London — RR</th>
-          <th>London — EV</th>
-          <th>London — #</th>
-          <th>NY — RR</th>
-          <th>NY — EV</th>
-          <th>NY — #</th>
-          <th>Shadow SL</th>
-          <th>Auto</th>
+          <th onclick="sortMatrix(0)" class="sortable">Pair ↕</th>
+          <th onclick="sortMatrix(1)" class="sortable">Asia — RR ↕</th>
+          <th onclick="sortMatrix(2)" class="sortable">Asia — EV ↕</th>
+          <th onclick="sortMatrix(3)" class="sortable">Asia — # ↕</th>
+          <th onclick="sortMatrix(4)" class="sortable">London — RR ↕</th>
+          <th onclick="sortMatrix(5)" class="sortable">London — EV ↕</th>
+          <th onclick="sortMatrix(6)" class="sortable">London — # ↕</th>
+          <th onclick="sortMatrix(7)" class="sortable">NY — RR ↕</th>
+          <th onclick="sortMatrix(8)" class="sortable">NY — EV ↕</th>
+          <th onclick="sortMatrix(9)" class="sortable">NY — # ↕</th>
+          <th onclick="sortMatrix(10)" class="sortable">Shadow SL ↕</th>
+          <th onclick="sortMatrix(11)" class="sortable">Auto ↕</th>
         </tr>
       </thead>
       <tbody id="matrix-body">
@@ -2462,6 +2454,50 @@ ${slTimeRows.length === 0 ? `
 </main>
 
 <script>
+// ── SESSION TABLE SORT ──
+let sessSort = { key: 'sess', dir: 1 };
+function sortSess(key) {
+  if (sessSort.key === key) sessSort.dir *= -1;
+  else { sessSort.key = key; sessSort.dir = 1; }
+  document.querySelectorAll('#sess-table th').forEach(th => th.classList.remove('sort-asc','sort-desc'));
+  const idx = ['sess','n','winrate','slRate','avgRR','bestRR','bestEV','tpLocks','evLocks','pnl'].indexOf(key);
+  const ths = document.querySelectorAll('#sess-table thead th');
+  if (ths[idx]) ths[idx].classList.add(sessSort.dir === 1 ? 'sort-asc' : 'sort-desc');
+  const tbody = document.getElementById('sess-tbody');
+  if (!tbody) return;
+  const rows = [...tbody.querySelectorAll('tr')];
+  const dataKey = { sess:'sess', n:'n', winrate:'winrate', slRate:'slrate', avgRR:'avgrr', bestRR:'bestrr', bestEV:'bestev', tpLocks:'tplocks', evLocks:'evlocks', pnl:'pnl' }[key] || key;
+  rows.sort((a, b) => {
+    const av = a.dataset[dataKey] ?? '';
+    const bv = b.dataset[dataKey] ?? '';
+    const an = parseFloat(av), bn = parseFloat(bv);
+    const cmp = isNaN(an) || isNaN(bn) ? av.localeCompare(bv) : an - bn;
+    return cmp * sessSort.dir;
+  });
+  rows.forEach(r => tbody.appendChild(r));
+}
+
+// ── MATRIX TABLE SORT ──
+let matrixSort = { key: 0, dir: 1 };
+function sortMatrix(colIdx) {
+  if (matrixSort.key === colIdx) matrixSort.dir *= -1;
+  else { matrixSort.key = colIdx; matrixSort.dir = 1; }
+  document.querySelectorAll('#matrix-tbl thead th').forEach(th => th.classList.remove('sort-asc','sort-desc'));
+  const ths = document.querySelectorAll('#matrix-tbl thead th');
+  if (ths[colIdx]) ths[colIdx].classList.add(matrixSort.dir === 1 ? 'sort-asc' : 'sort-desc');
+  const tbody = document.getElementById('matrix-body');
+  if (!tbody) return;
+  const rows = [...tbody.querySelectorAll('tr')];
+  rows.sort((a, b) => {
+    const ac = a.cells[colIdx]?.textContent?.trim() ?? '';
+    const bc = b.cells[colIdx]?.textContent?.trim() ?? '';
+    const an = parseFloat(ac), bn = parseFloat(bc);
+    const cmp = isNaN(an) || isNaN(bn) ? ac.localeCompare(bc) : an - bn;
+    return cmp * matrixSort.dir;
+  });
+  rows.forEach(r => tbody.appendChild(r));
+}
+
 // ── CLOCK ──
 function tick() {
   document.getElementById('hclock').textContent =
@@ -2633,7 +2669,7 @@ async function start() {
     }
 
     app.listen(PORT, () => {
-      console.log(`✅ Server v7.1 luistert op port ${PORT}`);
+      console.log(`✅ Server v7.2 luistert op port ${PORT}`);
       console.log(`   🔹 Dashboard: /dashboard`);
       console.log(`   🔹 Nieuwe endpoints: /analysis/rr, /analysis/sessions`);
       console.log(`   🔹 Nieuwe endpoints: /research/tp-optimizer, /research/tp-optimizer/sessie`);
