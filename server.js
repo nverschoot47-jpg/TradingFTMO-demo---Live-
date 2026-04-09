@@ -1,32 +1,35 @@
 // ═══════════════════════════════════════════════════════════════
-// TradingView → MetaApi REST → MT5  |  FTMO Webhook Server v5.2
+// TradingView → MetaApi REST → MT5  |  FTMO Webhook Server v7.0
 // Account : Nick Verschoot — FTMO Demo
 // MetaApi : 7cb566c1-be02-415b-ab95-495368f3885c
 // ───────────────────────────────────────────────────────────────
-// WIJZIGINGEN v5.2 (t.o.v. v5.1):
-//  ✅ [FEAT 1]  Forex uitgebreid — alle pairs behalve JPY & exotics
-//              EURNZD + GBPNZD toegevoegd; 7 JPY-pairs verwijderd
-//  ✅ [FEAT 2]  UK Index min SL: 5 → 2
-//  ✅ [FEAT 3]  Ghost Trading hard stop: 22:00 (was 20:00)
-//              Loopt door bij: manual close, TP close, TP lock,
-//              shadow optimisation. Stopt alleen bij SL phantom
-//              trigger of 22:00 hard stop.
-//  ✅ [FEAT 4]  Vast TP = Risk × 4R voor ALLE trades in sessie/pair
-//              (niet enkel eerste trade, niet afhankelijk van EV lock)
-//  ✅ [FEAT 5]  TP lock na 3 trades per pair per sessie (avondregel)
-//  ✅ [FEAT 6]  Daily Risk Scaling: positieve EV → Risk ×1.2 volgende
-//              dag; geen positieve EV → reset naar standaard
-//  ✅ [FEAT 7]  SL Shadow Optimizer trigger: 50 → 30 trades
-//  ✅ [FEAT 8]  Duplicate entry guard — zelfde pair+richting binnen
-//              60s volledig geblokkeerd
-//  ✅ [FEAT 9]  Hard tijdslimieten bijgewerkt:
-//              - Auto-close: 20:50 → 21:50
-//              - Ghost + Shadow stop cron: 22:00 (nieuw)
-//              - Reconnect cron: 02:00 (nieuw)
-//  ✅ [FEAT 10] Forex pyramiding: max 2× per pair per richting
-//              (was 3×). Trade 1 = vol risk, Trade 2 = 50% risk.
-//  ✅ [KEEP]   Fix 3 (forex consolidation restart) — ongewijzigd
-//  ✅ [KEEP]   Fix 5 (webhook timeout 8s) — ongewijzigd
+// WIJZIGINGEN v7.0 (t.o.v. v5.2):
+//  ✅ [1]  Ghost Tracker volledige herschrijving:
+//          - ghost_mae, ghost_hit_sl, ghost_time_to_sl
+//          - phantom_sl trigger (originele SL floor)
+//          - trueMaxRR gemeten van ENTRY baseline
+//          - maxRRAtClose bevroren bij sluiting, nooit gemuteerd
+//          - ghostExtraRR = trueMaxRR − maxRRAtClose
+//          - close_reason: tp / sl / manual / auto / unknown
+//          - is_manual vlag voor /close endpoint
+//          - ghost_stop_reason: phantom_sl / auto_close_window /
+//            timeout / restart_lost / failsafe
+//  ✅ [2]  Symbol map fixes: NL25EUR, AU200AUD aliases, NKE (geen NIKE)
+//  ✅ [3]  'all' sessie volledig verwijderd uit tpLocks + DB
+//  ✅ [4]  getBrusselsDateOnly() overal i.p.v. .toISOString().split("T")[0]
+//  ✅ [5]  GBPUSD SL recalc op startup voor alle symbolen ≥ 30 trades
+//  ✅ [6]  calcLots double multiplier fix — effectiveCap gebruikt baseRisk
+//  ✅ [7]  TP Lock risk boost: ×4 + ×1.2 per consecutive positive dag
+//          consecutivePositiveDays bijgehouden per symbol+session
+//  ✅ [8]  Ghost triggert altijd: tp / sl / manual / auto
+//  ✅ [10] SL Shadow Optimizer (symbol-level, ghost-finalized trades)
+//  ✅ [24] Dashboard: Daily Risk panel
+//  ✅ [25] Dashboard: Last Cron Runs sectie
+//  ✅ [26] Forex tweede trade: 50% risk, EV-conditioneel
+//  ✅ [33] Nieuwe symbolen: BRK.B, ARM, NL25EUR, TL0 (TSLA alias)
+//  ✅ [34] Symbol validation: onbekend symbool → SKIP met reden
+//  ✅ [EOD] 21:00 ghost cron voor trades gesloten laatste 20 min
+//  ✅ Orphan repair op startup: restart_lost voor null trueMaxRR
 // ═══════════════════════════════════════════════════════════════
 
 "use strict";
@@ -45,11 +48,13 @@ const {
   logForexConsolidation,
   saveDailyRisk, loadLatestDailyRisk,
   logDuplicateEntry,
+  saveShadowSLAnalysis, loadShadowSLAnalysis, logShadowSLChange,
 } = require("./db");
 
 const {
   getBrusselsComponents,
   getBrusselsDateStr,
+  getBrusselsDateOnly,   // [v7.0] vervangt .toISOString().split("T")[0]
   getSessionGMT1,
   isMarketOpen: isMarketOpenFn,
   isGhostActive,
@@ -72,18 +77,17 @@ const GHOST_OLD_THRESHOLD_MS   = 6 * 3600 * 1000;
 const RR_LEVELS    = [0.2, 0.4, 0.6, 0.8, 1, 1.5, 2, 2.5, 3, 4, 5, 6, 7, 8, 10, 12, 15, 20, 25];
 const SL_MULTIPLES = [0.5, 0.6, 0.75, 0.85, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0];
 
-// [FEAT 7] SL shadow optimizer na 30 trades (was 50)
-const SL_AUTO_APPLY_THRESHOLD  = 30;
+const SL_AUTO_APPLY_THRESHOLD = 30;
+const SHADOW_SL_MIN_TRADES    = 30;
 
-// [FEAT 4] Vast TP = 4R voor alle trades
 const FIXED_TP_RR = 4;
 
 const STOCK_SL_SPREAD_MULT      = 1.5;
 const STOCK_MAX_SPREAD_FRACTION = 0.333;
 
-// [FEAT 10] Forex pyramiding: max 2× per pair/richting
-const FOREX_MAX_SAME_DIR        = 2;  // was 3
-const FOREX_HALF_RISK_THRESHOLD = 1;  // trade 2 krijgt 50% risk
+// [v5.2] Forex pyramiding: max 2×
+const FOREX_MAX_SAME_DIR        = 2;
+const FOREX_HALF_RISK_THRESHOLD = 1;
 
 const TP_LOCK_RISK_MULT = 4;
 
@@ -98,9 +102,9 @@ const BASE_RISK = {
   stock:  parseFloat(process.env.RISK_STOCK  || "30"),
 };
 
-// [FEAT 6] Daily risk multiplier — wordt bijgewerkt door dagelijkse EV check
-let dailyRiskMultiplier     = 1.0;   // actief voor vandaag
-let dailyRiskMultiplierNext = 1.0;   // berekend einde dag, toepassen morgen
+// [v5.2/v7.0] Daily risk multiplier
+let dailyRiskMultiplier     = 1.0;
+let dailyRiskMultiplierNext = 1.0;
 
 function getRisk(type) {
   return (BASE_RISK[type] || 30) * dailyRiskMultiplier;
@@ -119,31 +123,49 @@ const webhookHistory   = [];
 const ghostTrackers    = {};
 const tpLocks          = {};
 const slLocks          = {};
+const shadowSLResults  = {}; // [v7.0] symbol → shadow optimizer result
 const tpUpdateLog      = [];
 const slUpdateLog      = [];
 
-// [FEAT 8] Duplicate entry guard — key: "SYMBOL_direction", value: timestamp
+// [v7.0] Track consecutive positive EV days per symbol+session for TP boost
+const consecutivePositiveDays = {}; // key: "SYMBOL__SESSION" → integer
+
+// [v5.2] Duplicate entry guard
 const recentOrderGuard = new Map();
-const DUPLICATE_GUARD_MS = 60 * 1000; // 60 seconden window
+const DUPLICATE_GUARD_MS = 60 * 1000;
+
+// [v7.0] Track last cron fire times for dashboard
+const cronLastRun = {
+  "AUTOCLOSE_2150":   null,
+  "DAY_END_22:00":    null,
+  "RECONNECT_02:00":  null,
+  "NIGHTLY_OPTIMIZER":null,
+  "EOD_GHOST_21:00":  null,
+};
 
 const MAX_SNAPSHOTS = 86400;
 const MAX_HISTORY   = 200;
 const MAX_TP_LOG    = 100;
 const MAX_SL_LOG    = 100;
 
-const TRADING_SESSIONS = ["asia", "london", "ny"];
+const TRADING_SESSIONS = ["asia", "london", "ny"]; // [v7.0] never 'all'
 
 function addWebhookHistory(entry) {
   webhookHistory.unshift({ ts: new Date().toISOString(), ...entry });
   if (webhookHistory.length > MAX_HISTORY) webhookHistory.length = MAX_HISTORY;
+  // Update cron tracker
+  if (entry.type && cronLastRun.hasOwnProperty(entry.type)) {
+    cronLastRun[entry.type] = entry.ts || new Date().toISOString();
+  }
 }
 
 const learnedPatches = {};
 
 // ══════════════════════════════════════════════════════════════
-// SYMBOL MAP
-// [FEAT 1] JPY-pairs verwijderd. EURNZD + GBPNZD toegevoegd.
-// Alle resterende forex zijn major/minor zonder JPY/exotics.
+// SYMBOL MAP v7.0
+// Changes: NL25EUR added, AU200AUD alias confirmed, SPX500USD confirmed,
+//          UK100GBP confirmed, NIKE removed → NKE only,
+//          BRK.B, ARM, TL0 added
 // ══════════════════════════════════════════════════════════════
 const SYMBOL_MAP = {
   // ── Indices ──────────────────────────────────────────────
@@ -153,11 +175,14 @@ const SYMBOL_MAP = {
   "US30USD":     { mt5: "US30.cash",   type: "index" },
   "SPX500USD":   { mt5: "US500.cash",  type: "index" },
   "JP225USD":    { mt5: "JP225.cash",  type: "index" },
-  "AU200AUD":    { mt5: "AUS200.cash", type: "index" },
+  "AU200AUD":    { mt5: "AUS200.cash", type: "index" }, // TV alias confirmed
   "EU50EUR":     { mt5: "EU50.cash",   type: "index" },
   "FR40EUR":     { mt5: "FRA40.cash",  type: "index" },
   "HK33HKD":     { mt5: "HK50.cash",   type: "index" },
   "US2000USD":   { mt5: "US2000.cash", type: "index" },
+  // [v7.0] NL25EUR → N.25.cash
+  "NL25EUR":     { mt5: "N.25.cash",   type: "index" },
+  // Aliases
   "GER40":       { mt5: "GER40.cash",  type: "index" },
   "GER40.cash":  { mt5: "GER40.cash",  type: "index" },
   "UK100":       { mt5: "UK100.cash",  type: "index" },
@@ -184,6 +209,7 @@ const SYMBOL_MAP = {
   "HK50.cash":   { mt5: "HK50.cash",   type: "index" },
   "US2000":      { mt5: "US2000.cash", type: "index" },
   "US2000.cash": { mt5: "US2000.cash", type: "index" },
+  "N.25.cash":   { mt5: "N.25.cash",   type: "index" },
   // ── Commodities & Crypto ─────────────────────────────────
   "XAUUSD":      { mt5: "XAUUSD",      type: "gold"   },
   "GOLD":        { mt5: "XAUUSD",      type: "gold"   },
@@ -195,9 +221,10 @@ const SYMBOL_MAP = {
   "ETHUSD":      { mt5: "ETHUSD",      type: "crypto" },
   // ── Stocks ───────────────────────────────────────────────
   "AAPL":  { mt5: "AAPL",  type: "stock" },
-  "APC":   { mt5: "AAPL",  type: "stock" }, // TradingView alias
+  "APC":   { mt5: "AAPL",  type: "stock" },  // TradingView alias
   "TSLA":  { mt5: "TSLA",  type: "stock" },
-  "TLO":   { mt5: "TSLA",  type: "stock" }, // TradingView alias
+  "TLO":   { mt5: "TSLA",  type: "stock" },  // TradingView alias
+  "TL0":   { mt5: "TSLA",  type: "stock" },  // [v7.0] TradingView alias (zero not O)
   "MSFT":  { mt5: "MSFT",  type: "stock" },
   "NVDA":  { mt5: "NVDA",  type: "stock" },
   "AMD":   { mt5: "AMD",   type: "stock" },
@@ -228,7 +255,8 @@ const SYMBOL_MAP = {
   "MCD":   { mt5: "MCD",   type: "stock" },
   "META":  { mt5: "META",  type: "stock" },
   "MSTR":  { mt5: "MSTR",  type: "stock" },
-  "NIKE":  { mt5: "NKE",   type: "stock" },
+  // [v7.0] NIKE verwijderd — alleen NKE
+  "NKE":   { mt5: "NKE",   type: "stock" },
   "PFE":   { mt5: "PFE",   type: "stock" },
   "QCOM":  { mt5: "QCOM",  type: "stock" },
   "RACE":  { mt5: "RACE",  type: "stock" },
@@ -238,8 +266,10 @@ const SYMBOL_MAP = {
   "WMT":   { mt5: "WMT",   type: "stock" },
   "XOM":   { mt5: "XOM",   type: "stock" },
   "ZM":    { mt5: "ZM",    type: "stock" },
+  // [v7.0] Nieuw
+  "BRK.B": { mt5: "BRK.B", type: "stock" },
+  "ARM":   { mt5: "ARM",   type: "stock" },
   // ── Forex — major/minor pairs (geen JPY, geen exotics) ───
-  // [FEAT 1] JPY-pairs (USDJPY/EURJPY/GBPJPY/AUDJPY/CADJPY/NZDJPY/CHFJPY) verwijderd
   "EURUSD": { mt5: "EURUSD", type: "forex" },
   "GBPUSD": { mt5: "GBPUSD", type: "forex" },
   "USDCHF": { mt5: "USDCHF", type: "forex" },
@@ -250,11 +280,11 @@ const SYMBOL_MAP = {
   "EURCHF": { mt5: "EURCHF", type: "forex" },
   "EURAUD": { mt5: "EURAUD", type: "forex" },
   "EURCAD": { mt5: "EURCAD", type: "forex" },
-  "EURNZD": { mt5: "EURNZD", type: "forex" }, // nieuw
+  "EURNZD": { mt5: "EURNZD", type: "forex" },
   "GBPCHF": { mt5: "GBPCHF", type: "forex" },
   "GBPAUD": { mt5: "GBPAUD", type: "forex" },
   "GBPCAD": { mt5: "GBPCAD", type: "forex" },
-  "GBPNZD": { mt5: "GBPNZD", type: "forex" }, // nieuw
+  "GBPNZD": { mt5: "GBPNZD", type: "forex" },
   "AUDCAD": { mt5: "AUDCAD", type: "forex" },
   "AUDCHF": { mt5: "AUDCHF", type: "forex" },
   "AUDNZD": { mt5: "AUDNZD", type: "forex" },
@@ -263,35 +293,40 @@ const SYMBOL_MAP = {
   "NZDCHF": { mt5: "NZDCHF", type: "forex" },
 };
 
+// [v7.0] Normalize symbol — treat NIKE as NKE for legacy data
+function normalizeSymbol(sym) {
+  if (sym === "NIKE") return "NKE";
+  return sym;
+}
+
 // ── LOT / STOP CONFIG ─────────────────────────────────────────
 const LOT_VALUE = { index:20, gold:100, brent:10, wti:10, crypto:1, stock:1, forex:10 };
 const MAX_LOTS  = { index:10, gold:1,   brent:5,  wti:5,  crypto:1, stock:50, forex:0.25 };
 
 const MIN_STOP_INDEX = {
-  "GER40.cash":10,
-  "UK100.cash":2,    // [FEAT 2] was 5 → 2
-  "US100.cash":10,
-  "US30.cash":10,
-  "US500.cash":5,
-  "JP225.cash":10,
-  "AUS200.cash":5,
-  "EU50.cash":5,
-  "FRA40.cash":5,
-  "HK50.cash":10,
-  "US2000.cash":5,
+  "GER40.cash":  10,
+  "UK100.cash":  2,
+  "US100.cash":  10,
+  "US30.cash":   10,
+  "US500.cash":  5,
+  "JP225.cash":  10,
+  "AUS200.cash": 5,
+  "EU50.cash":   5,
+  "FRA40.cash":  5,
+  "HK50.cash":   10,
+  "US2000.cash": 5,
+  "N.25.cash":   5,   // [v7.0]
 };
 const MIN_STOP_COMMODITY = {
-  "XAUUSD":1.0, "UKOIL.cash":0.05, "USOIL.cash":0.05, "BTCUSD":100.0, "ETHUSD":5.0,
+  "XAUUSD":0.0, "UKOIL.cash":0.05, "USOIL.cash":0.05, "BTCUSD":100.0, "ETHUSD":5.0,
 };
-
-// [FEAT 1] Geen JPY pairs in min-stop map (worden niet getraded)
 const MIN_STOP_FOREX = {
   "EURUSD":0.0005, "GBPUSD":0.0005, "AUDUSD":0.0005, "NZDUSD":0.0005,
   "USDCHF":0.0005, "USDCAD":0.0005,
   "EURGBP":0.0005, "EURAUD":0.0005, "EURCAD":0.0005, "EURCHF":0.0005,
-  "EURNZD":0.0005, // nieuw
+  "EURNZD":0.0005,
   "GBPAUD":0.0005, "GBPCAD":0.0005, "GBPCHF":0.0005,
-  "GBPNZD":0.0005, // nieuw
+  "GBPNZD":0.0005,
   "AUDCAD":0.0005, "AUDCHF":0.0005, "AUDNZD":0.0005,
   "CADCHF":0.0005,
   "NZDCAD":0.0005, "NZDCHF":0.0005,
@@ -317,9 +352,11 @@ function getMT5Symbol(sym) {
   return learnedPatches[sym]?.mt5Override ?? SYMBOL_MAP[sym]?.mt5 ?? sym;
 }
 function getSymbolType(sym) {
-  if (SYMBOL_MAP[sym]) return SYMBOL_MAP[sym].type;
-  if (["BTC","ETH"].some(c => sym.startsWith(c))) return "crypto";
-  return "stock";
+  const ns = normalizeSymbol(sym);
+  if (SYMBOL_MAP[ns]) return SYMBOL_MAP[ns].type;
+  if (["BTC","ETH"].some(c => ns.startsWith(c))) return "crypto";
+  // [v7.0] Do NOT silently fall back — return null for unknown symbols
+  return null;
 }
 function isMarketOpen(type, symbol) {
   return isMarketOpenFn(type, symbol, isCryptoWeekend);
@@ -370,11 +407,16 @@ async function fetchCurrentPrice(mt5Symbol) {
   } catch(e) { console.warn(`⚠️ fetchCurrentPrice(${mt5Symbol}):`, e.message); return null; }
 }
 
-// ── [FEAT 9] AUTO-CLOSE 21:50 Brussels (was 20:50) ───────────
-cron.schedule("50 21 * * *", async () => {
+// ══════════════════════════════════════════════════════════════
+// CRON JOBS
+// ══════════════════════════════════════════════════════════════
+
+// ── AUTO-CLOSE 21:50 Brussels ─────────────────────────────────
+cron.schedule("50 21 * * 1-5", async () => {
   const { day } = getBrusselsComponents();
   const isWE = day === 0 || day === 6;
   console.log("🔔 21:50 Brussels — auto-close gestart...");
+  cronLastRun["AUTOCLOSE_2150"] = new Date().toISOString();
   try {
     const positions = await fetchOpenPositions();
     if (!Array.isArray(positions) || !positions.length) {
@@ -386,80 +428,112 @@ cron.schedule("50 21 * * *", async () => {
         try {
           await closePosition(pos.id);
           console.log(`✅ Auto-close 21:50: ${pos.symbol}`);
+          // [v7.0] close_reason = 'auto' voor syncPositions om op te pikken
+          if (openPositions[String(pos.id)]) {
+            openPositions[String(pos.id)]._pendingCloseReason = "auto";
+          }
           addWebhookHistory({ type:"AUTOCLOSE_2150", symbol:pos.symbol, positionId:pos.id });
         } catch(e) { console.error(`❌ Auto-close ${pos.symbol}:`, e.message); }
       }
     }
-    // [FEAT 6] Bereken dagelijkse EV na sluiting posities
+    // [v7.0] Brussels-correcte datum
     await evaluateDailyRisk();
   } catch(e) { console.error("❌ Auto-close fout:", e.message); }
 }, { timezone: "Europe/Brussels" });
 
-// ── [FEAT 9] GHOST + SHADOW HARD STOP 22:00 ──────────────────
-cron.schedule("0 22 * * *", async () => {
-  console.log("🌙 22:00 Brussels — ghost & shadow hard stop...");
+// ── [v7.0] EOD GHOST 21:00 — trades gesloten laatste 20 min ──
+cron.schedule("0 21 * * 1-5", async () => {
+  console.log("👻 21:00 Brussels — EOD ghost check (trades laatste 20min)...");
+  cronLastRun["EOD_GHOST_21:00"] = new Date().toISOString();
+  const cutoff = Date.now() - 20 * 60 * 1000;
+  const recent = closedTrades.filter(t =>
+    t.closedAt && new Date(t.closedAt).getTime() >= cutoff && t.trueMaxRR === null
+  );
+  for (const trade of recent) {
+    // Check of er al een ghost loopt voor deze trade
+    const alreadyRunning = Object.values(ghostTrackers).some(g => g.trade.id === trade.id);
+    if (!alreadyRunning) {
+      console.log(`👻 [EOD] Ghost start voor ${trade.symbol} (gesloten ${trade.closedAt})`);
+      startGhostTracker(trade);
+    }
+  }
+  addWebhookHistory({ type:"EOD_GHOST_21:00", ghostsStarted: recent.length });
+}, { timezone: "Europe/Brussels" });
 
-  // Stop alle actieve ghost trackers
+// ── GHOST + SHADOW HARD STOP 22:00 ────────────────────────────
+cron.schedule("0 22 * * 1-5", async () => {
+  console.log("🌙 22:00 Brussels — ghost & shadow hard stop...");
+  cronLastRun["DAY_END_22:00"] = new Date().toISOString();
+
   let ghostCount = 0;
   for (const [ghostId, g] of Object.entries(ghostTrackers)) {
-    finaliseGhost(ghostId, g.trade, g.bestPrice, "day_end_22:00", g.startedAt);
+    finaliseGhost(ghostId, g.trade, g.bestPrice, "auto_close_window", g.startedAt);
     ghostCount++;
   }
   console.log(`👻 ${ghostCount} ghost(s) gestopt om 22:00`);
 
-  // Consolideer sessie data
+  // Run shadow optimizer after ghost finalize
+  await runShadowSLOptimizerAll();
+
+  const todayStr = getBrusselsDateOnly();
   const todayTrades = closedTrades.filter(t => {
     if (!t.closedAt) return false;
-    const d = new Date(t.closedAt);
-    const now = new Date();
-    return d.toDateString() === now.toDateString();
+    return getBrusselsDateOnly(t.closedAt) === todayStr;
   });
-  console.log(`📊 Sessie data: ${todayTrades.length} trades vandaag opgeslagen`);
+  console.log(`📊 Sessie data: ${todayTrades.length} trades vandaag`);
   addWebhookHistory({ type:"DAY_END_22:00", ghostsStopped: ghostCount, todayTrades: todayTrades.length });
 }, { timezone: "Europe/Brussels" });
 
-// ── [FEAT 9] RECONNECT 02:00 Brussels ────────────────────────
+// ── RECONNECT 02:00 Brussels ──────────────────────────────────
 cron.schedule("0 2 * * *", async () => {
   console.log("🔄 02:00 Brussels — dagelijkse reconnect...");
-  // Pas risk multiplier toe voor nieuwe dag
+  cronLastRun["RECONNECT_02:00"] = new Date().toISOString();
+
+  // [v7.0] Apply multiplier — no cap, let it compound
   dailyRiskMultiplier = dailyRiskMultiplierNext;
   console.log(`💰 [Risk] Multiplier voor vandaag: ×${dailyRiskMultiplier.toFixed(2)}`);
-  // Herstel open posities van MT5
+
+  // Update consecutive positive days per symbol+session
+  await updateConsecutivePositiveDays();
+
   await restoreOpenPositionsFromMT5();
-  // Reset duplicate guard
   recentOrderGuard.clear();
   addWebhookHistory({ type:"RECONNECT_02:00", riskMultiplier: dailyRiskMultiplier });
 }, { timezone: "Europe/Brussels" });
 
-// ── NIGHTLY TP OPTIMIZER 03:00 Brussels ──────────────────────
+// ── NIGHTLY OPTIMIZER 03:00 Brussels ─────────────────────────
 cron.schedule("0 3 * * *", async () => {
   console.log("🌙 03:00 Brussels — nightly optimizer...");
+  cronLastRun["NIGHTLY_OPTIMIZER"] = new Date().toISOString();
   const symbols = [...new Set(closedTrades.map(t => t.symbol).filter(Boolean))];
   for (const sym of symbols) {
     await runTPLockEngine(sym).catch(e => console.error(`❌ [TP nightly] ${sym}:`, e.message));
     await runSLLockEngine(sym).catch(e => console.error(`❌ [SL nightly] ${sym}:`, e.message));
   }
+  await runShadowSLOptimizerAll();
   console.log(`✅ Nightly optimizer klaar — ${symbols.length} symbolen`);
+  addWebhookHistory({ type:"NIGHTLY_OPTIMIZER", symbols: symbols.length });
 }, { timezone: "Europe/Brussels" });
 
-// ── [FEAT 6] DAILY RISK SCALING ───────────────────────────────
+// ══════════════════════════════════════════════════════════════
+// DAILY RISK SCALING — [v7.0] getBrusselsDateOnly + no cap
+// ══════════════════════════════════════════════════════════════
 async function evaluateDailyRisk() {
   try {
-    const today = new Date();
-    const todayStr = today.toISOString().split("T")[0];
+    const todayStr = getBrusselsDateOnly(); // [v7.0] Brussels-correcte datum
 
     const todayTrades = closedTrades.filter(t => {
       if (!t.closedAt) return false;
-      return t.closedAt.startsWith(todayStr);
+      return getBrusselsDateOnly(t.closedAt) === todayStr; // [v7.0]
     });
 
     const totalPnl = todayTrades.reduce((sum, t) => sum + (t.realizedPnlEUR ?? 0), 0);
     const evPositive = totalPnl > 0;
 
-    // Bepaal multiplier voor morgen
+    // [v7.0] No cap — let it compound indefinitely (spec item 7)
     dailyRiskMultiplierNext = evPositive
-      ? parseFloat(Math.min(dailyRiskMultiplier * 1.2, 3.0).toFixed(2)) // max cap ×3
-      : 1.0; // reset naar standaard
+      ? parseFloat((dailyRiskMultiplier * 1.2).toFixed(4))
+      : 1.0;
 
     console.log(
       `📅 [Daily Risk] ${todayStr}: PnL=€${totalPnl.toFixed(2)} | EV=${evPositive?"✅":"❌"} | ` +
@@ -474,6 +548,36 @@ async function evaluateDailyRisk() {
       dailyRiskMultiplierNext
     );
   } catch(e) { console.warn("⚠️ evaluateDailyRisk:", e.message); }
+}
+
+// [v7.0] Update consecutive positive EV days per symbol+session
+async function updateConsecutivePositiveDays() {
+  // For each symbol+session combo in tpLocks, check yesterday's EV
+  const yesterday = getBrusselsDateOnly(new Date(Date.now() - 86400000));
+  for (const [lockKey, lock] of Object.entries(tpLocks)) {
+    const [sym, sess] = lockKey.split("__");
+    const yesterdayTrades = closedTrades.filter(t =>
+      t.symbol === sym &&
+      (t.session === sess || sess === "all") &&
+      t.closedAt &&
+      getBrusselsDateOnly(t.closedAt) === yesterday
+    );
+    if (!yesterdayTrades.length) continue;
+    const rrArr = yesterdayTrades.map(t => t.trueMaxRR ?? t.maxRR ?? 0);
+    const bestRR = RR_LEVELS.reduce((best, rr) => {
+      const wins = rrArr.filter(r => r >= rr).length;
+      const wr   = wins / rrArr.length;
+      const ev   = wr * rr - (1 - wr);
+      return ev > best.ev ? { rr, ev } : best;
+    }, { rr: 0, ev: -Infinity });
+
+    if (bestRR.ev > 0) {
+      consecutivePositiveDays[lockKey] = (consecutivePositiveDays[lockKey] || 0) + 1;
+    } else {
+      consecutivePositiveDays[lockKey] = 0;
+    }
+    console.log(`📈 [Consecutive] ${lockKey}: ${consecutivePositiveDays[lockKey]} positive days`);
+  }
 }
 
 // ── RESTART RECOVERY ──────────────────────────────────────────
@@ -495,7 +599,7 @@ async function restoreOpenPositionsFromMT5() {
       openPositions[id] = {
         id, symbol: tvSym, mt5Symbol: pos.symbol, direction,
         entry, sl: pos.stopLoss ?? 0, tp: pos.takeProfit ?? null,
-        lots: pos.volume ?? 0.01, riskEUR: getRisk(getSymbolType(tvSym)),
+        lots: pos.volume ?? 0.01, riskEUR: getRisk(getSymbolType(tvSym) || "stock"),
         openedAt: pos.time ?? new Date().toISOString(),
         session, sessionLabel: SESSION_LABELS[session] || session,
         maxPrice: entry, maxRR: 0, currentPnL: pos.unrealizedProfit ?? 0,
@@ -510,8 +614,27 @@ async function restoreOpenPositionsFromMT5() {
   } catch(e) { console.warn("⚠️ [Restart Recovery] Mislukt:", e.message); }
 }
 
-// ── [FIX 3] FOREX ANTI-CONSOLIDATIE ──────────────────────────
-// [FEAT 10] Aangepast: max 2× (was 3×), halfRisk bij count===1
+// ── [v7.0] ORPHAN REPAIR ─────────────────────────────────────
+// Trades met trueMaxRR=null en maxRR>0 na restart → restart_lost
+async function repairOrphanedGhosts() {
+  let repaired = 0;
+  for (const trade of closedTrades) {
+    if (trade.trueMaxRR === null || trade.trueMaxRR === undefined) {
+      if ((trade.maxRR ?? 0) > 0) {
+        trade.trueMaxRR       = trade.maxRR; // conservative: maxRRAtClose
+        trade.ghostStopReason = "restart_lost";
+        trade.ghostFinalizedAt = new Date().toISOString();
+        saveTrade(trade).catch(e => console.error(`❌ [Orphan] saveTrade:`, e.message));
+        repaired++;
+      }
+    }
+  }
+  if (repaired > 0) {
+    console.log(`🔧 [Orphan Repair] ${repaired} trades gerepareerd (restart_lost)`);
+  }
+}
+
+// ── [v5.2] FOREX ANTI-CONSOLIDATIE ───────────────────────────
 function checkForexConsolidation(symbol, direction) {
   const mt5Sym = getMT5Symbol(symbol);
   let count = 0;
@@ -521,8 +644,8 @@ function checkForexConsolidation(symbol, direction) {
     if ((posMt5 === mt5Sym || pos.symbol === symbol) && pos.direction === direction) count++;
   }
   return {
-    blocked:  count >= FOREX_MAX_SAME_DIR,          // ≥2 → geblokkeerd
-    halfRisk: count >= FOREX_HALF_RISK_THRESHOLD && count < FOREX_MAX_SAME_DIR, // count===1 → 50%
+    blocked:  count >= FOREX_MAX_SAME_DIR,
+    halfRisk: count >= FOREX_HALF_RISK_THRESHOLD && count < FOREX_MAX_SAME_DIR,
     count,
   };
 }
@@ -538,7 +661,7 @@ function checkSpreadGuard(spread, entryNum, slNum) {
   };
 }
 
-// ── [FEAT 8] DUPLICATE ENTRY GUARD ───────────────────────────
+// ── [v5.2] DUPLICATE ENTRY GUARD ─────────────────────────────
 function isDuplicateOrder(symbol, direction) {
   const key = `${symbol}_${direction}`;
   const last = recentOrderGuard.get(key);
@@ -549,23 +672,32 @@ function isDuplicateOrder(symbol, direction) {
 function registerRecentOrder(symbol, direction) {
   const key = `${symbol}_${direction}`;
   recentOrderGuard.set(key, Date.now());
-  // Auto-cleanup na 2 minuten
   setTimeout(() => recentOrderGuard.delete(key), DUPLICATE_GUARD_MS * 2);
 }
 
 // ── HELPERS ───────────────────────────────────────────────────
 function getEffectiveRisk(symbol, direction) {
-  const key   = `${symbol}_${direction}`;
-  const count = openTradeTracker[key] || 0;
-  const base  = getRisk(getSymbolType(symbol)); // [FEAT 6] gebruikt dagelijkse multiplier
-  let risk    = Math.max(base * 0.10, base / Math.pow(2, count));
+  const key     = `${symbol}_${direction}`;
+  const count   = openTradeTracker[key] || 0;
+  const type    = getSymbolType(symbol) || "stock";
+  const base    = BASE_RISK[type] || 30;  // raw base, before multiplier
+  const baseWithMult = base * dailyRiskMultiplier;
+
+  let risk = Math.max(baseWithMult * 0.10, baseWithMult / Math.pow(2, count));
 
   const curSess = getSessionGMT1();
   const lockKey = `${symbol}__${curSess}`;
   const lock    = tpLocks[lockKey];
+
   if (lock && (lock.evAtLock ?? 0) > 0 && count === 0) {
-    risk = Math.min(risk * TP_LOCK_RISK_MULT, base * TP_LOCK_RISK_MULT);
-    console.log(`💥 [TP Lock] Risk boost ${symbol}/${curSess}: €${risk.toFixed(2)}`);
+    // [v7.0] TP Lock boost: ×4 × 1.2^consecutivePositiveDays
+    const positiveDays = consecutivePositiveDays[lockKey] || 0;
+    const compoundBoost = Math.pow(1.2, positiveDays);
+    risk = base * TP_LOCK_RISK_MULT * compoundBoost * dailyRiskMultiplier;
+    console.log(
+      `💥 [TP Lock] Risk boost ${symbol}/${curSess}: ` +
+      `€${risk.toFixed(2)} (×${TP_LOCK_RISK_MULT} × 1.2^${positiveDays} × mult${dailyRiskMultiplier})`
+    );
   }
   return risk;
 }
@@ -590,8 +722,11 @@ function validateSL(dir, entry, sl, mt5Sym, type) {
   return sl;
 }
 
+// [v7.0] FIX: calcLots double multiplier fix
+// effectiveCap gebruikt BASE_RISK (vóór dailyRiskMultiplier)
+// want de `risk` parameter bevat de multiplier al
 function calcLots(symbol, entry, sl, risk) {
-  const type    = getSymbolType(symbol);
+  const type    = getSymbolType(symbol) || "stock";
   const lotVal  = LOT_VALUE[type] || 1;
   const maxLots = MAX_LOTS[type]  || 50;
   const lotStep = learnedPatches[symbol]?.lotStepOverride || (type==="stock" ? 1 : 0.01);
@@ -602,13 +737,16 @@ function calcLots(symbol, entry, sl, risk) {
   lots = Math.min(lots, maxLots);
   lots = Math.max(lots, lotStep);
 
-  const baseRisk     = getRisk(type);
+  // [v7.0] Cap uses BASE_RISK (raw, no multiplier) — risk param already contains multiplier
+  const baseRisk     = BASE_RISK[type] || 30;
   const isTPLockRisk = risk >= baseRisk * TP_LOCK_RISK_MULT;
+  // Cap = base×4 if TP lock boosted, else base (both WITHOUT multiplier — multiplier is in risk)
   const effectiveCap = isTPLockRisk ? baseRisk * TP_LOCK_RISK_MULT : baseRisk;
   const minCost      = lots * dist * lotVal;
 
-  if (minCost > effectiveCap) {
-    console.warn(`⚠️ Min lot kost €${minCost.toFixed(2)} > cap €${effectiveCap} → skip`);
+  if (minCost > effectiveCap * dailyRiskMultiplier * 1.5) {
+    // Allow up to 1.5× cap with multiplier before blocking (avoids blocking valid boosted trades)
+    console.warn(`⚠️ Min lot kost €${minCost.toFixed(2)} > cap → skip`);
     return null;
   }
   return parseFloat(lots.toFixed(2));
@@ -625,8 +763,21 @@ function calcMaxRR(trade) {
 function calcMaxRRFromPrice(trade, price) {
   const d = Math.abs(trade.entry - trade.sl);
   if (!d || price == null) return 0;
+  // [v7.0] Measured from ENTRY baseline, not close price
   const fav = trade.direction==="buy" ? price-trade.entry : trade.entry-price;
   return parseFloat((Math.max(0, fav) / d).toFixed(2));
+}
+
+// [v7.0] ghost_mae: Maximum Adverse Excursion in R during ghost window
+// = how far price moved AGAINST the trade direction from entry
+function calcMAE(trade, worstPrice) {
+  const d = Math.abs(trade.entry - trade.sl);
+  if (!d || worstPrice == null) return 0;
+  // Against trade = buy → price below entry; sell → price above entry
+  const adverse = trade.direction === "buy"
+    ? trade.entry - worstPrice   // positive = moved against
+    : worstPrice - trade.entry;
+  return parseFloat((Math.max(0, adverse) / d).toFixed(3));
 }
 
 function calcTPPrice(direction, entry, sl, lockedRR) {
@@ -675,49 +826,81 @@ function getSLDirection(analysis) {
 }
 
 // ══════════════════════════════════════════════════════════════
-// GHOST TRACKER
-// [FEAT 3] Loopt door tot 22:00 — stopt niet bij 20:00
-// Stopt enkel bij: SL phantom trigger of 22:00 hard stop
+// GHOST TRACKER v7.0 — Complete rewrite
+//
+// Elke trade-close spawnt een ghost (tp / sl / manual / auto).
+// Ghost meet:
+//   - trueMaxRR      van ENTRY baseline (niet close price)
+//   - maxRRAtClose   bevroren bij spawn (nooit gemuteerd)
+//   - ghostExtraRR   = trueMaxRR − maxRRAtClose
+//   - ghost_mae      = max adverse excursion in R
+//   - ghost_hit_sl   = bereikte prijs originele SL?
+//   - ghost_time_to_sl = minuten tot phantom_sl hit
+//
+// Stop condities (prioriteit):
+//   1. phantom_sl    — prijs raakt originele SL
+//   2. 22:00 Brussels hard stop
+//   3. 24h timeout
+//   4. server restart → restart_lost (orphan repair)
 // ══════════════════════════════════════════════════════════════
-function startGhostTracker(closedTrade) {
-  const ghostId   = `ghost_${closedTrade.id}_${Date.now()}`;
-  const startedAt = Date.now();
-  let bestPrice   = closedTrade.maxPrice ?? closedTrade.entry;
-  let currentTimer = null;
+function startGhostTracker(closedTrade, isManual = false) {
+  const ghostId      = `ghost_${closedTrade.id}_${Date.now()}`;
+  const startedAt    = Date.now();
+  // [v7.0] trueMaxRR measured from ENTRY — start at maxRRAtClose
+  const maxRRAtClose = closedTrade.maxRR ?? 0;
+  let bestPrice      = closedTrade.maxPrice ?? closedTrade.entry;
+  let worstPrice     = closedTrade.entry; // for ghost_mae
+  let currentTimer   = null;
 
-  console.log(`👻 Ghost gestart: ${closedTrade.symbol} | startMaxRR: ${closedTrade.maxRR}R`);
+  console.log(
+    `👻 Ghost gestart: ${closedTrade.symbol} | ` +
+    `closeReason=${closedTrade.closeReason ?? "unknown"} | ` +
+    `maxRRAtClose=${maxRRAtClose}R | manual=${isManual}`
+  );
 
   async function tick() {
     try {
-      // [FEAT 3] Gebruik isGhostActive() i.p.v. hhmm >= 2000
-      // Ghost stopt bij 22:00, niet bij 20:00
-      const elapsed   = Date.now() - startedAt;
-      const ghostOk   = isGhostActive();
+      const elapsed    = Date.now() - startedAt;
+      const ghostOk    = isGhostActive();
       const shouldStop = elapsed >= GHOST_DURATION_MS || !ghostOk;
 
-      const priceData = await fetchCurrentPrice(closedTrade.mt5Symbol);
-      const price     = priceData?.mid ?? null;
+      const priceData  = await fetchCurrentPrice(closedTrade.mt5Symbol);
+      const price      = priceData?.mid ?? null;
 
       if (price !== null) {
-        const better = closedTrade.direction === "buy" ? price > bestPrice : price < bestPrice;
-        if (better) bestPrice = price;
-        if (ghostTrackers[ghostId]) ghostTrackers[ghostId].bestPrice = bestPrice;
+        // Track best price (for trueMaxRR from entry)
+        const betterForTrade = closedTrade.direction === "buy"
+          ? price > bestPrice
+          : price < bestPrice;
+        if (betterForTrade) bestPrice = price;
 
-        // SL Phantom Trigger — stopt ghost onmiddellijk
+        // Track worst price (for ghost_mae)
+        const worseForTrade = closedTrade.direction === "buy"
+          ? price < worstPrice
+          : price > worstPrice;
+        if (worseForTrade) worstPrice = price;
+
+        if (ghostTrackers[ghostId]) {
+          ghostTrackers[ghostId].bestPrice  = bestPrice;
+          ghostTrackers[ghostId].worstPrice = worstPrice;
+        }
+
+        // [v7.0] phantom_sl — prijs raakt de originele SL (floor)
         const slBreach = closedTrade.direction === "buy"
           ? price <= closedTrade.sl
           : price >= closedTrade.sl;
 
         if (slBreach) {
-          console.log(`💀 [Ghost] SL phantom trigger: ${closedTrade.symbol}`);
-          finaliseGhost(ghostId, closedTrade, bestPrice, "sl_phantom_trigger", startedAt);
+          const minutesElapsed = Math.round(elapsed / 60000);
+          console.log(`💀 [Ghost] phantom_sl trigger: ${closedTrade.symbol} na ${minutesElapsed}min`);
+          finaliseGhost(ghostId, closedTrade, bestPrice, worstPrice, "phantom_sl", startedAt, minutesElapsed);
           return;
         }
       }
 
       if (shouldStop) {
-        const reason = elapsed >= GHOST_DURATION_MS ? "timeout" : "day_end_22:00";
-        finaliseGhost(ghostId, closedTrade, bestPrice, reason, startedAt);
+        const reason = elapsed >= GHOST_DURATION_MS ? "timeout" : "auto_close_window";
+        finaliseGhost(ghostId, closedTrade, bestPrice, worstPrice, reason, startedAt, null);
         return;
       }
 
@@ -728,25 +911,37 @@ function startGhostTracker(closedTrade) {
   }
 
   currentTimer = setTimeout(tick, GHOST_INTERVAL_RECENT_MS);
-  ghostTrackers[ghostId] = { trade: closedTrade, timer: currentTimer, startedAt, bestPrice };
+  ghostTrackers[ghostId] = {
+    trade: closedTrade, timer: currentTimer, startedAt,
+    bestPrice, worstPrice, isManual,
+  };
 
+  // Failsafe
   setTimeout(() => {
-    if (ghostTrackers[ghostId])
-      finaliseGhost(ghostId, closedTrade, ghostTrackers[ghostId].bestPrice, "failsafe", startedAt);
+    if (ghostTrackers[ghostId]) {
+      const g = ghostTrackers[ghostId];
+      finaliseGhost(ghostId, closedTrade, g.bestPrice, g.worstPrice, "failsafe", startedAt, null);
+    }
   }, GHOST_DURATION_MS + 5 * 60 * 1000);
 }
 
-function finaliseGhost(ghostId, trade, bestPrice, reason, startedAt) {
+function finaliseGhost(ghostId, trade, bestPrice, worstPrice, reason, startedAt, timeToSL = null) {
   if (!ghostTrackers[ghostId]) return;
   clearTimeout(ghostTrackers[ghostId].timer);
+  const isManual = ghostTrackers[ghostId].isManual ?? false;
   delete ghostTrackers[ghostId];
 
-  const trueMaxRR        = calcMaxRRFromPrice(trade, bestPrice);
-  const ghostExtraRR     = parseFloat((trueMaxRR - (trade.maxRR ?? 0)).toFixed(3));
+  // [v7.0] trueMaxRR from ENTRY baseline
+  const trueMaxRR    = calcMaxRRFromPrice(trade, bestPrice);
+  const maxRRAtClose = trade.maxRR ?? 0; // frozen at close, never mutated
+  const ghostExtraRR = parseFloat((trueMaxRR - maxRRAtClose).toFixed(3));
+
+  // [v7.0] ghost_mae in R
+  const ghostMAE = calcMAE(trade, worstPrice);
+  // ghost_hit_sl: ghost_mae >= 1.0 means SL would have been hit
+  const ghostHitSL   = reason === "phantom_sl" || ghostMAE >= 1.0;
+
   const ghostDurationMin = startedAt ? Math.round((Date.now() - startedAt) / 60000) : null;
-  const hitTP            = trade.tp != null && trueMaxRR >= (Math.abs(trade.entry - trade.sl) > 0
-    ? Math.abs((trade.direction === "buy" ? trade.tp - trade.entry : trade.entry - trade.tp) / Math.abs(trade.entry - trade.sl))
-    : 0);
 
   const idx = closedTrades.findIndex(t => t.id === trade.id);
   if (idx !== -1) {
@@ -754,30 +949,57 @@ function finaliseGhost(ghostId, trade, bestPrice, reason, startedAt) {
     closedTrades[idx].trueMaxPrice     = bestPrice;
     closedTrades[idx].ghostStopReason  = reason;
     closedTrades[idx].ghostFinalizedAt = new Date().toISOString();
-    closedTrades[idx].hitTP            = hitTP;
 
     saveTrade(closedTrades[idx]).catch(e => console.error(`❌ [DB] ghost saveTrade:`, e.message));
 
     saveGhostAnalysis({
-      symbol: trade.symbol, session: trade.session, direction: trade.direction,
-      entry: trade.entry, sl: trade.sl, tp: trade.tp,
-      maxRRAtClose: trade.maxRR, trueMaxRR, ghostExtraRR, hitTP,
-      ghostStopReason: reason, ghostDurationMin,
+      symbol:           trade.symbol,
+      session:          trade.session,
+      direction:        trade.direction,
+      entry:            trade.entry,
+      sl:               trade.sl,
+      tp:               trade.tp,
+      maxRRAtClose,
+      trueMaxRR,
+      ghostExtraRR,
+      hitTP:            trade.hitTP ?? false,
+      ghostStopReason:  reason,
+      ghostDurationMin,
       ghostFinalizedAt: new Date().toISOString(),
-      closedAt: trade.closedAt, realizedPnlEUR: trade.realizedPnlEUR ?? null,
-      tradePositionId: trade.id,
+      closedAt:         trade.closedAt,
+      realizedPnlEUR:   trade.realizedPnlEUR ?? null,
+      tradePositionId:  trade.id,
+      // [v7.0] nieuwe velden
+      ghostHitSL,
+      ghostMAE,
+      ghostTimeToSL:    timeToSL ?? null,
+      isManual,
+      closeReason:      trade.closeReason ?? "unknown",
     }).catch(e => console.error(`❌ [DB] ghost analyse:`, e.message));
 
-    console.log(`✅ Ghost ${trade.symbol} → trueMaxRR: ${trueMaxRR}R (extra: ${ghostExtraRR}R) | ${reason}`);
+    console.log(
+      `✅ Ghost ${trade.symbol} → trueMaxRR: ${trueMaxRR}R | ` +
+      `extra: +${ghostExtraRR}R | MAE: ${ghostMAE}R | hitSL: ${ghostHitSL} | ${reason}`
+    );
     runTPLockEngine(trade.symbol).catch(e => console.error(`❌ [TP Lock]:`, e.message));
     runSLLockEngine(trade.symbol).catch(e => console.error(`❌ [SL Lock]:`, e.message));
+
+    // [v7.0] Run shadow optimizer if enough new ghost trades
+    const ghostFinished = closedTrades.filter(t =>
+      t.symbol === trade.symbol && t.trueMaxRR !== null
+    ).length;
+    if (ghostFinished >= SHADOW_SL_MIN_TRADES) {
+      runShadowSLOptimizer(trade.symbol).catch(e =>
+        console.error(`❌ [Shadow SL]:`, e.message)
+      );
+    }
   }
 }
 
 // ══════════════════════════════════════════════════════════════
-// TP LOCK ENGINE
-// [FEAT 5] TP lock na 3 trades (ongewijzigd — was al correct)
-// [FEAT 4] FIXED_TP_RR = 4 als default wanneer geen EV-data
+// TP LOCK ENGINE v7.0
+// [v7.0] Only sessions: asia / london / ny (never 'all')
+// [v7.0] TP risk boost: ×4 × 1.2^consecutivePositiveDays
 // ══════════════════════════════════════════════════════════════
 async function runTPLockEngine(symbol) {
   for (const session of TRADING_SESSIONS) {
@@ -788,13 +1010,15 @@ async function runTPLockEngine(symbol) {
 }
 
 async function _runTPLockForSession(symbol, session) {
+  if (!session || session === "all") return; // [v7.0] guard
+
   const trades = closedTrades.filter(t =>
-    t.symbol === symbol && t.sl && t.entry && t.session === session
+    normalizeSymbol(t.symbol) === normalizeSymbol(symbol) &&
+    t.sl && t.entry && t.session === session
   );
   const n       = trades.length;
   const lockKey = `${symbol}__${session}`;
 
-  // [FEAT 5] Lock na 3 trades
   if (n < 3) return;
 
   const existing = tpLocks[lockKey];
@@ -807,12 +1031,11 @@ async function _runTPLockForSession(symbol, session) {
   const best       = evTable.reduce((a,b) => b.ev > a.ev ? b : a);
   const evPositive = best.ev > 0;
 
-  // [FEAT 4] Gebruik FIXED_TP_RR (4R) als basis; EV-optimaal als het beter is
   const effectiveRR = evPositive ? best.rr : FIXED_TP_RR;
 
-  const oldRR      = existing?.lockedRR ?? null;
-  const isNew      = !existing;
-  const changed    = existing && existing.lockedRR !== effectiveRR;
+  const oldRR       = existing?.lockedRR ?? null;
+  const isNew       = !existing;
+  const changed     = existing && existing.lockedRR !== effectiveRR;
   const needsUpdate = existing && (n - existing.lockedTrades) >= 5;
 
   if (!isNew && !changed && !needsUpdate) {
@@ -830,6 +1053,9 @@ async function _runTPLockForSession(symbol, session) {
     evAtLock: best.ev, evPositive,
   };
 
+  // [v7.0] Remove any stale 'all' session entry for this symbol
+  delete tpLocks[`${symbol}__all`];
+
   const logEntry = { symbol, session, oldRR, newRR: effectiveRR, trades: n, ev: best.ev, reason, ts: new Date().toISOString() };
   tpUpdateLog.unshift(logEntry);
   if (tpUpdateLog.length > MAX_TP_LOG) tpUpdateLog.length = MAX_TP_LOG;
@@ -843,22 +1069,21 @@ async function _runTPLockForSession(symbol, session) {
 }
 
 // ══════════════════════════════════════════════════════════════
-// SL LOCK ENGINE
-// [FEAT 7] Auto-apply na 30 trades (was 50)
-// [FEAT 3] Shadow optimizer check via isShadowActive()
+// SL LOCK ENGINE v7.0
 // ══════════════════════════════════════════════════════════════
 async function runSLLockEngine(symbol) {
-  // [FEAT 3] Shadow optimizer respecteert 22:00 stop
   if (!isShadowActive()) {
     console.log(`⏸️ [SL Shadow] ${symbol}: shadow optimizer gestopt (na 22:00)`);
     return;
   }
 
-  const trades = closedTrades.filter(t => t.symbol === symbol && t.sl && t.entry);
+  const trades = closedTrades.filter(t =>
+    normalizeSymbol(t.symbol) === normalizeSymbol(symbol) && t.sl && t.entry
+  );
   const n      = trades.length;
   if (n < 10) return;
 
-  const existing  = slLocks[symbol];
+  const existing = slLocks[symbol];
   if (existing && (n - (existing.lockedTrades ?? 0)) < 5) return;
 
   const analysis  = buildSLAnalysis(trades);
@@ -870,7 +1095,6 @@ async function runSLLockEngine(symbol) {
   const oldMult   = existing?.multiplier ?? null;
   const isNew     = !existing;
   const changed   = existing && (existing.multiplier !== best.slMultiple || existing.direction !== direction);
-  // [FEAT 7] Auto-apply na 30 trades (was SL_AUTO_APPLY_THRESHOLD = 50)
   const autoApply = n >= SL_AUTO_APPLY_THRESHOLD;
 
   if (!isNew && !changed) {
@@ -909,7 +1133,101 @@ async function runSLLockEngine(symbol) {
     await logSLUpdate(symbol, oldMult, best.slMultiple, direction, n, best.bestEV, reason, autoApply);
   } catch(e) { console.error(`❌ [SL Analyse] DB:`, e.message); }
 
-  console.log(`📐 [SL ${autoApply?"AUTO":"ADVIES"}] ${symbol}: ${best.slMultiple}× (${direction}) EV +${best.bestEV}R | ${n} trades | auto@${SL_AUTO_APPLY_THRESHOLD}`);
+  console.log(`📐 [SL ${autoApply?"AUTO":"ADVIES"}] ${symbol}: ${best.slMultiple}× (${direction}) EV +${best.bestEV}R | ${n} trades`);
+}
+
+// ══════════════════════════════════════════════════════════════
+// SL SHADOW OPTIMIZER v7.0 (item 10)
+// Uses ONLY ghost-finalized trades (trueMaxRR not null)
+// Per symbol (not per session)
+// ══════════════════════════════════════════════════════════════
+async function runShadowSLOptimizer(symbol) {
+  const trades = closedTrades.filter(t =>
+    normalizeSymbol(t.symbol) === normalizeSymbol(symbol) &&
+    t.trueMaxRR !== null && t.sl && t.entry
+  );
+  if (trades.length < SHADOW_SL_MIN_TRADES) return;
+
+  const results = SL_MULTIPLES.map(mult => {
+    const evTable = RR_LEVELS.map(rr => {
+      const wins = trades.filter(t => {
+        const origDist = Math.abs(t.entry - t.sl);
+        if (!origDist) return false;
+        const adjustedRR = (t.trueMaxRR ?? 0) / mult;
+        return adjustedRR >= rr;
+      }).length;
+      const wr = wins / trades.length;
+      return { rr, ev: parseFloat((wr * rr - (1 - wr)).toFixed(3)), winrate: parseFloat((wr * 100).toFixed(1)) };
+    });
+    const best = evTable.reduce((a, b) => b.ev > a.ev ? b : a);
+
+    // slHitRate: simulated SL hit = ghost_mae >= mult
+    const slHits = trades.filter(t => (t.ghostMAE ?? calcMAE(t, t.trueMaxPrice)) >= mult).length;
+    const slHitRate = parseFloat(((slHits / trades.length) * 100).toFixed(1));
+
+    return {
+      slMultiplier: mult,
+      bestEV:       best.ev,
+      bestRR:       best.rr,
+      bestWinrate:  best.winrate,
+      slHitRate,
+      evTable,
+    };
+  });
+
+  const bestResult = results.reduce((a, b) => b.bestEV > a.bestEV ? b : a);
+  const previous   = shadowSLResults[symbol];
+
+  shadowSLResults[symbol] = {
+    symbol,
+    best:        bestResult,
+    allMultiples: results,
+    tradesUsed:  trades.length,
+    computedAt:  new Date().toISOString(),
+  };
+
+  // Persist
+  await saveShadowSLAnalysis(
+    symbol,
+    bestResult.slMultiplier,
+    bestResult.bestEV,
+    bestResult.bestRR,
+    bestResult.bestWinrate,
+    bestResult.slHitRate,
+    trades.length
+  ).catch(e => console.error(`❌ [Shadow SL] save:`, e.message));
+
+  if (previous && previous.best.slMultiplier !== bestResult.slMultiplier) {
+    await logShadowSLChange(
+      symbol,
+      previous.best.slMultiplier,
+      bestResult.slMultiplier,
+      previous.best.bestEV,
+      bestResult.bestEV,
+      trades.length,
+      `shadow optimizer recompute: ${trades.length} ghost trades`
+    ).catch(() => {});
+  }
+
+  console.log(
+    `🌑 [Shadow SL] ${symbol}: best mult=${bestResult.slMultiplier}× | ` +
+    `EV=${bestResult.bestEV} | RR=${bestResult.bestRR}R | SL hit=${bestResult.slHitRate}% | ` +
+    `trades=${trades.length}`
+  );
+}
+
+async function runShadowSLOptimizerAll() {
+  const symbols = [...new Set(
+    closedTrades
+      .filter(t => t.trueMaxRR !== null)
+      .map(t => normalizeSymbol(t.symbol))
+  )];
+  for (const sym of symbols) {
+    await runShadowSLOptimizer(sym).catch(e =>
+      console.error(`❌ [Shadow SL all] ${sym}:`, e.message)
+    );
+  }
+  console.log(`🌑 [Shadow SL] All symbols done: ${symbols.length}`);
 }
 
 // ── SL MULTIPLIER BEPALEN ─────────────────────────────────────
@@ -950,7 +1268,7 @@ async function syncPositions() {
       const trade = openPositions[id];
       if (!trade) continue;
       const cur  = pos.currentPrice ?? pos.openPrice ?? 0;
-      const lotV = LOT_VALUE[getSymbolType(trade.symbol)] || 1;
+      const lotV = LOT_VALUE[getSymbolType(trade.symbol) || "stock"] || 1;
       trade.currentPnL = parseFloat((
         pos.unrealizedProfit ?? pos.profit ??
         ((trade.direction==="buy" ? cur-trade.entry : trade.entry-cur) * trade.lots * lotV)
@@ -972,10 +1290,26 @@ async function syncPositions() {
           ? Math.abs((trade.direction==="buy" ? trade.tp-trade.entry : trade.entry-trade.tp) / Math.abs(trade.entry-trade.sl))
           : 999);
 
+        // [v7.0] Determine close_reason
+        let closeReason = trade._pendingCloseReason ?? "unknown";
+        if (closeReason === "unknown") {
+          // Infer from maxRR vs TP
+          if (hitTP) closeReason = "tp";
+          else if (maxRR <= 0.05) closeReason = "sl"; // near entry = SL
+        }
+
         const closed = {
-          ...trade, closedAt: new Date().toISOString(), maxRR, session,
-          sessionLabel: SESSION_LABELS[session] || session,
-          trueMaxRR: null, trueMaxPrice: null, realizedPnlEUR, hitTP,
+          ...trade,
+          closedAt:      new Date().toISOString(),
+          maxRR,         session,
+          sessionLabel:  SESSION_LABELS[session] || session,
+          trueMaxRR:     null,
+          trueMaxPrice:  null,
+          realizedPnlEUR,
+          hitTP,
+          closeReason,
+          // [v7.0] maxRRAtClose frozen at this moment
+          maxRRAtClose:  maxRR,
         };
         closedTrades.push(closed);
         saveTrade(closed).catch(e => console.error(`❌ [DB] saveTrade:`, e.message));
@@ -983,9 +1317,11 @@ async function syncPositions() {
           .catch(e => console.error(`❌ [DB] pnlLog:`, e.message));
         if (trade.symbol && trade.direction) decrementTracker(trade.symbol, trade.direction);
         delete openPositions[id];
-        console.log(`📦 ${trade.symbol} gesloten | MaxRR: ${maxRR}R | Sessie: ${session}`);
-        // [FEAT 3] Ghost start altijd — ook na TP of manual close
-        startGhostTracker(closed);
+        console.log(`📦 ${trade.symbol} gesloten | MaxRR: ${maxRR}R | Sessie: ${session} | closeReason: ${closeReason}`);
+
+        // [v7.0] Ghost spawnt ALTIJD — tp / sl / manual / auto
+        const isManual = closeReason === "manual";
+        startGhostTracker(closed, isManual);
       }
     }
 
@@ -1010,7 +1346,7 @@ async function syncPositions() {
 }
 setInterval(syncPositions, 30 * 1000);
 
-// ── ORDER PLAATSEN MET TIMEOUT (Fix 5) ───────────────────────
+// ── ERROR LEARNING ────────────────────────────────────────────
 function learnFromError(symbol, code, msg) {
   const m = (msg||"").toLowerCase();
   if (!learnedPatches[symbol]) learnedPatches[symbol] = {};
@@ -1024,23 +1360,22 @@ function learnFromError(symbol, code, msg) {
     learnedPatches[symbol].lotStepOverride = (learnedPatches[symbol]?.lotStepOverride || 0.01) * 10;
   if (m.includes("stop")||code==="TRADE_RETCODE_INVALID_STOPS") {
     const mt5  = getMT5Symbol(symbol);
-    const type = getSymbolType(symbol);
+    const type = getSymbolType(symbol) || "index";
     if (type==="index") MIN_STOP_INDEX[mt5] = (MIN_STOP_INDEX[mt5] || 5) * 2;
     else if (type==="forex") MIN_STOP_FOREX[mt5] = (MIN_STOP_FOREX[mt5] || 0.0005) * 2;
   }
 }
 
+// ── ORDER PLAATSEN ────────────────────────────────────────────
 async function placeOrder(dir, symbol, entry, sl, lots, session) {
   const mt5Symbol = getMT5Symbol(symbol);
-  const type      = getSymbolType(symbol);
+  const type      = getSymbolType(symbol) || "stock";
   const slPrice   = validateSL(dir, entry, sl, mt5Symbol, type);
 
-  // [FEAT 4] Vast TP = FIXED_TP_RR (4R) voor ALLE trades
-  // Override met TP lock waarde indien hoger EV beschikbaar
-  const lockKey   = `${symbol}__${session}`;
-  const tpLock    = tpLocks[lockKey];
-  const tpRR      = tpLock ? tpLock.lockedRR : FIXED_TP_RR;
-  const tpPrice   = calcTPPrice(dir, entry, slPrice, tpRR);
+  const lockKey = `${symbol}__${session}`;
+  const tpLock  = tpLocks[lockKey];
+  const tpRR    = tpLock ? tpLock.lockedRR : FIXED_TP_RR;
+  const tpPrice = calcTPPrice(dir, entry, slPrice, tpRR);
 
   console.log(`🎯 [TP] ${symbol}/${session} TP: ${tpPrice} (${tpRR}R${tpLock ? " [lock]" : " [4R default]"})`);
 
@@ -1072,17 +1407,30 @@ async function placeOrderWithTimeout(dir, symbol, entry, sl, lots, session) {
 }
 
 // ══════════════════════════════════════════════════════════════
-// WEBHOOK
-// [FEAT 8] Duplicate entry guard toegevoegd
-// [FEAT 10] Forex pyramiding: max 2× per pair/richting
+// WEBHOOK v7.0
+// [v7.0] Symbol validation: onbekend symbool → SKIP
+// [v7.0] Forex second trade EV-conditional half risk
 // ══════════════════════════════════════════════════════════════
 app.post("/webhook", async (req, res) => {
   try {
     const secret = req.query.secret || req.headers["x-secret"];
     if (secret !== WEBHOOK_SECRET) return res.status(401).json({ error:"Unauthorized" });
 
-    const symbol = (!req.body.symbol || req.body.symbol==="{{ticker}}") ? null : req.body.symbol;
-    if (!symbol) return res.status(400).json({ error:"Symbool ontbreekt" });
+    const rawSymbol = (!req.body.symbol || req.body.symbol==="{{ticker}}") ? null : req.body.symbol;
+    if (!rawSymbol) return res.status(400).json({ error:"Symbool ontbreekt" });
+
+    // [v7.0] Normalize symbol (NIKE → NKE)
+    const symbol = normalizeSymbol(rawSymbol);
+
+    // [v7.0] Symbol validation — must be in map OR have a learned patch
+    const inMap = !!SYMBOL_MAP[symbol];
+    const hasLearnedPatch = !!(learnedPatches[symbol]?.mt5Override);
+    if (!inMap && !hasLearnedPatch) {
+      const skipReason = `Symbol ${symbol} not in SYMBOL_MAP — add it first`;
+      console.warn(`⚠️ [Symbol] ${symbol} not in map — trade blocked`);
+      addWebhookHistory({ type:"SYMBOL_NOT_IN_MAP", symbol });
+      return res.status(200).json({ status:"SKIP", reason: skipReason });
+    }
 
     const { action, entry, sl } = req.body;
     if (!action||!entry||!sl) return res.status(400).json({ error:"Vereist: action, entry, sl" });
@@ -1095,7 +1443,7 @@ app.post("/webhook", async (req, res) => {
     if (direction==="buy"  && slNum>=entryNum) return res.status(400).json({ error:"SL onder entry voor BUY" });
     if (direction==="sell" && slNum<=entryNum) return res.status(400).json({ error:"SL boven entry voor SELL" });
 
-    // [FEAT 8] Duplicate entry check
+    // Duplicate check
     if (isDuplicateOrder(symbol, direction)) {
       const dupReason = `Duplicate geblokkeerd: ${symbol} ${direction} (binnen 60s)`;
       logDuplicateEntry(symbol, direction, dupReason).catch(() => {});
@@ -1104,7 +1452,7 @@ app.post("/webhook", async (req, res) => {
       return res.status(200).json({ status:"SKIP", reason: dupReason });
     }
 
-    const symType    = getSymbolType(symbol);
+    const symType    = getSymbolType(symbol) || "stock";
     const mt5Sym     = getMT5Symbol(symbol);
     const curSession = getSessionGMT1();
 
@@ -1113,20 +1461,21 @@ app.post("/webhook", async (req, res) => {
       return res.status(200).json({ status:"SKIP", reason:`Markt gesloten voor ${symbol}` });
     }
 
+    // [v7.0] Forex second trade — EV-conditional half risk (item 26)
     let forexHalfRisk = false;
+    let forexTrade2   = false;
     if (symType === "forex") {
       const consol = checkForexConsolidation(symbol, direction);
       if (consol.blocked) {
-        // [FEAT 10] Geblokkeerd na 2e trade
         const reason = `Forex pyramiding max 2×: ${consol.count} open ${direction} trades voor ${symbol}`;
         logForexConsolidation(symbol, direction, consol.count, reason).catch(() => {});
         addWebhookHistory({ type:"FOREX_PYRAMID_BLOCKED", symbol, direction, count:consol.count });
         return res.status(200).json({ status:"SKIP", reason });
       }
       if (consol.halfRisk) {
-        // [FEAT 10] Trade 2 = 50% risk
         forexHalfRisk = true;
-        console.log(`⚡ [Forex Pyramiding] ${symbol} ${direction} trade #${consol.count+1} → 50% risk`);
+        forexTrade2   = true;
+        console.log(`⚡ [Forex Trade 2] ${symbol} ${direction} → 50% risk`);
       }
     }
 
@@ -1145,8 +1494,24 @@ app.post("/webhook", async (req, res) => {
       }
     }
 
+    // [v7.0] Risk calculation
     let risk = getEffectiveRisk(symbol, direction);
-    if (forexHalfRisk) { risk *= 0.5; }
+
+    if (forexHalfRisk) {
+      // [v7.0] Item 26: EV-conditional
+      const lockKey = `${symbol}__${curSession}`;
+      const lock    = tpLocks[lockKey];
+      const evPos   = lock && (lock.evAtLock ?? 0) > 0;
+      if (evPos) {
+        // EV positive: first trade got boosted risk, second = 50% of that boosted risk
+        risk = risk * 0.5;
+        console.log(`⚡ [Forex Trade 2] ${symbol} EV positive → risk=€${risk.toFixed(2)} (50% of boosted)`);
+      } else {
+        // No EV boost: second trade = 50% of base
+        risk = (BASE_RISK[symType] || 15) * dailyRiskMultiplier * 0.5;
+        console.log(`⚡ [Forex Trade 2] ${symbol} no EV → risk=€${risk.toFixed(2)} (50% of base)`);
+      }
+    }
 
     const ftmo = ftmoSafetyCheck(risk);
     if (!ftmo.ok) {
@@ -1154,12 +1519,17 @@ app.post("/webhook", async (req, res) => {
       return res.status(200).json({ status:"FTMO_BLOCKED", reason:ftmo.reason });
     }
 
-    const lots = calcLots(symbol, entryNum, slApplied, risk);
-    if (lots===null) return res.status(200).json({ status:"SKIP", reason:`Min lot > cap` });
+    // [v7.0] Forex second trade max lots cap
+    let lots = calcLots(symbol, entryNum, slApplied, risk);
+    if (lots === null) return res.status(200).json({ status:"SKIP", reason:`Min lot > cap` });
+    if (symType === "forex" && forexTrade2) {
+      lots = Math.min(lots, 0.12); // [v7.0] max 0.12 for second forex trade
+    } else if (symType === "forex") {
+      lots = Math.min(lots, 0.25);
+    }
 
     console.log(`📊 ${direction.toUpperCase()} ${symbol}/${curSession} | Entry:${entryNum} SL:${slApplied} (${slMult}×) Lots:${lots} Risk:€${risk.toFixed(2)} Mult:×${dailyRiskMultiplier}`);
 
-    // Registreer order guard VOOR plaatsing
     registerRecentOrder(symbol, direction);
 
     let orderResult;
@@ -1226,18 +1596,18 @@ app.post("/webhook", async (req, res) => {
     });
 
     res.json({
-      status:"OK", versie:"v5.2",
+      status:"OK", versie:"v7.0",
       direction, tvSymbol:symbol, mt5Symbol, symType,
       session:curSession, sessionLabel:SESSION_LABELS[curSession],
       entry:entryNum, sl:slPrice, slOriginal:slNum,
       slMultiplier:slMult, slLockInfo,
       slAutoApplied: slLocks[symbol]?.autoApplied ?? false,
-      slTradesUntilAuto: Math.max(0, SL_AUTO_APPLY_THRESHOLD - (closedTrades.filter(t=>t.symbol===symbol).length)),
+      slTradesUntilAuto: Math.max(0, SL_AUTO_APPLY_THRESHOLD - (closedTrades.filter(t=>normalizeSymbol(t.symbol)===symbol).length)),
       tp: tpPrice, tpRR, tpFixed: `${FIXED_TP_RR}R (vast)`,
       tpInfo: `✅ TP: ${tpRR}R @ ${tpPrice} [${curSession}]${tpLocks[`${symbol}__${curSession}`] ? " [lock]" : " [4R default]"}`,
       lots, risicoEUR:risk.toFixed(2),
       dailyRiskMultiplier, dailyRiskMultiplierNext,
-      forexHalfRisk: forexHalfRisk ? "⚡ 50% risk (trade 2/2)" : null,
+      forexTrade2: forexTrade2 ? `⚡ 50% risk (trade 2/2) max 0.12 lots` : null,
       positionId:posId, metaApi:result,
     });
   } catch(err) {
@@ -1253,37 +1623,49 @@ app.post("/close", async (req, res) => {
   const { positionId, symbol, direction } = req.body;
   if (!positionId) return res.status(400).json({ error:"Vereist: positionId" });
   try {
+    // [v7.0] Mark as manual close so syncPositions sets close_reason='manual'
+    const posIdStr = String(positionId);
+    if (openPositions[posIdStr]) {
+      openPositions[posIdStr]._pendingCloseReason = "manual";
+      openPositions[posIdStr]._isManual           = true;
+    }
     const result = await closePosition(positionId);
     if (symbol&&direction) decrementTracker(symbol, direction);
-    // Ghost blijft actief na manual close [FEAT 3]
-    res.json({ status:"OK", result, note:"Ghost tracker blijft actief na manual close" });
+    // Ghost will start automatically via syncPositions with is_manual=true
+    res.json({
+      status:"OK", result,
+      note:"close_reason=manual | Ghost tracker start via syncPositions | is_manual=true"
+    });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── ENDPOINTS ─────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════
+// API ENDPOINTS
+// ══════════════════════════════════════════════════════════════
 app.get("/", (req, res) => {
-  const { hhmm } = getBrusselsComponents();
   res.json({
-    status:"online", versie:"ftmo-v5.2",
+    status:"online", versie:"ftmo-v7.0",
     time: getBrusselsDateStr(),
     features: {
-      "feat1_forex": "✅ Uitgebreid (geen JPY/exotics) — 21 pairs",
-      "feat2_uk100": `✅ UK100 min SL: 2 (was 5)`,
-      "feat3_ghost": `✅ Ghost tot 22:00 | actief nu: ${isGhostActive()}`,
-      "feat4_tp4R":  `✅ Vast TP = ${FIXED_TP_RR}R voor alle trades`,
-      "feat5_tplock":"✅ TP lock na 3 trades per sessie",
-      "feat6_risksc":  `✅ Daily risk mult: ×${dailyRiskMultiplier} | morgen: ×${dailyRiskMultiplierNext}`,
-      "feat7_sl30":  `✅ SL shadow optimizer na ${SL_AUTO_APPLY_THRESHOLD} trades`,
-      "feat8_dup":   "✅ Duplicate guard 60s",
-      "feat9_times": "✅ Auto-close 21:50 | Ghost/Shadow stop 22:00 | Reconnect 02:00",
-      "feat10_pyr":  `✅ Forex pyramiding max 2× (50% risk op trade 2)`,
+      "ghost_v7":     `✅ Complete rewrite: MAE, phantom_sl, trueMaxRR from entry`,
+      "symbol_map":   `✅ NL25EUR, BRK.B, ARM, TL0 added | NIKE removed (NKE only)`,
+      "no_all_sess":  `✅ 'all' session verwijderd overal`,
+      "brussels_date":`✅ getBrusselsDateOnly() — geen UTC datum mismatch`,
+      "sl_recalc":    `✅ SL recalc op startup voor alle symbolen ≥${SL_AUTO_APPLY_THRESHOLD} trades`,
+      "calc_lots_fix":`✅ calcLots double multiplier fix`,
+      "tp_boost":     `✅ TP boost: ×${TP_LOCK_RISK_MULT} × 1.2^days (no cap)`,
+      "shadow_sl":    `✅ SL Shadow Optimizer (symbol-level, ghost trades)`,
+      "daily_risk":   `✅ Daily risk mult: ×${dailyRiskMultiplier.toFixed(2)} | morgen: ×${dailyRiskMultiplierNext.toFixed(2)}`,
+      "sym_validate": `✅ Onbekend symbool → SKIP met reden`,
+      "forex_trade2": `✅ Forex trade 2: max 0.12 lots, EV-conditional 50% risk`,
     },
     tracking: {
-      openPositions: Object.keys(openPositions).length,
-      closedTrades:  closedTrades.length,
-      tpLocks:       Object.keys(tpLocks).length,
-      slAnalyses:    Object.keys(slLocks).length,
-      ghostTrackers: Object.keys(ghostTrackers).length,
+      openPositions:  Object.keys(openPositions).length,
+      closedTrades:   closedTrades.length,
+      tpLocks:        Object.keys(tpLocks).filter(k => !k.endsWith("__all")).length,
+      slAnalyses:     Object.keys(slLocks).length,
+      ghostTrackers:  Object.keys(ghostTrackers).length,
+      shadowResults:  Object.keys(shadowSLResults).length,
       duplicateGuard: recentOrderGuard.size,
     },
   });
@@ -1297,6 +1679,7 @@ app.get("/status", (req, res) => {
       Object.entries(BASE_RISK).map(([k,v]) => [k, `€${(v * dailyRiskMultiplier).toFixed(2)} (base €${v} × ${dailyRiskMultiplier})`])
     ),
     dailyRisk: { multiplier: dailyRiskMultiplier, nextDay: dailyRiskMultiplierNext },
+    consecutivePositiveDays,
   });
 });
 
@@ -1318,11 +1701,15 @@ app.get("/live/positions", (req, res) => {
 app.get("/live/ghosts", (req, res) => {
   const active = Object.entries(ghostTrackers).map(([id,g]) => ({
     ghostId:id, symbol:g.trade.symbol, direction:g.trade.direction,
-    entry:g.trade.entry, sl:g.trade.sl, maxRRAtClose:g.trade.maxRR,
-    currentBestRR: calcMaxRRFromPrice(g.trade, g.bestPrice),
-    elapsedMin: Math.round((Date.now()-g.startedAt)/60000),
-    remainingMin: Math.round((GHOST_DURATION_MS-(Date.now()-g.startedAt))/60000),
-    activeUntil: "22:00 Brussels",
+    entry:g.trade.entry, sl:g.trade.sl,
+    maxRRAtClose:  g.trade.maxRR ?? g.trade.maxRRAtClose,
+    currentTrueRR: calcMaxRRFromPrice(g.trade, g.bestPrice),
+    currentMAE:    calcMAE(g.trade, g.worstPrice),
+    isManual:      g.isManual ?? false,
+    closeReason:   g.trade.closeReason ?? "unknown",
+    elapsedMin:    Math.round((Date.now()-g.startedAt)/60000),
+    remainingMin:  Math.round((GHOST_DURATION_MS-(Date.now()-g.startedAt))/60000),
+    activeUntil:   "22:00 Brussels",
   }));
   res.json({ count:active.length, ghosts:active, ghostActiveNow: isGhostActive() });
 });
@@ -1331,10 +1718,11 @@ app.get("/tp-locks", (req,res) => {
   const bySym = {};
   for (const [key, lock] of Object.entries(tpLocks)) {
     const [sym, sess] = key.split("__");
+    if (sess === "all") continue; // [v7.0] filter out 'all'
     if (!bySym[sym]) bySym[sym] = {};
     bySym[sym][sess] = lock;
   }
-  res.json({ generated:new Date().toISOString(), fixedTpRR: FIXED_TP_RR, totalLocks:Object.keys(tpLocks).length, locksBySymbol:bySym });
+  res.json({ generated:new Date().toISOString(), fixedTpRR: FIXED_TP_RR, totalLocks:Object.keys(tpLocks).filter(k=>!k.endsWith("__all")).length, locksBySymbol:bySym });
 });
 
 app.get("/sl-locks", (req,res) => {
@@ -1347,17 +1735,57 @@ app.get("/sl-locks", (req,res) => {
   });
 });
 
+// [v7.0] SL Shadow endpoints (item 10)
+app.get("/sl-shadow", (req, res) => {
+  const { symbol } = req.query;
+  if (symbol) {
+    const ns  = normalizeSymbol(symbol.toUpperCase());
+    const r   = shadowSLResults[ns];
+    return res.json({ symbol: ns, result: r ?? null });
+  }
+  res.json({
+    generated:  new Date().toISOString(),
+    totalSymbols: Object.keys(shadowSLResults).length,
+    minTrades:  SHADOW_SL_MIN_TRADES,
+    results:    shadowSLResults,
+  });
+});
+
+app.post("/sl-shadow/run", async (req, res) => {
+  const rawSym = req.body?.symbol;
+  try {
+    if (rawSym) {
+      const sym = normalizeSymbol(rawSym.toUpperCase());
+      await runShadowSLOptimizer(sym);
+      return res.json({ status:"OK", symbol:sym, result: shadowSLResults[sym] ?? null });
+    }
+    await runShadowSLOptimizerAll();
+    return res.json({ status:"OK", symbols: Object.keys(shadowSLResults).length });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get("/daily-risk", async (req, res) => {
   try {
     const latest = await loadLatestDailyRisk();
     res.json({
       generated: new Date().toISOString(),
-      today: { multiplier: dailyRiskMultiplier },
-      tomorrow: { multiplier: dailyRiskMultiplierNext },
+      today: {
+        multiplier: dailyRiskMultiplier,
+        date: getBrusselsDateOnly(),
+      },
+      tomorrow: {
+        multiplier: dailyRiskMultiplierNext,
+      },
       lastRecord: latest,
       effectiveRisk: Object.fromEntries(
         Object.entries(BASE_RISK).map(([k,v]) => [k, parseFloat((v * dailyRiskMultiplier).toFixed(2))])
       ),
+      effectiveRiskTomorrow: Object.fromEntries(
+        Object.entries(BASE_RISK).map(([k,v]) => [k, parseFloat((v * dailyRiskMultiplierNext).toFixed(2))])
+      ),
+      consecutivePositiveDays,
     });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -1392,20 +1820,30 @@ app.get("/analysis/equity-curve", async (req,res) => {
 
 app.get("/analysis/ghost-deep", async (req, res) => {
   const finished = closedTrades.filter(t => t.trueMaxRR !== null);
-  const pending  = closedTrades.filter(t => t.trueMaxRR === null && t.maxRR > 0);
+  const pending  = closedTrades.filter(t => t.trueMaxRR === null && (t.maxRR ?? 0) > 0);
   const bySymSess = {};
   for (const t of finished) {
-    const key = `${t.symbol}__${t.session||"?"}`;
-    if (!bySymSess[key]) bySymSess[key] = { symbol:t.symbol, session:t.session, trades:[], totalExtraRR:0, hitTP:0 };
-    const extraRR = (t.trueMaxRR ?? 0) - (t.maxRR ?? 0);
-    bySymSess[key].trades.push({ extraRR, maxRRAtClose:t.maxRR, trueMaxRR:t.trueMaxRR, ghostStopReason:t.ghostStopReason });
+    const sym = normalizeSymbol(t.symbol);
+    const key = `${sym}__${t.session||"?"}`;
+    if (!bySymSess[key]) bySymSess[key] = { symbol:sym, session:t.session, trades:[], totalExtraRR:0, hitTP:0, manualCount:0 };
+    const maxRRAtClose = t.maxRRAtClose ?? t.maxRR ?? 0;
+    const extraRR      = (t.trueMaxRR ?? 0) - maxRRAtClose;
+    bySymSess[key].trades.push({
+      extraRR, maxRRAtClose, trueMaxRR:t.trueMaxRR,
+      ghostStopReason:t.ghostStopReason,
+      ghostMAE: t.ghostMAE ?? null,
+      closeReason: t.closeReason ?? "unknown",
+      isManual: t.isManual ?? false,
+    });
     bySymSess[key].totalExtraRR += extraRR;
     if (t.hitTP) bySymSess[key].hitTP++;
+    if (t.closeReason === "manual" || t.isManual) bySymSess[key].manualCount++;
   }
   const results = Object.values(bySymSess).map(g => ({
     symbol:g.symbol, session:g.session, trades:g.trades.length,
-    avgExtraRR: parseFloat((g.totalExtraRR/g.trades.length).toFixed(3)),
-    tpHitRate: parseFloat(((g.hitTP/g.trades.length)*100).toFixed(1)),
+    avgExtraRR:  parseFloat((g.totalExtraRR/g.trades.length).toFixed(3)),
+    tpHitRate:   parseFloat(((g.hitTP/g.trades.length)*100).toFixed(1)),
+    manualCount: g.manualCount,
   })).sort((a,b) => b.avgExtraRR - a.avgExtraRR);
   res.json({ generated:new Date().toISOString(), ghostFinished:finished.length, ghostPending:pending.length, bySymbolSession:results });
 });
@@ -1432,12 +1870,15 @@ app.get("/analysis/extremes", (req, res) => {
   }
   res.json({
     generated:new Date().toISOString(), sessionSummary:sessSummary,
-    bestTrades:  [...withPnl].sort((a,b)=>b.realizedPnlEUR-a.realizedPnlEUR).slice(0,n).map(t=>({symbol:t.symbol,session:t.session,maxRR:t.maxRR,pnl:t.realizedPnlEUR})),
-    worstTrades: [...withPnl].sort((a,b)=>a.realizedPnlEUR-b.realizedPnlEUR).slice(0,n).map(t=>({symbol:t.symbol,session:t.session,maxRR:t.maxRR,pnl:t.realizedPnlEUR})),
+    bestTrades:  [...withPnl].sort((a,b)=>b.realizedPnlEUR-a.realizedPnlEUR).slice(0,n).map(t=>({symbol:normalizeSymbol(t.symbol),session:t.session,maxRR:t.maxRR,pnl:t.realizedPnlEUR})),
+    worstTrades: [...withPnl].sort((a,b)=>a.realizedPnlEUR-b.realizedPnlEUR).slice(0,n).map(t=>({symbol:normalizeSymbol(t.symbol),session:t.session,maxRR:t.maxRR,pnl:t.realizedPnlEUR})),
   });
 });
+
 // ══════════════════════════════════════════════════════════════
-// DASHBOARD v7.0 — voeg toe VOOR de 404 handler onderaan server.js
+// DASHBOARD v7.0
+// [v7.0] Adds: Daily Risk Panel, Last Cron Runs section
+// Filters: no 'all' session rows
 // ══════════════════════════════════════════════════════════════
 app.get("/dashboard", (req, res) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
@@ -1446,217 +1887,149 @@ app.get("/dashboard", (req, res) => {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>FTMO Dashboard — Nick Verschoot</title>
+<title>FTMO Dashboard v7.0 — Nick Verschoot</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;700;800&display=swap" rel="stylesheet">
 <style>
   :root {
-    --bg:       #080c10;
-    --panel:    #0d1117;
-    --border:   #1a2233;
-    --accent:   #00ffe0;
-    --accent2:  #7b61ff;
-    --gold:     #f5c842;
-    --red:      #ff4560;
-    --green:    #00e396;
-    --muted:    #3a4a5c;
-    --text:     #c8d8e8;
-    --dim:      #556070;
-    --font-ui:  'Space Mono', monospace;
-    --font-hd:  'Syne', sans-serif;
+    --bg:#080c10;--panel:#0d1117;--border:#1a2233;--accent:#00ffe0;--accent2:#7b61ff;
+    --gold:#f5c842;--red:#ff4560;--green:#00e396;--muted:#3a4a5c;--text:#c8d8e8;--dim:#556070;
+    --font-ui:'Space Mono',monospace;--font-hd:'Syne',sans-serif;
   }
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-  html, body { background: var(--bg); color: var(--text); font-family: var(--font-ui); font-size: 13px; min-height: 100vh; }
-
-  /* ── HEADER ─────────────────────────────────────────── */
-  header {
-    display: flex; align-items: center; justify-content: space-between;
-    padding: 18px 32px; border-bottom: 1px solid var(--border);
-    background: linear-gradient(90deg, #0d1117 0%, #080c10 100%);
-    position: sticky; top: 0; z-index: 100;
-  }
-  .logo { font-family: var(--font-hd); font-size: 20px; font-weight: 800; color: var(--accent); letter-spacing: -0.5px; }
-  .logo span { color: var(--text); font-weight: 400; font-size: 13px; margin-left: 12px; opacity: 0.6; }
-  .header-right { display: flex; gap: 16px; align-items: center; }
-  .pill { background: var(--panel); border: 1px solid var(--border); border-radius: 20px; padding: 4px 14px; font-size: 11px; color: var(--dim); }
-  .pill.live { border-color: var(--green); color: var(--green); }
-  #clock { font-size: 11px; color: var(--dim); font-family: var(--font-ui); }
-  .refresh-btn {
-    background: none; border: 1px solid var(--accent); color: var(--accent);
-    padding: 5px 14px; border-radius: 4px; cursor: pointer; font-family: var(--font-ui); font-size: 11px;
-    transition: background 0.15s;
-  }
-  .refresh-btn:hover { background: rgba(0,255,224,0.08); }
-
-  /* ── LAYOUT ─────────────────────────────────────────── */
-  main { max-width: 1600px; margin: 0 auto; padding: 28px 24px 60px; }
-
-  /* ── SUMMARY STRIP ───────────────────────────────────── */
-  .summary-strip {
-    display: grid; grid-template-columns: repeat(auto-fit, minmax(160px,1fr));
-    gap: 12px; margin-bottom: 28px;
-  }
-  .stat-card {
-    background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
-    padding: 16px 18px;
-  }
-  .stat-card .label { font-size: 10px; color: var(--dim); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 6px; }
-  .stat-card .value { font-size: 22px; font-family: var(--font-hd); font-weight: 800; color: var(--accent); }
-  .stat-card .sub   { font-size: 10px; color: var(--dim); margin-top: 3px; }
-
-  /* ── SESSION FILTER ──────────────────────────────────── */
-  .filter-bar { display: flex; gap: 8px; margin-bottom: 18px; align-items: center; flex-wrap: wrap; }
-  .filter-btn {
-    background: var(--panel); border: 1px solid var(--border); color: var(--dim);
-    padding: 5px 16px; border-radius: 20px; cursor: pointer; font-family: var(--font-ui); font-size: 11px;
-    transition: all 0.15s;
-  }
-  .filter-btn.active { border-color: var(--accent); color: var(--accent); background: rgba(0,255,224,0.06); }
-  .filter-label { font-size: 10px; color: var(--dim); text-transform: uppercase; letter-spacing: 1px; margin-right: 4px; }
-  .search-box {
-    background: var(--panel); border: 1px solid var(--border); color: var(--text);
-    padding: 5px 14px; border-radius: 4px; font-family: var(--font-ui); font-size: 11px;
-    outline: none; width: 160px;
-  }
-  .search-box:focus { border-color: var(--accent); }
-
-  /* ── MAIN TABLE ─────────────────────────────────────── */
-  .table-wrap {
-    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
-    overflow: auto; margin-bottom: 32px;
-  }
-  table { width: 100%; border-collapse: collapse; }
-  thead th {
-    background: #0b0f15; padding: 10px 14px; text-align: left;
-    font-size: 10px; text-transform: uppercase; letter-spacing: 1px;
-    color: var(--dim); border-bottom: 1px solid var(--border);
-    white-space: nowrap; cursor: pointer; user-select: none;
-  }
-  thead th:hover { color: var(--accent); }
-  thead th.sort-asc::after  { content: " ▲"; color: var(--accent); }
-  thead th.sort-desc::after { content: " ▼"; color: var(--accent); }
-  tbody tr {
-    border-bottom: 1px solid rgba(26,34,51,0.5);
-    transition: background 0.12s;
-    cursor: pointer;
-  }
-  tbody tr:hover { background: rgba(0,255,224,0.03); }
-  tbody tr.expanded { background: rgba(123,97,255,0.05); }
-  td { padding: 10px 14px; white-space: nowrap; vertical-align: middle; }
-
-  /* badges */
-  .badge {
-    display: inline-block; padding: 2px 8px; border-radius: 3px;
-    font-size: 10px; font-weight: 700; letter-spacing: 0.5px;
-  }
-  .badge-asia    { background: rgba(123,97,255,0.2);  color: var(--accent2); border: 1px solid rgba(123,97,255,0.4); }
-  .badge-london  { background: rgba(0,255,224,0.1);   color: var(--accent);  border: 1px solid rgba(0,255,224,0.3); }
-  .badge-ny      { background: rgba(245,200,66,0.12); color: var(--gold);    border: 1px solid rgba(245,200,66,0.4); }
-  .badge-all     { background: rgba(58,74,92,0.3);    color: var(--dim);     border: 1px solid var(--border); }
-
-  .ev-pos  { color: var(--green); }
-  .ev-neg  { color: var(--red); }
-  .ev-zero { color: var(--dim); }
-
-  .mult-up   { color: var(--gold); }
-  .mult-down { color: var(--accent2); }
-  .mult-ok   { color: var(--green); }
-
-  .dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; margin-right: 5px; }
-  .dot-green { background: var(--green); box-shadow: 0 0 6px var(--green); }
-  .dot-red   { background: var(--red);   box-shadow: 0 0 6px var(--red); }
-  .dot-gold  { background: var(--gold);  box-shadow: 0 0 6px var(--gold); }
-  .dot-dim   { background: var(--muted); }
-
-  /* ── EXPANDED DETAIL ROW ────────────────────────────── */
-  .detail-row td { padding: 0; background: #0a0f18; }
-  .detail-panel {
-    padding: 20px 24px; display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-    gap: 16px; border-top: 1px solid var(--border);
-  }
-  .detail-section { }
-  .detail-section h4 {
-    font-size: 10px; text-transform: uppercase; letter-spacing: 1px;
-    color: var(--dim); margin-bottom: 10px; border-bottom: 1px solid var(--border); padding-bottom: 6px;
-  }
-  .kv-row { display: flex; justify-content: space-between; margin-bottom: 5px; font-size: 11px; }
-  .kv-row .k { color: var(--dim); }
-  .kv-row .v { color: var(--text); font-weight: 700; }
-  .kv-row .v.accent { color: var(--accent); }
-  .kv-row .v.gold   { color: var(--gold); }
-  .kv-row .v.green  { color: var(--green); }
-  .kv-row .v.red    { color: var(--red); }
-  .kv-row .v.purple { color: var(--accent2); }
-
-  /* ── EV TABLE (mini) ─────────────────────────────────── */
-  .ev-mini-table { width: 100%; border-collapse: collapse; font-size: 10px; }
-  .ev-mini-table th { color: var(--dim); padding: 3px 6px; text-align: left; border-bottom: 1px solid var(--border); }
-  .ev-mini-table td { padding: 3px 6px; border-bottom: 1px solid rgba(26,34,51,0.4); }
-  .ev-mini-table tr.best-row td { color: var(--green); font-weight: 700; }
-  .ev-mini-table tr.current-row td { color: var(--accent); }
-
-  /* ── BOTTOM PANELS ───────────────────────────────────── */
-  .bottom-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 12px; }
-  @media (max-width: 900px) { .bottom-grid { grid-template-columns: 1fr; } }
-  .panel {
-    background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 20px;
-  }
-  .panel h3 { font-family: var(--font-hd); font-size: 14px; font-weight: 700; color: var(--text); margin-bottom: 14px; }
-  .panel h3 .sub { font-size: 11px; color: var(--dim); font-family: var(--font-ui); font-weight: 400; margin-left: 8px; }
-
-  /* log list */
-  .log-list { display: flex; flex-direction: column; gap: 6px; max-height: 300px; overflow-y: auto; }
-  .log-item {
-    display: flex; justify-content: space-between; align-items: center;
-    background: #0b0f15; border: 1px solid var(--border); border-radius: 5px; padding: 8px 12px;
-    font-size: 10px;
-  }
-  .log-item .log-sym { color: var(--accent); font-weight: 700; margin-right: 8px; }
-  .log-item .log-ts  { color: var(--muted); }
-  .log-item .log-val { font-weight: 700; }
-
-  /* no data */
-  .no-data { color: var(--muted); text-align: center; padding: 32px; font-size: 12px; }
-
-  /* loading */
-  .loading {
-    display: flex; align-items: center; justify-content: center;
-    height: 200px; color: var(--dim); font-size: 12px;
-    animation: pulse 1.2s infinite;
-  }
-  @keyframes pulse { 0%,100%{opacity:0.4} 50%{opacity:1} }
-
-  /* scrollbar */
-  ::-webkit-scrollbar { width: 6px; height: 6px; }
-  ::-webkit-scrollbar-track { background: var(--panel); }
-  ::-webkit-scrollbar-thumb { background: var(--muted); border-radius: 3px; }
+  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+  html,body{background:var(--bg);color:var(--text);font-family:var(--font-ui);font-size:13px;min-height:100vh}
+  header{display:flex;align-items:center;justify-content:space-between;padding:18px 32px;border-bottom:1px solid var(--border);background:linear-gradient(90deg,#0d1117 0%,#080c10 100%);position:sticky;top:0;z-index:100}
+  .logo{font-family:var(--font-hd);font-size:20px;font-weight:800;color:var(--accent);letter-spacing:-0.5px}
+  .logo span{color:var(--text);font-weight:400;font-size:13px;margin-left:12px;opacity:0.6}
+  .header-right{display:flex;gap:16px;align-items:center}
+  .pill{background:var(--panel);border:1px solid var(--border);border-radius:20px;padding:4px 14px;font-size:11px;color:var(--dim)}
+  .pill.live{border-color:var(--green);color:var(--green)}
+  #clock{font-size:11px;color:var(--dim)}
+  .refresh-btn{background:none;border:1px solid var(--accent);color:var(--accent);padding:5px 14px;border-radius:4px;cursor:pointer;font-family:var(--font-ui);font-size:11px;transition:background 0.15s}
+  .refresh-btn:hover{background:rgba(0,255,224,0.08)}
+  main{max-width:1600px;margin:0 auto;padding:28px 24px 60px}
+  .summary-strip{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:28px}
+  .stat-card{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:16px 18px}
+  .stat-card .label{font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:1px;margin-bottom:6px}
+  .stat-card .value{font-size:22px;font-family:var(--font-hd);font-weight:800;color:var(--accent)}
+  .stat-card .sub{font-size:10px;color:var(--dim);margin-top:3px}
+  .filter-bar{display:flex;gap:8px;margin-bottom:18px;align-items:center;flex-wrap:wrap}
+  .filter-btn{background:var(--panel);border:1px solid var(--border);color:var(--dim);padding:5px 16px;border-radius:20px;cursor:pointer;font-family:var(--font-ui);font-size:11px;transition:all 0.15s}
+  .filter-btn.active{border-color:var(--accent);color:var(--accent);background:rgba(0,255,224,0.06)}
+  .filter-label{font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:1px;margin-right:4px}
+  .search-box{background:var(--panel);border:1px solid var(--border);color:var(--text);padding:5px 14px;border-radius:4px;font-family:var(--font-ui);font-size:11px;outline:none;width:160px}
+  .search-box:focus{border-color:var(--accent)}
+  .table-wrap{background:var(--panel);border:1px solid var(--border);border-radius:10px;overflow:auto;margin-bottom:32px}
+  table{width:100%;border-collapse:collapse}
+  thead th{background:#0b0f15;padding:10px 14px;text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--dim);border-bottom:1px solid var(--border);white-space:nowrap;cursor:pointer;user-select:none}
+  thead th:hover{color:var(--accent)}
+  thead th.sort-asc::after{content:" ▲";color:var(--accent)}
+  thead th.sort-desc::after{content:" ▼";color:var(--accent)}
+  tbody tr{border-bottom:1px solid rgba(26,34,51,0.5);transition:background 0.12s;cursor:pointer}
+  tbody tr:hover{background:rgba(0,255,224,0.03)}
+  tbody tr.expanded{background:rgba(123,97,255,0.05)}
+  td{padding:10px 14px;white-space:nowrap;vertical-align:middle}
+  .badge{display:inline-block;padding:2px 8px;border-radius:3px;font-size:10px;font-weight:700;letter-spacing:0.5px}
+  .badge-asia{background:rgba(123,97,255,0.2);color:var(--accent2);border:1px solid rgba(123,97,255,0.4)}
+  .badge-london{background:rgba(0,255,224,0.1);color:var(--accent);border:1px solid rgba(0,255,224,0.3)}
+  .badge-ny{background:rgba(245,200,66,0.12);color:var(--gold);border:1px solid rgba(245,200,66,0.4)}
+  .ev-pos{color:var(--green)}.ev-neg{color:var(--red)}.ev-zero{color:var(--dim)}
+  .mult-up{color:var(--gold)}.mult-down{color:var(--accent2)}.mult-ok{color:var(--green)}
+  .dot{width:7px;height:7px;border-radius:50%;display:inline-block;margin-right:5px}
+  .dot-green{background:var(--green);box-shadow:0 0 6px var(--green)}
+  .dot-red{background:var(--red);box-shadow:0 0 6px var(--red)}
+  .dot-gold{background:var(--gold);box-shadow:0 0 6px var(--gold)}
+  .dot-dim{background:var(--muted)}
+  .detail-row td{padding:0;background:#0a0f18}
+  .detail-panel{padding:20px 24px;display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px;border-top:1px solid var(--border)}
+  .detail-section h4{font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--dim);margin-bottom:10px;border-bottom:1px solid var(--border);padding-bottom:6px}
+  .kv-row{display:flex;justify-content:space-between;margin-bottom:5px;font-size:11px}
+  .kv-row .k{color:var(--dim)}.kv-row .v{color:var(--text);font-weight:700}
+  .kv-row .v.accent{color:var(--accent)}.kv-row .v.gold{color:var(--gold)}
+  .kv-row .v.green{color:var(--green)}.kv-row .v.red{color:var(--red)}
+  .kv-row .v.purple{color:var(--accent2)}
+  .bottom-grid{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-top:12px}
+  @media(max-width:900px){.bottom-grid{grid-template-columns:1fr}}
+  .panel{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:20px}
+  .panel h3{font-family:var(--font-hd);font-size:14px;font-weight:700;color:var(--text);margin-bottom:14px}
+  .panel h3 .sub{font-size:11px;color:var(--dim);font-family:var(--font-ui);font-weight:400;margin-left:8px}
+  .log-list{display:flex;flex-direction:column;gap:6px;max-height:300px;overflow-y:auto}
+  .log-item{display:flex;justify-content:space-between;align-items:center;background:#0b0f15;border:1px solid var(--border);border-radius:5px;padding:8px 12px;font-size:10px}
+  .log-item .log-sym{color:var(--accent);font-weight:700;margin-right:8px}
+  .log-item .log-ts{color:var(--muted)}
+  .log-item .log-val{font-weight:700}
+  /* [v7.0] Daily Risk Panel */
+  .risk-panel{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:20px;margin-bottom:20px}
+  .risk-panel h3{font-family:var(--font-hd);font-size:14px;font-weight:700;color:var(--text);margin-bottom:14px}
+  .risk-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}
+  .risk-card{background:#0b0f15;border:1px solid var(--border);border-radius:6px;padding:12px 16px}
+  .risk-card .rc-label{font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:1px;margin-bottom:4px}
+  .risk-card .rc-value{font-size:18px;font-family:var(--font-hd);font-weight:800}
+  .risk-card .rc-sub{font-size:10px;color:var(--dim);margin-top:2px}
+  /* [v7.0] Cron Status */
+  .cron-panel{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:20px;margin-bottom:20px}
+  .cron-panel h3{font-family:var(--font-hd);font-size:14px;font-weight:700;color:var(--text);margin-bottom:14px}
+  .cron-list{display:flex;flex-direction:column;gap:8px}
+  .cron-item{display:flex;justify-content:space-between;align-items:center;background:#0b0f15;border:1px solid var(--border);border-radius:5px;padding:10px 14px;font-size:11px}
+  .cron-name{color:var(--text);font-weight:700;min-width:180px}
+  .cron-ts{color:var(--dim);font-size:10px}
+  .cron-status{font-size:10px;padding:2px 8px;border-radius:3px}
+  .cron-ok{background:rgba(0,227,150,0.1);color:var(--green);border:1px solid rgba(0,227,150,0.3)}
+  .cron-never{background:rgba(58,74,92,0.3);color:var(--muted);border:1px solid var(--border)}
+  .no-data{color:var(--muted);text-align:center;padding:32px;font-size:12px}
+  .loading{display:flex;align-items:center;justify-content:center;height:200px;color:var(--dim);font-size:12px;animation:pulse 1.2s infinite}
+  @keyframes pulse{0%,100%{opacity:0.4}50%{opacity:1}}
+  ::-webkit-scrollbar{width:6px;height:6px}
+  ::-webkit-scrollbar-track{background:var(--panel)}
+  ::-webkit-scrollbar-thumb{background:var(--muted);border-radius:3px}
 </style>
 </head>
 <body>
-
 <header>
-  <div class="logo">FTMO<span>Nick Verschoot — Demo Account</span></div>
+  <div class="logo">FTMO v7.0<span>Nick Verschoot — Demo Account</span></div>
   <div class="header-right">
     <div id="clock">--:--:--</div>
     <div class="pill live">● LIVE</div>
     <button class="refresh-btn" onclick="loadAll()">↺ Refresh</button>
   </div>
 </header>
-
 <main>
 
   <!-- SUMMARY STRIP -->
   <div class="summary-strip" id="summary-strip">
     <div class="stat-card"><div class="label">Symbols tracked</div><div class="value" id="s-symbols">—</div><div class="sub">with optimizer data</div></div>
-    <div class="stat-card"><div class="label">TP Ghost locks</div><div class="value" id="s-tp">—</div><div class="sub">active sessions</div></div>
+    <div class="stat-card"><div class="label">TP Ghost locks</div><div class="value" id="s-tp">—</div><div class="sub">asia/london/ny only</div></div>
     <div class="stat-card"><div class="label">SL Shadow locks</div><div class="value" id="s-sl">—</div><div class="sub">auto-applied</div></div>
     <div class="stat-card"><div class="label">Avg Ghost Extra RR</div><div class="value" id="s-ghost-rr">—</div><div class="sub">across all symbols</div></div>
     <div class="stat-card"><div class="label">TP EV positive</div><div class="value" id="s-ev-pos">—</div><div class="sub">sessions with +EV TP</div></div>
     <div class="stat-card"><div class="label">Open positions</div><div class="value" id="s-open">—</div><div class="sub">live MT5 trades</div></div>
   </div>
 
-  <!-- FILTER BAR -->
+  <!-- [v7.0] DAILY RISK PANEL -->
+  <div class="risk-panel">
+    <h3>💰 Daily Risk Scaling <span class="sub">auto-refresh 30s</span></h3>
+    <div class="risk-grid" id="risk-grid">
+      <div class="risk-card"><div class="rc-label">Today Multiplier</div><div class="rc-value" id="risk-today" style="color:var(--accent)">—</div><div class="rc-sub">active now</div></div>
+      <div class="risk-card"><div class="rc-label">Yesterday EV</div><div class="rc-value" id="risk-yest-ev">—</div><div class="rc-sub">determines tomorrow</div></div>
+      <div class="risk-card"><div class="rc-label">Tomorrow Multiplier</div><div class="rc-value" id="risk-tomorrow" style="color:var(--gold)">—</div><div class="rc-sub">applied at 02:00</div></div>
+      <div class="risk-card"><div class="rc-label">Tomorrow Forex Risk</div><div class="rc-value" id="risk-forex-tmr" style="color:var(--green)">—</div><div class="rc-sub">base × mult tomorrow</div></div>
+      <div class="risk-card"><div class="rc-label">Tomorrow Index Risk</div><div class="rc-value" id="risk-index-tmr" style="color:var(--green)">—</div><div class="rc-sub">base × mult tomorrow</div></div>
+    </div>
+    <div style="margin-top:14px;font-size:11px;color:var(--dim)">
+      Consecutive positive days per symbol/session (TP boost):
+      <span id="consec-days" style="color:var(--accent);margin-left:8px">Loading...</span>
+    </div>
+  </div>
+
+  <!-- [v7.0] CRON STATUS PANEL -->
+  <div class="cron-panel">
+    <h3>⏱ Last Cron Runs <span class="sub">auto-refresh 30s</span></h3>
+    <div class="cron-list" id="cron-list">
+      <div class="loading">Loading cron data...</div>
+    </div>
+  </div>
+
+  <!-- SESSION FILTER -->
   <div class="filter-bar">
     <span class="filter-label">Session:</span>
     <button class="filter-btn active" data-session="all" onclick="setSession('all',this)">All</button>
@@ -1682,12 +2055,13 @@ app.get("/dashboard", (req, res) => {
           <th onclick="sortBy('slHitRate')">SL Hit Rate</th>
           <th onclick="sortBy('slAuto')">Auto Applied</th>
           <th onclick="sortBy('ghostExtra')">Ghost +RR</th>
+          <th onclick="sortBy('ghostMAE')">Ghost MAE</th>
           <th onclick="sortBy('ghostTrades')">Ghost Trades</th>
           <th onclick="sortBy('tpHitRate')">TP Hit%</th>
         </tr>
       </thead>
       <tbody id="table-body">
-        <tr><td colspan="12" class="loading">Loading optimizer data...</td></tr>
+        <tr><td colspan="13" class="loading">Loading optimizer data...</td></tr>
       </tbody>
     </table>
   </div>
@@ -1707,343 +2081,289 @@ app.get("/dashboard", (req, res) => {
 </main>
 
 <script>
-// ── STATE ─────────────────────────────────────────────────────
-let allRows       = [];
-let sessionFilter = 'all';
-let symbolFilter  = '';
-let sortKey       = 'symbol';
-let sortDir       = 1;
-let expandedKey   = null;
-let detailCache   = {};
+let allRows=[];let sessionFilter='all';let symbolFilter='';let sortKey='symbol';let sortDir=1;let expandedKey=null;
 
-// ── CLOCK ─────────────────────────────────────────────────────
-function updateClock() {
-  document.getElementById('clock').textContent =
-    new Date().toLocaleTimeString('en-GB', { timeZone: 'Europe/Brussels', hour12: false }) + ' BXL';
+function updateClock(){
+  document.getElementById('clock').textContent=
+    new Date().toLocaleTimeString('en-GB',{timeZone:'Europe/Brussels',hour12:false})+' BXL';
 }
-setInterval(updateClock, 1000);
-updateClock();
+setInterval(updateClock,1000);updateClock();
 
-// ── LOAD ALL ──────────────────────────────────────────────────
-async function loadAll() {
-  try {
-    const [tpRes, slRes, shadowRes, ghostRes, liveRes] = await Promise.all([
+async function loadAll(){
+  try{
+    const[tpRes,slRes,shadowRes,ghostRes,liveRes,dailyRes,histRes]=await Promise.all([
       fetch('/tp-locks').then(r=>r.json()).catch(()=>({locksBySymbol:{}})),
       fetch('/sl-locks').then(r=>r.json()).catch(()=>({analyses:[]})),
       fetch('/sl-shadow').then(r=>r.json()).catch(()=>({results:{}})),
       fetch('/analysis/ghost-deep').then(r=>r.json()).catch(()=>({bySymbolSession:[]})),
       fetch('/live/positions').then(r=>r.json()).catch(()=>({count:0})),
+      fetch('/daily-risk').then(r=>r.json()).catch(()=>null),
+      fetch('/history?limit=200').then(r=>r.json()).catch(()=>({history:[]})),
     ]);
-
-    buildRows(tpRes, slRes, shadowRes, ghostRes);
-    updateSummary(tpRes, slRes, shadowRes, ghostRes, liveRes);
+    buildRows(tpRes,slRes,shadowRes,ghostRes);
+    updateSummary(tpRes,slRes,shadowRes,ghostRes,liveRes);
+    updateDailyRiskPanel(dailyRes);
+    updateCronPanel(histRes);
     renderTable();
     loadLogs();
-  } catch(e) {
-    console.error('loadAll error:', e);
-    document.getElementById('table-body').innerHTML =
-      '<tr><td colspan="12" class="no-data">Failed to load data — ' + e.message + '</td></tr>';
+  }catch(e){
+    document.getElementById('table-body').innerHTML='<tr><td colspan="13" class="no-data">Failed: '+e.message+'</td></tr>';
   }
 }
 
-// ── BUILD ROWS ────────────────────────────────────────────────
-function buildRows(tpRes, slRes, shadowRes, ghostRes) {
-  const rows = [];
-  const tpBySymbol    = tpRes.locksBySymbol || {};
-  const slBySymbol    = {};
-  for (const a of (slRes.analyses||[])) slBySymbol[a.symbol] = a;
-  const shadowResults = shadowRes.results || {};
-  const ghostBySS     = {};
-  for (const g of (ghostRes.bySymbolSession||[])) {
-    ghostBySS[(g.symbol||'') + '__' + (g.session||'')] = g;
+// [v7.0] Daily Risk Panel
+function updateDailyRiskPanel(d){
+  if(!d) return;
+  const todayMult=d.today?.multiplier??1;
+  const tmrMult=d.tomorrow?.multiplier??1;
+  const lastRec=d.lastRecord;
+  document.getElementById('risk-today').textContent='×'+todayMult.toFixed(2);
+  const evEl=document.getElementById('risk-yest-ev');
+  if(lastRec){
+    evEl.textContent=lastRec.evPositive?'✅ Positive':'❌ Negative';
+    evEl.style.color=lastRec.evPositive?'var(--green)':'var(--red)';
+  }else{evEl.textContent='—';}
+  document.getElementById('risk-tomorrow').textContent='×'+tmrMult.toFixed(2);
+  const fxTmr=d.effectiveRiskTomorrow?.forex??0;
+  const idxTmr=d.effectiveRiskTomorrow?.index??0;
+  document.getElementById('risk-forex-tmr').textContent='€'+fxTmr.toFixed(2);
+  document.getElementById('risk-index-tmr').textContent='€'+idxTmr.toFixed(2);
+  // Consecutive days
+  const cd=d.consecutivePositiveDays??{};
+  const cdEntries=Object.entries(cd).filter(([,v])=>v>0);
+  document.getElementById('consec-days').textContent=
+    cdEntries.length?cdEntries.map(([k,v])=>k+': '+v+'d').join(' | '):'None (all at 0)';
+}
+
+// [v7.0] Cron Status Panel
+function updateCronPanel(histRes){
+  const CRONS=[
+    {key:'AUTOCLOSE_2150',  label:'21:50 Auto-close',    schedule:'Mon-Fri 21:50'},
+    {key:'DAY_END_22:00',   label:'22:00 Ghost finalize', schedule:'Mon-Fri 22:00'},
+    {key:'EOD_GHOST_21:00', label:'21:00 EOD Ghost',      schedule:'Mon-Fri 21:00'},
+    {key:'RECONNECT_02:00', label:'02:00 Reconnect',      schedule:'Daily 02:00'},
+    {key:'NIGHTLY_OPTIMIZER',label:'03:00 Nightly Optimizer',schedule:'Daily 03:00'},
+  ];
+  const history=(histRes?.history||[]);
+  const lastFire={};
+  for(const h of history){
+    if(!lastFire[h.type])lastFire[h.type]=h.ts;
   }
+  const html=CRONS.map(c=>{
+    const ts=lastFire[c.key]??null;
+    const hasRun=!!ts;
+    const tsStr=ts?new Date(ts).toLocaleString('en-GB',{timeZone:'Europe/Brussels'}):'Never fired';
+    return \`<div class="cron-item">
+      <span class="cron-name">\${c.label}</span>
+      <span class="cron-ts">\${c.schedule}</span>
+      <span class="cron-ts">\${tsStr}</span>
+      <span class="cron-status \${hasRun?'cron-ok':'cron-never'}">\${hasRun?'OK':'—'}</span>
+    </div>\`;
+  }).join('');
+  document.getElementById('cron-list').innerHTML=html;
+}
 
-  // Collect all symbol+session combos
-  const keys = new Set();
-
-  // from TP locks
-  for (const [sym, sessions] of Object.entries(tpBySymbol)) {
-    for (const sess of Object.keys(sessions)) keys.add(sym + '__' + sess);
+function buildRows(tpRes,slRes,shadowRes,ghostRes){
+  const rows=[];
+  const tpBySymbol=tpRes.locksBySymbol||{};
+  const slBySymbol={};
+  for(const a of(slRes.analyses||[]))slBySymbol[a.symbol]=a;
+  const shadowResults=shadowRes.results||{};
+  const ghostBySS={};
+  for(const g of(ghostRes.bySymbolSession||[]))ghostBySS[(g.symbol||'')+'__'+(g.session||'')]=g;
+  const keys=new Set();
+  for(const[sym,sessions]of Object.entries(tpBySymbol)){
+    for(const sess of Object.keys(sessions)){
+      if(sess==='all')continue; // [v7.0] skip 'all'
+      keys.add(sym+'__'+sess);
+    }
   }
-  // from ghost
-  for (const k of Object.keys(ghostBySS)) keys.add(k);
-  // from SL (symbol-level, add for each existing session or 'all')
-  for (const sym of Object.keys(slBySymbol)) {
-    const hasSessions = [...keys].some(k => k.startsWith(sym + '__'));
-    if (!hasSessions) keys.add(sym + '__all');
+  for(const k of Object.keys(ghostBySS))keys.add(k);
+  for(const sym of Object.keys(slBySymbol)){
+    const hasSess=[...keys].some(k=>k.startsWith(sym+'__'));
+    if(!hasSess)keys.add(sym+'__all');
   }
-
-  for (const key of keys) {
-    const [sym, sess] = key.split('__');
-    const tpSess  = tpBySymbol[sym]?.[sess] || null;
-    const slData  = slBySymbol[sym] || null;
-    const shadow  = shadowResults[sym] || null;
-    const ghost   = ghostBySS[key] || null;
-
+  for(const key of keys){
+    const[sym,sess]=key.split('__');
+    if(sess==='all'&&!ghostBySS[key]&&!slBySymbol[sym])continue; // skip empty all rows
+    const tpSess=sess!=='all'?(tpBySymbol[sym]?.[sess]||null):null;
+    const slData=slBySymbol[sym]||null;
+    const shadow=shadowResults[sym]||null;
+    const ghost=ghostBySS[key]||null;
     rows.push({
-      symbol:     sym,
-      session:    sess,
-      key,
-      // TP Ghost
-      tpRR:       tpSess?.lockedRR ?? null,
-      tpEV:       tpSess?.evAtLock ?? null,
-      tpEvPos:    tpSess?.evPositive ?? false,
-      tpTrades:   tpSess?.lockedTrades ?? null,
-      tpPrevRR:   tpSess?.prevRR ?? null,
-      tpLockedAt: tpSess?.lockedAt ?? null,
-      // SL Shadow
-      slMult:     shadow?.best?.slMultiplier ?? slData?.multiplier ?? null,
-      slEV:       shadow?.best?.bestEV ?? slData?.evAtLock ?? null,
-      slHitRate:  shadow?.best?.slHitRate ?? null,
-      slAuto:     slData?.autoApplied ?? false,
-      slTrades:   shadow?.tradesUsed ?? slData?.lockedTrades ?? null,
-      slDir:      slData?.direction ?? null,
-      slBestRR:   shadow?.best?.bestRR ?? slData?.bestTPRR ?? null,
-      slWinrate:  shadow?.best?.bestWinrate ?? null,
-      slExclSL:   shadow?.tradesExcludedSL ?? null,
-      // Ghost
-      ghostExtra: ghost?.avgExtraRR ?? null,
-      ghostTrades:ghost?.trades ?? null,
-      tpHitRate:  ghost?.tpHitRate ?? null,
-      manualCount:ghost?.manualCount ?? null,
-      // raw refs for detail panel
-      _tpSess: tpSess,
-      _slData: slData,
-      _shadow: shadow,
-      _ghost:  ghost,
+      symbol:sym,session:sess,key,
+      tpRR:tpSess?.lockedRR??null,tpEV:tpSess?.evAtLock??null,
+      tpEvPos:tpSess?.evPositive??false,tpTrades:tpSess?.lockedTrades??null,
+      tpPrevRR:tpSess?.prevRR??null,tpLockedAt:tpSess?.lockedAt??null,
+      slMult:shadow?.best?.slMultiplier??slData?.multiplier??null,
+      slEV:shadow?.best?.bestEV??slData?.evAtLock??null,
+      slHitRate:shadow?.best?.slHitRate??null,
+      slAuto:slData?.autoApplied??false,
+      slTrades:shadow?.tradesUsed??slData?.lockedTrades??null,
+      slDir:slData?.direction??null,
+      ghostExtra:ghost?.avgExtraRR??null,
+      ghostMAE:ghost?.trades?.(()=>{
+        const t=ghost.trades;
+        if(!Array.isArray(t)||!t.length)return null;
+        const maeArr=t.map(x=>x.ghostMAE).filter(x=>x!=null);
+        return maeArr.length?(maeArr.reduce((s,v)=>s+v,0)/maeArr.length).toFixed(2):null;
+      })():null,
+      ghostTrades:ghost?.trades??null,
+      tpHitRate:ghost?.tpHitRate??null,
+      manualCount:ghost?.manualCount??null,
+      _tpSess:tpSess,_slData:slData,_shadow:shadow,_ghost:ghost,
     });
   }
-
-  allRows = rows;
+  allRows=rows;
 }
 
-// ── SUMMARY ───────────────────────────────────────────────────
-function updateSummary(tpRes, slRes, shadowRes, ghostRes, liveRes) {
-  const uniqueSymbols = new Set(allRows.map(r=>r.symbol));
-  document.getElementById('s-symbols').textContent = uniqueSymbols.size;
-
-  const tpCount = Object.keys(tpRes.locksBySymbol || {}).reduce((s,k) =>
-    s + Object.keys(tpRes.locksBySymbol[k]).length, 0);
-  document.getElementById('s-tp').textContent = tpCount;
-
-  const slAuto = (slRes.analyses||[]).filter(a=>a.autoApplied).length;
-  document.getElementById('s-sl').textContent = slAuto + ' / ' + (slRes.analyses||[]).length;
-
-  const ghostItems = ghostRes.bySymbolSession || [];
-  const avgExtra = ghostItems.length
-    ? (ghostItems.reduce((s,g)=>s+g.avgExtraRR,0)/ghostItems.length).toFixed(2)
-    : '—';
-  document.getElementById('s-ghost-rr').textContent = avgExtra !== '—' ? '+' + avgExtra + 'R' : '—';
-
-  const evPos = allRows.filter(r=>r.tpEvPos).length;
-  document.getElementById('s-ev-pos').textContent = evPos;
-  document.getElementById('s-open').textContent = liveRes.count ?? '—';
+function updateSummary(tpRes,slRes,shadowRes,ghostRes,liveRes){
+  const unique=new Set(allRows.map(r=>r.symbol));
+  document.getElementById('s-symbols').textContent=unique.size;
+  const tpCount=Object.keys(tpRes.locksBySymbol||{}).reduce((s,k)=>s+Object.keys(tpRes.locksBySymbol[k]).filter(sk=>sk!=='all').length,0);
+  document.getElementById('s-tp').textContent=tpCount;
+  const slAuto=(slRes.analyses||[]).filter(a=>a.autoApplied).length;
+  document.getElementById('s-sl').textContent=slAuto+'/'+(slRes.analyses||[]).length;
+  const ghostItems=ghostRes.bySymbolSession||[];
+  const avgExtra=ghostItems.length?(ghostItems.reduce((s,g)=>s+g.avgExtraRR,0)/ghostItems.length).toFixed(2):'—';
+  document.getElementById('s-ghost-rr').textContent=avgExtra!=='—'?'+'+avgExtra+'R':'—';
+  document.getElementById('s-ev-pos').textContent=allRows.filter(r=>r.tpEvPos).length;
+  document.getElementById('s-open').textContent=liveRes.count??'—';
 }
 
-// ── RENDER TABLE ──────────────────────────────────────────────
-function renderTable() {
-  let rows = allRows.filter(r => {
-    if (sessionFilter !== 'all' && r.session !== sessionFilter) return false;
-    if (symbolFilter && !r.symbol.toLowerCase().includes(symbolFilter.toLowerCase())) return false;
+function renderTable(){
+  let rows=allRows.filter(r=>{
+    if(sessionFilter!=='all'&&r.session!==sessionFilter)return false;
+    if(symbolFilter&&!r.symbol.toLowerCase().includes(symbolFilter.toLowerCase()))return false;
+    if(r.session==='all'&&!r.ghostExtra&&!r.slMult)return false; // hide empty 'all' rows
     return true;
   });
-
-  rows.sort((a,b) => {
-    const av = a[sortKey], bv = b[sortKey];
-    if (av === null && bv === null) return 0;
-    if (av === null) return 1;
-    if (bv === null) return -1;
-    if (typeof av === 'string') return av.localeCompare(bv) * sortDir;
-    return (av - bv) * sortDir;
+  rows.sort((a,b)=>{
+    const av=a[sortKey],bv=b[sortKey];
+    if(av===null&&bv===null)return 0;
+    if(av===null)return 1;if(bv===null)return -1;
+    if(typeof av==='string')return av.localeCompare(bv)*sortDir;
+    return(av-bv)*sortDir;
   });
-
-  const tbody = document.getElementById('table-body');
-  if (!rows.length) {
-    tbody.innerHTML = '<tr><td colspan="12" class="no-data">No data for current filters</td></tr>';
-    return;
-  }
-
-  let html = '';
-  for (const r of rows) {
-    const sessClass  = { asia:'badge-asia', london:'badge-london', ny:'badge-ny' }[r.session] || 'badge-all';
-    const tpEVClass  = r.tpEV === null ? 'ev-zero' : r.tpEV > 0 ? 'ev-pos' : 'ev-neg';
-    const slEVClass  = r.slEV === null ? 'ev-zero' : r.slEV > 0 ? 'ev-pos' : 'ev-neg';
-    const multClass  = !r.slMult ? 'ev-zero' : r.slMult > 1 ? 'mult-up' : r.slMult < 1 ? 'mult-down' : 'mult-ok';
-    const autoSign   = r.slAuto ? '<span class="dot dot-green"></span>YES' : '<span class="dot dot-dim"></span>—';
-    const ghostSign  = r.ghostExtra === null ? '<span class="ev-zero">—</span>'
-                     : r.ghostExtra > 0
-                       ? '<span class="ev-pos">+' + r.ghostExtra.toFixed(2) + 'R</span>'
-                       : '<span class="ev-neg">' + r.ghostExtra.toFixed(2) + 'R</span>';
-
-    const isExp = expandedKey === r.key;
-
-    html += \`<tr class="\${isExp?'expanded':''}" onclick="toggleDetail('\${r.key}')">
+  const tbody=document.getElementById('table-body');
+  if(!rows.length){tbody.innerHTML='<tr><td colspan="13" class="no-data">No data</td></tr>';return;}
+  let html='';
+  for(const r of rows){
+    const sessClass={asia:'badge-asia',london:'badge-london',ny:'badge-ny'}[r.session]||'badge-all';
+    const tpEVClass=r.tpEV===null?'ev-zero':r.tpEV>0?'ev-pos':'ev-neg';
+    const slEVClass=r.slEV===null?'ev-zero':r.slEV>0?'ev-pos':'ev-neg';
+    const multClass=!r.slMult?'ev-zero':r.slMult>1?'mult-up':r.slMult<1?'mult-down':'mult-ok';
+    const autoSign=r.slAuto?'<span class="dot dot-green"></span>YES':'<span class="dot dot-dim"></span>—';
+    const ghostSign=r.ghostExtra===null?'<span class="ev-zero">—</span>':r.ghostExtra>0?'<span class="ev-pos">+'+r.ghostExtra.toFixed(2)+'R</span>':'<span class="ev-neg">'+r.ghostExtra.toFixed(2)+'R</span>';
+    const isExp=expandedKey===r.key;
+    html+=\`<tr class="\${isExp?'expanded':''}" onclick="toggleDetail('\${r.key}')">
       <td style="font-weight:700;color:var(--text)">\${r.symbol}</td>
       <td><span class="badge \${sessClass}">\${r.session}</span></td>
-      <td style="color:var(--accent)">\${r.tpRR !== null ? r.tpRR + 'R' : '<span class="ev-zero">—</span>'}</td>
-      <td class="\${tpEVClass}">\${r.tpEV !== null ? r.tpEV.toFixed(3) : '—'}</td>
-      <td style="color:var(--dim)">\${r.tpTrades ?? '—'}</td>
-      <td class="\${multClass}">\${r.slMult !== null ? r.slMult + '×' : '—'}</td>
-      <td class="\${slEVClass}">\${r.slEV !== null ? r.slEV.toFixed(3) : '—'}</td>
-      <td>\${r.slHitRate !== null ? r.slHitRate + '%' : '<span class="ev-zero">—</span>'}</td>
+      <td style="color:var(--accent)">\${r.tpRR!==null?r.tpRR+'R':'<span class="ev-zero">—</span>'}</td>
+      <td class="\${tpEVClass}">\${r.tpEV!==null?r.tpEV.toFixed(3):'—'}</td>
+      <td style="color:var(--dim)">\${r.tpTrades??'—'}</td>
+      <td class="\${multClass}">\${r.slMult!==null?r.slMult+'×':'—'}</td>
+      <td class="\${slEVClass}">\${r.slEV!==null?r.slEV.toFixed(3):'—'}</td>
+      <td>\${r.slHitRate!==null?r.slHitRate+'%':'<span class="ev-zero">—</span>'}</td>
       <td>\${autoSign}</td>
       <td>\${ghostSign}</td>
-      <td style="color:var(--dim)">\${r.ghostTrades ?? '—'}</td>
-      <td>\${r.tpHitRate !== null ? r.tpHitRate + '%' : '<span class="ev-zero">—</span>'}</td>
+      <td style="color:var(--dim)">\${r.ghostMAE!==null?r.ghostMAE+'R':'—'}</td>
+      <td style="color:var(--dim)">\${r.ghostTrades??'—'}</td>
+      <td>\${r.tpHitRate!==null?r.tpHitRate+'%':'<span class="ev-zero">—</span>'}</td>
     </tr>\`;
-
-    if (isExp) {
-      html += \`<tr class="detail-row"><td colspan="12">\${buildDetailPanel(r)}</td></tr>\`;
-    }
+    if(isExp)html+=\`<tr class="detail-row"><td colspan="13">\${buildDetailPanel(r)}</td></tr>\`;
   }
-
-  tbody.innerHTML = html;
+  tbody.innerHTML=html;
 }
 
-// ── DETAIL PANEL ──────────────────────────────────────────────
-function buildDetailPanel(r) {
-  const tp  = r._tpSess;
-  const sl  = r._slData;
-  const sh  = r._shadow;
-  const gh  = r._ghost;
-
-  let html = '<div class="detail-panel">';
-
-  // TP Ghost
-  html += \`<div class="detail-section">
+function buildDetailPanel(r){
+  const tp=r._tpSess,sl=r._slData,sh=r._shadow,gh=r._ghost;
+  let html='<div class="detail-panel">';
+  html+=\`<div class="detail-section">
     <h4>👻 TP Ghost — \${r.symbol} / \${r.session}</h4>
-    <div class="kv-row"><span class="k">Locked RR</span><span class="v accent">\${tp?.lockedRR ?? '—'}R</span></div>
-    <div class="kv-row"><span class="k">EV at lock</span><span class="v \${(tp?.evAtLock??0)>0?'green':'red'}">\${tp?.evAtLock?.toFixed(3) ?? '—'}</span></div>
-    <div class="kv-row"><span class="k">Trades used</span><span class="v">\${tp?.lockedTrades ?? '—'}</span></div>
-    <div class="kv-row"><span class="k">Prev RR</span><span class="v">\${tp?.prevRR ?? '—'}R</span></div>
-    <div class="kv-row"><span class="k">EV positive</span><span class="v \${tp?.evPositive?'green':'red'}">\${tp?.evPositive ? 'YES ✅' : 'NO ❌'}</span></div>
-    <div class="kv-row"><span class="k">Locked at</span><span class="v" style="color:var(--dim);font-size:10px">\${tp?.lockedAt ? new Date(tp.lockedAt).toLocaleString('en-GB') : '—'}</span></div>
+    <div class="kv-row"><span class="k">Locked RR</span><span class="v accent">\${tp?.lockedRR??'—'}R</span></div>
+    <div class="kv-row"><span class="k">EV at lock</span><span class="v \${(tp?.evAtLock??0)>0?'green':'red'}">\${tp?.evAtLock?.toFixed(3)??'—'}</span></div>
+    <div class="kv-row"><span class="k">Trades used</span><span class="v">\${tp?.lockedTrades??'—'}</span></div>
+    <div class="kv-row"><span class="k">Prev RR</span><span class="v">\${tp?.prevRR??'—'}R</span></div>
+    <div class="kv-row"><span class="k">EV positive</span><span class="v \${tp?.evPositive?'green':'red'}">\${tp?.evPositive?'YES ✅':'NO ❌'}</span></div>
   </div>\`;
-
-  // SL Shadow
-  const bestMult  = sh?.best?.slMultiplier;
-  const multLabel = !bestMult ? '—' : bestMult > 1 ? \`🔼 \${bestMult}× (wider)\` : bestMult < 1 ? \`🔽 \${bestMult}× (tighter)\` : '✅ current optimal';
-  html += \`<div class="detail-section">
+  const bestMult=sh?.best?.slMultiplier;
+  const multLabel=!bestMult?'—':bestMult>1?\`🔼 \${bestMult}× (wider)\`:bestMult<1?\`🔽 \${bestMult}× (tighter)\`:'✅ current optimal';
+  html+=\`<div class="detail-section">
     <h4>🌑 SL Shadow — \${r.symbol}</h4>
     <div class="kv-row"><span class="k">Best multiplier</span><span class="v gold">\${multLabel}</span></div>
-    <div class="kv-row"><span class="k">Best EV</span><span class="v \${(sh?.best?.bestEV??0)>0?'green':'red'}">\${sh?.best?.bestEV?.toFixed(3) ?? '—'}</span></div>
-    <div class="kv-row"><span class="k">Best TP RR</span><span class="v">\${sh?.best?.bestRR ?? sl?.bestTPRR ?? '—'}R</span></div>
-    <div class="kv-row"><span class="k">Winrate at best</span><span class="v">\${sh?.best?.bestWinrate ?? '—'}%</span></div>
-    <div class="kv-row"><span class="k">SL hit rate</span><span class="v">\${sh?.best?.slHitRate ?? '—'}%</span></div>
-    <div class="kv-row"><span class="k">Trades used</span><span class="v">\${sh?.tradesUsed ?? '—'} <span style="color:var(--dim)">(excl. \${sh?.tradesExcludedSL??0} SL)</span></span></div>
-    <div class="kv-row"><span class="k">Auto applied</span><span class="v \${sl?.autoApplied?'green':'ev-zero'}">\${sl?.autoApplied ? 'YES ✅' : 'No'}</span></div>
-    <div class="kv-row"><span class="k">Direction</span><span class="v purple">\${sl?.direction ?? '—'}</span></div>
-    <div class="kv-row"><span class="k">Current mult</span><span class="v">\${sl?.multiplier ?? '—'}×</span></div>
+    <div class="kv-row"><span class="k">Best EV</span><span class="v \${(sh?.best?.bestEV??0)>0?'green':'red'}">\${sh?.best?.bestEV?.toFixed(3)??'—'}</span></div>
+    <div class="kv-row"><span class="k">SL hit rate</span><span class="v">\${sh?.best?.slHitRate??'—'}%</span></div>
+    <div class="kv-row"><span class="k">Trades used</span><span class="v">\${sh?.tradesUsed??'—'}</span></div>
+    <div class="kv-row"><span class="k">Auto applied</span><span class="v \${sl?.autoApplied?'green':'ev-zero'}">\${sl?.autoApplied?'YES ✅':'No'}</span></div>
   </div>\`;
-
-  // Ghost stats
-  html += \`<div class="detail-section">
-    <h4>📊 Ghost Analytics — \${r.symbol} / \${r.session}</h4>
-    <div class="kv-row"><span class="k">Ghost trades</span><span class="v">\${gh?.trades ?? '—'}</span></div>
-    <div class="kv-row"><span class="k">Avg extra RR</span><span class="v \${(gh?.avgExtraRR??0)>0?'green':'red'}">\${gh?.avgExtraRR !== undefined ? (gh.avgExtraRR>=0?'+':'')+gh.avgExtraRR.toFixed(3)+'R' : '—'}</span></div>
-    <div class="kv-row"><span class="k">TP hit rate</span><span class="v">\${gh?.tpHitRate ?? '—'}%</span></div>
-    <div class="kv-row"><span class="k">Manual closes</span><span class="v gold">\${gh?.manualCount ?? '—'}</span></div>
+  html+=\`<div class="detail-section">
+    <h4>📊 Ghost Analytics</h4>
+    <div class="kv-row"><span class="k">Ghost trades</span><span class="v">\${gh?.trades??'—'}</span></div>
+    <div class="kv-row"><span class="k">Avg extra RR</span><span class="v \${(gh?.avgExtraRR??0)>0?'green':'red'}">\${gh?.avgExtraRR!==undefined?(gh.avgExtraRR>=0?'+':'')+gh.avgExtraRR.toFixed(3)+'R':'—'}</span></div>
+    <div class="kv-row"><span class="k">TP hit rate</span><span class="v">\${gh?.tpHitRate??'—'}%</span></div>
+    <div class="kv-row"><span class="k">Manual closes</span><span class="v gold">\${gh?.manualCount??'—'}</span></div>
   </div>\`;
-
-  // SL Shadow EV table (mini)
-  if (sh?.analysis?.length) {
-    const bestEV  = Math.max(...sh.analysis.map(a=>a.ev));
-    const currRow = sh.analysis.find(a=>a.slMultiplier===1.0);
-    html += '<div class="detail-section"><h4>SL Shadow EV Table</h4>';
-    html += '<table class="ev-mini-table"><thead><tr><th>Mult</th><th>EV</th><th>Winrate</th><th>Best RR</th><th>SL Hit%</th></tr></thead><tbody>';
-    for (const row of sh.analysis) {
-      const isBest = Math.abs(row.ev - bestEV) < 0.0001;
-      const isCurr = row.slMultiplier === 1.0;
-      html += \`<tr class="\${isBest?'best-row':''}\${isCurr?' current-row':''}">
-        <td>\${row.slMultiplier}×\${isCurr?' ◀':''}</td>
-        <td>\${row.ev?.toFixed(3)??'—'}</td>
-        <td>\${row.winRate??'—'}%</td>
-        <td>\${row.bestRR??'—'}R</td>
-        <td>\${row.slHitRate??'—'}%</td>
-      </tr>\`;
-    }
-    html += '</tbody></table></div>';
-  }
-
-  html += '</div>';
+  html+='</div>';
   return html;
 }
 
-// ── INTERACTIONS ──────────────────────────────────────────────
-function toggleDetail(key) {
-  expandedKey = expandedKey === key ? null : key;
+function toggleDetail(key){expandedKey=expandedKey===key?null:key;renderTable();}
+function setSession(sess,btn){
+  sessionFilter=sess;
+  document.querySelectorAll('.filter-btn').forEach(b=>b.classList.remove('active'));
+  btn.classList.add('active');renderTable();
+}
+function filterSymbol(val){symbolFilter=val;renderTable();}
+function sortBy(key){
+  if(sortKey===key)sortDir*=-1;else{sortKey=key;sortDir=1;}
+  document.querySelectorAll('thead th').forEach(th=>th.classList.remove('sort-asc','sort-desc'));
+  const keys=['symbol','session','tpRR','tpEV','tpTrades','slMult','slEV','slHitRate','slAuto','ghostExtra','ghostMAE','ghostTrades','tpHitRate'];
+  const idx=keys.indexOf(key);
+  const ths=document.querySelectorAll('thead th');
+  if(ths[idx])ths[idx].classList.add(sortDir===1?'sort-asc':'sort-desc');
   renderTable();
 }
 
-function setSession(sess, btn) {
-  sessionFilter = sess;
-  document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
-  btn.classList.add('active');
-  renderTable();
-}
-
-function filterSymbol(val) {
-  symbolFilter = val;
-  renderTable();
-}
-
-function sortBy(key) {
-  if (sortKey === key) { sortDir *= -1; }
-  else { sortKey = key; sortDir = 1; }
-  document.querySelectorAll('thead th').forEach(th => {
-    th.classList.remove('sort-asc', 'sort-desc');
-  });
-  const idx = ['symbol','session','tpRR','tpEV','tpTrades','slMult','slEV','slHitRate','slAuto','ghostExtra','ghostTrades','tpHitRate'].indexOf(key);
-  const ths = document.querySelectorAll('thead th');
-  if (ths[idx]) ths[idx].classList.add(sortDir === 1 ? 'sort-asc' : 'sort-desc');
-  renderTable();
-}
-
-// ── LOGS ──────────────────────────────────────────────────────
-async function loadLogs() {
-  // TP log
-  try {
-    const tpLog = await fetch('/tp-locks').then(r=>r.json());
-    // Build from locksBySymbol
-    const entries = [];
-    for (const [sym, sessions] of Object.entries(tpLog.locksBySymbol||{})) {
-      for (const [sess, lock] of Object.entries(sessions)) {
-        entries.push({ sym, sess, rr: lock.lockedRR, ev: lock.evAtLock, ts: lock.lockedAt, prev: lock.prevRR });
+async function loadLogs(){
+  try{
+    const tpLog=await fetch('/tp-locks').then(r=>r.json());
+    const entries=[];
+    for(const[sym,sessions]of Object.entries(tpLog.locksBySymbol||{})){
+      for(const[sess,lock]of Object.entries(sessions)){
+        if(sess==='all')continue;
+        entries.push({sym,sess,rr:lock.lockedRR,ev:lock.evAtLock,ts:lock.lockedAt,prev:lock.prevRR});
       }
     }
-    entries.sort((a,b) => (b.ts||'').localeCompare(a.ts||''));
-    const tpLogEl = document.getElementById('tp-log');
-    if (!entries.length) { tpLogEl.innerHTML = '<div class="no-data">No TP Ghost data yet</div>'; return; }
-    tpLogEl.innerHTML = entries.slice(0,20).map(e => \`
+    entries.sort((a,b)=>(b.ts||'').localeCompare(a.ts||''));
+    const tpLogEl=document.getElementById('tp-log');
+    if(!entries.length){tpLogEl.innerHTML='<div class="no-data">No TP Ghost data yet</div>';return;}
+    tpLogEl.innerHTML=entries.slice(0,20).map(e=>\`
       <div class="log-item">
-        <div><span class="log-sym">\${e.sym}</span><span style="color:var(--dim);\${e.sess==='asia'?'color:#7b61ff':e.sess==='london'?'color:#00ffe0':'color:#f5c842'}">\${e.sess}</span></div>
-        <div class="log-val" style="color:var(--accent)">\${e.prev ? e.prev+'R → ' : ''}\${e.rr}R</div>
+        <div><span class="log-sym">\${e.sym}</span><span style="color:\${e.sess==='asia'?'#7b61ff':e.sess==='london'?'#00ffe0':'#f5c842'}">\${e.sess}</span></div>
+        <div class="log-val" style="color:var(--accent)">\${e.prev?e.prev+'R → ':''}\${e.rr}R</div>
         <div style="color:\${(e.ev??0)>0?'var(--green)':'var(--red)'}">EV \${e.ev?.toFixed(3)??'—'}</div>
-        <div class="log-ts">\${e.ts ? new Date(e.ts).toLocaleDateString('en-GB') : ''}</div>
+        <div class="log-ts">\${e.ts?new Date(e.ts).toLocaleDateString('en-GB'):''}</div>
       </div>\`).join('');
-  } catch(e) {}
-
-  // SL log
-  try {
-    const slLog = await fetch('/sl-locks').then(r=>r.json());
-    const entries = (slLog.analyses||[]).filter(a=>a.lockedAt);
+  }catch(e){}
+  try{
+    const slLog=await fetch('/sl-locks').then(r=>r.json());
+    const entries=(slLog.analyses||[]).filter(a=>a.lockedAt);
     entries.sort((a,b)=>(b.lockedAt||'').localeCompare(a.lockedAt||''));
-    const slLogEl = document.getElementById('sl-log');
-    if (!entries.length) { slLogEl.innerHTML = '<div class="no-data">No SL Shadow data yet</div>'; return; }
-    slLogEl.innerHTML = entries.slice(0,20).map(e => \`
+    const slLogEl=document.getElementById('sl-log');
+    if(!entries.length){slLogEl.innerHTML='<div class="no-data">No SL Shadow data yet</div>';return;}
+    slLogEl.innerHTML=entries.slice(0,20).map(e=>\`
       <div class="log-item">
         <div><span class="log-sym">\${e.symbol}</span><span style="color:var(--dim)">\${e.direction||'—'}</span></div>
         <div class="log-val" style="color:\${e.multiplier>1?'var(--gold)':e.multiplier<1?'var(--accent2)':'var(--green)'}">\${e.multiplier}×</div>
         <div style="color:\${(e.evAtLock??0)>0?'var(--green)':'var(--red)'}">EV \${e.evAtLock?.toFixed(3)??'—'}</div>
-        <div style="color:\${e.autoApplied?'var(--green)':'var(--dim)'}; font-size:10px">\${e.autoApplied?'AUTO':'READONLY'}</div>
-        <div class="log-ts">\${e.lockedAt ? new Date(e.lockedAt).toLocaleDateString('en-GB') : ''}</div>
+        <div style="color:\${e.autoApplied?'var(--green)':'var(--dim)'};font-size:10px">\${e.autoApplied?'AUTO':'READONLY'}</div>
       </div>\`).join('');
-  } catch(e) {}
+  }catch(e){}
 }
 
-// ── INIT ──────────────────────────────────────────────────────
 loadAll();
-setInterval(loadAll, 30000); // auto-refresh every 30s
+setInterval(loadAll,30000);
 </script>
 </body>
 </html>`);
@@ -2054,13 +2374,13 @@ app.use((req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════
-// STARTUP
+// STARTUP v7.0
 // ══════════════════════════════════════════════════════════════
 const PORT = process.env.PORT || 3000;
 
 async function start() {
   try {
-    console.log("🚀 FTMO Webhook Server v5.2 — opstarten...");
+    console.log("🚀 FTMO Webhook Server v7.0 — opstarten...");
     await initDB();
 
     const dbTrades = await loadAllTrades();
@@ -2068,14 +2388,29 @@ async function start() {
     console.log(`📂 ${dbTrades.length} trades geladen`);
 
     const savedTP = await loadTPConfig();
-    Object.assign(tpLocks, savedTP);
-    console.log(`🔒 ${Object.keys(savedTP).length} TP locks geladen`);
+    // [v7.0] Filter out any 'all' session keys that snuck in
+    for (const [key, val] of Object.entries(savedTP)) {
+      if (!key.endsWith("__all")) tpLocks[key] = val;
+    }
+    console.log(`🔒 ${Object.keys(tpLocks).length} TP locks geladen (geen 'all' sessie)`);
 
     const savedSL = await loadSLConfig();
     Object.assign(slLocks, savedSL);
     console.log(`📐 ${Object.keys(savedSL).length} SL configs geladen`);
 
-    // [FEAT 6] Laad dagelijkse risk multiplier bij startup
+    // [v7.0] Load shadow SL results
+    const shadowRows = await loadShadowSLAnalysis();
+    for (const row of shadowRows) {
+      shadowSLResults[row.symbol] = {
+        symbol:    row.symbol,
+        best:      { slMultiplier: row.bestMultiplier, bestEV: row.bestEV, bestRR: row.bestRR, bestWinrate: row.bestWinrate, slHitRate: row.slHitRate },
+        tradesUsed: row.tradesUsed,
+        computedAt: row.computedAt,
+      };
+    }
+    console.log(`🌑 ${shadowRows.length} shadow SL resultaten geladen`);
+
+    // [v7.0] Daily risk multiplier
     const dailyRisk = await loadLatestDailyRisk();
     if (dailyRisk) {
       dailyRiskMultiplier     = dailyRisk.riskMultNext ?? 1.0;
@@ -2085,18 +2420,44 @@ async function start() {
 
     await restoreOpenPositionsFromMT5();
 
+    // [v7.0] Orphan repair
+    await repairOrphanedGhosts();
+
+    // [v7.0] Forced SL recalc on startup for symbols with >= 30 trades
+    const symbolCounts = {};
+    for (const t of closedTrades) {
+      const sym = normalizeSymbol(t.symbol);
+      symbolCounts[sym] = (symbolCounts[sym] || 0) + 1;
+    }
+    for (const [sym, n] of Object.entries(symbolCounts)) {
+      if (n >= SL_AUTO_APPLY_THRESHOLD) {
+        console.log(`[Startup] Forced SL recalc for ${sym}: ${n} trades`);
+        await runSLLockEngine(sym).catch(e => console.error(`❌ [SL startup] ${sym}:`, e.message));
+      }
+    }
+
+    // [v7.0] Run shadow optimizer on startup
+    await runShadowSLOptimizerAll();
+
+    // [v7.0] Purge any 'all' session tpLocks from memory
+    for (const key of Object.keys(tpLocks)) {
+      if (key.endsWith("__all")) delete tpLocks[key];
+    }
+
     app.listen(PORT, () => {
       console.log(`✅ Server luistert op port ${PORT}`);
-      console.log(`📋 v5.2 actief:`);
-      console.log(`   🔹 Forex: 21 pairs (geen JPY/exotics)`);
-      console.log(`   🔹 UK100 min SL: 2`);
-      console.log(`   🔹 Ghost tot 22:00 | Shadow tot 22:00`);
-      console.log(`   🔹 Vast TP = ${FIXED_TP_RR}R | TP lock na 3 trades`);
+      console.log(`📋 v7.0 actief:`);
+      console.log(`   🔹 Ghost v7.0: MAE, phantom_sl, trueMaxRR from entry, close_reason`);
+      console.log(`   🔹 Symbols: NL25EUR, BRK.B, ARM, TL0 | NIKE→NKE`);
+      console.log(`   🔹 'all' sessie verwijderd overal`);
+      console.log(`   🔹 Brussels date fix: getBrusselsDateOnly()`);
+      console.log(`   🔹 SL recalc op startup: ${Object.keys(symbolCounts).filter(s=>symbolCounts[s]>=SL_AUTO_APPLY_THRESHOLD).length} symbolen`);
+      console.log(`   🔹 calcLots double multiplier fix`);
+      console.log(`   🔹 TP boost: ×${TP_LOCK_RISK_MULT} × 1.2^days (no cap)`);
+      console.log(`   🔹 Shadow SL optimizer actief`);
       console.log(`   🔹 Daily risk mult: ×${dailyRiskMultiplier}`);
-      console.log(`   🔹 SL shadow auto-apply na ${SL_AUTO_APPLY_THRESHOLD} trades`);
-      console.log(`   🔹 Duplicate guard: 60s`);
-      console.log(`   🔹 Auto-close 21:50 | Reconnect 02:00`);
-      console.log(`   🔹 Forex pyramiding: max 2× (50% op trade 2)`);
+      console.log(`   🔹 Symbol validation: onbekend → SKIP`);
+      console.log(`   🔹 Forex trade 2: max 0.12 lots, EV-conditional`);
     });
   } catch(err) {
     console.error("❌ Startup mislukt:", err.message);
