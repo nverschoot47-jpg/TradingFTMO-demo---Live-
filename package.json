@@ -1,7 +1,7 @@
 {
   "name": "nv-tradingview-webhook",
-  "version": "5.2.0",
-  "description": "TradingView → MetaApi REST → FTMO MT5 | NV v5.2 — Forex expanded (no JPY/exotics), fixed TP=4R, TP lock @3 trades, daily risk scaling, SL shadow @30 trades, ghost to 22:00, duplicate guard, pyramiding 2×, auto-close 21:50",
+  "version": "7.0.0",
+  "description": "TradingView → MetaApi REST → FTMO MT5 | NV v7.0 — Ghost rewrite (MAE/phantom_sl/trueMaxRR), SL Shadow Optimizer, Brussels date fix, TP boost compound, symbol validation, NL25EUR/BRK.B/ARM, no-all-session, calcLots fix, daily risk panel, cron status dashboard",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
