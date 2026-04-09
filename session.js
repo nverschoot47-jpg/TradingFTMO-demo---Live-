@@ -1,14 +1,15 @@
 // ═══════════════════════════════════════════════════════════════
-// session.js — Timezone + Sessie helpers  |  v5.2
+// session.js — Timezone + Sessie helpers  |  v7.0
 // Automatische zomer/wintertijd via Intl API (geen hardcoded +1h)
 //   Winter → CET  = UTC+1
 //   Zomer  → CEST = UTC+2
 //
-// Wijzigingen v5.2 (t.o.v. v5.0):
-//  ✅ isGhostActive()  — ghost mag doorlopen tot 22:00 (niet 20:00)
-//  ✅ isShadowActive() — shadow optimizer ook tot 22:00
-//  ✅ Geen wijzigingen aan sessie-definities of isMarketOpen
-//     (nieuwe trades nog steeds geblokkeerd na 20:00)
+// Wijzigingen v7.0 (t.o.v. v5.2):
+//  ✅ getBrusselsDateOnly() — Brussels-correcte datum YYYY-MM-DD
+//     Vervangt alle new Date().toISOString().split("T")[0] calls
+//     Fix: trade om 23:30 Brussels logt onder correcte Brussels dag
+//  ✅ isGhostActive()  — ongewijzigd (22:00 hard stop)
+//  ✅ isShadowActive() — ongewijzigd (22:00 hard stop)
 // ═══════════════════════════════════════════════════════════════
 
 "use strict";
@@ -55,6 +56,31 @@ function getBrusselsDateStr() {
     dateStyle: "short",
     timeStyle: "medium",
   }).format(new Date());
+}
+
+/**
+ * [v7.0] Geeft de huidige (of opgegeven) datum als YYYY-MM-DD
+ * in Brussels tijdzone.
+ *
+ * Vervangt ALLE uses van:
+ *   new Date().toISOString().split("T")[0]
+ *
+ * Reden: UTC midnight ≠ Brussels midnight. Een trade gesloten om
+ * 23:30 Brussels (= 21:30 UTC winter) werd onder de verkeerde
+ * UTC-dag geboekt. Brussels midnight is de correcte grens.
+ *
+ * @param {Date|string|number|null} date  optioneel, default = now
+ * @returns {string}  "YYYY-MM-DD" in Brussels tijd
+ */
+function getBrusselsDateOnly(date) {
+  const d = date ? new Date(date) : new Date();
+  // en-CA locale geeft altijd YYYY-MM-DD formaat
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: TIMEZONE,
+    year:     "numeric",
+    month:    "2-digit",
+    day:      "2-digit",
+  }).format(d);
 }
 
 const SESSION_LABELS = {
@@ -121,9 +147,9 @@ function isGhostActive(date) {
   const d = date ? new Date(date) : new Date();
   const { day, hhmm } = getBrusselsComponents(d);
   const isWE = day === 0 || day === 6;
-  if (isWE) return false;               // geen ghost in weekend
-  if (hhmm < 200)  return false;        // voor dagstart
-  if (hhmm >= 2200) return false;       // na 22:00 hard stop
+  if (isWE) return false;        // geen ghost in weekend
+  if (hhmm < 200)  return false; // voor dagstart
+  if (hhmm >= 2200) return false; // na 22:00 hard stop
   return true;
 }
 
@@ -138,6 +164,7 @@ function isShadowActive(date) {
 module.exports = {
   getBrusselsComponents,
   getBrusselsDateStr,
+  getBrusselsDateOnly,   // [v7.0] nieuw
   getSessionGMT1,
   isMarketOpen,
   isGhostActive,
