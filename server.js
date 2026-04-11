@@ -2728,7 +2728,7 @@ async function buildMatrix() {
   var tbody = document.getElementById('matrix-body');
   if (!tbody) return;
 
-  var data = await sf('/api/matrix', 10000);
+  var data = await sf('/api/matrix', 20000);
 
   if (!data) {
     tbody.innerHTML = '<tr><td colspan="12" class="no-data" style="color:var(--red)">Matrix fetch mislukt - zie browser console voor details</td></tr>';
