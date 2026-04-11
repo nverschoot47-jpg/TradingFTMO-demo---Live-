@@ -1,5 +1,13 @@
 // ═══════════════════════════════════════════════════════════════
-// db.js — PostgreSQL persistence layer  |  v7.4
+// db.js — PostgreSQL persistence layer  |  v7.5
+// Wijzigingen v7.5:
+//  ✅ shadow_sl_analysis: UNIQUE constraint op symbol in CREATE TABLE zelf
+//     Voorheen enkel via losse CREATE UNIQUE INDEX — crash tussen CREATE TABLE
+//     en index aanmaken liet tabel zonder constraint achter.
+//  ✅ saveTrade: closedAt fallback null i.p.v. new Date().toISOString()
+//     → DB DEFAULT NOW() is server-side correct; UTC ISO string was inconsistent
+//  ✅ initDB log message gecorrigeerd naar v7.5
+//
 // Wijzigingen v7.4:
 //  ✅ saveShadowSLAnalysis: INSERT → UPSERT ON CONFLICT (symbol)
 //     Tabel groeide onbeperkt; elke nightly run voegde een nieuwe rij toe.
@@ -272,7 +280,7 @@ async function initDB() {
   await client.query(`
     CREATE TABLE IF NOT EXISTS shadow_sl_analysis (
       id              SERIAL PRIMARY KEY,
-      symbol          TEXT        NOT NULL,
+      symbol          TEXT        NOT NULL UNIQUE,  -- [v7.5] UNIQUE direct op kolom, niet enkel via index
       best_multiplier NUMERIC,
       best_ev         NUMERIC,
       best_rr         NUMERIC,
@@ -334,7 +342,7 @@ async function initDB() {
   `);
 
     await client.query("COMMIT");
-    console.log("✅ [DB] Schema klaar (v7.0 — ghost MAE, shadow SL, close_reason, no-all-session)");
+    console.log("✅ [DB] Schema klaar (v7.5 — ghost MAE, shadow SL UNIQUE, close_reason, no-all-session)");
   } catch (e) {
     await client.query("ROLLBACK");
     console.error("❌ [DB] initDB mislukt — rollback uitgevoerd:", e.message);
@@ -384,7 +392,7 @@ async function saveTrade(trade) {
     trade.ghostFinalizedAt  ?? null,
     trade.session           ?? null,
     trade.openedAt          ?? null,
-    trade.closedAt          ?? new Date().toISOString(),
+    trade.closedAt          ?? null,           // [v7.5] null → DB gebruikt DEFAULT NOW() (was: new Date().toISOString() = UTC)
     trade.spreadGuard       ?? false,
     trade.slMultiplier      ?? 1.0,
     trade.realizedPnlEUR    ?? null,
