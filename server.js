@@ -2609,59 +2609,72 @@ async function sf(url, timeoutMs = 8000) {
 }
 
 // ── MATRIX BUILDER ──
+// NOTE: geen backtick templates hier - string-concatenatie enkel.
 async function buildMatrix() {
-  const tbody = document.getElementById('matrix-body');
+  var tbody = document.getElementById('matrix-body');
   if (!tbody) return;
 
-  const [tpRes, slRes, shadowRes] = await Promise.all([
+  var results = await Promise.all([
     sf('/tp-locks'),
     sf('/sl-locks'),
     sf('/sl-shadow'),
   ]);
+  var tpRes = results[0], slRes = results[1], shadowRes = results[2];
 
-  const tpBySymbol    = tpRes?.locksBySymbol  || {};
-  const slBySymbol    = {};
-  for (const a of (slRes?.analyses || [])) slBySymbol[a.symbol] = a;
-  const shadowResults = shadowRes?.results || {};
+  var tpBySymbol  = (tpRes && tpRes.locksBySymbol) ? tpRes.locksBySymbol : {};
+  var slBySymbol  = {};
+  var analyses    = (slRes && slRes.analyses) ? slRes.analyses : [];
+  for (var i = 0; i < analyses.length; i++) { slBySymbol[analyses[i].symbol] = analyses[i]; }
+  var shadowResults = (shadowRes && shadowRes.results) ? shadowRes.results : {};
 
-  const symbols = [...new Set([
-    ...Object.keys(tpBySymbol),
-    ...Object.keys(slBySymbol),
-  ])].sort();
+  var allSyms = Object.keys(tpBySymbol).concat(Object.keys(slBySymbol));
+  var symSet  = {};
+  for (var j = 0; j < allSyms.length; j++) symSet[allSyms[j]] = true;
+  var symbols = Object.keys(symSet).sort();
 
   if (!symbols.length) {
     tbody.innerHTML = '<tr><td colspan="12" class="no-data">Nog geen optimizer data — trades verschijnen hier na ghost finalisatie</td></tr>';
     return;
   }
 
-  const sess = ['asia','london','ny'];
-  tbody.innerHTML = symbols.map(sym => {
-    const slData   = slBySymbol[sym];
-    const shadow   = shadowResults[sym];
-    const cols     = sess.map(s => {
-      const lock = tpBySymbol[sym]?.[s];
-      if (!lock) return '<td class="c-muted">—</td><td class="c-muted">—</td><td class="c-muted">—</td>';
-      const evClass = (lock.evAtLock ?? 0) > 0 ? 'c-green' : 'c-red';
-      return \`<td class="bold c-c">\${lock.lockedRR}R</td>
-               <td class="\${evClass}">\${lock.evAtLock?.toFixed(3) ?? '—'}</td>
-               <td class="c-dim">\${lock.lockedTrades ?? '—'}</td>\`;
-    }).join('');
-
-    const shadowMult = shadow?.best?.slMultiplier ?? slData?.multiplier ?? null;
-    const shadowCol  = shadowMult !== null
-      ? \`<span class="\${shadowMult > 1 ? 'c-gold' : shadowMult < 1 ? 'c-purple' : 'c-green'}">\${shadowMult}×</span>\`
+  var sess = ['asia','london','ny'];
+  var html = '';
+  for (var si = 0; si < symbols.length; si++) {
+    var sym    = symbols[si];
+    var slData = slBySymbol[sym];
+    var shadow = shadowResults[sym];
+    var cols   = '';
+    for (var ci = 0; ci < sess.length; ci++) {
+      var s    = sess[ci];
+      var lock = (tpBySymbol[sym] && tpBySymbol[sym][s]) ? tpBySymbol[sym][s] : null;
+      if (!lock) {
+        cols += '<td class="c-muted">—</td><td class="c-muted">—</td><td class="c-muted">—</td>';
+      } else {
+        var evClass = (lock.evAtLock || 0) > 0 ? 'c-green' : 'c-red';
+        var evVal   = (lock.evAtLock != null) ? lock.evAtLock.toFixed(3) : '—';
+        var trCount = (lock.lockedTrades != null) ? lock.lockedTrades : '—';
+        cols += '<td class="bold c-c">' + lock.lockedRR + 'R</td>'
+              + '<td class="' + evClass + '">' + evVal + '</td>'
+              + '<td class="c-dim">' + trCount + '</td>';
+      }
+    }
+    var shadowMult = (shadow && shadow.best && shadow.best.slMultiplier != null)
+      ? shadow.best.slMultiplier
+      : (slData && slData.multiplier != null ? slData.multiplier : null);
+    var shadowCol = (shadowMult !== null)
+      ? '<span class="' + (shadowMult > 1 ? 'c-gold' : shadowMult < 1 ? 'c-purple' : 'c-green') + '">' + shadowMult + '×</span>'
       : '<span class="c-muted">—</span>';
-    const autoCol = slData?.autoApplied
+    var autoCol = (slData && slData.autoApplied)
       ? '<span class="c-green">✓ AUTO</span>'
-      : \`<span class="c-muted">⏳ \${slData?.lockedTrades ?? 0}/${30}</span>\`;
-
-    return \`<tr>
-      <td class="bold c-c">\${sym}</td>
-      \${cols}
-      <td>\${shadowCol}</td>
-      <td>\${autoCol}</td>
-    </tr>\`;
-  }).join('');
+      : '<span class="c-muted">⏳ ' + (slData ? (slData.lockedTrades || 0) : 0) + '/30</span>';
+    html += '<tr>'
+          + '<td class="bold c-c">' + sym + '</td>'
+          + cols
+          + '<td>' + shadowCol + '</td>'
+          + '<td>' + autoCol + '</td>'
+          + '</tr>';
+  }
+  tbody.innerHTML = html;
 }
 
 // ── LIVE DATA REFRESH ──
