@@ -1,32 +1,32 @@
-// ═══════════════════════════════════════════════════════════════
-// db.js — PostgreSQL persistence layer  |  v7.5
+// ===============================================================
+// db.js  -  PostgreSQL persistence layer  |  v7.5
 // Wijzigingen v7.5:
-//  ✅ shadow_sl_analysis: UNIQUE constraint op symbol in CREATE TABLE zelf
-//     Voorheen enkel via losse CREATE UNIQUE INDEX — crash tussen CREATE TABLE
+//  [OK] shadow_sl_analysis: UNIQUE constraint op symbol in CREATE TABLE zelf
+//     Voorheen enkel via losse CREATE UNIQUE INDEX  -  crash tussen CREATE TABLE
 //     en index aanmaken liet tabel zonder constraint achter.
-//  ✅ saveTrade: closedAt fallback null i.p.v. new Date().toISOString()
-//     → DB DEFAULT NOW() is server-side correct; UTC ISO string was inconsistent
-//  ✅ initDB log message gecorrigeerd naar v7.5
+//  [OK] saveTrade: closedAt fallback null i.p.v. new Date().toISOString()
+//     -> DB DEFAULT NOW() is server-side correct; UTC ISO string was inconsistent
+//  [OK] initDB log message gecorrigeerd naar v7.5
 //
 // Wijzigingen v7.4:
-//  ✅ saveShadowSLAnalysis: INSERT → UPSERT ON CONFLICT (symbol)
+//  [OK] saveShadowSLAnalysis: INSERT -> UPSERT ON CONFLICT (symbol)
 //     Tabel groeide onbeperkt; elke nightly run voegde een nieuwe rij toe.
-//     Nu: één rij per symbol, altijd actueel, geen DISTINCT ON workaround nodig.
-//  ✅ shadow_sl_analysis: UNIQUE constraint op symbol toegevoegd (voor UPSERT)
-//  ✅ initDB: BEGIN staat correct in try-block (COMMIT/ROLLBACK/finally al aanwezig)
+//     Nu: een rij per symbol, altijd actueel, geen DISTINCT ON workaround nodig.
+//  [OK] shadow_sl_analysis: UNIQUE constraint op symbol toegevoegd (voor UPSERT)
+//  [OK] initDB: BEGIN staat correct in try-block (COMMIT/ROLLBACK/finally al aanwezig)
 //
-// Wijzigingen v7.3: close_reason default/fallback unknown → manual (conform server v7.2+)
+// Wijzigingen v7.3: close_reason default/fallback unknown -> manual (conform server v7.2+)
 // Wijzigingen v7.0 (t.o.v. v5.2):
-//  ✅ ghost_analysis: nieuwe kolommen ghost_hit_sl, ghost_mae,
+//  [OK] ghost_analysis: nieuwe kolommen ghost_hit_sl, ghost_mae,
 //     ghost_time_to_sl, is_manual, close_reason
-//  ✅ closed_trades: nieuwe kolom close_reason
-//  ✅ shadow_sl_analysis + shadow_sl_log tabellen (item 10)
-//  ✅ DELETE tp_config WHERE session='all' op startup
-//  ✅ saveTrade accepteert close_reason
-//  ✅ saveGhostAnalysis accepteert alle nieuwe ghost velden
-//  ✅ saveShadowSLAnalysis + loadShadowSLAnalysis functies
-//  ✅ Alle v5.2 functies ongewijzigd bewaard
-// ═══════════════════════════════════════════════════════════════
+//  [OK] closed_trades: nieuwe kolom close_reason
+//  [OK] shadow_sl_analysis + shadow_sl_log tabellen (item 10)
+//  [OK] DELETE tp_config WHERE session='all' op startup
+//  [OK] saveTrade accepteert close_reason
+//  [OK] saveGhostAnalysis accepteert alle nieuwe ghost velden
+//  [OK] saveShadowSLAnalysis + loadShadowSLAnalysis functies
+//  [OK] Alle v5.2 functies ongewijzigd bewaard
+// ===============================================================
 
 "use strict";
 
@@ -44,7 +44,7 @@ async function initDB() {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-  // ── Basis tabellen ─────────────────────────────────────────
+  // -- Basis tabellen -----------------------------------------
   await client.query(`
     CREATE TABLE IF NOT EXISTS closed_trades (
       id                  SERIAL PRIMARY KEY,
@@ -86,7 +86,7 @@ async function initDB() {
     ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS close_reason       TEXT        DEFAULT 'manual';
   `);
 
-  // ── TP config (per sessie) ─────────────────────────────────
+  // -- TP config (per sessie) ---------------------------------
   await client.query(`
     CREATE TABLE IF NOT EXISTS tp_config (
       symbol          TEXT        NOT NULL,
@@ -123,13 +123,13 @@ async function initDB() {
     END $$;
   `);
 
-  // ── [v7.0] Verwijder 'all' sessie rijen uit tp_config ─────
+  // -- [v7.0] Verwijder 'all' sessie rijen uit tp_config -----
   const delResult = await client.query(`DELETE FROM tp_config WHERE session = 'all'`);
   if (delResult.rowCount > 0) {
     console.log(`🧹 [DB] ${delResult.rowCount} 'all' sessie rijen verwijderd uit tp_config`);
   }
 
-  // ── SL config (met auto-apply na 30 trades) ───────────────
+  // -- SL config (met auto-apply na 30 trades) ---------------
   await client.query(`
     CREATE TABLE IF NOT EXISTS sl_config (
       symbol            TEXT        PRIMARY KEY,
@@ -152,7 +152,7 @@ async function initDB() {
     ALTER TABLE sl_config ADD COLUMN IF NOT EXISTS applied_trades INTEGER;
   `);
 
-  // ── Overige tabellen ───────────────────────────────────────
+  // -- Overige tabellen ---------------------------------------
   await client.query(`
     CREATE TABLE IF NOT EXISTS tp_update_log (
       id          SERIAL PRIMARY KEY,
@@ -246,7 +246,7 @@ async function initDB() {
     );
   `);
 
-  // ── [v5.2] Daily Risk Scaling log ────────────────────────
+  // -- [v5.2] Daily Risk Scaling log ------------------------
   await client.query(`
     CREATE TABLE IF NOT EXISTS daily_risk_log (
       id                      SERIAL PRIMARY KEY,
@@ -263,7 +263,7 @@ async function initDB() {
       ON daily_risk_log(trade_date);
   `);
 
-  // ── [v5.2] Duplicate Entry Guard ─────────────────────────
+  // -- [v5.2] Duplicate Entry Guard -------------------------
   await client.query(`
     CREATE TABLE IF NOT EXISTS duplicate_entry_log (
       id          SERIAL PRIMARY KEY,
@@ -276,7 +276,7 @@ async function initDB() {
     CREATE INDEX IF NOT EXISTS idx_dup_symbol ON duplicate_entry_log(symbol, blocked_at DESC);
   `);
 
-  // ── [v7.0] SL Shadow Optimizer tabellen ──────────────────
+  // -- [v7.0] SL Shadow Optimizer tabellen ------------------
   await client.query(`
     CREATE TABLE IF NOT EXISTS shadow_sl_analysis (
       id              SERIAL PRIMARY KEY,
@@ -306,7 +306,7 @@ async function initDB() {
     CREATE INDEX IF NOT EXISTS idx_shadow_sl_log_sym ON shadow_sl_log(symbol);
   `);
 
-  // [v7.4] Dedupliceer shadow_sl_analysis vóór unieke index aanmaken.
+  // [v7.4] Dedupliceer shadow_sl_analysis voor unieke index aanmaken.
   // Bestaande installaties kunnen duplicate symbol-rijen hebben (elke run voegde een nieuwe toe).
   // Bewaar alleen de meest recente rij per symbol.
   await client.query(`
@@ -318,13 +318,13 @@ async function initDB() {
     )
   `);
 
-  // Nu pas de unieke index aanmaken — werkt gegarandeerd na deduplicatie
+  // Nu pas de unieke index aanmaken  -  werkt gegarandeerd na deduplicatie
   await client.query(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_shadow_sl_symbol_unique
       ON shadow_sl_analysis(symbol)
   `);
 
-  // ── Indices ────────────────────────────────────────────────
+  // -- Indices ------------------------------------------------
   await client.query(`
     CREATE INDEX IF NOT EXISTS idx_trades_symbol      ON closed_trades(symbol);
     CREATE INDEX IF NOT EXISTS idx_trades_closed      ON closed_trades(closed_at);
@@ -342,17 +342,17 @@ async function initDB() {
   `);
 
     await client.query("COMMIT");
-    console.log("✅ [DB] Schema klaar (v7.5 — ghost MAE, shadow SL UNIQUE, close_reason, no-all-session)");
+    console.log("[OK] [DB] Schema klaar (v7.5  -  ghost MAE, shadow SL UNIQUE, close_reason, no-all-session)");
   } catch (e) {
     await client.query("ROLLBACK");
-    console.error("❌ [DB] initDB mislukt — rollback uitgevoerd:", e.message);
+    console.error("[ERR] [DB] initDB mislukt  -  rollback uitgevoerd:", e.message);
     throw e;
   } finally {
     client.release();
   }
 }
 
-// ── Trades ────────────────────────────────────────────────────
+// -- Trades ----------------------------------------------------
 async function saveTrade(trade) {
   const q = `
     INSERT INTO closed_trades
@@ -392,7 +392,7 @@ async function saveTrade(trade) {
     trade.ghostFinalizedAt  ?? null,
     trade.session           ?? null,
     trade.openedAt          ?? null,
-    trade.closedAt          ?? null,           // [v7.5] null → DB gebruikt DEFAULT NOW() (was: new Date().toISOString() = UTC)
+    trade.closedAt          ?? null,           // [v7.5] null -> DB gebruikt DEFAULT NOW() (was: new Date().toISOString() = UTC)
     trade.spreadGuard       ?? false,
     trade.slMultiplier      ?? 1.0,
     trade.realizedPnlEUR    ?? null,
@@ -404,12 +404,12 @@ async function saveTrade(trade) {
     const isGhost = trade.trueMaxRR !== null && trade.trueMaxRR !== undefined;
     console.log(
       isGhost
-        ? `👻 [DB] Ghost update: id=${res.rows[0].id} ${trade.symbol} trueMaxRR=${trade.trueMaxRR}`
+        ? `[ghost] [DB] Ghost update: id=${res.rows[0].id} ${trade.symbol} trueMaxRR=${trade.trueMaxRR}`
         : `💾 [DB] Trade: id=${res.rows[0].id} ${trade.symbol} maxRR=${trade.maxRR}`
     );
     return res.rows[0].id;
   } catch (e) {
-    console.error("❌ [DB] saveTrade mislukt:", e.message);
+    console.error("[ERR] [DB] saveTrade mislukt:", e.message);
     throw e;
   }
 }
@@ -447,7 +447,7 @@ async function loadAllTrades() {
   return res.rows;
 }
 
-// ── Snapshots ─────────────────────────────────────────────────
+// -- Snapshots -------------------------------------------------
 let lastSnapshotSave = 0;
 const SNAPSHOT_INTERVAL_MS = 5 * 60 * 1000;
 
@@ -463,7 +463,7 @@ async function saveSnapshot(snap) {
 }
 
 async function loadSnapshots(hours = 24) {
-  // De pool heeft statement_timeout: 5000 ms — geen extra Promise.race nodig.
+  // De pool heeft statement_timeout: 5000 ms  -  geen extra Promise.race nodig.
   try {
     const res = await pool.query(`
       SELECT ts,
@@ -478,12 +478,12 @@ async function loadSnapshots(hours = 24) {
     `);
     return res.rows;
   } catch (e) {
-    console.warn("⚠️ loadSnapshots:", e.message);
+    console.warn("[!]️ loadSnapshots:", e.message);
     return [];
   }
 }
 
-// ── TP Config ─────────────────────────────────────────────────
+// -- TP Config -------------------------------------------------
 async function loadTPConfig() {
   try {
     // [v7.0] Laad nooit 'all' sessie rijen
@@ -511,7 +511,7 @@ async function loadTPConfig() {
     console.log(`📊 [DB] ${res.rows.length} TP configs geladen (geen 'all' sessie)`);
     return map;
   } catch (e) {
-    console.warn("⚠️ loadTPConfig:", e.message);
+    console.warn("[!]️ loadTPConfig:", e.message);
     return {};
   }
 }
@@ -519,7 +519,7 @@ async function loadTPConfig() {
 async function saveTPConfig(symbol, session, lockedRR, lockedTrades, evAtLock, prevRR, prevLockedAt) {
   // [v7.0] Nooit 'all' sessie opslaan
   if (!session || session === "all") {
-    console.warn(`⚠️ [TP] saveTPConfig geblokkeerd voor session='all' (${symbol})`);
+    console.warn(`[!]️ [TP] saveTPConfig geblokkeerd voor session='all' (${symbol})`);
     return;
   }
   const evPositive = (evAtLock ?? 0) > 0;
@@ -538,7 +538,7 @@ async function saveTPConfig(symbol, session, lockedRR, lockedTrades, evAtLock, p
     `, [symbol, session, lockedRR, lockedTrades, evAtLock ?? null,
         evPositive, prevRR ?? null, prevLockedAt ?? null]);
   } catch (e) {
-    console.error("❌ [DB] saveTPConfig mislukt:", e.message);
+    console.error("[ERR] [DB] saveTPConfig mislukt:", e.message);
     throw e;
   }
 }
@@ -550,9 +550,9 @@ async function logTPUpdate(symbol, session, oldRR, newRR, trades, ev, reason) {
       INSERT INTO tp_update_log (symbol, session, old_rr, new_rr, trades, ev, reason)
       VALUES ($1, $2, $3, $4, $5, $6, $7)
     `, [symbol, session, oldRR ?? null, newRR, trades, ev ?? null, reason]);
-    console.log(`📝 [DB] TP log: ${symbol}/${session} ${oldRR ?? "nieuw"}R → ${newRR}R`);
+    console.log(`📝 [DB] TP log: ${symbol}/${session} ${oldRR ?? "nieuw"}R -> ${newRR}R`);
   } catch (e) {
-    console.error("❌ [DB] logTPUpdate mislukt:", e.message);
+    console.error("[ERR] [DB] logTPUpdate mislukt:", e.message);
     throw e;
   }
 }
@@ -569,10 +569,10 @@ async function loadTPUpdateLog(limit = 50) {
       ORDER BY ts DESC LIMIT $1
     `, [limit]);
     return res.rows;
-  } catch (e) { console.warn("⚠️ loadTPUpdateLog:", e.message); return []; }
+  } catch (e) { console.warn("[!]️ loadTPUpdateLog:", e.message); return []; }
 }
 
-// ── SL Config (met auto-apply na 30 trades) ───────────────────
+// -- SL Config (met auto-apply na 30 trades) -------------------
 async function loadSLConfig() {
   try {
     const res = await pool.query(`SELECT * FROM sl_config ORDER BY symbol`);
@@ -594,7 +594,7 @@ async function loadSLConfig() {
     }
     console.log(`📐 [DB] ${res.rows.length} SL configs geladen`);
     return map;
-  } catch (e) { console.warn("⚠️ loadSLConfig:", e.message); return {}; }
+  } catch (e) { console.warn("[!]️ loadSLConfig:", e.message); return {}; }
 }
 
 async function saveSLConfig(symbol, multiplier, direction, lockedTrades, evAtLock, bestTPRR,
@@ -621,7 +621,7 @@ async function saveSLConfig(symbol, multiplier, direction, lockedTrades, evAtLoc
         evAtLock ?? null, bestTPRR ?? null, prevMultiplier ?? null, prevLockedAt ?? null,
         autoApplied, appliedAt, appliedTrades]);
   } catch (e) {
-    console.error("❌ [DB] saveSLConfig mislukt:", e.message);
+    console.error("[ERR] [DB] saveSLConfig mislukt:", e.message);
     throw e;
   }
 }
@@ -632,9 +632,9 @@ async function logSLUpdate(symbol, oldMult, newMult, direction, trades, ev, reas
       INSERT INTO sl_update_log (symbol, old_multiplier, new_multiplier, direction, trades, ev, reason, auto_applied)
       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
     `, [symbol, oldMult ?? null, newMult, direction || "unchanged", trades, ev ?? null, reason, autoApplied]);
-    console.log(`📝 [DB] SL log: ${symbol} ${oldMult ?? "nieuw"}× → ${newMult}× (${direction})${autoApplied ? " [AUTO APPLIED]" : ""}`);
+    console.log(`📝 [DB] SL log: ${symbol} ${oldMult ?? "nieuw"}x -> ${newMult}x (${direction})${autoApplied ? " [AUTO APPLIED]" : ""}`);
   } catch (e) {
-    console.error("❌ [DB] logSLUpdate mislukt:", e.message);
+    console.error("[ERR] [DB] logSLUpdate mislukt:", e.message);
     throw e;
   }
 }
@@ -649,10 +649,10 @@ async function loadSLUpdateLog(limit = 50) {
       FROM sl_update_log ORDER BY ts DESC LIMIT $1
     `, [limit]);
     return res.rows;
-  } catch (e) { console.warn("⚠️ loadSLUpdateLog:", e.message); return []; }
+  } catch (e) { console.warn("[!]️ loadSLUpdateLog:", e.message); return []; }
 }
 
-// ── Ghost Analyse ─────────────────────────────────────────────
+// -- Ghost Analyse ---------------------------------------------
 async function saveGhostAnalysis(data) {
   try {
     await pool.query(`
@@ -684,7 +684,7 @@ async function saveGhostAnalysis(data) {
       data.isManual         ?? false,
       data.closeReason      ?? "manual",
     ]);
-  } catch (e) { console.warn("⚠️ saveGhostAnalysis:", e.message); }
+  } catch (e) { console.warn("[!]️ saveGhostAnalysis:", e.message); }
 }
 
 async function loadGhostAnalysis(symbol = null, session = null, limit = 200) {
@@ -721,10 +721,10 @@ async function loadGhostAnalysis(symbol = null, session = null, limit = 200) {
       LIMIT $${vals.length}
     `, vals);
     return res.rows;
-  } catch (e) { console.warn("⚠️ loadGhostAnalysis:", e.message); return []; }
+  } catch (e) { console.warn("[!]️ loadGhostAnalysis:", e.message); return []; }
 }
 
-// ── PnL Log ───────────────────────────────────────────────────
+// -- PnL Log ---------------------------------------------------
 async function savePnlLog(symbol, session, direction, rrAchieved, hitTP, pnlEUR) {
   try {
     await pool.query(`
@@ -732,7 +732,7 @@ async function savePnlLog(symbol, session, direction, rrAchieved, hitTP, pnlEUR)
       VALUES ($1,$2,$3,$4,$5,$6)
     `, [symbol, session ?? null, direction ?? null,
         rrAchieved ?? null, hitTP ?? false, pnlEUR ?? null]);
-  } catch (e) { console.warn("⚠️ savePnlLog:", e.message); }
+  } catch (e) { console.warn("[!]️ savePnlLog:", e.message); }
 }
 
 async function loadPnlStats(symbol = null, session = null) {
@@ -761,10 +761,10 @@ async function loadPnlStats(symbol = null, session = null) {
       ORDER BY total_pnl DESC
     `, vals);
     return res.rows;
-  } catch (e) { console.warn("⚠️ loadPnlStats:", e.message); return []; }
+  } catch (e) { console.warn("[!]️ loadPnlStats:", e.message); return []; }
 }
 
-// ── [v5.2] Daily Risk Scaling ─────────────────────────────────
+// -- [v5.2] Daily Risk Scaling ---------------------------------
 async function saveDailyRisk(tradeDate, totalPnlEUR, tradesCount, riskMultApplied, riskMultNext) {
   try {
     const evPositive = (totalPnlEUR ?? 0) > 0;
@@ -781,8 +781,8 @@ async function saveDailyRisk(tradeDate, totalPnlEUR, tradesCount, riskMultApplie
         created_at              = NOW()
     `, [tradeDate, totalPnlEUR ?? 0, evPositive, tradesCount ?? 0,
         riskMultApplied ?? 1.0, riskMultNext ?? 1.0]);
-    console.log(`📅 [DB] Daily risk: ${tradeDate} PnL=€${(totalPnlEUR ?? 0).toFixed(2)} → next mult=${riskMultNext}`);
-  } catch (e) { console.warn("⚠️ saveDailyRisk:", e.message); }
+    console.log(`📅 [DB] Daily risk: ${tradeDate} PnL=€${(totalPnlEUR ?? 0).toFixed(2)} -> next mult=${riskMultNext}`);
+  } catch (e) { console.warn("[!]️ saveDailyRisk:", e.message); }
 }
 
 async function loadLatestDailyRisk() {
@@ -800,25 +800,25 @@ async function loadLatestDailyRisk() {
       LIMIT 1
     `);
     return res.rows[0] ?? null;
-  } catch (e) { console.warn("⚠️ loadLatestDailyRisk:", e.message); return null; }
+  } catch (e) { console.warn("[!]️ loadLatestDailyRisk:", e.message); return null; }
 }
 
-// ── [v5.2] Duplicate Entry Guard ─────────────────────────────
+// -- [v5.2] Duplicate Entry Guard -----------------------------
 async function logDuplicateEntry(symbol, direction, reason) {
   try {
     await pool.query(`
       INSERT INTO duplicate_entry_log (symbol, direction, reason)
       VALUES ($1, $2, $3)
     `, [symbol, direction, reason]);
-  } catch (e) { console.warn("⚠️ logDuplicateEntry:", e.message); }
+  } catch (e) { console.warn("[!]️ logDuplicateEntry:", e.message); }
 }
 
-// ── [v7.0] SL Shadow Optimizer persistence ───────────────────
+// -- [v7.0] SL Shadow Optimizer persistence -------------------
 async function saveShadowSLAnalysis(symbol, bestMultiplier, bestEV, bestRR, bestWinrate, slHitRate, tradesUsed) {
   try {
-    // [v7.4] UPSERT op symbol — voorheen werd elke run een nieuwe rij toegevoegd.
+    // [v7.4] UPSERT op symbol  -  voorheen werd elke run een nieuwe rij toegevoegd.
     // De tabel groeide onbeperkt; DISTINCT ON in loadShadowSLAnalysis was workaround.
-    // Nu: één rij per symbol, altijd up-to-date.
+    // Nu: een rij per symbol, altijd up-to-date.
     await pool.query(`
       INSERT INTO shadow_sl_analysis
         (symbol, best_multiplier, best_ev, best_rr, best_winrate, sl_hit_rate, trades_used, computed_at)
@@ -833,7 +833,7 @@ async function saveShadowSLAnalysis(symbol, bestMultiplier, bestEV, bestRR, best
         computed_at     = NOW()
     `, [symbol, bestMultiplier ?? null, bestEV ?? null, bestRR ?? null,
         bestWinrate ?? null, slHitRate ?? null, tradesUsed ?? null]);
-  } catch (e) { console.warn("⚠️ saveShadowSLAnalysis:", e.message); }
+  } catch (e) { console.warn("[!]️ saveShadowSLAnalysis:", e.message); }
 }
 
 async function loadShadowSLAnalysis(symbol = null) {
@@ -841,7 +841,7 @@ async function loadShadowSLAnalysis(symbol = null) {
     const vals = [];
     let where = "";
     if (symbol) { vals.push(symbol); where = "WHERE symbol = $1"; }
-    // [v7.4] DISTINCT ON niet meer nodig — tabel heeft nu UNIQUE constraint op symbol
+    // [v7.4] DISTINCT ON niet meer nodig  -  tabel heeft nu UNIQUE constraint op symbol
     const res = await pool.query(`
       SELECT
         symbol,
@@ -857,7 +857,7 @@ async function loadShadowSLAnalysis(symbol = null) {
       ORDER BY symbol
     `, vals);
     return res.rows;
-  } catch (e) { console.warn("⚠️ loadShadowSLAnalysis:", e.message); return []; }
+  } catch (e) { console.warn("[!]️ loadShadowSLAnalysis:", e.message); return []; }
 }
 
 async function logShadowSLChange(symbol, oldMult, newMult, oldEV, newEV, trades, reason) {
@@ -866,17 +866,17 @@ async function logShadowSLChange(symbol, oldMult, newMult, oldEV, newEV, trades,
       INSERT INTO shadow_sl_log (symbol, old_multiplier, new_multiplier, old_ev, new_ev, trades, reason)
       VALUES ($1, $2, $3, $4, $5, $6, $7)
     `, [symbol, oldMult ?? null, newMult ?? null, oldEV ?? null, newEV ?? null, trades ?? null, reason ?? null]);
-  } catch (e) { console.warn("⚠️ logShadowSLChange:", e.message); }
+  } catch (e) { console.warn("[!]️ logShadowSLChange:", e.message); }
 }
 
-// ── Misc ──────────────────────────────────────────────────────
+// -- Misc ------------------------------------------------------
 async function logForexConsolidation(symbol, direction, count, reason) {
   try {
     await pool.query(`
       INSERT INTO forex_consolidation_log (symbol, direction, count, reason)
       VALUES ($1, $2, $3, $4)
     `, [symbol, direction, count, reason]);
-  } catch (e) { console.warn("⚠️ logForexConsolidation:", e.message); }
+  } catch (e) { console.warn("[!]️ logForexConsolidation:", e.message); }
 }
 
 module.exports = {
