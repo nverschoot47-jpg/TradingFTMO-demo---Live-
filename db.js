@@ -1,5 +1,15 @@
 // ===============================================================
-// db.js  -  PostgreSQL persistence layer  |  v7.5
+// db.js  -  PostgreSQL persistence layer  |  v7.7
+// Wijzigingen v7.7 (fixes):
+//  [OK] saveTrade: slMultiplierApplied ?? slMultiplier ?? 1.0
+//     Veld in openPositions was slMultiplierApplied, saveTrade las slMultiplier
+//     -> DB sloeg altijd 1.0 op voor de werkelijke multiplier
+//  [OK] loadSnapshots: parameterized query ipv template literal (SQL injectie patroon)
+//  [OK] ghost_analysis: UNIQUE INDEX op trade_position_id (WHERE NOT NULL)
+//     ON CONFLICT DO NOTHING triggerde voorheen nooit (geen UNIQUE constraint)
+//     -> duplicate ghost analyses werden gewoon ingevoegd
+//  [OK] saveGhostAnalysis: ON CONFLICT (trade_position_id) DO NOTHING (was: DO NOTHING zonder kolom)
+//
 // Wijzigingen v7.5:
 //  [OK] shadow_sl_analysis: UNIQUE constraint op symbol in CREATE TABLE zelf
 //     Voorheen enkel via losse CREATE UNIQUE INDEX  -  crash tussen CREATE TABLE
@@ -233,6 +243,11 @@ async function initDB() {
     ALTER TABLE ghost_analysis ADD COLUMN IF NOT EXISTS is_manual           BOOLEAN  DEFAULT FALSE;
     ALTER TABLE ghost_analysis ADD COLUMN IF NOT EXISTS close_reason        TEXT     DEFAULT 'manual';
 
+    -- [v7.7 fix] UNIQUE index op trade_position_id zodat ON CONFLICT DO NOTHING werkt
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_ghost_trade_position_id
+      ON ghost_analysis(trade_position_id)
+      WHERE trade_position_id IS NOT NULL;
+
     -- Win/verlies log per sessie per symbool
     CREATE TABLE IF NOT EXISTS trade_pnl_log (
       id          SERIAL PRIMARY KEY,
@@ -394,7 +409,7 @@ async function saveTrade(trade) {
     trade.openedAt          ?? null,
     trade.closedAt          ?? null,           // [v7.5] null -> DB gebruikt DEFAULT NOW() (was: new Date().toISOString() = UTC)
     trade.spreadGuard       ?? false,
-    trade.slMultiplier      ?? 1.0,
+    trade.slMultiplierApplied ?? trade.slMultiplier ?? 1.0,   // [v7.7 fix] field was slMultiplierApplied in openPositions, slMultiplier was always undefined -> saved as 1.0
     trade.realizedPnlEUR    ?? null,
     trade.hitTP             ?? false,
     trade.closeReason       ?? "manual",
@@ -465,6 +480,7 @@ async function saveSnapshot(snap) {
 async function loadSnapshots(hours = 24) {
   // De pool heeft statement_timeout: 5000 ms  -  geen extra Promise.race nodig.
   try {
+    // [v7.7 fix] Gebruik parameterized query ipv template literal in SQL
     const res = await pool.query(`
       SELECT ts,
         CAST(balance     AS FLOAT) AS balance,
@@ -473,9 +489,9 @@ async function loadSnapshots(hours = 24) {
         CAST(margin      AS FLOAT) AS margin,
         CAST(free_margin AS FLOAT) AS "freeMargin"
       FROM equity_snapshots
-      WHERE ts > NOW() - INTERVAL '${hours} hours'
+      WHERE ts > NOW() - ($1 * INTERVAL '1 hour')
       ORDER BY ts ASC
-    `);
+    `, [hours]);
     return res.rows;
   } catch (e) {
     console.warn("[!]️ loadSnapshots:", e.message);
@@ -663,7 +679,7 @@ async function saveGhostAnalysis(data) {
          ghost_finalized_at, closed_at, realized_pnl_eur, trade_position_id,
          ghost_hit_sl, ghost_mae, ghost_time_to_sl, is_manual, close_reason)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
-      ON CONFLICT DO NOTHING
+      ON CONFLICT (trade_position_id) DO NOTHING  -- [v7.7 fix] was "DO NOTHING" zonder kolom -> triggerde nooit (enkel PK conflict); nu op trade_position_id unique index
     `, [
       data.symbol,          data.session,         data.direction,
       data.entry,           data.sl,              data.tp ?? null,
