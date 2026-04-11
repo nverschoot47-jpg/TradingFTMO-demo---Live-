@@ -56,7 +56,18 @@ const express = require("express");
 const helmet  = require("helmet");
 const cron    = require("node-cron");
 const app     = express();
-app.use(helmet());
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc:  ["'self'"],
+      scriptSrc:   ["'self'", "'unsafe-inline'"],   // [v7.7 fix] inline <script> in dashboard werd geblokkeerd -> matrix "Laden..." + klok "--:--:--"
+      styleSrc:    ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
+      fontSrc:     ["'self'", "https://fonts.gstatic.com"],
+      connectSrc:  ["'self'"],
+      imgSrc:      ["'self'", "data:"],
+    },
+  },
+}));
 app.use(express.json());
 
 const {
