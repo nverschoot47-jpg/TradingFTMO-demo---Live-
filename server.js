@@ -3,6 +3,19 @@
 // Account : Nick Verschoot  -  FTMO Demo
 // MetaApi : 7cb566c1-be02-415b-ab95-495368f3885c
 // ---------------------------------------------------------------
+// WIJZIGINGEN v7.7 (bugfixes):
+//  [OK] placeOrder: AbortController + signal op /trade POST fetch
+//     Voorheen: fetch had geen signal -> hing door na Promise.race timeout
+//     -> stale connections accumuleerden op Railway
+//  [OK] slMultiplierApplied -> slMultiplier fix (via db.js saveTrade)
+//     Veld in openPositions heette slMultiplierApplied, saveTrade las slMultiplier
+//     -> DB sloeg altijd 1.0 op; werkelijke multiplier ging verloren bij elke close
+//  [OK] Autoclose cron: isWE dead code verwijderd
+//     Cron draait enkel ma-vr (1-5) -> isWE altijd false -> crypto-skip triggerde nooit
+//  [OK] reconstructConsecutivePositiveDays: loop bound 30 -> 50 kd
+//     30 kalenderdagen bevatten ~22 werkdagen; loop stopte te vroeg voor 30 werkdagen target
+//  [OK] Dashboard title + logo: v7.5 -> v7.7
+//
 // WIJZIGINGEN v7.5 (t.o.v. v7.4):
 //  [OK] CRASHFIX: SyntaxError op Railway opgelost
 //     Oorzaak: ${ACCOUNT_BALANCE} in client-side <script> binnenin
@@ -318,8 +331,8 @@ async function fetchCurrentPrice(mt5Symbol) {
 // ==============================================================
 
 cron.schedule("50 21 * * 1-5", async () => {
-  const { day } = getBrusselsComponents();
-  const isWE = day === 0 || day === 6;
+  // [v7.7 fix] isWE verwijderd: deze cron draait enkel ma-vr (1-5),
+  // dus isWE is altijd false -> de crypto-weekend skip triggerde nooit.
   console.log("🔔 21:50 Brussels  -  auto-close gestart...");
   cronLastRun["AUTOCLOSE_2150"] = new Date().toISOString();
   try {
@@ -328,8 +341,6 @@ cron.schedule("50 21 * * 1-5", async () => {
       console.log("[ ] Geen open posities bij auto-close.");
     } else {
       for (const pos of positions) {
-        const tvSym = Object.keys(SYMBOL_MAP).find(k => SYMBOL_MAP[k].mt5 === pos.symbol) || pos.symbol;
-        if (isWE && getSymbolType(tvSym) === "crypto" && isCryptoWeekend(tvSym)) continue;
         try {
           await closePosition(pos.id);
           console.log(`[OK] Auto-close 21:50: ${pos.symbol}`);
@@ -444,7 +455,10 @@ function reconstructConsecutivePositiveDays() {
   // Weekenddagen worden overgeslagen: geen trades in weekend != negatieve dag.
   // Zonder deze skip brak elke maandag de streak, waardoor de compound boost nooit werkte.
   const dayStrings = [];
-  for (let i = 1; i <= MAX_LOOKBACK_DAYS && dayStrings.length < MAX_LOOKBACK_DAYS; i++) {
+  // [v7.7 fix] outer loop was i <= 30 (kalender) maar dayStrings.length < 30 stopt al na ~22 werkdagen in 30 kd.
+  // Als je 30 werkdagen wil, itereer over meer kalenderdagen (50 = voldoende buffer).
+  const MAX_CALENDAR_LOOKBACK = 50;
+  for (let i = 1; i <= MAX_CALENDAR_LOOKBACK && dayStrings.length < MAX_LOOKBACK_DAYS; i++) {
     const d = new Date(Date.now() - i * 86400000);
     const { day } = getBrusselsComponents(d); // [v7.4] Brussels weekday ipv UTC d.getDay()
     if (day === 0 || day === 6) continue; // weekend overslaan
@@ -1126,12 +1140,21 @@ async function placeOrder(dir, symbol, entry, sl, lots, session) {
     stopLoss: slPrice, takeProfit: tpPrice,
     comment: `FTMO-NV-${dir.toUpperCase()}-${symbol}-TP${tpRR}R-${session}`,
   };
-  const r = await fetch(`${META_BASE}/trade`, {
-    method: "POST",
-    headers: {"Content-Type":"application/json","auth-token":META_API_TOKEN},
-    body: JSON.stringify(body),
-  });
-  return { result: await r.json(), mt5Symbol, slPrice, body, tpPrice, tpRR };
+  // [v7.7 fix] AbortController toegevoegd op de /trade POST
+  // Voorheen: geen signal -> fetch kon hangen na Promise.race timeout in placeOrderWithTimeout
+  // -> stale connections accumuleerden op Railway
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 8000);
+  try {
+    const r = await fetch(`${META_BASE}/trade`, {
+      method: "POST",
+      headers: {"Content-Type":"application/json","auth-token":META_API_TOKEN},
+      body: JSON.stringify(body),
+      signal: ctrl.signal,
+    });
+    clearTimeout(t);
+    return { result: await r.json(), mt5Symbol, slPrice, body, tpPrice, tpRR };
+  } catch(e) { clearTimeout(t); throw e; }
 }
 
 async function placeOrderWithTimeout(dir, symbol, entry, sl, lots, session) {
@@ -1908,7 +1931,7 @@ app.get("/dashboard", async (req, res) => {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>FTMO v7.5  -  Nick Verschoot</title>
+<title>FTMO v7.7  -  Nick Verschoot</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Barlow+Condensed:wght@400;600;700;900&display=swap" rel="stylesheet">
 <style>
@@ -2289,7 +2312,7 @@ th.sort-desc::after { content: " ▼"; color: var(--c); font-size: 9px; }
 <div id="refresh-flash"></div>
 
 <header>
-  <div class="logo">FTMO <em>v7.5  -  Nick Verschoot</em></div>
+  <div class="logo">FTMO <em>v7.7  -  Nick Verschoot</em></div>
   <div class="header-mid">
     <div class="htag live">Live</div>
     <div class="htag">Demo Account</div>
