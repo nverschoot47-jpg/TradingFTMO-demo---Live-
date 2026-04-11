@@ -1,7 +1,7 @@
 {
   "name": "nv-tradingview-webhook",
-  "version": "7.5.0",
-  "description": "TradingView -> MetaApi REST -> FTMO MT5 | NV v7.5.0  -  fixes: session.js getBrusselsComponents string input, isMarketOpen testbaar, shadow_sl_analysis UNIQUE in DDL, saveTrade closedAt null fallback",
+  "version": "7.7.0",
+  "description": "TradingView -> MetaApi REST -> FTMO MT5 | NV v7.7.0  -  fixes: placeOrder AbortController, slMultiplierApplied->slMultiplier in saveTrade, ghost_analysis UNIQUE ON CONFLICT, loadSnapshots parameterized SQL, autoclose isWE dead code, reconstructConsecutiveDays loop bound, dashboard v7.5->v7.7",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
