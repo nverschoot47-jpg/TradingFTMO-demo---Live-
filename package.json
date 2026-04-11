@@ -1,7 +1,7 @@
 {
   "name": "nv-tradingview-webhook",
   "version": "7.5.0",
-  "description": "TradingView → MetaApi REST → FTMO MT5 | NV v7.5.0 — fixes: session.js getBrusselsComponents string input, isMarketOpen testbaar, shadow_sl_analysis UNIQUE in DDL, saveTrade closedAt null fallback",
+  "description": "TradingView -> MetaApi REST -> FTMO MT5 | NV v7.5.0  -  fixes: session.js getBrusselsComponents string input, isMarketOpen testbaar, shadow_sl_analysis UNIQUE in DDL, saveTrade closedAt null fallback",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -20,7 +20,7 @@
   "engines": {
     "node": ">=18.0.0"
   },
-  "author": "Nick Verschoot — PRONTO-AI",
+  "author": "Nick Verschoot  -  PRONTO-AI",
   "license": "UNLICENSED",
   "private": true
 }
