@@ -1,383 +1,844 @@
-# PRONTO-AI — nv-tradingview-webhook
-
-**TradingView → MetaApi REST → FTMO MT5**  
-Versie **4.3** — April 2026  
-Auteur: Nick Verschoot — [nick@pronto-ai.be](mailto:nick@pronto-ai.be)
-
-> ⚠️ **VERTROUWELIJK** — Privé project, niet voor distributie.
+# FTMO Webhook Server — Volledige Technische Documentatie
+**Versie:** v7.7 | **Auteur:** Nick Verschoot — PRONTO-AI | **Platform:** Railway + PostgreSQL
 
 ---
 
 ## Inhoudsopgave
 
-1. [Projectoverzicht](#1-projectoverzicht)
-2. [Systeemarchitectuur](#2-systeemarchitectuur)
-3. [Database Structuur](#3-database-structuur)
-4. [Risicobeheer & Parameters](#4-risicobeheer--parameters)
-5. [Environment Variabelen](#5-environment-variabelen)
-6. [API Endpoints](#6-api-endpoints)
-7. [Deployment & Infrastructure](#7-deployment--infrastructure)
-8. [Projectstructuur](#8-projectstructuur)
-9. [Versiegeschiedenis](#9-versiegeschiedenis)
-10. [Roadmap](#10-roadmap)
-11. [Bekende Issues](#11-bekende-issues)
-12. [Snelstartgids — Checklist](#12-snelstartgids--checklist)
+1. [Systeemoverzicht](#1-systeemoverzicht)
+2. [Architectuur](#2-architectuur)
+3. [Configuratie & Omgevingsvariabelen](#3-configuratie--omgevingsvariabelen)
+4. [Symbool- en Typelogica](#4-symbool--en-typelogica)
+5. [Sessielogica & Tijdzones](#5-sessielogica--tijdzones)
+6. [Risicobeheer](#6-risicobeheer)
+7. [Order Flow — van Webhook tot MT5](#7-order-flow--van-webhook-tot-mt5)
+8. [Ghost Tracker Engine](#8-ghost-tracker-engine)
+9. [TP Lock Engine](#9-tp-lock-engine)
+10. [SL Lock Engine](#10-sl-lock-engine)
+11. [Shadow SL Optimizer](#11-shadow-sl-optimizer)
+12. [Daily Risk Scaling](#12-daily-risk-scaling)
+13. [Positie Synchronisatie](#13-positie-synchronisatie)
+14. [Cron Jobs](#14-cron-jobs)
+15. [Database Schema](#15-database-schema)
+16. [API Endpoints — Volledig Overzicht](#16-api-endpoints--volledig-overzicht)
+17. [Dashboard](#17-dashboard)
+18. [Foutafhandeling & Zelflerend Systeem](#18-foutafhandeling--zelflerend-systeem)
+19. [Bugfixes v7.7](#19-bugfixes-v77)
+20. [Deploymentinstructies](#20-deploymentinstructies)
 
 ---
 
-## 1. Projectoverzicht
+## 1. Systeemoverzicht
 
-Volledig geautomatiseerde trading-infrastructuur. Ontvangt TradingView-alertsignalen via webhooks, berekent automatisch de juiste positiegrootte op basis van risicobeheer per instrumenttype, en voert orders uit op een FTMO MT5-account via de MetaApi REST API.
+Dit systeem ontvangt TradingView-webhook-alerts, verwerkt ze naar MetaApi REST-calls, en plaatst orders op een FTMO MT5 demo-account. Naast pure orderuitvoering bevat het een volledig statistisch analyse-ecosysteem dat leert van historische trades om TP-targets, SL-groottes en risico automatisch te optimaliseren.
 
-### Wat doet het systeem?
+### Kernprincipes
 
-- Ontvangen van TradingView webhook-signalen (`BUY` / `SELL` / `CLOSE`)
-- Automatische lot-berekening gebaseerd op ingesteld risico per instrumenttype
-- **Spread guard**: blokkeert trades bij te hoge spread (max 1/3 van SL-afstand)
-- **Forex anti-consolidatie**: half risk bij 1–2 open posities zelfde pair+richting, blok bij 3+
-- **Ghost tracker**: volgt maximum koersbeweging na sluiting voor statistische analyse
-- **TP/SL lock engine**: optimaliseert automatisch take-profit en stop-loss niveaus op basis van historische EV
-- Persistente PostgreSQL-database op Railway voor alle trade-data en configuratie
-- Live dashboard op Railway met real-time positiebeheer en analyse-endpoints
-- **Restart recovery** (v4.3): open posities worden automatisch hersteld na Railway herstart
+- **Geen hardcoded logica**: TP-targets, SL-multipliers en risicobedragen worden statistisch bepaald vanuit eigen tradedata.
+- **Brussels tijdzone overal**: alle tijdsberekeningen gebruiken `Intl.DateTimeFormat` met `Europe/Brussels` — geen hardcoded UTC-offsets.
+- **Data-driven**: het systeem verzamelt ghost-data (wat zou er zijn gebeurd als je de trade langer had aangehouden?) om de ware maximale RR per trade te berekenen.
+- **FTMO-regels**: auto-close om 21:50, geen trades buiten 02:00–20:00, weekend-blokkade behalve crypto.
 
-### Kerngegevens
+---
 
-| | |
+## 2. Architectuur
+
+```
+TradingView Alert
+       │
+       ▼
+POST /webhook
+       │
+  Validatie (secret, symbool, duplicaat, markt open)
+       │
+  Forex consolidatie check
+       │
+  SL Multiplier bepalen (getEffectiveSLMultiplier)
+       │
+  Spread Guard (stocks)
+       │
+  Risico + Lot berekening
+       │
+  placeOrderWithTimeout → MetaApi REST → MT5
+       │
+  openPositions bijwerken
+       │
+  ┌────────────────────────────────────┐
+  │         syncPositions (30s)        │
+  │  Detecteert gesloten posities      │
+  │  → closedTrades                    │
+  │  → startGhostTracker               │
+  │  → saveTrade (DB)                  │
+  └────────────────────────────────────┘
+       │
+  Ghost Tracker (async, per trade)
+       │
+  finaliseGhost → trueMaxRR opgeslagen
+       │
+  ┌─────────────────┐  ┌──────────────────┐  ┌──────────────────────┐
+  │ runTPLockEngine │  │ runSLLockEngine  │  │ runShadowSLOptimizer │
+  │ (per symbool)   │  │ (per symbool)    │  │ (per symbool)        │
+  └─────────────────┘  └──────────────────┘  └──────────────────────┘
+       │
+  PostgreSQL (Railway)
+```
+
+### Bestanden
+
+| Bestand | Functie |
 |---|---|
-| **Versie** | v4.3 (april 2026) |
-| **Broker / Account** | FTMO Demo (→ Live) |
-| **Platform** | MT5 via MetaApi REST API |
-| **Deployment** | Railway.app |
-| **Database** | PostgreSQL (Railway plugin) |
-| **Taal** | Node.js 18+ (JavaScript ES6+) |
-| **Licentie** | UNLICENSED / Privé |
-| **Live URL** | https://tradingftmo-demo-live-production-8b1e.up.railway.app |
+| `server.js` | Hoofdapplicatie: Express, webhooks, engines, cron, dashboard |
+| `session.js` | Tijdzone-helpers, sessiedefinities, marktopen-checks |
+| `db.js` | PostgreSQL persistence layer — alle tabellen en queries |
+| `package.json` | Dependencies: express, helmet, node-cron, pg |
 
 ---
 
-## 2. Systeemarchitectuur
+## 3. Configuratie & Omgevingsvariabelen
 
-### Stap 1 — TradingView stuurt een Alert
+| Variabele | Vereist | Standaard | Beschrijving |
+|---|---|---|---|
+| `META_API_TOKEN` | ✅ | — | MetaApi authenticatietoken |
+| `META_ACCOUNT_ID` | ✅ | — | MetaApi account-ID (UUID) |
+| `WEBHOOK_SECRET` | ✅ | — | Geheime sleutel voor webhook-authenticatie |
+| `DATABASE_URL` | ✅ | — | PostgreSQL connection string (Railway auto-inject) |
+| `ACCOUNT_BALANCE` | ❌ | 10000 | Startbalans voor risicopercentage-berekeningen |
+| `PORT` | ❌ | 3000 | HTTP-poort (Railway auto-inject) |
+| `RISK_INDEX` | ❌ | 200 | Basisrisico in EUR voor indices |
+| `RISK_FOREX` | ❌ | 15 | Basisrisico in EUR voor forex |
+| `RISK_GOLD` | ❌ | 30 | Basisrisico in EUR voor goud |
+| `RISK_BRENT` | ❌ | 30 | Basisrisico in EUR voor Brent olie |
+| `RISK_WTI` | ❌ | 30 | Basisrisico in EUR voor WTI olie |
+| `RISK_CRYPTO` | ❌ | 30 | Basisrisico in EUR voor crypto |
+| `RISK_STOCK` | ❌ | 30 | Basisrisico in EUR voor aandelen |
 
-TradingView voert een Pine Script-alert uit en stuurt een JSON-payload via HTTP POST naar `/webhook`.
+### Constanten (hardcoded in server.js)
 
-```json
-{
-  "secret": "FtmoNV2025",
-  "symbol": "NAS100USD",
-  "action": "BUY",
-  "entry": 18250.5,
-  "sl": 18100.0,
-  "tp": 18550.0,
-  "timeframe": "1h"
+| Constante | Waarde | Betekenis |
+|---|---|---|
+| `GHOST_DURATION_MS` | 24u | Max. duur ghost tracker |
+| `GHOST_INTERVAL_RECENT_MS` | 60s | Polling interval ghost eerste 6u |
+| `GHOST_INTERVAL_OLD_MS` | 5min | Polling interval ghost na 6u |
+| `SL_AUTO_APPLY_THRESHOLD` | 30 | Trades nodig voor auto-apply SL Lock |
+| `SHADOW_SL_MIN_TRADES` | 30 | Ghost trades nodig voor Shadow Optimizer |
+| `FIXED_TP_RR` | 4R | Initiële TP fallback (vóór eerste TP Lock) |
+| `FOREX_MAX_SAME_DIR` | 2 | Max. gelijktijdige forex orders zelfde richting |
+| `FOREX_HALF_RISK_THRESHOLD` | 1 | Vanaf 1 open positie → halftrade risico |
+| `TP_LOCK_RISK_MULT` | 4x | Risicomultiplier bij positieve TP Lock |
+| `STOCK_SL_SPREAD_MULT` | 1.5x | Extra SL-buffer voor aandelen |
+| `STOCK_MAX_SPREAD_FRACTION` | 33.3% | Max spread als % van SL-afstand voor stocks |
+| `DUPLICATE_GUARD_MS` | 60s | Blokkeerperiode voor duplicate orders |
+
+---
+
+## 4. Symbool- en Typelogica
+
+### Symboolmapping
+
+Alle inkomende TradingView-symbolen worden via `SYMBOL_MAP` vertaald naar MT5-symbolen. De map werkt via twee methoden:
+
+- `mapAliases(aliases, mt5, type)` — meerdere invoernamen naar één MT5-symbool
+- `mapDirect(symbols, type)` — directe 1-op-1 mapping
+
+**Ondersteunde types:**
+
+| Type | Voorbeelden | Basisrisico |
+|---|---|---|
+| `index` | GER40, US100, US30, SP500 | €200 |
+| `gold` | XAUUSD | €30 |
+| `brent` | UKOIL | €30 |
+| `wti` | USOIL | €30 |
+| `crypto` | BTCUSD, ETHUSD | €30 |
+| `stock` | AAPL, TSLA, NVDA, ... | €30 |
+| `forex` | EURUSD, GBPUSD, ... | €15 |
+
+### Normalisatie
+
+`normalizeSymbol()` corrigeert bekende aliassen (bijv. NIKE → NKE).
+
+### Zelflerend patchsysteem (`learnedPatches`)
+
+Als MetaApi een order afwijst vanwege een ongekend symbool, probeert het systeem automatisch:
+1. `.cash` toe te voegen of te verwijderen aan het MT5-symbool
+2. De lotgrootte-stap aan te passen bij volume-fouten
+3. De minimale stop te verdubbelen bij stop-fouten
+
+---
+
+## 5. Sessielogica & Tijdzones
+
+### Brussels Tijdzone (session.js)
+
+Alle tijdsberekeningen gebruiken `Intl.DateTimeFormat` met `Europe/Brussels`. Dit handelt zomer/wintertijd automatisch af (geen hardcoded +1h of +2h).
+
+**Kernfuncties:**
+
+| Functie | Output | Gebruik |
+|---|---|---|
+| `getBrusselsComponents(date?)` | `{ day, hhmm, hour, minute }` | Sessie- en marktchecks |
+| `getBrusselsDateOnly(date?)` | `"YYYY-MM-DD"` | Dagelijkse trade-groepering |
+| `getBrusselsDateStr()` | Leesbare string | Dashboard weergave |
+| `getSessionGMT1(date?)` | `"asia"/"london"/"ny"/"buiten_venster"` | Sessielabeling per trade |
+
+### Handelssessies
+
+| Sessie | Brussels Tijd | Gebruik |
+|---|---|---|
+| Asia | 02:00 – 08:00 | TP Lock per sessie |
+| London | 08:00 – 15:30 | TP Lock per sessie |
+| New York | 15:30 – 20:00 | TP Lock per sessie |
+| Buiten venster | 20:00 – 02:00 | Geen nieuwe trades |
+
+### Markt Open Logica (`isMarketOpen`)
+
+- **Alle types behalve stock**: ma–vr, 02:00–20:00
+- **Stocks**: alleen 15:30–20:00 (NY-venster)
+- **Crypto**: ook weekend 02:00–20:00 (BTCUSD, ETHUSD)
+
+### Ghost & Shadow Venster
+
+- Ghost tracker actief: 02:00–22:00 (ma–vr)
+- Hard stop alle ghosts: 22:00 via cron
+- Weekend: geen ghost tracking
+
+---
+
+## 6. Risicobeheer
+
+### Effectief Risico (`getEffectiveRisk`)
+
+Het risico per trade wordt beïnvloed door drie factoren:
+
+**1. Pyramiding-halveringen**
+Bij meerdere gelijktijdige trades in dezelfde richting wordt het risico gehalveerd:
+```
+risk = baseRisk / 2^(count)
+minimum = baseRisk × 10%
+```
+
+**2. TP Lock Compound Boost**
+Als een TP Lock actief is met positieve EV én dit de eerste trade is (count=0):
+```
+risk = BASE_RISK × 4 × compoundBoost × dailyRiskMultiplier
+compoundBoost = 1.2^(aaneengesloten positieve dagen)
+```
+
+**3. Daily Risk Multiplier**
+Dagelijks aangepast op basis van PnL van vorige dag:
+- Positieve dag: multiplier × 1.2 (maximaal compounderen)
+- Negatieve dag: reset naar 1.0
+
+### Lot Berekening (`calcLots`)
+
+```
+lots = floor((risk / (SL_afstand × lot_value)) / lot_step) × lot_step
+```
+
+Gemaximeerd op `MAX_LOTS` per type en gecontroleerd op overschrijding van 1.5× het effectieve risicocap.
+
+### Forex Vaste Lots
+
+Forex gebruikt altijd vaste lotgroottes (geen risico-berekening):
+- Eerste trade in richting: **0.25L**
+- Tweede trade (halfrisico): **0.12L**
+
+### SL Validatie (`validateSL`)
+
+- Minimale SL-afstand per instrument (zie `MIN_STOP_*` tabellen)
+- Stocks: SL altijd vergroot met factor 1.5 (spread buffer)
+- Forex: minimale pip-afstand van 0.0005
+
+---
+
+## 7. Order Flow — van Webhook tot MT5
+
+### Stap 1: Authenticatie
+```
+POST /webhook?secret=WEBHOOK_SECRET
+Header: x-secret: WEBHOOK_SECRET
+Body: { symbol, action, entry, sl }
+```
+
+### Stap 2: Validaties (in volgorde)
+1. Secret check → 401 bij mismatch
+2. Symbool aanwezig → 400 bij ontbreken
+3. Symbool in SYMBOL_MAP of learnedPatches → SKIP bij onbekend
+4. `action`, `entry`, `sl` aanwezig → 400 bij ontbreken
+5. SL aan juiste kant van entry (buy: sl < entry, sell: sl > entry) → 400
+6. Duplicate guard (60s blokkade per symbool+richting) → SKIP
+7. Symbooltype bepalen
+8. `isMarketOpen()` check → SKIP bij gesloten markt
+9. Forex consolidatie check → SKIP bij >2 posities zelfde richting
+
+### Stap 3: SL Multiplier bepalen
+Via `getEffectiveSLMultiplier()` — zie sectie 10.
+
+### Stap 4: Spread Guard (alleen stocks)
+Live spread ophalen via MetaApi. Als spread > 33.3% van SL-afstand → SKIP.
+
+### Stap 5: Risico & Lots
+- `getEffectiveRisk()` → risicobedrag in EUR
+- Forex: vaste lots
+- Overig: `calcLots()` → lotgrootte
+
+### Stap 6: Order plaatsen
+`placeOrderWithTimeout()` → 8 seconden timeout (Promise.race + AbortController op fetch).
+
+TP-prijs berekend via TP Lock (of FIXED_TP_RR=4 als fallback).
+
+### Stap 7: Foutafhandeling & Retry
+Bij orderfout:
+1. `learnFromError()` → patches opslaan
+2. Herberekening lots
+3. Eén retry (ook met 8s timeout)
+4. Bij tweede fout: ERROR_LEARNED teruggeven
+
+### Stap 8: Positie registreren
+```javascript
+openPositions[posId] = {
+  symbol, mt5Symbol, direction, entry, sl, tp, lots,
+  riskEUR, session, slMultiplierApplied, ...
 }
 ```
 
-### Stap 2 — Server ontvangt & valideert het signaal
-
-- `POST /webhook` ontvangen door Express.js server op Railway
-- Secret-sleutel gecontroleerd (`WEBHOOK_SECRET` env var)
-- Symbol opgezocht in `SYMBOL_MAP` (TV-naam → MT5-naam + instrument type)
-- Marktvenster gecheckt via `session.js` (Brussels tijdzone, automatisch CET/CEST)
-  - Stocks: alleen 15:30–20:00
-  - Indices: ook Asia 02:00–08:00
-  - Crypto: ook weekend
-
-### Stap 3 — Risicocalculatie
-
-- Risico in EUR bepaald op basis van instrument type (index: €200, forex: €15, gold: €30, enz.)
-- SL-afstand berekend: `|entry - sl|`
-- Spread opgehaald via MetaApi en gecontroleerd: max **1/3 van SL-afstand** (v4.3)
-- `Lot-grootte = risico EUR / (SL afstand × pip waarde per lot)`
-- Forex anti-consolidatie: zelfde pair + richting al open? → 50% risk of volledig geblokkeerd
-- Min lot cap: `baseRisk` per type — v4.3 fix (was vaste €60, nu dynamisch per instrumenttype)
-
-### Stap 4 — Order naar MetaApi
-
-- MetaApi REST API call: `POST /users/current/accounts/{accountId}/trade`
-- Order type: `ORDER_TYPE_BUY` of `ORDER_TYPE_SELL` met lot, SL en TP
-- Positie opgeslagen in `openPositions{}` (in-memory) én PostgreSQL (bij sluiting)
-- Ghost tracker gestart: volgt koersbeweging na opening in achtergrond
-
-### Stap 5 — Ghost Tracker (post-trade monitoring)
-
-- Na sluiting van een trade: ghost tracker blijft **24 uur** actief
-- Jonger dan 6 uur gesloten → controle elke **60 seconden** (prioriteit batching)
-- Ouder dan 6 uur gesloten → controle elke **5 minuten** (efficiëntie)
-- Registreert `trueMaxRR`: de maximale koersbeweging na sluiting
-- Leert het systeem of de TP te vroeg of te laat was ingesteld
-
-### Stap 6 — TP/SL Lock Engine (automatische optimalisatie)
-
-- Na **10+ trades** per symbool per sessie berekent de engine het beste RR-niveau
-- EV (Expected Value) berekend voor elk RR-niveau: `0.2R, 0.4R, 0.6R ... 25R`
-- RR-niveau met de hoogste EV wordt automatisch als TP-lock ingesteld en opgeslagen
-- SL-optimizer adviseert of SL groter of kleiner moet op basis van historische data
-- Alle wijzigingen gelogd in `tp_update_log` en `sl_update_log` (PostgreSQL)
-
-### Stap 7 — Restart Recovery (v4.3 kritieke fix)
-
-Na een Railway-herstart worden alle openstaande posities automatisch hersteld via MetaApi. Weesposities (open op MT5 maar niet in server-memory) worden gedetecteerd en opnieuw geregistreerd in `openPositions{}`.
-
----
-
-## 3. Database Structuur
-
-Database wordt automatisch aangemaakt bij eerste opstart via `initDB()`. Alle `ALTER TABLE` statements zijn idempotent voor veilige herstarts.
-
-| Tabel | Doel |
-|---|---|
-| `closed_trades` | Alle gesloten trades: entry, SL, TP, lots, riskEUR, ghost data, sessie, spread guard, SL multiplier |
-| `tp_config` | TP lock per symbool per sessie — geoptimaliseerd RR-niveau met EV en historiek |
-| `tp_update_log` | Volledige historiek van alle TP wijzigingen met reden en timestamp |
-| `sl_config` | SL multiplier advies per symbool (0.5× t/m 3.0×) met richting (up/down/unchanged) |
-| `sl_update_log` | Historiek van alle SL aanpassingen |
-| `forex_consolidation_log` | Log van geblokkeerde of half-risk forex trades bij consolidatie |
-| `equity_snapshots` | Account balance en equity elke 5 minuten voor equity curve analyse |
-
----
-
-## 4. Risicobeheer & Parameters
-
-### 4.1 Risico per Instrumenttype
-
-| Type | Std. risico | Env variabele | TP lock cap (×4) |
-|---|---|---|---|
-| index | €200 | `RISK_INDEX` | €800 |
-| forex | €15 | `RISK_FOREX` | €60 |
-| gold | €30 | `RISK_GOLD` | €120 |
-| brent | €30 | `RISK_BRENT` | €120 |
-| wti | €30 | `RISK_WTI` | €120 |
-| crypto | €30 | `RISK_CRYPTO` | €120 |
-| stock | €30 | `RISK_STOCK` | €120 |
-
-### 4.2 Handelssessies (Brussels Tijdzone — automatisch CET/CEST)
-
-| Sessie | Venster | Toegestane instrumenten |
-|---|---|---|
-| Asia | 02:00 – 08:00 | Forex, Indices, Gold, Crypto, Olie |
-| London | 08:00 – 15:30 | Forex, Indices, Gold, Crypto, Olie |
-| New York | 15:30 – 20:00 | Alles inclusief Stocks |
-| Buiten venster | 20:00 – 02:00 | Volledig geblokkeerd (crypto weekend uitzondering) |
-| Weekend | Zat / Zon | Alleen crypto 02:00–20:00 |
-
-### 4.3 Forex Anti-Consolidatie (v4.3)
-
-- **0 open** trades zelfde pair + richting → normaal risico (€15)
-- **1–2 open** trades zelfde pair + richting → **50% risico** (€7,50) — `forexHalfRisk` flag
-- **3+ open** trades zelfde pair + richting → trade **VOLLEDIG GEBLOKKEERD**
-- Alle events gelogd in `forex_consolidation_log`
-
-### 4.4 Spread Guard
-
-- Spread real-time opgehaald via MetaApi `symbolSpecification`
-- Maximum spread = **1/3 van de SL-afstand** in pips (aangescherpt in v4.3, was 1/2)
-- Bij overschrijding: trade geblokkeerd, `spreadGuard=true` gelogd in database
-
-### 4.5 RR Niveaus & SL Multiples
-
-```js
-RR_LEVELS    = [0.2, 0.4, 0.6, 0.8, 1, 1.5, 2, 2.5, 3, 4, 5, 6, 7, 8, 10, 12, 15, 20, 25]
-SL_MULTIPLES = [0.5, 0.6, 0.75, 0.85, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0]
+### Response bij succes
+```json
+{
+  "status": "OK",
+  "versie": "v7.7",
+  "direction": "buy",
+  "tvSymbol": "EURUSD",
+  "mt5Symbol": "EURUSD",
+  "entry": 1.0850,
+  "sl": 1.0820,
+  "tp": 1.0970,
+  "tpRR": 4,
+  "lots": 0.25,
+  "risicoEUR": "15.00",
+  "slMultiplier": 0.5,
+  "positionId": "12345678"
+}
 ```
 
 ---
 
-## 5. Environment Variabelen
+## 8. Ghost Tracker Engine
 
-Instellen via **Railway → Settings → Variables**. Nooit hard-coden in broncode.
+### Doel
+Na het sluiten van een trade volgt de ghost tracker de marktprijs door om te berekenen wat de maximale RR *had kunnen zijn* als je de trade langer had aangehouden. Dit levert `trueMaxRR` op — de basis voor alle optimalisatie-engines.
 
-| Variabele | Voorbeeld | Beschrijving |
-|---|---|---|
-| `META_API_TOKEN` | `7cb566c1-...` | MetaApi API token (MetaApi dashboard → API tokens) |
-| `META_ACCOUNT_ID` | `abc123def456` | MetaApi account ID van het FTMO MT5 account |
-| `WEBHOOK_SECRET` | `MijnGeheimWW2026` | Beveiligingssleutel — elke webhook moet dit bevatten |
-| `ACCOUNT_BALANCE` | `10000` | Account grootte in EUR |
-| `DATABASE_URL` | *(auto Railway)* | PostgreSQL connectie URL — automatisch gezet door Railway |
-| `RISK_INDEX` | `200` | Risico per indextrade in EUR |
-| `RISK_FOREX` | `15` | Risico per forextrade in EUR |
-| `RISK_GOLD` | `30` | Risico per goud-trade in EUR |
-| `RISK_BRENT` | `30` | Risico per Brent-olie trade in EUR |
-| `RISK_WTI` | `30` | Risico per WTI-olie trade in EUR |
-| `RISK_CRYPTO` | `30` | Risico per crypto-trade in EUR |
-| `RISK_STOCK` | `30` | Risico per aandelen-trade in EUR |
-| `PORT` | `3000` | Server poort — Railway stelt dit automatisch in |
+### Werking
 
-> ⚠️ De fallback `WEBHOOK_SECRET = "FtmoNV2025"` staat hardcoded in `server.js`. Op productie **altijd** de env var gebruiken en de fallback verwijderen.
+**Start:** `startGhostTracker(closedTrade, isManual)` wordt automatisch aangeroepen vanuit `syncPositions()` zodra een positie gesloten wordt (behalve bij insta-SL: `maxRR ≤ 0.05`).
+
+**Polling:**
+- Eerste 6 uur: elke 60 seconden
+- Na 6 uur: elke 5 minuten
+- Maximum: 24 uur (of 22:00 Brussels, wat eerder is)
+
+**Per tick:**
+1. Actuele prijs ophalen via MetaApi (`fetchCurrentPrice`)
+2. `bestPrice` bijwerken (meest gunstige koers voor de trade)
+3. `worstPrice` bijwerken (meest ongunstige → MAE berekening)
+4. Check: heeft de prijs de originele SL geraakt? → `phantom_sl` stop
+5. Buiten tijdvenster? → `auto_close_window` stop
+
+**Stopredenen:**
+
+| Reden | Trigger |
+|---|---|
+| `phantom_sl` | Prijs raakt de originele SL |
+| `timeout` | 24 uur verstreken |
+| `auto_close_window` | 22:00 Brussels |
+| `failsafe` | 24u + 5min veiligheidsklep |
+| `restart_lost` | Ghost verloren bij herstart (orphan repair) |
+
+**Finalise:**
+- `trueMaxRR` = max RR bereikt na sluiting
+- `ghostExtraRR` = trueMaxRR − maxRR@close
+- `ghostMAE` = max adverse excursion in R
+- Opgeslagen in `closedTrades` en PostgreSQL
+- Triggert daarna automatisch TP Lock, SL Lock en Shadow Optimizer
+
+### Ghost Manual Extension
+Als een trade **manueel** gesloten wordt (`closeReason = "manual"`), loopt de ghost tracker door met `isManual = true`. Dit laat zien wat er was gebeurd als je de trade niet handmatig had gesloten.
+
+### Orphan Repair
+Bij herstart van de server worden ghost trackers die verloren gingen gerepareerd: `trueMaxRR = maxRR` en `ghostStopReason = "restart_lost"`.
 
 ---
 
-## 6. API Endpoints
+## 9. TP Lock Engine
 
-### Webhook & Kern
+### Doel
+Bepaalt statistisch de optimale TP-target (in R) per symbool per sessie.
 
-| Endpoint | Methode | Beschrijving |
+### Triggering
+- Na elke ghost finalisatie (`finaliseGhost`)
+- Nightly cron om 03:00 (alle symbolen)
+
+### Algoritme (`_runTPLockForSession`)
+
+1. Filter trades: zelfde symbool + sessie, minimaal 3 trades
+2. Bereken EV voor elke RR-level:
+   ```
+   EV = winrate × RR − (1 − winrate)
+   ```
+3. Kies het RR-level met de hoogste EV (ook bij negatieve EV — altijd statistisch beste)
+4. Lock opslaan als: nieuw, veranderd, of ≥5 nieuwe trades
+
+**Composite key:** `SYMBOL__SESSION` (bijv. `EURUSD__london`)
+
+**Compound Boost:**
+Als een symbool/sessie meerdere aaneengesloten winstdagen heeft:
+```
+compoundBoost = 1.2^(aaneengesloten positieve dagen)
+```
+Dit verhoogt het risicobedrag bij nieuwe trades met een actieve positieve lock.
+
+### Persistentie
+- In-memory: `tpLocks` object
+- PostgreSQL: `tp_config` tabel (UPSERT per symbool+sessie)
+- Log: `tp_update_log`
+
+---
+
+## 10. SL Lock Engine
+
+### Doel
+Bepaalt de optimale SL-groottefactor (multiplier) statistisch. Een multiplier < 1.0 verkleint de SL (hogere RR maar meer SL-hits), > 1.0 vergroot de SL.
+
+### Triggering
+- Na elke ghost finalisatie
+- Nightly cron om 03:00
+- Startup bij symbolen met ≥30 trades
+
+### Algoritme (`runSLLockEngine`)
+
+1. Filter: minimaal 10 trades, SL en entry aanwezig
+2. `buildSLAnalysis()`: voor elke SL-multiplier (0.5×, 0.6×, 0.75×, ..., 3.0×) bereken beste EV
+3. Kies de multiplier met de hoogste EV
+4. Richting bepalen: `up` (groter), `down` (kleiner), `unchanged`
+5. Auto-apply bij ≥30 trades
+
+### SL Multipliers beschikbaar
+`[0.5, 0.6, 0.75, 0.85, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0]`
+
+### Auto-Apply vs. Readonly
+
+| Trades | Status |
+|---|---|
+| < 10 | Geen analyse |
+| 10–29 | Readonly (suggestie, niet toegepast) |
+| ≥ 30 | Auto-applied (direct toegepast op nieuwe orders) |
+
+---
+
+## 11. Shadow SL Optimizer
+
+### Doel
+Verfijnde SL-optimalisatie op basis van `trueMaxRR` (ghost-gecorrigeerde data). Nauwkeuriger dan de SL Lock Engine omdat het de werkelijke prijs na sluiting meeneemt.
+
+### Verschil met SL Lock Engine
+
+| | SL Lock Engine | Shadow SL Optimizer |
 |---|---|---|
-| `/webhook` | `POST` | Ontvang TradingView signaal — BUY / SELL / CLOSE |
-| `/webhook/close-all` | `POST` | Sluit alle open posities onmiddellijk via MetaApi |
-| `/dashboard` | `GET` | Live overzicht: open posities, stats, actieve fixes |
-| `/health` | `GET` | Server gezondheidscheck — retourneert 200 OK |
-| `/history` | `GET` | Laatste 200 webhook-events met tijdstempel en resultaat |
+| Data | maxRR@close | trueMaxRR (ghost) |
+| Nauwkeurigheid | Gebaseerd op sluitmoment | Gebaseerd op werkelijk verloop |
+| Minimaal | 10 trades | 30 ghost-gefinaliseerde trades |
+| Triggering | Elke ghost finalisatie | Na 30+ ghost trades + na 22:00 cron |
 
-### Analyse & Research
+### Algoritme
+
+Voor elke SL-multiplier: bereken of `trueMaxRR / mult ≥ RR` per trade.
+Kies de combinatie met hoogste EV.
+
+### Route
+`GET /sl-shadow` — bekijk alle resultaten
+`POST /sl-shadow/run` — handmatig triggeren
+
+---
+
+## 12. Daily Risk Scaling
+
+### Doel
+Past het dagelijkse risico aan op basis van de prestaties van de vorige dag.
+
+### Mechanisme
+
+**Om 21:50** (na auto-close):
+- Alle trades van die dag worden opgeteld
+- Totale PnL positief? → `dailyRiskMultiplierNext = huidig × 1.2`
+- Totale PnL negatief? → `dailyRiskMultiplierNext = 1.0` (reset)
+
+**Om 02:00** (dagelijkse reconnect):
+- `dailyRiskMultiplier = dailyRiskMultiplierNext`
+- Nieuwe dag start met bijgewerkt risico
+
+### Consecutive Positive Days
+
+Het systeem telt aaneengesloten winstdagen per symbool+sessie combinatie. Dit wordt gebruikt voor de compound boost bij TP Lock trades.
+
+Bij herstart wordt dit gereconstrueerd vanuit `closedTrades` (max. 30 werkdagen terug, weekenden worden overgeslagen).
+
+---
+
+## 13. Positie Synchronisatie
+
+### syncPositions (elke 30 seconden)
+
+1. **Open posities ophalen** van MetaApi
+2. **Prijzen bijwerken** per positie: currentPnL, maxPrice, maxRR
+3. **Gesloten posities detecteren** (aanwezig in `openPositions` maar niet meer op MT5):
+   - `closeReason` bepalen: `tp`, `sl`, of `manual`
+   - TP-hit check: `maxRR ≥ TP RR`
+   - SL-hit: `maxRR ≤ 0.05`
+   - Overig: `manual`
+   - Trade opslaan in `closedTrades` en PostgreSQL
+   - Ghost tracker starten (tenzij insta-SL)
+4. **Account snapshot** elke 5 minuten (balance, equity, floating PnL)
+
+### Restart Recovery (`restoreOpenPositionsFromMT5`)
+
+Bij serverherstart:
+1. Haal live posities op van MT5
+2. Posities die tijdens downtime gesloten zijn → verwijder uit tracker
+3. Nieuwe posities die niet in `openPositions` staan → herstel
+
+---
+
+## 14. Cron Jobs
+
+Alle crons draaien in `Europe/Brussels` tijdzone.
+
+| Tijd | Dagen | Actie |
+|---|---|---|
+| **21:50** | Ma–Vr | Auto-close alle open posities |
+| **21:00** | Ma–Vr | EOD Ghost Check: start ghosts voor recent gesloten trades zonder trueMaxRR |
+| **22:00** | Ma–Vr | Hard stop alle actieve ghost trackers + Shadow Optimizer run |
+| **02:00** | Dagelijks | Reconnect: risk multiplier activeren, positions herstellen, duplicate guard clearen |
+| **03:00** | Dagelijks | Nightly Optimizer: TP Lock + SL Lock + Shadow Optimizer voor alle symbolen |
+
+### Auto-Close (21:50)
+- Alle open MT5-posities worden gesloten
+- Crypto in weekend wordt **niet** gesloten (apart weekend-venster)
+- Na close: `evaluateDailyRisk()` triggeren voor morgen-multiplier
+
+---
+
+## 15. Database Schema
+
+### Tabellen
+
+#### `closed_trades`
+Alle gesloten trades met ghost-data.
+
+| Kolom | Type | Beschrijving |
+|---|---|---|
+| `position_id` | TEXT UNIQUE | MT5 positie-ID |
+| `symbol` | TEXT | TradingView symbool |
+| `direction` | TEXT | buy/sell |
+| `entry` | NUMERIC | Instapprijs |
+| `sl` | NUMERIC | Stop Loss prijs |
+| `tp` | NUMERIC | Take Profit prijs |
+| `max_rr` | NUMERIC | Max RR bij sluiting |
+| `true_max_rr` | NUMERIC | Max RR na ghost tracking |
+| `ghost_stop_reason` | TEXT | phantom_sl / timeout / etc. |
+| `close_reason` | TEXT | tp / sl / manual / auto |
+| `realized_pnl_eur` | NUMERIC | Gerealiseerde winst/verlies |
+| `sl_multiplier` | NUMERIC | Toegepaste SL-multiplier |
+
+#### `tp_config`
+TP Lock configuratie per symbool + sessie.
+
+| Kolom | Type | Beschrijving |
+|---|---|---|
+| `symbol` | TEXT | Handelssymbool |
+| `session` | TEXT | asia/london/ny |
+| `locked_rr` | NUMERIC | Gekozen TP in R |
+| `ev_at_lock` | NUMERIC | EV op moment van lock |
+| `locked_trades` | INTEGER | Aantal trades bij lock |
+
+**Primary key:** `(symbol, session)`
+
+#### `sl_config`
+SL Lock configuratie per symbool.
+
+| Kolom | Type | Beschrijving |
+|---|---|---|
+| `symbol` | TEXT PRIMARY KEY | Handelssymbool |
+| `multiplier` | NUMERIC | Gekozen SL-multiplier |
+| `direction` | TEXT | up/down/unchanged |
+| `auto_applied` | BOOLEAN | True vanaf ≥30 trades |
+| `ev_at_lock` | NUMERIC | EV bij lock |
+
+#### `ghost_analysis`
+Detailanalyse per ghost-run.
+
+Bevat: symbol, session, direction, entry, sl, tp, maxRRAtClose, trueMaxRR, ghostExtraRR, ghostHitSL, ghostMAE, ghostTimeToSL, isManual, closeReason, ghostDurationMin.
+
+**UNIQUE INDEX:** `trade_position_id` (v7.7 fix — voorheen geen constraint)
+
+#### `shadow_sl_analysis`
+Shadow SL Optimizer resultaten, één rij per symbool (UPSERT).
+
+| Kolom | Beschrijving |
+|---|---|
+| `best_multiplier` | Optimale SL-multiplier |
+| `best_ev` | Bijbehorende EV |
+| `best_rr` | Optimale TP bij die multiplier |
+| `sl_hit_rate` | % trades waarbij prijs SL raakte |
+| `trades_used` | Aantal ghost-trades gebruikt |
+
+#### Overige tabellen
+- `equity_snapshots` — account balance/equity elke 5 min
+- `tp_update_log` — geschiedenis van TP Lock wijzigingen
+- `sl_update_log` — geschiedenis van SL Lock wijzigingen
+- `ghost_analysis` — uitgebreide ghost statistieken
+- `trade_pnl_log` — PnL per trade (voor snelle aggregaties)
+- `daily_risk_log` — dagelijkse risico-multiplier log
+- `duplicate_entry_log` — geblokkeerde duplicate orders
+- `forex_consolidation_log` — geblokkeerde forex pyramiding
+- `shadow_sl_log` — wijzigingen in shadow optimizer
+
+---
+
+## 16. API Endpoints — Volledig Overzicht
+
+**Base URL:** `https://tradingftmo-demo-live-production-8b1e.up.railway.app`
+
+### Webhooks (POST)
+
+| Endpoint | Body | Beschrijving |
+|---|---|---|
+| `POST /webhook?secret=...` | `{ symbol, action, entry, sl }` | TradingView alert verwerken |
+| `POST /close` | `{ positionId, symbol?, direction? }` | Positie manueel sluiten |
+| `POST /sl-shadow/run` | `{ symbol? }` | Shadow optimizer triggeren |
+
+### Live Data (GET)
 
 | Endpoint | Beschrijving |
 |---|---|
-| `GET /research/tp-optimizer` | Beste TP per symbool per sessie op basis van historische EV — min. 5 trades |
-| `GET /research/sl-optimizer` | SL-multiplier advies: kleiner / groter / optimaal — min. 5 trades |
-| `GET /analysis/equity-curve` | Equity curve laatste N uur (`?hours=24`) — uit DB of memory |
-| `GET /analysis/ghost-pending` | Alle trades zonder `trueMaxRR` ghost-data |
-| `GET /tp-locks` | Actieve TP locks per symbool per sessie met EV en timestamp |
-| `GET /sl-locks` | Actieve SL analyses met multiplier, richting en EV bij lock |
-| `DELETE /tp-locks/:symbol` | Verwijder alle TP locks voor een symbool |
-| `DELETE /tp-locks/:symbol/:session` | Verwijder TP lock voor één symbool + sessie combinatie |
-| `DELETE /sl-locks/:symbol` | Verwijder SL analyse voor een symbool |
+| `GET /` | Server status, versie, tracking counts |
+| `GET /status` | OpenTradeTracker, learnedPatches, risico per type |
+| `GET /live/positions` | Alle open posities met risk%/PnL%/SL% |
+| `GET /live/ghosts` | Actieve ghost trackers met delta en MAE |
+
+### Optimizers (GET)
+
+| Endpoint | Parameters | Beschrijving |
+|---|---|---|
+| `GET /tp-locks` | — | Alle TP Locks per symbool/sessie |
+| `GET /sl-locks` | — | Alle SL analyses + auto-apply status |
+| `GET /sl-shadow` | `?symbol=` | Shadow SL resultaten |
+| `GET /daily-risk` | — | Dagelijkse multiplier + effectief risico |
+
+### Analyse (GET)
+
+| Endpoint | Parameters | Beschrijving |
+|---|---|---|
+| `GET /analysis/equity-curve` | `?hours=24` | Equity snapshots uit DB of memory |
+| `GET /analysis/ghost-deep` | — | Ghost statistieken per symbool/sessie |
+| `GET /analysis/pnl` | `?symbol=&session=` | PnL statistieken uit DB |
+| `GET /analysis/extremes` | `?n=10` | Beste/slechtste trades + sessie summary |
+| `GET /analysis/rr` | `?symbol=&session=` | RR verdeling + EV tabel |
+| `GET /analysis/sessions` | — | Asia/London/NY vergelijking |
+
+### Research (GET)
+
+| Endpoint | Parameters | Beschrijving |
+|---|---|---|
+| `GET /research/tp-optimizer` | `?symbol=` | Beste TP RR globaal + per symbool/sessie |
+| `GET /research/tp-optimizer/sessie` | `?symbol=` | TP optimizer per sessie |
+
+### Matrix & History (GET)
+
+| Endpoint | Beschrijving |
+|---|---|
+| `GET /api/matrix` | Pair × sessie matrix (server-side computed) |
+| `GET /history?limit=50` | Laatste webhook events |
+
+### Admin (DELETE)
+
+| Endpoint | Beschrijving |
+|---|---|
+| `DELETE /tp-locks/:symbol` | TP Locks verwijderen voor symbool |
+| `DELETE /sl-locks/:symbol` | SL analyse verwijderen voor symbool |
+
+### Dashboard
+
+| Endpoint | Beschrijving |
+|---|---|
+| `GET /dashboard` | Dark terminal UI — volledig interactief |
 
 ---
 
-## 7. Deployment & Infrastructure
+## 17. Dashboard
 
-### Railway.app Setup
+Het dashboard is een server-side gerenderde HTML-pagina met client-side data-refresh elke 30 seconden.
 
-1. Ga naar [railway.app](https://railway.app) en log in met je GitHub account
-2. Klik **New Project** → **Deploy from GitHub repo** → selecteer je repository
-3. Voeg PostgreSQL toe: klik **+ New** → **Database** → **Add PostgreSQL**
-4. `DATABASE_URL` wordt automatisch beschikbaar als environment variabele
-5. Ga naar **Settings → Variables** en voeg alle env vars toe (zie Sectie 5)
-6. Railway detecteert automatisch `node server.js` als start-commando via `package.json`
-7. Eerste deploy start automatisch — database schema aangemaakt via `initDB()`
-8. Bij elke push naar `main`: automatische redeploy zonder downtime
+### Secties
 
-### TradingView Alert Instellen
+1. **Account KPI Strip** — Balance, Floating P&L, Open Posities, Actieve Ghosts, Closed Trades, Gem. RR, TP Locks
+2. **Daily Risk** — Vandaag/morgen multiplier, risico% per type
+3. **Open Posities** — Risk%, SL afstand%, PnL%, lots, SL multiplier, openingstijd
+4. **Actieve Ghosts** — delta (trueRR − maxRR@close), MAE, closeReason badge, elapsed tijd
+5. **Sessie Overzicht** — Asia/London/NY tabel (sorteerbaar op alle kolommen)
+6. **Tijd-tot-SL** — Gem/snelste/traagste minuten per pair × sessie
+7. **Pair × Sessie Matrix** — TP Lock RR, EV, trades, shadow SL, auto-apply status
+8. **Cron Status** — Laatste run tijd per job
+9. **Webhook History** — Laatste 20 events
 
-1. Open TradingView en navigeer naar je indicator of strategie
-2. Klik op het klok-icoon rechtsboven (**Create Alert**) of gebruik `Alt+A`
-3. Stel de alert-conditie in (bijv. crossover, RSI level, MACD signaal)
-4. Selecteer **Webhook URL** als notificatiemethode onder Notifications
-5. Vul jouw Railway URL in: `https://[jouw-app].up.railway.app/webhook`
-6. Plak de JSON payload in het **Message** veld (zie Sectie 2, Stap 1)
-7. Activeer de alert — het systeem is nu volledig live
+### CSP Configuratie (v7.7 fix)
+Helmet is geconfigureerd met `unsafe-inline` voor scripts (vereist voor inline dashboard JS) en Google Fonts toestemming.
 
 ---
 
-## 8. Projectstructuur
+## 18. Foutafhandeling & Zelflerend Systeem
 
+### learnFromError
+
+Bij MetaApi-fouten past het systeem automatisch aan:
+
+| Foutcode | Aanpassing |
+|---|---|
+| `TRADE_RETCODE_INVALID` + "symbol" | Probeer `.cash` toe te voegen/verwijderen aan MT5-symbool |
+| "volume" of "lot" in bericht | Lot-stap × 10 |
+| "stop" of `TRADE_RETCODE_INVALID_STOPS` | Minimale stop verdubbelen voor dat instrument |
+
+Deze patches worden opgeslagen in `learnedPatches[symbol]` en overleven herstarts niet (in-memory). Bij een herstart worden ze opnieuw opgebouwd vanuit fouten.
+
+### Timeout Beveiliging
+
+Alle MetaApi-calls hebben een AbortController + 8 seconden timeout:
+- `fetchOpenPositions()`
+- `fetchAccountInfo()`
+- `closePosition()`
+- `placeOrder()` (v7.7 fix: ook de /trade POST)
+- `placeOrderWithTimeout()` via Promise.race
+
+### Ghost Failsafe Timer
+
+Elke ghost tracker heeft naast de normale poll-timer ook een failsafe timer van 24u + 5 minuten. Als de normale timer crasht, ruimt de failsafe op.
+
+---
+
+## 19. Bugfixes v7.7
+
+### Bug 1 — CRITICAL: slMultiplierApplied niet opgeslagen in DB
+
+**Probleem:** In `openPositions` werd het veld `slMultiplierApplied` gezet, maar `saveTrade()` in `db.js` las `trade.slMultiplier` (undefined → standaard 1.0). De werkelijk toegepaste SL-multiplier ging verloren bij elke trade-close.
+
+**Fix:** `db.js` saveTrade: `trade.slMultiplierApplied ?? trade.slMultiplier ?? 1.0`
+
+### Bug 2 — CRITICAL: placeOrder fetch zonder AbortController
+
+**Probleem:** De `fetch` naar `/trade` in `placeOrder()` had geen `signal`. Na 8s timeout via `Promise.race` in `placeOrderWithTimeout()` bleef de onderliggende fetch hangen → stale connections accumuleerden op Railway.
+
+**Fix:** `server.js` placeOrder: AbortController + `signal: ctrl.signal` toegevoegd aan de fetch.
+
+### Bug 3 — ghost_analysis ON CONFLICT triggerde nooit
+
+**Probleem:** De `ghost_analysis` tabel had geen UNIQUE constraint op `trade_position_id`. `ON CONFLICT DO NOTHING` conflicteerde dus enkel op de SERIAL primary key (nooit) → duplicate ghost analyses werden ingevoegd.
+
+**Fix:** `db.js` initDB: `CREATE UNIQUE INDEX idx_ghost_trade_position_id ON ghost_analysis(trade_position_id) WHERE trade_position_id IS NOT NULL` + `ON CONFLICT (trade_position_id) DO NOTHING`.
+
+### Bug 4 — loadSnapshots SQL injection patroon
+
+**Probleem:** `WHERE ts > NOW() - INTERVAL '${hours} hours'` gebruikte een template literal in SQL.
+
+**Fix:** `db.js` loadSnapshots: `WHERE ts > NOW() - ($1 * INTERVAL '1 hour')` met parameterized query.
+
+### Bug 5 — Autoclose cron isWE altijd false
+
+**Probleem:** De cron draait alleen ma–vr (`1-5`), dus `isWE` was altijd `false`. De crypto-weekend-skip in de loop triggerde nooit.
+
+**Fix:** `server.js`: dead code verwijderd.
+
+### Bug 6 — reconstructConsecutivePositiveDays loop te kort
+
+**Probleem:** Loop `i <= 30` over kalenderdagen bevat ~22 werkdagen, niet 30. De streak-reconstructie was dus korter dan bedoeld.
+
+**Fix:** `server.js`: outer loop tot 50 kalenderdagen zodat 30 werkdagen bereikt worden.
+
+### Bug 7 — Dashboard title v7.5 in v7.7 codebase
+
+**Fix:** HTML `<title>` en logo label bijgewerkt naar v7.7.
+
+### Bug 8 — Helmet CSP blokkeerde inline dashboard scripts
+
+**Probleem:** `app.use(helmet())` met standaard CSP blokkeerde alle inline `<script>` tags → matrix bleef "Laden...", klok toonde "--:--:--".
+
+**Fix:** Helmet geconfigureerd met `scriptSrc: ["'self'", "'unsafe-inline'"]` en Google Fonts toegestaan.
+
+### Bug 9 — package.json versie 7.5.0 bij v7.7 codebase
+
+**Fix:** `"version": "7.7.0"` in package.json.
+
+---
+
+## 20. Deploymentinstructies
+
+### Vereisten
+- Node.js ≥ 18.0.0
+- PostgreSQL database (Railway auto-provisioned)
+- MetaApi account met REST API toegang
+
+### Railway Setup
+
+1. Nieuwe Railway service aanmaken
+2. GitHub repo koppelen (of bestanden uploaden)
+3. PostgreSQL database toevoegen aan project
+4. Environment variabelen instellen (zie sectie 3)
+5. `railway up` of auto-deploy via GitHub push
+
+### Lokaal draaien
+```bash
+npm install
+node server.js
 ```
-nv-tradingview-webhook/
-├── server.js      ← Hoofdserver: webhook ontvangst, order executie, TP/SL engines
-├── db.js          ← PostgreSQL persistence layer: alle CRUD operaties
-├── session.js     ← Tijdzone & sessie helpers (Brussels, automatisch CET/CEST)
-├── package.json   ← Dependencies: express, node-cron, pg | Scripts: start, dev
-└── README.md      ← Dit document
+
+### Eerste startup
+Bij eerste start:
+1. `initDB()` — alle tabellen worden aangemaakt (idempotent via `IF NOT EXISTS`)
+2. `loadAllTrades()` — bestaande trades geladen
+3. `loadTPConfig()` / `loadSLConfig()` / `loadShadowSLAnalysis()` — optimizer-data hersteld
+4. `restoreOpenPositionsFromMT5()` — open posities van MT5 hersteld
+5. `repairOrphanedGhosts()` — verloren ghost-data gerepareerd
+6. `reconstructConsecutivePositiveDays()` — streaks hersteld
+7. `runSLLockEngine()` voor symbolen met ≥30 trades
+8. `runShadowSLOptimizerAll()` — alle shadow analyses
+9. Server start luisteren op `PORT`
+
+### TradingView Alert Configuratie
 ```
-
-### Dependencies
-
-```json
+URL: https://tradingftmo-demo-live-production-8b1e.up.railway.app/webhook?secret={{WEBHOOK_SECRET}}
+Method: POST
+Body:
 {
-  "express":    "^4.18.2",
-  "node-cron":  "^3.0.3",
-  "pg":         "^8.11.0"
+  "symbol": "{{ticker}}",
+  "action": "{{strategy.order.action}}",
+  "entry": {{close}},
+  "sl": {{plot_0}}
 }
 ```
 
-**Node.js vereist: >= 18.0.0**
-
-```bash
-npm install        # installeer dependencies
-npm start          # productie
-npm run dev        # ontwikkeling met nodemon
-```
-
 ---
 
-## 9. Versiegeschiedenis
+## Technische Stack
 
-| Versie | Datum | Wijzigingen |
-|---|---|---|
-| **v4.3** | April 2026 | **FIX** Min lot cap = `baseRisk` per type (niet vaste €60) — indices buiten Asia werken correct · **FIX** Restart recovery — open posities hersteld vanuit MT5 na Railway herstart · **FEAT** Forex half risk bij 1–2 open trades zelfde pair+richting · Spread guard aangescherpt van 1/2 → 1/3 van SL-afstand · Ghost tracker prioriteit batching (recent 60s, oud 5min) · DB sessie herberekening op `openedAt` voor trades zonder sessie |
-| **v4.2** | Maart 2026 | Indices toegestaan tijdens Asia sessie (02:00–08:00) · Stocks beperkt tot NY venster (15:30–20:00) · Automatische zomer/wintertijd via `Intl` API (geen hardcoded +1h/+2h) |
-| **v4.1** | Februari 2026 | sub-1R TP niveaus (0.2/0.4/0.6/0.8) in `tp_config` · `spread_guard` en `sl_multiplier` kolommen in `closed_trades` · `forex_consolidation_log` tabel · `sl_config` direction kolom (up/down/unchanged) |
-| **v4.0** | Januari 2026 | TP/SL lock engine geïntroduceerd · Ghost tracker systeem · PostgreSQL persistentie (was enkel in-memory) · Sessie-gebaseerde TP optimalisatie |
-
----
-
-## 10. Roadmap
-
-### Fase 1 — Stabilisatie (Nu → Mei 2026)
-
-- [ ] **Live HTML dashboard herstellen**: `/dashboard` retourneert nu JSON — volledige visuele versie (equity curve, open posities, ghost tracker) moet worden geherintegreerd
-- [ ] **Monitoring alerts**: notificaties voor server down, hoge spread, geblokkeerde trade, 3+ forex posities op hetzelfde pair
-- [ ] **FTMO Safety Check implementeren**: `ftmoSafetyCheck()` retourneert nu altijd `{ ok: true }` — dagelijkse verlieslimieten (5% daily drawdown) moeten worden geïmplementeerd vóór live trading
-- [ ] Automated tests schrijven voor lot-berekening, sessie-logica en spread guard
-- [ ] `learnedPatches` object (dode code) verwijderen
-- [ ] `WEBHOOK_SECRET` fallback hardcode verwijderen uit `server.js`
-
-### Fase 2 — Live Account (Mei → Juli 2026)
-
-- [ ] FTMO Demo → FTMO Live na 3 succesvolle maanden op demo
-- [ ] `META_ACCOUNT_ID` en `ACCOUNT_BALANCE` updaten naar live credentials
-- [ ] Telegram / Discord notificaties bij trade-opening, sluiting en blokkering
-- [ ] `WEBHOOK_SECRET` roteren naar sterk wachtwoord
-
-### Fase 3 — Schaalvergroting (Juli → December 2026)
-
-- [ ] Multi-account support: meerdere FTMO accounts simultaan
-- [ ] Portfolio risicobeheer: totaal open risico over alle accounts bewaken
-- [ ] Backtesting engine: historische TradingView signals simuleren op gesloten trade-database
-- [ ] React/Next.js web interface voor configuratie en monitoring
-- [ ] Machine learning TP/SL optimalisatie op basis van marktregime (trend vs. range)
-
----
-
-## 11. Bekende Issues
-
-### 🔴 Kritiek
-
-| Issue | Beschrijving |
+| Component | Technologie |
 |---|---|
-| **FTMO Safety Check UIT** | `ftmoSafetyCheck()` retourneert altijd `{ ok: true }`. Dagelijkse verlieslimieten worden **NIET** gecontroleerd. Grootste risico voor live trading — moet als eerste worden opgelost. |
-| **Webhook Secret fallback** | `"FtmoNV2025"` staat hardcoded als fallback in `server.js`. Op productie altijd de env var gebruiken. |
-
-### 🟡 Minor
-
-| Issue | Beschrijving |
-|---|---|
-| **Dashboard vereenvoudigd** | `/dashboard` retourneert een JSON-object i.p.v. het volledige visuele HTML-dashboard. |
-| **Dode code** | `learnedPatches` object gedeclareerd maar nergens gebruikt — kan worden verwijderd. |
-| **Inconsistentie safety** | `ftmoDailyLossUsed` tracking is geïmplementeerd maar de check is uitgeschakeld. |
-| **SQL interpolatie** | `loadSnapshots` gebruikt template string interpolatie voor `INTERVAL` parameter. Praktisch veilig (`parseInt`), maar formeel een code smell. |
+| Runtime | Node.js 18+ |
+| Framework | Express 4 |
+| Security | Helmet (CSP geconfigureerd) |
+| Scheduling | node-cron |
+| Database | PostgreSQL via `pg` |
+| Hosting | Railway |
+| Broker API | MetaApi REST (London endpoint) |
+| Alerts | TradingView webhooks |
+| Tijdzone | Intl.DateTimeFormat — Europe/Brussels |
 
 ---
 
-## 12. Snelstartgids — Checklist
-
-### Server Setup
-
-- [ ] Railway project aangemaakt en GitHub repository gekoppeld
-- [ ] PostgreSQL plugin toegevoegd aan Railway project
-- [ ] `META_API_TOKEN` ingesteld (MetaApi dashboard → API tokens)
-- [ ] `META_ACCOUNT_ID` ingesteld (MetaApi dashboard → jouw MT5 account)
-- [ ] `WEBHOOK_SECRET` ingesteld op een sterk uniek wachtwoord
-- [ ] `ACCOUNT_BALANCE` ingesteld op jouw accountgrootte in EUR
-- [ ] Risico per type ingesteld (`RISK_INDEX`, `RISK_FOREX`, `RISK_GOLD`, enz.)
-- [ ] Server deployed en operationeel: `GET /health` retourneert 200 OK
-
-### TradingView Configuratie
-
-- [ ] Alert aangemaakt op indicator of strategie
-- [ ] Webhook URL correct ingesteld: `https://[jouw-app].up.railway.app/webhook`
-- [ ] JSON payload correct geconfigureerd met `secret`, `symbol`, `action`, `entry`, `sl`, `tp`
-- [ ] Test-alert handmatig gestuurd en resultaat gecheckt via `GET /history`
-
-### Monitoring
-
-- [ ] `GET /dashboard` bookmark aangemaakt voor dagelijks gebruik
-- [ ] `GET /research/tp-optimizer` gecheckt na 10+ trades voor TP aanbevelingen
-- [ ] `GET /analysis/equity-curve` gecheckt voor equity curve visualisatie
-- [ ] `GET /tp-locks` gecheckt voor actieve TP lock configuratie
-
----
-
-*PRONTO-AI — Nick Verschoot | nick@pronto-ai.be | April 2026 | VERTROUWELIJK*
+*Documentatie gegenereerd voor FTMO Webhook Server v7.7 | Nick Verschoot — PRONTO-AI | April 2026*
