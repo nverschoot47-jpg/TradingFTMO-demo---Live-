@@ -1,7 +1,7 @@
 {
   "name": "nv-tradingview-webhook",
-  "version": "7.4.0",
-  "description": "TradingView → MetaApi REST → FTMO MT5 | NV v7.4.0 — fixes: closePosition timeout, fetchAccountInfo timeout, Brussels weekday, SL multiplier engine (5 mechanismen), shadow_sl_analysis UPSERT, balance undefined dashboard",
+  "version": "7.5.0",
+  "description": "TradingView → MetaApi REST → FTMO MT5 | NV v7.5.0 — fixes: session.js getBrusselsComponents string input, isMarketOpen testbaar, shadow_sl_analysis UNIQUE in DDL, saveTrade closedAt null fallback",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -14,7 +14,8 @@
     "pg": "^8.13.0"
   },
   "devDependencies": {
-    "nodemon": "^3.1.0"
+    "nodemon": "^3.1.0",
+    "morgan": "^1.10.0"
   },
   "engines": {
     "node": ">=18.0.0"
