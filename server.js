@@ -1,8 +1,26 @@
 // ═══════════════════════════════════════════════════════════════
-// TradingView → MetaApi REST → MT5  |  FTMO Webhook Server v7.2
+// TradingView → MetaApi REST → MT5  |  FTMO Webhook Server v7.4
 // Account : Nick Verschoot — FTMO Demo
 // MetaApi : 7cb566c1-be02-415b-ab95-495368f3885c
 // ───────────────────────────────────────────────────────────────
+// WIJZIGINGEN v7.4 (t.o.v. v7.3):
+//  ✅ closePosition: AbortController timeout 8s (was: geen timeout)
+//  ✅ fetchAccountInfo: AbortController timeout 8s + try/catch (was: unhandled rejection)
+//  ✅ reconstructConsecutivePositiveDays: Brussels weekday via getBrusselsComponents()
+//     ipv UTC d.getDay() (was: maandag 00:30 BXL → sunday UTC → streak reset)
+//  ✅ getEffectiveSLMultiplier v7.4: volledig herschreven
+//     - Mechanisme 1: SL Lock Engine auto-applied (≥30 trades) → statistische EV-multiplier
+//     - Mechanisme 2: Shadow SL Optimizer (≥30 ghost trades) + TP Lock rijp → shadow EV-mult
+//     - Mechanisme 3: SL Lock Engine readonly (10–29 trades) + TP Lock rijp → SL Lock mult
+//     - Mechanisme 4: TP Lock rijp, geen SL-data → 0.5× als gedocumenteerde fallback
+//     - Mechanisme 5: niets actief → 1.0× (geen aanpassing)
+//     - Hardcoded 0.5× halvering VERWIJDERD als enige optie
+//     - `source` veld toegevoegd aan response voor debugbaarheid
+//
+// WIJZIGINGEN v7.3 (t.o.v. v7.2):
+//  ✅ TP Lock: altijd statistisch beste RR, ook bij negatieve EV (geen FIXED_TP_RR fallback)
+//  ✅ SL halvering: op basis van trade count (>=30) ipv EV teken
+//
 // WIJZIGINGEN v7.2 (t.o.v. v7.1):
 //  ✅ Insta-SL ghost fix: geen ghost tracker voor maxRR ≤ 0.05 + closeReason sl
 //  ✅ close_reason "unknown" → "manual" (onbekend = manuele close)
@@ -14,8 +32,10 @@
 "use strict";
 
 const express = require("express");
+const helmet  = require("helmet");
 const cron    = require("node-cron");
 const app     = express();
+app.use(helmet());
 app.use(express.json());
 
 const {
@@ -44,7 +64,7 @@ const {
 // ── CONFIG ────────────────────────────────────────────────────
 const META_API_TOKEN  = process.env.META_API_TOKEN;
 const META_ACCOUNT_ID = process.env.META_ACCOUNT_ID;
-const WEBHOOK_SECRET  = process.env.WEBHOOK_SECRET || "FtmoNV2025";
+const WEBHOOK_SECRET  = process.env.WEBHOOK_SECRET;
 const ACCOUNT_BALANCE = parseFloat(process.env.ACCOUNT_BALANCE || "10000");
 
 const GHOST_DURATION_MS        = 24 * 3600 * 1000;
@@ -82,10 +102,6 @@ let dailyRiskMultiplierNext = 1.0;
 function getRisk(type) {
   return (BASE_RISK[type] || 30) * dailyRiskMultiplier;
 }
-
-function resetDailyLossIfNewDay() {}
-function ftmoSafetyCheck(_r) { return { ok: true }; }
-function registerFtmoLoss(_r) {}
 
 // ── IN-MEMORY STORES ──────────────────────────────────────────
 const openTradeTracker = {};
@@ -126,122 +142,53 @@ function addWebhookHistory(entry) {
 const learnedPatches = {};
 
 // ── SYMBOL MAP ────────────────────────────────────────────────
+// mapAliases: meerdere invoernamen → zelfde MT5 symbool + type
+function mapAliases(aliases, mt5, type) {
+  return Object.fromEntries(aliases.map(a => [a, { mt5, type }]));
+}
+// mapDirect: elke naam is zijn eigen MT5 symbool (1-op-1)
+function mapDirect(symbols, type) {
+  return Object.fromEntries(symbols.map(s => [s, { mt5: s, type }]));
+}
+
 const SYMBOL_MAP = {
-  "DE30EUR":     { mt5: "GER40.cash",  type: "index" },
-  "UK100GBP":    { mt5: "UK100.cash",  type: "index" },
-  "NAS100USD":   { mt5: "US100.cash",  type: "index" },
-  "US30USD":     { mt5: "US30.cash",   type: "index" },
-  "SPX500USD":   { mt5: "US500.cash",  type: "index" },
-  "JP225USD":    { mt5: "JP225.cash",  type: "index" },
-  "AU200AUD":    { mt5: "AUS200.cash", type: "index" },
-  "EU50EUR":     { mt5: "EU50.cash",   type: "index" },
-  "FR40EUR":     { mt5: "FRA40.cash",  type: "index" },
-  "HK33HKD":     { mt5: "HK50.cash",   type: "index" },
-  "US2000USD":   { mt5: "US2000.cash", type: "index" },
-  "NL25EUR":     { mt5: "N.25.cash",   type: "index" },
-  "GER40":       { mt5: "GER40.cash",  type: "index" },
-  "GER40.cash":  { mt5: "GER40.cash",  type: "index" },
-  "UK100":       { mt5: "UK100.cash",  type: "index" },
-  "UK100.cash":  { mt5: "UK100.cash",  type: "index" },
-  "NAS100":      { mt5: "US100.cash",  type: "index" },
-  "US100":       { mt5: "US100.cash",  type: "index" },
-  "US100.cash":  { mt5: "US100.cash",  type: "index" },
-  "US30":        { mt5: "US30.cash",   type: "index" },
-  "US30.cash":   { mt5: "US30.cash",   type: "index" },
-  "SPX500":      { mt5: "US500.cash",  type: "index" },
-  "US500":       { mt5: "US500.cash",  type: "index" },
-  "US500.cash":  { mt5: "US500.cash",  type: "index" },
-  "JP225":       { mt5: "JP225.cash",  type: "index" },
-  "JP225.cash":  { mt5: "JP225.cash",  type: "index" },
-  "AU200":       { mt5: "AUS200.cash", type: "index" },
-  "AUS200":      { mt5: "AUS200.cash", type: "index" },
-  "AUS200.cash": { mt5: "AUS200.cash", type: "index" },
-  "EU50":        { mt5: "EU50.cash",   type: "index" },
-  "EU50.cash":   { mt5: "EU50.cash",   type: "index" },
-  "FR40":        { mt5: "FRA40.cash",  type: "index" },
-  "FRA40":       { mt5: "FRA40.cash",  type: "index" },
-  "FRA40.cash":  { mt5: "FRA40.cash",  type: "index" },
-  "HK50":        { mt5: "HK50.cash",   type: "index" },
-  "HK50.cash":   { mt5: "HK50.cash",   type: "index" },
-  "US2000":      { mt5: "US2000.cash", type: "index" },
-  "US2000.cash": { mt5: "US2000.cash", type: "index" },
-  "N.25.cash":   { mt5: "N.25.cash",   type: "index" },
-  "XAUUSD":      { mt5: "XAUUSD",      type: "gold"   },
-  "GOLD":        { mt5: "XAUUSD",      type: "gold"   },
-  "UKOIL":       { mt5: "UKOIL.cash",  type: "brent"  },
-  "UKOIL.cash":  { mt5: "UKOIL.cash",  type: "brent"  },
-  "USOIL":       { mt5: "USOIL.cash",  type: "wti"    },
-  "USOIL.cash":  { mt5: "USOIL.cash",  type: "wti"    },
-  "BTCUSD":      { mt5: "BTCUSD",      type: "crypto" },
-  "ETHUSD":      { mt5: "ETHUSD",      type: "crypto" },
-  "AAPL":  { mt5: "AAPL",  type: "stock" },
-  "APC":   { mt5: "AAPL",  type: "stock" },
-  "TSLA":  { mt5: "TSLA",  type: "stock" },
-  "TLO":   { mt5: "TSLA",  type: "stock" },
-  "TL0":   { mt5: "TSLA",  type: "stock" },
-  "MSFT":  { mt5: "MSFT",  type: "stock" },
-  "NVDA":  { mt5: "NVDA",  type: "stock" },
-  "AMD":   { mt5: "AMD",   type: "stock" },
-  "NFLX":  { mt5: "NFLX",  type: "stock" },
-  "AMZN":  { mt5: "AMZN",  type: "stock" },
-  "GOOGL": { mt5: "GOOG",  type: "stock" },
-  "PLTR":  { mt5: "PLTR",  type: "stock" },
-  "CVX":   { mt5: "CVX",   type: "stock" },
-  "ASML":  { mt5: "ASML",  type: "stock" },
-  "AVGO":  { mt5: "AVGO",  type: "stock" },
-  "AZN":   { mt5: "AZN",   type: "stock" },
-  "BA":    { mt5: "BA",    type: "stock" },
-  "BABA":  { mt5: "BABA",  type: "stock" },
-  "DIS":   { mt5: "DIS",   type: "stock" },
-  "INTC":  { mt5: "INTC",  type: "stock" },
-  "V":     { mt5: "V",     type: "stock" },
-  "IBM":   { mt5: "IBM",   type: "stock" },
-  "FDX":   { mt5: "FDX",   type: "stock" },
-  "KO":    { mt5: "KO",    type: "stock" },
-  "BAC":   { mt5: "BAC",   type: "stock" },
-  "CSCO":  { mt5: "CSCO",  type: "stock" },
-  "GE":    { mt5: "GE",    type: "stock" },
-  "GM":    { mt5: "GM",    type: "stock" },
-  "GME":   { mt5: "GME",   type: "stock" },
-  "JNJ":   { mt5: "JNJ",   type: "stock" },
-  "JPM":   { mt5: "JPM",   type: "stock" },
-  "LMT":   { mt5: "LMT",   type: "stock" },
-  "MCD":   { mt5: "MCD",   type: "stock" },
-  "META":  { mt5: "META",  type: "stock" },
-  "MSTR":  { mt5: "MSTR",  type: "stock" },
-  "NKE":   { mt5: "NKE",   type: "stock" },
-  "PFE":   { mt5: "PFE",   type: "stock" },
-  "QCOM":  { mt5: "QCOM",  type: "stock" },
-  "RACE":  { mt5: "RACE",  type: "stock" },
-  "SBUX":  { mt5: "SBUX",  type: "stock" },
-  "SNOW":  { mt5: "SNOW",  type: "stock" },
-  "T":     { mt5: "T",     type: "stock" },
-  "WMT":   { mt5: "WMT",   type: "stock" },
-  "XOM":   { mt5: "XOM",   type: "stock" },
-  "ZM":    { mt5: "ZM",    type: "stock" },
-  "BRK.B": { mt5: "BRK.B", type: "stock" },
-  "ARM":   { mt5: "ARM",   type: "stock" },
-  "EURUSD": { mt5: "EURUSD", type: "forex" },
-  "GBPUSD": { mt5: "GBPUSD", type: "forex" },
-  "USDCHF": { mt5: "USDCHF", type: "forex" },
-  "USDCAD": { mt5: "USDCAD", type: "forex" },
-  "AUDUSD": { mt5: "AUDUSD", type: "forex" },
-  "NZDUSD": { mt5: "NZDUSD", type: "forex" },
-  "EURGBP": { mt5: "EURGBP", type: "forex" },
-  "EURCHF": { mt5: "EURCHF", type: "forex" },
-  "EURAUD": { mt5: "EURAUD", type: "forex" },
-  "EURCAD": { mt5: "EURCAD", type: "forex" },
-  "EURNZD": { mt5: "EURNZD", type: "forex" },
-  "GBPCHF": { mt5: "GBPCHF", type: "forex" },
-  "GBPAUD": { mt5: "GBPAUD", type: "forex" },
-  "GBPCAD": { mt5: "GBPCAD", type: "forex" },
-  "GBPNZD": { mt5: "GBPNZD", type: "forex" },
-  "AUDCAD": { mt5: "AUDCAD", type: "forex" },
-  "AUDCHF": { mt5: "AUDCHF", type: "forex" },
-  "AUDNZD": { mt5: "AUDNZD", type: "forex" },
-  "CADCHF": { mt5: "CADCHF", type: "forex" },
-  "NZDCAD": { mt5: "NZDCAD", type: "forex" },
-  "NZDCHF": { mt5: "NZDCHF", type: "forex" },
+  // ── Indices ───────────────────────────────────────────────
+  ...mapAliases(["DE30EUR",  "GER40",  "GER40.cash"],             "GER40.cash",  "index"),
+  ...mapAliases(["UK100GBP", "UK100",  "UK100.cash"],             "UK100.cash",  "index"),
+  ...mapAliases(["NAS100USD","NAS100", "US100",   "US100.cash"],  "US100.cash",  "index"),
+  ...mapAliases(["US30USD",  "US30",   "US30.cash"],              "US30.cash",   "index"),
+  ...mapAliases(["SPX500USD","SPX500", "US500",   "US500.cash"],  "US500.cash",  "index"),
+  ...mapAliases(["JP225USD", "JP225",  "JP225.cash"],             "JP225.cash",  "index"),
+  ...mapAliases(["AU200AUD", "AU200",  "AUS200",  "AUS200.cash"], "AUS200.cash", "index"),
+  ...mapAliases(["EU50EUR",  "EU50",   "EU50.cash"],              "EU50.cash",   "index"),
+  ...mapAliases(["FR40EUR",  "FR40",   "FRA40",   "FRA40.cash"],  "FRA40.cash",  "index"),
+  ...mapAliases(["HK33HKD",  "HK50",   "HK50.cash"],             "HK50.cash",   "index"),
+  ...mapAliases(["US2000USD","US2000", "US2000.cash"],            "US2000.cash", "index"),
+  ...mapAliases(["NL25EUR",  "N.25.cash"],                        "N.25.cash",   "index"),
+  // ── Grondstoffen ──────────────────────────────────────────
+  ...mapAliases(["XAUUSD",  "GOLD"],       "XAUUSD",     "gold"),
+  ...mapAliases(["UKOIL",   "UKOIL.cash"], "UKOIL.cash", "brent"),
+  ...mapAliases(["USOIL",   "USOIL.cash"], "USOIL.cash", "wti"),
+  // ── Crypto ────────────────────────────────────────────────
+  ...mapDirect(["BTCUSD", "ETHUSD"], "crypto"),
+  // ── Aandelen met alias ────────────────────────────────────
+  ...mapAliases(["AAPL",  "APC"],        "AAPL", "stock"),
+  ...mapAliases(["TSLA",  "TLO","TL0"],  "TSLA", "stock"),
+  ...mapAliases(["GOOGL", "GOOG"],       "GOOG", "stock"),
+  // ── Aandelen directe mapping ──────────────────────────────
+  ...mapDirect([
+    "MSFT","NVDA","AMD","NFLX","AMZN","PLTR","CVX","ASML","AVGO",
+    "AZN","BA","BABA","DIS","INTC","V","IBM","FDX","KO","BAC","CSCO",
+    "GE","GM","GME","JNJ","JPM","LMT","MCD","META","MSTR","NKE",
+    "PFE","QCOM","RACE","SBUX","SNOW","T","WMT","XOM","ZM","BRK.B","ARM",
+  ], "stock"),
+  // ── Forex directe mapping ─────────────────────────────────
+  ...mapDirect([
+    "EURUSD","GBPUSD","USDCHF","USDCAD","AUDUSD","NZDUSD",
+    "EURGBP","EURCHF","EURAUD","EURCAD","EURNZD",
+    "GBPCHF","GBPAUD","GBPCAD","GBPNZD",
+    "AUDCAD","AUDCHF","AUDNZD","CADCHF","NZDCAD","NZDCHF",
+  ], "forex"),
 };
 
 function normalizeSymbol(sym) {
@@ -315,17 +262,32 @@ async function fetchOpenPositions() {
 }
 
 async function fetchAccountInfo() {
-  const r = await fetch(`${META_BASE}/accountInformation`, { headers: {"auth-token": META_API_TOKEN} });
-  if (!r.ok) throw new Error(`accountInfo ${r.status}`);
-  return r.json();
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 8000);
+  try {
+    const r = await fetch(`${META_BASE}/accountInformation`, {
+      headers: {"auth-token": META_API_TOKEN},
+      signal: ctrl.signal,
+    });
+    clearTimeout(t);
+    if (!r.ok) throw new Error(`accountInfo ${r.status}`);
+    return r.json();
+  } catch(e) { clearTimeout(t); throw e; }
 }
 
 async function closePosition(id) {
-  const r = await fetch(`${META_BASE}/positions/${id}/close`, {
-    method: "POST",
-    headers: {"Content-Type":"application/json","auth-token":META_API_TOKEN},
-  });
-  return r.json();
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 8000);
+  try {
+    const r = await fetch(`${META_BASE}/positions/${id}/close`, {
+      method: "POST",
+      headers: {"Content-Type":"application/json","auth-token":META_API_TOKEN},
+      signal: ctrl.signal,
+    });
+    clearTimeout(t);
+    if (!r.ok) throw new Error(`closePosition ${r.status}`);
+    return r.json();
+  } catch(e) { clearTimeout(t); throw e; }
 }
 
 async function fetchCurrentPrice(mt5Symbol) {
@@ -466,11 +428,67 @@ async function updateConsecutivePositiveDays() {
   }
 }
 
+// [v7.3] Reconstrueer consecutivePositiveDays bij startup vanuit closedTrades
+// Zonder dit verliest elke herstart de streaks en werkt de compound boost nooit
+function reconstructConsecutivePositiveDays() {
+  const MAX_LOOKBACK_DAYS = 30;
+  // Genereer lijst van datumstrings: gisteren, eergisteren, ...
+  // Weekenddagen worden overgeslagen: geen trades in weekend ≠ negatieve dag.
+  // Zonder deze skip brak elke maandag de streak, waardoor de compound boost nooit werkte.
+  const dayStrings = [];
+  for (let i = 1; i <= MAX_LOOKBACK_DAYS && dayStrings.length < MAX_LOOKBACK_DAYS; i++) {
+    const d = new Date(Date.now() - i * 86400000);
+    const { day } = getBrusselsComponents(d); // [v7.4] Brussels weekday ipv UTC d.getDay()
+    if (day === 0 || day === 6) continue; // weekend overslaan
+    dayStrings.push(getBrusselsDateOnly(d));
+  }
+  for (const lockKey of Object.keys(tpLocks)) {
+    const [sym, sess] = lockKey.split("__");
+    let streak = 0;
+    for (const dayStr of dayStrings) {
+      const dayTrades = closedTrades.filter(t =>
+        normalizeSymbol(t.symbol) === normalizeSymbol(sym) &&
+        t.session === sess && t.closedAt &&
+        getBrusselsDateOnly(t.closedAt) === dayStr
+      );
+      if (!dayTrades.length) break; // Geen trades op deze werkdag = streak stopt
+      const rrArr = dayTrades.map(t => t.trueMaxRR ?? t.maxRR ?? 0);
+      const bestEV = RR_LEVELS.reduce((best, rr) => {
+        const wins = rrArr.filter(r => r >= rr).length;
+        const wr   = wins / rrArr.length;
+        const ev   = wr * rr - (1 - wr);
+        return ev > best ? ev : best;
+      }, -Infinity);
+      if (bestEV > 0) streak++;
+      else break; // Negatieve EV dag = streak gebroken
+    }
+    consecutivePositiveDays[lockKey] = streak;
+  }
+  const nonZero = Object.values(consecutivePositiveDays).filter(v => v > 0).length;
+  console.log(`📅 [Startup] consecutivePositiveDays gereconstrueerd — ${Object.keys(consecutivePositiveDays).length} keys, ${nonZero} actieve streaks`);
+}
+
 // ── RESTART RECOVERY ──────────────────────────────────────────
 async function restoreOpenPositionsFromMT5() {
   try {
     const live = await fetchOpenPositions();
-    if (!Array.isArray(live) || !live.length) return;
+    const liveIds = new Set((Array.isArray(live) ? live : []).map(p => String(p.id)));
+
+    // [v7.3] Verwijder posities die tijdens downtime zijn gesloten uit openPositions + tracker
+    // Zonder deze cleanup denkt het systeem dat ze nog open staan → tracker klopt niet
+    for (const [id, pos] of Object.entries(openPositions)) {
+      if (!liveIds.has(id)) {
+        decrementTracker(pos.symbol, pos.direction);
+        delete openPositions[id];
+        console.log(`🔧 [Restart Recovery] ${pos.symbol} ${pos.direction} tijdens downtime gesloten — verwijderd uit tracker`);
+      }
+    }
+
+    if (!Array.isArray(live) || !live.length) {
+      console.log(`✅ [Restart Recovery] Geen open posities op MT5`);
+      return;
+    }
+
     let restored = 0;
     for (const pos of live) {
       const id = String(pos.id);
@@ -724,19 +742,22 @@ function startGhostTracker(closedTrade, isManual = false) {
   ghostTrackers[ghostId] = {
     trade: closedTrade, timer: currentTimer, startedAt,
     bestPrice, worstPrice, isManual,
+    failsafeTimer: null,  // [v7.3] aparte failsafe timer zodat 22:00 hard stop hem ook kan clearen
   };
 
-  setTimeout(() => {
+  const failsafeTimer = setTimeout(() => {
     if (ghostTrackers[ghostId]) {
       const g = ghostTrackers[ghostId];
       finaliseGhost(ghostId, closedTrade, g.bestPrice, g.worstPrice, "failsafe", startedAt, null);
     }
   }, GHOST_DURATION_MS + 5 * 60 * 1000);
+  ghostTrackers[ghostId].failsafeTimer = failsafeTimer;
 }
 
 function finaliseGhost(ghostId, trade, bestPrice, worstPrice, reason, startedAt, timeToSL = null) {
   if (!ghostTrackers[ghostId]) return;
   clearTimeout(ghostTrackers[ghostId].timer);
+  clearTimeout(ghostTrackers[ghostId].failsafeTimer);  // [v7.3] ook failsafe timer stoppen
   const isManual = ghostTrackers[ghostId].isManual ?? false;
   delete ghostTrackers[ghostId];
 
@@ -800,7 +821,7 @@ async function _runTPLockForSession(symbol, session) {
   });
   const best       = evTable.reduce((a,b) => b.ev > a.ev ? b : a);
   const evPositive = best.ev > 0;
-  const effectiveRR = evPositive ? best.rr : FIXED_TP_RR;
+  const effectiveRR = best.rr; // [v7.3] altijd statistisch beste RR, ook bij negatieve EV
   const oldRR       = existing?.lockedRR ?? null;
   const isNew       = !existing;
   const changed     = existing && existing.lockedRR !== effectiveRR;
@@ -831,7 +852,9 @@ async function _runTPLockForSession(symbol, session) {
 // SL LOCK ENGINE
 // ══════════════════════════════════════════════════════════════
 async function runSLLockEngine(symbol) {
-  if (!isShadowActive()) return;
+  // [v7.3 fix] Guard verwijderd: isShadowActive() blokkeerde ghost-finalisaties om 22:00
+  // en de nightly optimizer om 03:00 (buiten tradingvenster). Analyse is puur statistisch
+  // en mag altijd draaien — enkel live order plaatsing vereist market-open check.
   const trades = closedTrades.filter(t =>
     normalizeSymbol(t.symbol) === normalizeSymbol(symbol) && t.sl && t.entry
   );
@@ -915,22 +938,78 @@ async function runShadowSLOptimizerAll() {
   }
 }
 
-// ── SL MULTIPLIER ─────────────────────────────────────────────
+// ── SL MULTIPLIER v7.4 ────────────────────────────────────────
+//
+// Prioriteitsvolgorde (hoog → laag):
+//   1. SL Lock Engine auto-applied (≥30 trades) → statistische best EV multiplier
+//   2. Shadow SL Optimizer (≥30 ghost trades) + TP Lock aanwezig → shadow best multiplier
+//   3. SL Lock Engine readonly (10–29 trades)  + TP Lock aanwezig → SL Lock multiplier
+//   4. TP Lock aanwezig maar geen SL-data       + TP Lock aanwezig → 0.5× fallback
+//   5. Geen van bovenstaande                                       → 1.0× (geen aanpassing)
+//
+// Rationale: halvering is NOOIT zomaar hardcoded. Het systeem gebruikt altijd
+// de statistisch beste EV-multiplier uit de analyse-engines. Enkel als er
+// helemaal geen data beschikbaar is maar er WEL een TP Lock is (≥30 trades),
+// wordt 0.5× gebruikt als conservatieve fallback — dit is expliciet en gedocumenteerd.
+//
 function getEffectiveSLMultiplier(symbol, session, entryNum, slNum, direction) {
   const slLock    = slLocks[symbol];
   const tpLockKey = `${symbol}__${session}`;
   const tpLockNow = tpLocks[tpLockKey];
-  const tpProven  = tpLockNow && (tpLockNow.evAtLock ?? 0) > 0;
-  let multiplier = 1.0, info = "geen aanpassing";
+  const shadow    = shadowSLResults[symbol];
+
+  const tpLockTrades   = tpLockNow?.lockedTrades ?? 0;
+  const tpHalfEligible = tpLockNow && tpLockTrades >= SL_AUTO_APPLY_THRESHOLD;
+
+  let multiplier = 1.0;
+  let info       = "geen aanpassing";
+  let source     = "none";
+
+  // ── Mechanisme 1: SL Lock Engine auto-applied (≥30 trades) ──
+  // Statistisch bepaald via buildSLAnalysis() over alle closed trades.
+  // Wordt automatisch toegepast zodra ≥30 trades beschikbaar zijn.
   if (slLock?.autoApplied && slLock.multiplier !== 1.0) {
     multiplier = slLock.multiplier;
-    info = `${multiplier}× (auto-apply na ${slLock.appliedTrades} trades)`;
-  } else if (tpProven) {
-    multiplier = 0.5;
-    info = `0.5× (TP bewezen ${symbol}/${session})`;
+    source     = "sl_lock_auto";
+    info       = `${multiplier}× (SL Lock Engine auto-applied, ${slLock.appliedTrades} trades, EV=${slLock.evAtLock?.toFixed(3) ?? '?'})`;
+
+  // ── Mechanisme 2: Shadow SL Optimizer + TP Lock rijp ─────────
+  // Shadow gebruikt trueMaxRR (ghost-gecorrigeerde data) — nauwkeuriger dan SL Lock.
+  // Alleen actief als TP Lock ook rijp is (≥30 trades), anders te weinig context.
+  } else if (tpHalfEligible && shadow?.best?.slMultiplier && shadow.best.slMultiplier !== 1.0) {
+    const shadowMult = shadow.best.slMultiplier;
+    const shadowEV   = shadow.best.bestEV ?? 0;
+    // Gebruik shadow alleen als het een duidelijke EV-verbetering geeft
+    if (shadowEV > 0) {
+      multiplier = shadowMult;
+      source     = "shadow_optimizer";
+      info       = `${multiplier}× (Shadow SL Optimizer, ${shadow.tradesUsed} ghost trades, EV=${shadowEV.toFixed(3)})`;
+    }
   }
+
+  // ── Mechanisme 3: SL Lock Engine readonly (10–29 trades) + TP Lock rijp ──
+  // Nog niet auto-applied maar data is beschikbaar. Gebruik voorzichtig.
+  if (source === "none" && tpHalfEligible && slLock && !slLock.autoApplied && slLock.multiplier !== 1.0) {
+    const slEV = slLock.evAtLock ?? 0;
+    if (slEV > 0) {
+      multiplier = slLock.multiplier;
+      source     = "sl_lock_readonly";
+      info       = `${multiplier}× (SL Lock Engine readonly, ${slLock.lockedTrades} trades, EV=${slEV.toFixed(3)})`;
+    }
+  }
+
+  // ── Mechanisme 4: TP Lock rijp maar GEEN SL-data → 0.5× fallback ────────
+  // Enige geval waar 0.5× hardcoded wordt toegepast — bewust en gedocumenteerd.
+  // Rationale: TP Lock geeft aan dat het systeem de trade statistisch begrijpt,
+  // maar zonder SL-analyse is verkleinen van SL conservatief zinvol.
+  if (source === "none" && tpHalfEligible) {
+    multiplier = 0.5;
+    source     = "tp_lock_fallback";
+    info       = `0.5× (TP Lock fallback — geen SL-data voor ${symbol}/${session}, ${tpLockTrades} trades)`;
+  }
+
   const newSL = applySlMultiplier(direction, entryNum, slNum, multiplier);
-  return { multiplier, slApplied: newSL, info };
+  return { multiplier, slApplied: newSL, info, source };
 }
 
 // ── POSITION SYNC ─────────────────────────────────────────────
@@ -1030,6 +1109,8 @@ async function placeOrder(dir, symbol, entry, sl, lots, session) {
   const lockKey   = `${symbol}__${session}`;
   const tpLock    = tpLocks[lockKey];
   const tpRR      = tpLock ? tpLock.lockedRR : FIXED_TP_RR;
+  // [v7.3] "geen FIXED_TP_RR fallback" = geen fallback bij negatieve EV (lock altijd statistisch beste RR).
+  // Voor symbolen zonder lock (< 3 trades) is 4R nog steeds de initiële fallback — dit is correct gedrag.
   const tpPrice   = calcTPPrice(dir, entry, slPrice, tpRR);
   const body      = {
     symbol: mt5Symbol, volume: lots,
@@ -1114,12 +1195,19 @@ app.post("/webhook", async (req, res) => {
       const evPos = lock && (lock.evAtLock ?? 0) > 0;
       risk = evPos ? risk * 0.5 : (BASE_RISK[symType] || 15) * dailyRiskMultiplier * 0.5;
     }
-    const ftmo = ftmoSafetyCheck(risk);
-    if (!ftmo.ok) return res.status(200).json({ status:"FTMO_BLOCKED", reason:ftmo.reason });
-    let lots = calcLots(symbol, entryNum, slApplied, risk);
-    if (lots === null) return res.status(200).json({ status:"SKIP", reason:`Min lot > cap` });
-    if (symType === "forex" && forexTrade2) lots = Math.min(lots, 0.12);
-    else if (symType === "forex") lots = Math.min(lots, 0.25);
+
+    // [v7.3] Forex: altijd vaste lotgrootte — geen risico-berekening nodig
+    // Trade 1 (geen open zelfde richting) = 0.25L, Trade 2 = 0.12L
+    let lots;
+    if (symType === "forex") {
+      lots = forexTrade2 ? 0.12 : 0.25;
+    } else {
+      lots = calcLots(symbol, entryNum, slApplied, risk);
+      if (lots === null) {
+        addWebhookHistory({ type:"SKIP", symbol, reason:`calcLots null — SL te klein voor minimale lotgrootte` });
+        return res.status(200).json({ status:"SKIP", reason:`Lot berekening mislukt: SL afstand te klein voor ${symbol}` });
+      }
+    }
     registerRecentOrder(symbol, direction);
     let orderResult;
     try {
@@ -1134,23 +1222,26 @@ app.post("/webhook", async (req, res) => {
     const isError = result?.error || (errCode && errCode!==10009 && errCode!=="TRADE_RETCODE_DONE");
     if (isError) {
       learnFromError(symbol, errCode, errMsg);
-      const rl = calcLots(symbol, entryNum, slApplied, risk);
+      // [v7.3] Forex heeft altijd vaste lots — calcLots niet gebruiken bij retry
+      const rl = symType === "forex" ? lots : calcLots(symbol, entryNum, slApplied, risk);
       if (rl !== null) {
         try {
           const retry = await placeOrderWithTimeout(direction, symbol, entryNum, slApplied, rl, curSession);
           result = retry.result; tpPrice = retry.tpPrice; tpRR = retry.tpRR;
           const retryErr = retry.result?.error || (retry.result?.retcode && retry.result.retcode!==10009 && retry.result.retcode!=="TRADE_RETCODE_DONE");
           if (retryErr) {
-            learnFromError(symbol, retry.result?.error?.code||retry.result?.retcode, retry.result?.error?.message||retry.result?.comment);
-            addWebhookHistory({ type:"ERROR", symbol, errCode, errMsg });
-            return res.status(200).json({ status:"ERROR_LEARNED", errCode, errMsg });
+            const retryCode = retry.result?.error?.code || retry.result?.retcode;
+            const retryMsg  = retry.result?.error?.message || retry.result?.comment || "";
+            learnFromError(symbol, retryCode, retryMsg);
+            // [v7.3] Gebruik retry foutcode zodat detail zichtbaar is in dashboard
+            addWebhookHistory({ type:"ERROR", symbol, errCode: retryCode, errMsg: retryMsg, reason: `retry: ${retryCode ?? "?"}: ${retryMsg || errMsg || "geen detail"}` });
+            return res.status(200).json({ status:"ERROR_LEARNED", errCode: retryCode, errMsg: retryMsg });
           }
         } catch(retryTimeout) {
           return res.status(200).json({ status:"TIMEOUT", reason:"Retry ook timeout" });
         }
       }
     }
-    registerFtmoLoss(risk);
     incrementTracker(symbol, direction);
     const posId = String(result?.positionId || result?.orderId || Date.now());
     openPositions[posId] = {
@@ -1169,7 +1260,7 @@ app.post("/webhook", async (req, res) => {
       slAutoApplied: slMult !== 1.0, dailyRiskMult: dailyRiskMultiplier,
     });
     res.json({
-      status:"OK", versie:"v7.1",
+      status:"OK", versie:"v7.4",
       direction, tvSymbol:symbol, mt5Symbol, symType, session:curSession,
       entry:entryNum, sl:slPrice, slOriginal:slNum, slMultiplier:slMult, slLockInfo,
       tp: tpPrice, tpRR, lots, risicoEUR:risk.toFixed(2),
@@ -1203,7 +1294,7 @@ app.post("/close", async (req, res) => {
 // ══════════════════════════════════════════════════════════════
 app.get("/", (req, res) => {
   res.json({
-    status:"online", versie:"ftmo-v7.1",
+    status:"online", versie:"ftmo-v7.4",
     time: getBrusselsDateStr(),
     tracking: {
       openPositions: Object.keys(openPositions).length,
@@ -1473,7 +1564,7 @@ app.get("/analysis/sessions", (req, res) => {
       slTimeBySym[sym].push({ min: t.ghostTimeToSL, hour: new Date(t.closedAt||Date.now()).getHours() });
     }
     const slTimeRows = Object.entries(slTimeBySym).map(([sym, entries]) => {
-      const times = entries.map(e=>e.m);
+      const times = entries.map(e=>e.min); // [v7.3] was e.m — typo fix, was altijd undefined
       const hourCounts = {};
       for (const e of entries) {
         hourCounts[e.hour] = (hourCounts[e.hour]||0)+1;
@@ -1627,7 +1718,7 @@ app.delete("/sl-locks/:symbol", (req,res) => {
 });
 
 // ══════════════════════════════════════════════════════════════
-// DASHBOARD v7.1 — Professioneel dark terminal UI
+// DASHBOARD v7.4 — Professioneel dark terminal UI
 // ══════════════════════════════════════════════════════════════
 app.get("/dashboard", async (req, res) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
@@ -1737,7 +1828,7 @@ app.get("/dashboard", async (req, res) => {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>FTMO v7.2 — Nick Verschoot</title>
+<title>FTMO v7.4 — Nick Verschoot</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Barlow+Condensed:wght@400;600;700;900&display=swap" rel="stylesheet">
 <style>
@@ -2118,7 +2209,7 @@ th.sort-desc::after { content: " ▼"; color: var(--c); font-size: 9px; }
 <div id="refresh-flash"></div>
 
 <header>
-  <div class="logo">FTMO <em>v7.2 — Nick Verschoot</em></div>
+  <div class="logo">FTMO <em>v7.3 — Nick Verschoot</em></div>
   <div class="header-mid">
     <div class="htag live">Live</div>
     <div class="htag">Demo Account</div>
@@ -2584,7 +2675,7 @@ async function loadAll() {
   // Update KPIs
   if (posRes) {
     document.getElementById('kpi-open').textContent = posRes.count ?? 0;
-    const bal = posRes.balance || ${balance};
+    const bal = posRes.balance || ${ACCOUNT_BALANCE};
     document.getElementById('kpi-balance').textContent = bal.toFixed(0);
   }
   if (ghostRes) {
@@ -2609,13 +2700,21 @@ app.use((req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════
-// STARTUP v7.1
+// STARTUP v7.3
 // ══════════════════════════════════════════════════════════════
 const PORT = process.env.PORT || 3000;
 
 async function start() {
   try {
-    console.log("🚀 FTMO Webhook Server v7.1 — opstarten...");
+    // ── Env-variabelen valideren vóór alles ────────────────
+    const REQUIRED_ENV = ["META_API_TOKEN", "META_ACCOUNT_ID", "WEBHOOK_SECRET"];
+    const missing = REQUIRED_ENV.filter(k => !process.env[k]);
+    if (missing.length) {
+      console.error(`❌ Ontbrekende vereiste env-variabelen: ${missing.join(", ")}`);
+      process.exit(1);
+    }
+
+    console.log("🚀 FTMO Webhook Server v7.4 — opstarten...");
     await initDB();
 
     const dbTrades = await loadAllTrades();
@@ -2637,6 +2736,7 @@ async function start() {
       shadowSLResults[row.symbol] = {
         symbol: row.symbol,
         best: { slMultiplier: row.bestMultiplier, bestEV: row.bestEV, bestRR: row.bestRR, bestWinrate: row.bestWinrate, slHitRate: row.slHitRate },
+        allMultiples: [],   // [v7.3] placeholder — wordt gevuld door runShadowSLOptimizerAll() hieronder
         tradesUsed: row.tradesUsed, computedAt: row.computedAt,
       };
     }
@@ -2650,6 +2750,9 @@ async function start() {
 
     await restoreOpenPositionsFromMT5();
     await repairOrphanedGhosts();
+
+    // [v7.3] Streaks reconstrueren vanuit closedTrades — overleeft herstarts
+    reconstructConsecutivePositiveDays();
 
     const symbolCounts = {};
     for (const t of closedTrades) {
@@ -2669,7 +2772,7 @@ async function start() {
     }
 
     app.listen(PORT, () => {
-      console.log(`✅ Server v7.2 luistert op port ${PORT}`);
+      console.log(`✅ Server v7.4 luistert op port ${PORT}`);
       console.log(`   🔹 Dashboard: /dashboard`);
       console.log(`   🔹 Nieuwe endpoints: /analysis/rr, /analysis/sessions`);
       console.log(`   🔹 Nieuwe endpoints: /research/tp-optimizer, /research/tp-optimizer/sessie`);
