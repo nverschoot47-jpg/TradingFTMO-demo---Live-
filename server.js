@@ -1,5 +1,5 @@
 // ===============================================================
-// TradingView -> MetaApi REST -> MT5  |  FTMO Webhook Server v7.5
+// TradingView -> MetaApi REST -> MT5  |  FTMO Webhook Server v7.6
 // Account : Nick Verschoot  -  FTMO Demo
 // MetaApi : 7cb566c1-be02-415b-ab95-495368f3885c
 // ---------------------------------------------------------------
@@ -1268,7 +1268,7 @@ app.post("/webhook", async (req, res) => {
       slAutoApplied: slMult !== 1.0, dailyRiskMult: dailyRiskMultiplier,
     });
     res.json({
-      status:"OK", versie:"v7.5",
+      status:"OK", versie:"v7.6",
       direction, tvSymbol:symbol, mt5Symbol, symType, session:curSession,
       entry:entryNum, sl:slPrice, slOriginal:slNum, slMultiplier:slMult, slLockInfo,
       tp: tpPrice, tpRR, lots, risicoEUR:risk.toFixed(2),
@@ -1302,7 +1302,7 @@ app.post("/close", async (req, res) => {
 // ==============================================================
 app.get("/", (req, res) => {
   res.json({
-    status:"online", versie:"ftmo-v7.5",
+    status:"online", versie:"ftmo-v7.6",
     time: getBrusselsDateStr(),
     tracking: {
       openPositions: Object.keys(openPositions).length,
@@ -1415,6 +1415,78 @@ app.post("/sl-shadow/run", async (req, res) => {
     }
     await runShadowSLOptimizerAll();
     return res.json({ status:"OK", symbols: Object.keys(shadowSLResults).length });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// /api/matrix -- server-side pre-computed matrix for dashboard
+// Combineert closedTrades + tpLocks + slLocks + shadowSLResults
+// Alle pairs die ooit getraded zijn verschijnen hier, ook zonder optimizer data
+app.get("/api/matrix", (req, res) => {
+  try {
+    const SESSIONS = ['asia', 'london', 'ny'];
+
+    // Verzamel alle symbols uit closedTrades + optimizer data
+    const symSet = new Set();
+    for (const t of closedTrades) { if (t.symbol) symSet.add(normalizeSymbol(t.symbol)); }
+    for (const key of Object.keys(tpLocks)) { const [s] = key.split('__'); symSet.add(s); }
+    for (const s of Object.keys(slLocks)) symSet.add(s);
+    for (const s of Object.keys(shadowSLResults)) symSet.add(s);
+    const symbols = [...symSet].sort();
+
+    const rows = symbols.map(sym => {
+      // Trades per sessie
+      const tradesBySess = {};
+      for (const sess of SESSIONS) {
+        const t = closedTrades.filter(t =>
+          normalizeSymbol(t.symbol) === sym && t.session === sess && t.entry && t.sl
+        );
+        const n = t.length;
+        const rrs = t.map(x => getBestRR(x));
+        const wins = rrs.filter(r => r >= (tpLocks[`${sym}__${sess}`]?.lockedRR ?? 1)).length;
+        const wr   = n ? wins / n : null;
+
+        // Beste EV uit RR tabel
+        let bestEV = null, bestRR = null;
+        if (n >= 3) {
+          const ev = RR_LEVELS.map(rr => {
+            const w = rrs.filter(r => r >= rr).length / n;
+            return { rr, ev: parseFloat((w * rr - (1 - w)).toFixed(3)) };
+          }).reduce((a, b) => b.ev > a.ev ? b : a);
+          bestEV = ev.ev;
+          bestRR = ev.rr;
+        }
+
+        const lock = tpLocks[`${sym}__${sess}`] ?? null;
+        tradesBySess[sess] = {
+          count: n,
+          lockedRR:   lock?.lockedRR   ?? null,
+          evAtLock:   lock?.evAtLock   ?? bestEV,
+          bestRR:     lock?.lockedRR   ?? bestRR,
+          winrate:    wr !== null ? parseFloat((wr * 100).toFixed(1)) : null,
+          hasLock:    !!lock,
+        };
+      }
+
+      // SL & Shadow
+      const slData  = slLocks[sym]  ?? null;
+      const shadow  = shadowSLResults[sym] ?? null;
+      const totalTrades = closedTrades.filter(t => normalizeSymbol(t.symbol) === sym).length;
+
+      return {
+        symbol:      sym,
+        totalTrades,
+        sessions:    tradesBySess,
+        slMult:      slData?.multiplier      ?? null,
+        slAutoApplied: slData?.autoApplied   ?? false,
+        slTrades:    slData?.lockedTrades    ?? 0,
+        slEV:        slData?.evAtLock        ?? null,
+        shadowMult:  shadow?.best?.slMultiplier ?? null,
+        shadowEV:    shadow?.best?.bestEV    ?? null,
+        shadowTrades: shadow?.tradesUsed     ?? null,
+      };
+    });
+
+    res.json({ generated: new Date().toISOString(), count: rows.length, rows });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -2481,18 +2553,18 @@ ${slTimeRows.length === 0 ? `
     <table>
       <thead>
         <tr>
-          <th onclick="sortMatrix(0)" class="sortable">Pair ↕</th>
-          <th onclick="sortMatrix(1)" class="sortable">Asia  -  RR ↕</th>
-          <th onclick="sortMatrix(2)" class="sortable">Asia  -  EV ↕</th>
-          <th onclick="sortMatrix(3)" class="sortable">Asia  -  # ↕</th>
-          <th onclick="sortMatrix(4)" class="sortable">London  -  RR ↕</th>
-          <th onclick="sortMatrix(5)" class="sortable">London  -  EV ↕</th>
-          <th onclick="sortMatrix(6)" class="sortable">London  -  # ↕</th>
-          <th onclick="sortMatrix(7)" class="sortable">NY  -  RR ↕</th>
-          <th onclick="sortMatrix(8)" class="sortable">NY  -  EV ↕</th>
-          <th onclick="sortMatrix(9)" class="sortable">NY  -  # ↕</th>
-          <th onclick="sortMatrix(10)" class="sortable">Shadow SL ↕</th>
-          <th onclick="sortMatrix(11)" class="sortable">Auto ↕</th>
+          <th onclick="sortMatrix(0)" class="sortable">Pair / Total</th>
+          <th onclick="sortMatrix(1)" class="sortable">Asia RR</th>
+          <th onclick="sortMatrix(2)" class="sortable">Asia EV</th>
+          <th onclick="sortMatrix(3)" class="sortable">Asia #</th>
+          <th onclick="sortMatrix(4)" class="sortable">London RR</th>
+          <th onclick="sortMatrix(5)" class="sortable">London EV</th>
+          <th onclick="sortMatrix(6)" class="sortable">London #</th>
+          <th onclick="sortMatrix(7)" class="sortable">NY RR</th>
+          <th onclick="sortMatrix(8)" class="sortable">NY EV</th>
+          <th onclick="sortMatrix(9)" class="sortable">NY #</th>
+          <th onclick="sortMatrix(10)" class="sortable">Shadow SL</th>
+          <th onclick="sortMatrix(11)" class="sortable">SL Auto</th>
         </tr>
       </thead>
       <tbody id="matrix-body">
@@ -2621,72 +2693,79 @@ async function sf(url, timeoutMs = 8000) {
   } catch(e) { console.warn('sf failed:', url, e.message); return null; }
 }
 
-// -- MATRIX BUILDER --
-// NOTE: geen backtick templates hier - string-concatenatie enkel.
+// -- MATRIX BUILDER -- uses /api/matrix (server-side pre-computed)
 async function buildMatrix() {
   var tbody = document.getElementById('matrix-body');
   if (!tbody) return;
 
-  var results = await Promise.all([
-    sf('/tp-locks'),
-    sf('/sl-locks'),
-    sf('/sl-shadow'),
-  ]);
-  var tpRes = results[0], slRes = results[1], shadowRes = results[2];
+  var data = await sf('/api/matrix', 10000);
 
-  var tpBySymbol  = (tpRes && tpRes.locksBySymbol) ? tpRes.locksBySymbol : {};
-  var slBySymbol  = {};
-  var analyses    = (slRes && slRes.analyses) ? slRes.analyses : [];
-  for (var i = 0; i < analyses.length; i++) { slBySymbol[analyses[i].symbol] = analyses[i]; }
-  var shadowResults = (shadowRes && shadowRes.results) ? shadowRes.results : {};
-
-  var allSyms = Object.keys(tpBySymbol).concat(Object.keys(slBySymbol));
-  var symSet  = {};
-  for (var j = 0; j < allSyms.length; j++) symSet[allSyms[j]] = true;
-  var symbols = Object.keys(symSet).sort();
-
-  if (!symbols.length) {
-    tbody.innerHTML = '<tr><td colspan="12" class="no-data">Nog geen optimizer data  -  trades verschijnen hier na ghost finalisatie</td></tr>';
+  if (!data || !data.rows || !data.rows.length) {
+    tbody.innerHTML = '<tr><td colspan="12" class="no-data">Nog geen trades beschikbaar - matrix verschijnt na eerste gesloten positie</td></tr>';
     return;
   }
 
-  var sess = ['asia','london','ny'];
+  var rows = data.rows;
   var html = '';
-  for (var si = 0; si < symbols.length; si++) {
-    var sym    = symbols[si];
-    var slData = slBySymbol[sym];
-    var shadow = shadowResults[sym];
-    var cols   = '';
-    for (var ci = 0; ci < sess.length; ci++) {
-      var s    = sess[ci];
-      var lock = (tpBySymbol[sym] && tpBySymbol[sym][s]) ? tpBySymbol[sym][s] : null;
-      if (!lock) {
-        cols += '<td class="c-muted"> - </td><td class="c-muted"> - </td><td class="c-muted"> - </td>';
+
+  for (var i = 0; i < rows.length; i++) {
+    var r    = rows[i];
+    var cols = '';
+    var sess = ['asia', 'london', 'ny'];
+
+    for (var j = 0; j < sess.length; j++) {
+      var s  = sess[j];
+      var sd = r.sessions[s];
+
+      if (!sd || sd.count === 0) {
+        cols += '<td class="c-muted">-</td><td class="c-muted">-</td><td class="c-muted">-</td>';
       } else {
-        var evClass = (lock.evAtLock || 0) > 0 ? 'c-green' : 'c-red';
-        var evVal   = (lock.evAtLock != null) ? lock.evAtLock.toFixed(3) : ' - ';
-        var trCount = (lock.lockedTrades != null) ? lock.lockedTrades : ' - ';
-        cols += '<td class="bold c-c">' + lock.lockedRR + 'R</td>'
-              + '<td class="' + evClass + '">' + evVal + '</td>'
-              + '<td class="c-dim">' + trCount + '</td>';
+        var rrTxt  = sd.lockedRR  != null ? sd.lockedRR + 'R'            : (sd.bestRR != null ? '~' + sd.bestRR + 'R' : '-');
+        var evTxt  = sd.evAtLock  != null ? sd.evAtLock.toFixed(3)       : '-';
+        var evCls  = sd.evAtLock  != null ? (sd.evAtLock > 0 ? 'c-green' : 'c-red') : 'c-muted';
+        var rrCls  = sd.hasLock             ? 'bold c-c'                 : 'c-dim';
+        var wrTxt  = sd.winrate   != null   ? sd.winrate + '%'           : '';
+        cols += '<td class="' + rrCls + '">' + rrTxt + (wrTxt ? '<br><span class="c-muted" style="font-size:9px">' + sd.count + 'tr ' + wrTxt + '</span>' : '<br><span class="c-muted" style="font-size:9px">' + sd.count + ' trades</span>') + '</td>'
+              + '<td class="' + evCls + '">' + evTxt + '</td>'
+              + '<td class="c-dim">' + sd.count + '</td>';
       }
     }
-    var shadowMult = (shadow && shadow.best && shadow.best.slMultiplier != null)
-      ? shadow.best.slMultiplier
-      : (slData && slData.multiplier != null ? slData.multiplier : null);
-    var shadowCol = (shadowMult !== null)
-      ? '<span class="' + (shadowMult > 1 ? 'c-gold' : shadowMult < 1 ? 'c-purple' : 'c-green') + '">' + shadowMult + 'x</span>'
-      : '<span class="c-muted"> - </span>';
-    var autoCol = (slData && slData.autoApplied)
-      ? '<span class="c-green">✓ AUTO</span>'
-      : '<span class="c-muted">⏳ ' + (slData ? (slData.lockedTrades || 0) : 0) + '/30</span>';
+
+    // Shadow SL kolom
+    var shadowMult = r.shadowMult != null ? r.shadowMult : r.slMult;
+    var shadowCol;
+    if (shadowMult == null) {
+      shadowCol = '<span class="c-muted">-</span>';
+    } else {
+      var smCls = shadowMult > 1 ? 'c-gold' : shadowMult < 1 ? 'c-purple' : 'c-green';
+      var smEV  = r.shadowEV != null ? ' <span class="c-muted" style="font-size:9px">EV ' + r.shadowEV.toFixed(3) + '</span>' : '';
+      shadowCol = '<span class="' + smCls + '">' + shadowMult + 'x</span>' + smEV;
+    }
+
+    // Auto-apply kolom
+    var autoCol;
+    if (r.slAutoApplied) {
+      var evStr = r.slEV != null ? ' EV=' + r.slEV.toFixed(3) : '';
+      autoCol = '<span class="c-green">AUTO ' + (r.slMult || '?') + 'x' + evStr + '</span>';
+    } else {
+      var pct     = Math.min(100, Math.round((r.slTrades / 30) * 100));
+      var barColor = pct >= 66 ? '#00e396' : pct >= 33 ? '#f0c040' : '#506070';
+      autoCol = '<span class="c-muted">' + r.slTrades + '/30</span>'
+              + '<div style="margin-top:3px;height:3px;background:#161e2a;border-radius:2px;width:60px">'
+              + '<div style="height:100%;width:' + pct + '%;background:' + barColor + ';border-radius:2px"></div></div>';
+    }
+
+    // Total trades badge
+    var totCls = r.totalTrades >= 30 ? 'c-green' : r.totalTrades >= 10 ? 'c-gold' : 'c-dim';
+
     html += '<tr>'
-          + '<td class="bold c-c">' + sym + '</td>'
+          + '<td class="bold c-c">' + r.symbol + '<br><span class="' + totCls + '" style="font-size:9px">' + r.totalTrades + ' total</span></td>'
           + cols
           + '<td>' + shadowCol + '</td>'
           + '<td>' + autoCol + '</td>'
           + '</tr>';
   }
+
   tbody.innerHTML = html;
 }
 
@@ -2750,7 +2829,7 @@ async function start() {
       process.exit(1);
     }
 
-    console.log("🚀 FTMO Webhook Server v7.5  -  opstarten...");
+    console.log("🚀 FTMO Webhook Server v7.6  -  opstarten...");
     await initDB();
 
     const dbTrades = await loadAllTrades();
@@ -2808,7 +2887,7 @@ async function start() {
     }
 
     app.listen(PORT, () => {
-      console.log(`[OK] Server v7.5 luistert op port ${PORT}`);
+      console.log(`[OK] Server v7.6 luistert op port ${PORT}`);
       console.log(`   🔹 Dashboard: /dashboard`);
       console.log(`   🔹 Nieuwe endpoints: /analysis/rr, /analysis/sessions`);
       console.log(`   🔹 Nieuwe endpoints: /research/tp-optimizer, /research/tp-optimizer/sessie`);
