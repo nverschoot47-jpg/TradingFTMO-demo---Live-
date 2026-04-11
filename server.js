@@ -2209,7 +2209,7 @@ th.sort-desc::after { content: " ▼"; color: var(--c); font-size: 9px; }
 <div id="refresh-flash"></div>
 
 <header>
-  <div class="logo">FTMO <em>v7.3 — Nick Verschoot</em></div>
+  <div class="logo">FTMO <em>v7.4 — Nick Verschoot</em></div>
   <div class="header-mid">
     <div class="htag live">Live</div>
     <div class="htag">Demo Account</div>
@@ -2596,10 +2596,13 @@ function tick() {
 }
 setInterval(tick, 1000); tick();
 
-// ── SAFE FETCH ──
-async function sf(url) {
+// ── SAFE FETCH met timeout ──
+async function sf(url, timeoutMs = 8000) {
   try {
-    const r = await fetch(url);
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), timeoutMs);
+    const r = await fetch(url, { signal: ctrl.signal });
+    clearTimeout(t);
     if (!r.ok) throw new Error(r.status);
     return r.json();
   } catch(e) { console.warn('sf failed:', url, e.message); return null; }
@@ -2607,15 +2610,17 @@ async function sf(url) {
 
 // ── MATRIX BUILDER ──
 async function buildMatrix() {
+  const tbody = document.getElementById('matrix-body');
+  if (!tbody) return;
+
   const [tpRes, slRes, shadowRes] = await Promise.all([
     sf('/tp-locks'),
     sf('/sl-locks'),
     sf('/sl-shadow'),
   ]);
-  if (!tpRes) return;
 
-  const tpBySymbol = tpRes.locksBySymbol || {};
-  const slBySymbol = {};
+  const tpBySymbol    = tpRes?.locksBySymbol  || {};
+  const slBySymbol    = {};
   for (const a of (slRes?.analyses || [])) slBySymbol[a.symbol] = a;
   const shadowResults = shadowRes?.results || {};
 
@@ -2624,13 +2629,12 @@ async function buildMatrix() {
     ...Object.keys(slBySymbol),
   ])].sort();
 
-  const sess = ['asia','london','ny'];
-  const tbody = document.getElementById('matrix-body');
   if (!symbols.length) {
     tbody.innerHTML = '<tr><td colspan="12" class="no-data">Nog geen optimizer data — trades verschijnen hier na ghost finalisatie</td></tr>';
     return;
   }
 
+  const sess = ['asia','london','ny'];
   tbody.innerHTML = symbols.map(sym => {
     const slData   = slBySymbol[sym];
     const shadow   = shadowResults[sym];
@@ -2663,29 +2667,35 @@ async function buildMatrix() {
 // ── LIVE DATA REFRESH ──
 async function loadAll() {
   const flash = document.getElementById('refresh-flash');
-  flash.classList.add('on');
-  setTimeout(() => flash.classList.remove('on'), 300);
+  if (flash) { flash.classList.add('on'); setTimeout(() => flash.classList.remove('on'), 300); }
 
-  const [posRes, ghostRes, dailyRes] = await Promise.all([
-    sf('/live/positions'),
-    sf('/live/ghosts'),
-    sf('/daily-risk'),
-  ]);
+  try {
+    const [posRes, ghostRes, dailyRes] = await Promise.all([
+      sf('/live/positions'),
+      sf('/live/ghosts'),
+      sf('/daily-risk'),
+    ]);
 
-  // Update KPIs
-  if (posRes) {
-    document.getElementById('kpi-open').textContent = posRes.count ?? 0;
-    const bal = posRes.balance || ${ACCOUNT_BALANCE};
-    document.getElementById('kpi-balance').textContent = bal.toFixed(0);
-  }
-  if (ghostRes) {
-    document.getElementById('kpi-ghosts').textContent = ghostRes.count ?? 0;
-  }
-  if (dailyRes) {
-    document.getElementById('risk-tmr-mult').textContent = '×' + (dailyRes.tomorrow?.multiplier ?? 1).toFixed(2);
-  }
+    if (posRes) {
+      document.getElementById('kpi-open').textContent = posRes.count ?? 0;
+      const bal = posRes.balance || ${ACCOUNT_BALANCE};
+      document.getElementById('kpi-balance').textContent = bal.toFixed(0);
+    }
+    if (ghostRes) {
+      document.getElementById('kpi-ghosts').textContent = ghostRes.count ?? 0;
+    }
+    if (dailyRes) {
+      document.getElementById('risk-tmr-mult').textContent = '×' + (dailyRes.tomorrow?.multiplier ?? 1).toFixed(2);
+    }
+  } catch(e) { console.warn('loadAll KPI fout:', e.message); }
 
-  await buildMatrix();
+  try {
+    await buildMatrix();
+  } catch(e) {
+    console.warn('buildMatrix fout:', e.message);
+    const tbody = document.getElementById('matrix-body');
+    if (tbody) tbody.innerHTML = '<tr><td colspan="12" class="no-data">⚠️ Matrix laad fout — refresh om opnieuw te proberen</td></tr>';
+  }
 }
 
 loadAll();
