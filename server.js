@@ -1437,12 +1437,12 @@ app.get("/api/matrix", (req, res) => {
       // Trades per sessie
       const tradesBySess = {};
       for (const sess of SESSIONS) {
-        const t = closedTrades.filter(t =>
-          normalizeSymbol(t.symbol) === sym && t.session === sess && t.entry && t.sl
+        const trades = closedTrades.filter(tr =>
+          normalizeSymbol(tr.symbol) === sym && tr.session === sess && tr.entry && tr.sl
         );
-        const n = t.length;
-        const rrs = t.map(x => getBestRR(x));
-        const wins = rrs.filter(r => r >= (tpLocks[`${sym}__${sess}`]?.lockedRR ?? 1)).length;
+        const n = trades.length;
+        const rrs = trades.map(x => getBestRR(x));
+        const wins = rrs.filter(r => r >= (tpLocks[sym + '__' + sess] ? tpLocks[sym + '__' + sess].lockedRR : 1)).length;
         const wr   = n ? wins / n : null;
 
         // Beste EV uit RR tabel
@@ -1456,7 +1456,7 @@ app.get("/api/matrix", (req, res) => {
           bestRR = ev.rr;
         }
 
-        const lock = tpLocks[`${sym}__${sess}`] ?? null;
+        const lock = tpLocks[sym + '__' + sess] || null;
         tradesBySess[sess] = {
           count: n,
           lockedRR:   lock?.lockedRR   ?? null,
@@ -2688,9 +2688,16 @@ async function sf(url, timeoutMs = 8000) {
     const t = setTimeout(() => ctrl.abort(), timeoutMs);
     const r = await fetch(url, { signal: ctrl.signal });
     clearTimeout(t);
-    if (!r.ok) throw new Error(r.status);
+    if (!r.ok) {
+      const txt = await r.text().catch(() => '');
+      console.warn('sf HTTP ' + r.status + ':', url, txt.slice(0, 200));
+      return { _error: 'HTTP ' + r.status, _detail: txt.slice(0, 200) };
+    }
     return r.json();
-  } catch(e) { console.warn('sf failed:', url, e.message); return null; }
+  } catch(e) {
+    console.warn('sf failed:', url, e.message);
+    return { _error: e.message };
+  }
 }
 
 // -- MATRIX BUILDER -- uses /api/matrix (server-side pre-computed)
@@ -2700,7 +2707,15 @@ async function buildMatrix() {
 
   var data = await sf('/api/matrix', 10000);
 
-  if (!data || !data.rows || !data.rows.length) {
+  if (!data) {
+    tbody.innerHTML = '<tr><td colspan="12" class="no-data" style="color:var(--red)">Matrix fetch mislukt - zie browser console voor details</td></tr>';
+    return;
+  }
+  if (data._error) {
+    tbody.innerHTML = '<tr><td colspan="12" class="no-data" style="color:var(--red)">Server fout: ' + data._error + (data._detail ? ' - ' + data._detail.slice(0,150) : '') + '</td></tr>';
+    return;
+  }
+  if (!data.rows || !data.rows.length) {
     tbody.innerHTML = '<tr><td colspan="12" class="no-data">Nog geen trades beschikbaar - matrix verschijnt na eerste gesloten positie</td></tr>';
     return;
   }
