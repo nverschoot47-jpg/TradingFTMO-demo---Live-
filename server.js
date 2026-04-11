@@ -1,5 +1,5 @@
 // ===============================================================
-// TradingView -> MetaApi REST -> MT5  |  FTMO Webhook Server v7.6
+// TradingView -> MetaApi REST -> MT5  |  FTMO Webhook Server v7.7
 // Account : Nick Verschoot  -  FTMO Demo
 // MetaApi : 7cb566c1-be02-415b-ab95-495368f3885c
 // ---------------------------------------------------------------
@@ -310,7 +310,7 @@ async function fetchCurrentPrice(mt5Symbol) {
     if (bid !== null && ask !== null) return { mid: (bid+ask)/2, spread: ask-bid, bid, ask };
     const mid = bid ?? ask ?? null;
     return mid !== null ? { mid, spread:0, bid:mid, ask:mid } : null;
-  } catch(e) { console.warn(`[!]️ fetchCurrentPrice(${mt5Symbol}):`, e.message); return null; }
+  } catch(e) { console.warn(`[!] fetchCurrentPrice(${mt5Symbol}):`, e.message); return null; }
 }
 
 // ==============================================================
@@ -409,7 +409,7 @@ async function evaluateDailyRisk() {
       ? parseFloat((dailyRiskMultiplier * 1.2).toFixed(4))
       : 1.0;
     await saveDailyRisk(todayStr, totalPnl, todayTrades.length, dailyRiskMultiplier, dailyRiskMultiplierNext);
-  } catch(e) { console.warn("[!]️ evaluateDailyRisk:", e.message); }
+  } catch(e) { console.warn("[!] evaluateDailyRisk:", e.message); }
 }
 
 async function updateConsecutivePositiveDays() {
@@ -519,7 +519,7 @@ async function restoreOpenPositionsFromMT5() {
       restored++;
     }
     console.log(`[OK] [Restart Recovery] ${restored} positie(s) hersteld`);
-  } catch(e) { console.warn("[!]️ [Restart Recovery]:", e.message); }
+  } catch(e) { console.warn("[!] [Restart Recovery]:", e.message); }
 }
 
 async function repairOrphanedGhosts() {
@@ -743,7 +743,7 @@ function startGhostTracker(closedTrade, isManual = false) {
       const interval = elapsed < GHOST_OLD_THRESHOLD_MS ? GHOST_INTERVAL_RECENT_MS : GHOST_INTERVAL_OLD_MS;
       currentTimer = setTimeout(tick, interval);
       if (ghostTrackers[ghostId]) ghostTrackers[ghostId].timer = currentTimer;
-    } catch(e) { console.warn(`[!]️ Ghost ${ghostId}:`, e.message); }
+    } catch(e) { console.warn(`[!] Ghost ${ghostId}:`, e.message); }
   }
 
   currentTimer = setTimeout(tick, GHOST_INTERVAL_RECENT_MS);
@@ -1083,9 +1083,9 @@ async function syncPositions() {
         accountSnapshots.push(snap);
         if (accountSnapshots.length > MAX_SNAPSHOTS) accountSnapshots.shift();
         saveSnapshot(snap).catch(() => {});
-      } catch(e) { console.warn("[!]️ Snapshot mislukt:", e.message); }
+      } catch(e) { console.warn("[!] Snapshot mislukt:", e.message); }
     }
-  } catch(e) { console.warn("[!]️ syncPositions:", e.message); }
+  } catch(e) { console.warn("[!] syncPositions:", e.message); }
 }
 setInterval(syncPositions, 30 * 1000);
 
@@ -1268,7 +1268,7 @@ app.post("/webhook", async (req, res) => {
       slAutoApplied: slMult !== 1.0, dailyRiskMult: dailyRiskMultiplier,
     });
     res.json({
-      status:"OK", versie:"v7.6",
+      status:"OK", versie:"v7.7",
       direction, tvSymbol:symbol, mt5Symbol, symType, session:curSession,
       entry:entryNum, sl:slPrice, slOriginal:slNum, slMultiplier:slMult, slLockInfo,
       tp: tpPrice, tpRR, lots, risicoEUR:risk.toFixed(2),
@@ -1302,7 +1302,7 @@ app.post("/close", async (req, res) => {
 // ==============================================================
 app.get("/", (req, res) => {
   res.json({
-    status:"online", versie:"ftmo-v7.6",
+    status:"online", versie:"ftmo-v7.7",
     time: getBrusselsDateStr(),
     tracking: {
       openPositions: Object.keys(openPositions).length,
@@ -2547,7 +2547,7 @@ ${slTimeRows.length === 0 ? `
 </div>
 
 <!-- PAIRS x SESSIE MATRIX -->
-<div class="sec-hd"><span>Pair x Sessie Matrix</span><small>TP lock RR · EV · trades  -  alle combinaties</small></div>
+<div class="sec-hd"><span>Pair x Sessie Matrix</span><small>TP lock RR - EV - trades  -  alle combinaties</small></div>
 <div id="matrix-section">
   <div class="tbl-wrap pair-sess-wrap fade-in" id="matrix-tbl">
     <table>
@@ -2814,12 +2814,11 @@ async function loadAll() {
   } catch(e) {
     console.warn('buildMatrix fout:', e.message);
     const tbody = document.getElementById('matrix-body');
-    if (tbody) tbody.innerHTML = '<tr><td colspan="12" class="no-data">[!]️ Matrix laad fout  -  refresh om opnieuw te proberen</td></tr>';
+    if (tbody) tbody.innerHTML = '<tr><td colspan="12" class="no-data">[!] Matrix laad fout  -  refresh om opnieuw te proberen</td></tr>';
   }
 }
 
-loadAll();
-setInterval(loadAll, 30000);
+document.addEventListener("DOMContentLoaded", function() { loadAll(); setInterval(loadAll, 30000); });
 </script>
 </body>
 </html>`);
@@ -2844,7 +2843,7 @@ async function start() {
       process.exit(1);
     }
 
-    console.log("🚀 FTMO Webhook Server v7.6  -  opstarten...");
+    console.log("🚀 FTMO Webhook Server v7.7  -  opstarten...");
     await initDB();
 
     const dbTrades = await loadAllTrades();
@@ -2902,7 +2901,7 @@ async function start() {
     }
 
     app.listen(PORT, () => {
-      console.log(`[OK] Server v7.6 luistert op port ${PORT}`);
+      console.log(`[OK] Server v7.7 luistert op port ${PORT}`);
       console.log(`   🔹 Dashboard: /dashboard`);
       console.log(`   🔹 Nieuwe endpoints: /analysis/rr, /analysis/sessions`);
       console.log(`   🔹 Nieuwe endpoints: /research/tp-optimizer, /research/tp-optimizer/sessie`);
