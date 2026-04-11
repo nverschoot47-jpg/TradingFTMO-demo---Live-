@@ -272,7 +272,7 @@ async function initDB() {
   await client.query(`
     CREATE TABLE IF NOT EXISTS shadow_sl_analysis (
       id              SERIAL PRIMARY KEY,
-      symbol          TEXT        NOT NULL UNIQUE,
+      symbol          TEXT        NOT NULL,
       best_multiplier NUMERIC,
       best_ev         NUMERIC,
       best_rr         NUMERIC,
@@ -281,10 +281,6 @@ async function initDB() {
       trades_used     INTEGER,
       computed_at     TIMESTAMPTZ DEFAULT NOW()
     );
-
-    -- [v7.4] Voeg UNIQUE constraint toe op bestaande installaties (idempotent)
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_shadow_sl_symbol_unique
-      ON shadow_sl_analysis(symbol);
 
     CREATE TABLE IF NOT EXISTS shadow_sl_log (
       id              SERIAL PRIMARY KEY,
@@ -300,6 +296,24 @@ async function initDB() {
 
     CREATE INDEX IF NOT EXISTS idx_shadow_sl_symbol ON shadow_sl_analysis(symbol);
     CREATE INDEX IF NOT EXISTS idx_shadow_sl_log_sym ON shadow_sl_log(symbol);
+  `);
+
+  // [v7.4] Dedupliceer shadow_sl_analysis vóór unieke index aanmaken.
+  // Bestaande installaties kunnen duplicate symbol-rijen hebben (elke run voegde een nieuwe toe).
+  // Bewaar alleen de meest recente rij per symbol.
+  await client.query(`
+    DELETE FROM shadow_sl_analysis
+    WHERE id NOT IN (
+      SELECT DISTINCT ON (symbol) id
+      FROM shadow_sl_analysis
+      ORDER BY symbol, computed_at DESC
+    )
+  `);
+
+  // Nu pas de unieke index aanmaken — werkt gegarandeerd na deduplicatie
+  await client.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_shadow_sl_symbol_unique
+      ON shadow_sl_analysis(symbol)
   `);
 
   // ── Indices ────────────────────────────────────────────────
