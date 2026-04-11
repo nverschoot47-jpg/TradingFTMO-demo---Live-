@@ -1,8 +1,16 @@
 // ═══════════════════════════════════════════════════════════════
-// TradingView → MetaApi REST → MT5  |  FTMO Webhook Server v7.4
+// TradingView → MetaApi REST → MT5  |  FTMO Webhook Server v7.5
 // Account : Nick Verschoot — FTMO Demo
 // MetaApi : 7cb566c1-be02-415b-ab95-495368f3885c
 // ───────────────────────────────────────────────────────────────
+// WIJZIGINGEN v7.5 (t.o.v. v7.4):
+//  ✅ CRASHFIX: SyntaxError op Railway opgelost
+//     Oorzaak: ${ACCOUNT_BALANCE} in client-side <script> binnenin
+//     server-side template literal → Node.js v18 op Railway crashte
+//     op lijn 62:5 (eerste } na de template literal opening)
+//     Fix: config injection via window.__CONFIG__ = ${JSON.stringify(...)}
+//     in aparte <script> tag vóór de client-side code
+//
 // WIJZIGINGEN v7.4 (t.o.v. v7.3):
 //  ✅ closePosition: AbortController timeout 8s (was: geen timeout)
 //  ✅ fetchAccountInfo: AbortController timeout 8s + try/catch (was: unhandled rejection)
@@ -1260,7 +1268,7 @@ app.post("/webhook", async (req, res) => {
       slAutoApplied: slMult !== 1.0, dailyRiskMult: dailyRiskMultiplier,
     });
     res.json({
-      status:"OK", versie:"v7.4",
+      status:"OK", versie:"v7.5",
       direction, tvSymbol:symbol, mt5Symbol, symType, session:curSession,
       entry:entryNum, sl:slPrice, slOriginal:slNum, slMultiplier:slMult, slLockInfo,
       tp: tpPrice, tpRR, lots, risicoEUR:risk.toFixed(2),
@@ -1294,7 +1302,7 @@ app.post("/close", async (req, res) => {
 // ══════════════════════════════════════════════════════════════
 app.get("/", (req, res) => {
   res.json({
-    status:"online", versie:"ftmo-v7.4",
+    status:"online", versie:"ftmo-v7.5",
     time: getBrusselsDateStr(),
     tracking: {
       openPositions: Object.keys(openPositions).length,
@@ -1718,7 +1726,7 @@ app.delete("/sl-locks/:symbol", (req,res) => {
 });
 
 // ══════════════════════════════════════════════════════════════
-// DASHBOARD v7.4 — Professioneel dark terminal UI
+// DASHBOARD v7.5 — Professioneel dark terminal UI
 // ══════════════════════════════════════════════════════════════
 app.get("/dashboard", async (req, res) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
@@ -1828,7 +1836,7 @@ app.get("/dashboard", async (req, res) => {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>FTMO v7.4 — Nick Verschoot</title>
+<title>FTMO v7.5 — Nick Verschoot</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Barlow+Condensed:wght@400;600;700;900&display=swap" rel="stylesheet">
 <style>
@@ -2209,7 +2217,7 @@ th.sort-desc::after { content: " ▼"; color: var(--c); font-size: 9px; }
 <div id="refresh-flash"></div>
 
 <header>
-  <div class="logo">FTMO <em>v7.4 — Nick Verschoot</em></div>
+  <div class="logo">FTMO <em>v7.5 — Nick Verschoot</em></div>
   <div class="header-mid">
     <div class="htag live">Live</div>
     <div class="htag">Demo Account</div>
@@ -2545,6 +2553,11 @@ ${slTimeRows.length === 0 ? `
 </main>
 
 <script>
+// ── SERVER CONFIG (server-side injected, safe) ──
+window.__CONFIG__ = ${JSON.stringify({ accountBalance: ACCOUNT_BALANCE })};
+</script>
+
+<script>
 // ── SESSION TABLE SORT ──
 let sessSort = { key: 'sess', dir: 1 };
 function sortSess(key) {
@@ -2691,7 +2704,7 @@ async function loadAll() {
 
     if (posRes) {
       document.getElementById('kpi-open').textContent = posRes.count ?? 0;
-      const bal = posRes.balance || ${ACCOUNT_BALANCE};
+      const bal = posRes.balance || window.__CONFIG__.accountBalance;
       document.getElementById('kpi-balance').textContent = bal.toFixed(0);
     }
     if (ghostRes) {
@@ -2737,7 +2750,7 @@ async function start() {
       process.exit(1);
     }
 
-    console.log("🚀 FTMO Webhook Server v7.4 — opstarten...");
+    console.log("🚀 FTMO Webhook Server v7.5 — opstarten...");
     await initDB();
 
     const dbTrades = await loadAllTrades();
@@ -2795,7 +2808,7 @@ async function start() {
     }
 
     app.listen(PORT, () => {
-      console.log(`✅ Server v7.4 luistert op port ${PORT}`);
+      console.log(`✅ Server v7.5 luistert op port ${PORT}`);
       console.log(`   🔹 Dashboard: /dashboard`);
       console.log(`   🔹 Nieuwe endpoints: /analysis/rr, /analysis/sessions`);
       console.log(`   🔹 Nieuwe endpoints: /research/tp-optimizer, /research/tp-optimizer/sessie`);
