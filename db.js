@@ -1,5 +1,12 @@
 // ===============================================================
-// db.js  -  PostgreSQL persistence layer  |  v7.7
+// db.js  -  PostgreSQL persistence layer  |  v7.8
+// Wijzigingen v7.8:
+//  [OK] fix2: kelly_fraction kolom toegevoegd aan shadow_sl_analysis
+//     saveShadowSLAnalysis accepteert nu kellyFraction parameter
+//  [OK] fix4: insta_sl_log tabel aangemaakt
+//     saveInstaSL() + loadInstaSLStats() functies toegevoegd
+//     Logt spread-killed trades met uur, sessie, spread voor patroonanalyse
+//
 // Wijzigingen v7.7 (fixes):
 //  [OK] saveTrade: slMultiplierApplied ?? slMultiplier ?? 1.0
 //     Veld in openPositions was slMultiplierApplied, saveTrade las slMultiplier
@@ -339,7 +346,30 @@ async function initDB() {
       ON shadow_sl_analysis(symbol)
   `);
 
-  // -- Indices ------------------------------------------------
+  // -- [v7.8 fix4] Insta-SL spread-killed log ------------------
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS insta_sl_log (
+      id              SERIAL PRIMARY KEY,
+      symbol          TEXT        NOT NULL,
+      mt5_symbol      TEXT,
+      session         TEXT,
+      direction       TEXT,
+      entry           NUMERIC,
+      sl              NUMERIC,
+      spread          NUMERIC,
+      hour_brussels   INTEGER,
+      closed_at       TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_insta_sl_symbol  ON insta_sl_log(symbol);
+    CREATE INDEX IF NOT EXISTS idx_insta_sl_session ON insta_sl_log(session);
+    CREATE INDEX IF NOT EXISTS idx_insta_sl_hour    ON insta_sl_log(hour_brussels);
+  `);
+
+  // -- [v7.8 fix2] Kelly fraction kolom toevoegen aan shadow_sl_analysis --
+  await client.query(`
+    ALTER TABLE shadow_sl_analysis ADD COLUMN IF NOT EXISTS kelly_fraction NUMERIC;
+  `);
   await client.query(`
     CREATE INDEX IF NOT EXISTS idx_trades_symbol      ON closed_trades(symbol);
     CREATE INDEX IF NOT EXISTS idx_trades_closed      ON closed_trades(closed_at);
@@ -830,15 +860,13 @@ async function logDuplicateEntry(symbol, direction, reason) {
 }
 
 // -- [v7.0] SL Shadow Optimizer persistence -------------------
-async function saveShadowSLAnalysis(symbol, bestMultiplier, bestEV, bestRR, bestWinrate, slHitRate, tradesUsed) {
+async function saveShadowSLAnalysis(symbol, bestMultiplier, bestEV, bestRR, bestWinrate, slHitRate, tradesUsed, kellyFraction = null) {
   try {
-    // [v7.4] UPSERT op symbol  -  voorheen werd elke run een nieuwe rij toegevoegd.
-    // De tabel groeide onbeperkt; DISTINCT ON in loadShadowSLAnalysis was workaround.
-    // Nu: een rij per symbol, altijd up-to-date.
+    // [v7.4] UPSERT op symbol — [v7.8 fix2] kelly_fraction toegevoegd
     await pool.query(`
       INSERT INTO shadow_sl_analysis
-        (symbol, best_multiplier, best_ev, best_rr, best_winrate, sl_hit_rate, trades_used, computed_at)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+        (symbol, best_multiplier, best_ev, best_rr, best_winrate, sl_hit_rate, trades_used, kelly_fraction, computed_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
       ON CONFLICT (symbol) DO UPDATE SET
         best_multiplier = EXCLUDED.best_multiplier,
         best_ev         = EXCLUDED.best_ev,
@@ -846,9 +874,10 @@ async function saveShadowSLAnalysis(symbol, bestMultiplier, bestEV, bestRR, best
         best_winrate    = EXCLUDED.best_winrate,
         sl_hit_rate     = EXCLUDED.sl_hit_rate,
         trades_used     = EXCLUDED.trades_used,
+        kelly_fraction  = EXCLUDED.kelly_fraction,
         computed_at     = NOW()
     `, [symbol, bestMultiplier ?? null, bestEV ?? null, bestRR ?? null,
-        bestWinrate ?? null, slHitRate ?? null, tradesUsed ?? null]);
+        bestWinrate ?? null, slHitRate ?? null, tradesUsed ?? null, kellyFraction ?? null]);
   } catch (e) { console.warn("[!]️ saveShadowSLAnalysis:", e.message); }
 }
 
@@ -867,6 +896,7 @@ async function loadShadowSLAnalysis(symbol = null) {
         CAST(best_winrate    AS FLOAT) AS "bestWinrate",
         CAST(sl_hit_rate     AS FLOAT) AS "slHitRate",
         trades_used                    AS "tradesUsed",
+      CAST(kelly_fraction  AS FLOAT) AS "kellyFraction",
         computed_at                    AS "computedAt"
       FROM shadow_sl_analysis
       ${where}
@@ -895,6 +925,42 @@ async function logForexConsolidation(symbol, direction, count, reason) {
   } catch (e) { console.warn("[!]️ logForexConsolidation:", e.message); }
 }
 
+// -- [v7.8 fix4] Insta-SL spread-killed log -------------------
+async function saveInstaSL({ symbol, mt5Symbol, session, direction, entry, sl, spread, hourBrussels, closedAt }) {
+  try {
+    await pool.query(`
+      INSERT INTO insta_sl_log
+        (symbol, mt5_symbol, session, direction, entry, sl, spread, hour_brussels, closed_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+    `, [symbol, mt5Symbol ?? null, session ?? null, direction ?? null,
+        entry ?? null, sl ?? null, spread ?? null, hourBrussels ?? null,
+        closedAt ?? null]);
+  } catch (e) { console.warn("[!]️ saveInstaSL:", e.message); }
+}
+
+async function loadInstaSLStats(symbol = null, session = null) {
+  try {
+    let where = "WHERE 1=1";
+    const vals = [];
+    if (symbol)  { vals.push(symbol);  where += ` AND symbol = $${vals.length}`; }
+    if (session) { vals.push(session); where += ` AND session = $${vals.length}`; }
+    const res = await pool.query(`
+      SELECT
+        symbol, session, direction,
+        CAST(entry         AS FLOAT) AS entry,
+        CAST(sl            AS FLOAT) AS sl,
+        CAST(spread        AS FLOAT) AS spread,
+        hour_brussels                AS "hourBrussels",
+        closed_at                    AS "closedAt"
+      FROM insta_sl_log
+      ${where}
+      ORDER BY closed_at DESC
+      LIMIT 500
+    `, vals);
+    return res.rows;
+  } catch (e) { console.warn("[!]️ loadInstaSLStats:", e.message); return []; }
+}
+
 module.exports = {
   initDB,
   saveTrade, loadAllTrades,
@@ -909,4 +975,6 @@ module.exports = {
   logDuplicateEntry,
   // v7.0
   saveShadowSLAnalysis, loadShadowSLAnalysis, logShadowSLChange,
+  // v7.8
+  saveInstaSL, loadInstaSLStats,
 };
