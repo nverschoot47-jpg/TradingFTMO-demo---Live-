@@ -1,8 +1,25 @@
 // ===============================================================
-// TradingView -> MetaApi REST -> MT5  |  FTMO Webhook Server v7.7
+// TradingView -> MetaApi REST -> MT5  |  FTMO Webhook Server v7.8
 // Account : Nick Verschoot  -  FTMO Demo
 // MetaApi : 7cb566c1-be02-415b-ab95-495368f3885c
 // ---------------------------------------------------------------
+// WIJZIGINGEN v7.8:
+//  [OK] fix1: EOD Ghost Check cron (21:00) verwijderd — geïntegreerd in syncPositions()
+//     Reden: cron draaide vóór auto-close (21:50) dus vond nooit trades zonder trueMaxRR.
+//     Nu: elke sync-cyclus automatisch orphan ghosts detecteren en starten.
+//  [OK] fix2: Kelly Criterion toegevoegd aan Shadow SL Optimizer
+//     Shadow koos voorheen enkel op hoogste EV. Kelly weegt EV/RR × (1 - slHitRate):
+//     penaliseert hoge variance (hoge slHitRate) → stabielere multiplier-keuze.
+//  [OK] fix3: RR_LEVELS verfijnd — 19 → 29 niveaus, fijnere stappen onder 3R
+//     Tussenwaarden 0.3, 0.5, 0.7, 0.9, 1.1, 1.2, 1.3, 1.4, 1.75 toegevoegd.
+//     Nauwkeuriger EV-maximum per sessie, minder kans op gemist optimum.
+//  [OK] fix4: Insta-SL "spread-killed" logging (saveInstaSL / loadInstaSLStats)
+//     Trades met maxRR ≤ 0.05 + closeReason=sl krijgen geen ghost maar worden
+//     gelogd met uur, sessie, spread → patroonanalyse via GET /analysis/insta-sl.
+//  [OK] fix5: Compound boost (4×) geldt voor ALLE trades met positieve EV lock
+//     Niet meer enkel count===0. Bij positieve EV lock = altijd 4× base (+ compound)
+//     voor elke trade in die pair/sessie — pyramiding-halvering vervalt dan.
+//
 // WIJZIGINGEN v7.7 (bugfixes):
 //  [OK] placeOrder: AbortController + signal op /trade POST fetch
 //     Voorheen: fetch had geen signal -> hing door na Promise.race timeout
@@ -80,6 +97,7 @@ const {
   saveDailyRisk, loadLatestDailyRisk,
   logDuplicateEntry,
   saveShadowSLAnalysis, loadShadowSLAnalysis, logShadowSLChange,
+  saveInstaSL, loadInstaSLStats,
 } = require("./db");
 
 const {
@@ -105,7 +123,13 @@ const GHOST_INTERVAL_OLD_MS    = 5 * 60 * 1000;
 const GHOST_OLD_THRESHOLD_MS   = 6 * 3600 * 1000;
 
 // -- RR / SL LEVELS --------------------------------------------
-const RR_LEVELS    = [0.2, 0.4, 0.6, 0.8, 1, 1.5, 2, 2.5, 3, 4, 5, 6, 7, 8, 10, 12, 15, 20, 25];
+// [v7.8 fix3] Fijnere RR stappen onder 3R — tussenwaarden 1.1/1.2/1.3/1.4/1.75 geven
+// nauwkeuriger EV-maximum per sessie ipv sprongen van 0.5R die optimum kunnen missen
+const RR_LEVELS    = [
+  0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9,
+  1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.75,
+  2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.0, 12.0, 15.0, 20.0, 25.0,
+];
 const SL_MULTIPLES = [0.5, 0.6, 0.75, 0.85, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0];
 
 const SL_AUTO_APPLY_THRESHOLD = 30;
@@ -155,7 +179,7 @@ const cronLastRun = {
   "DAY_END_22:00":     null,
   "RECONNECT_02:00":   null,
   "NIGHTLY_OPTIMIZER": null,
-  "EOD_GHOST_21:00":   null,
+  // [v7.8 fix1] EOD_GHOST_21:00 verwijderd — ghost check geïntegreerd in syncPositions()
 };
 const MAX_SNAPSHOTS = 86400;
 const MAX_HISTORY   = 200;
@@ -366,19 +390,10 @@ cron.schedule("50 21 * * 1-5", async () => {
   } catch(e) { console.error("[ERR] Auto-close fout:", e.message); }
 }, { timezone: "Europe/Brussels" });
 
-cron.schedule("0 21 * * 1-5", async () => {
-  console.log("[ghost] 21:00 Brussels  -  EOD ghost check...");
-  cronLastRun["EOD_GHOST_21:00"] = new Date().toISOString();
-  const cutoff = Date.now() - 20 * 60 * 1000;
-  const recent = closedTrades.filter(t =>
-    t.closedAt && new Date(t.closedAt).getTime() >= cutoff && t.trueMaxRR === null
-  );
-  for (const trade of recent) {
-    const alreadyRunning = Object.values(ghostTrackers).some(g => g.trade.id === trade.id);
-    if (!alreadyRunning) startGhostTracker(trade);
-  }
-  addWebhookHistory({ type:"EOD_GHOST_21:00", ghostsStarted: recent.length });
-}, { timezone: "Europe/Brussels" });
+// [v7.8 fix1] EOD Ghost Check cron (21:00) verwijderd.
+// Was: aparte cron die om 21:00 zocht naar trades zonder trueMaxRR om dan ghosts te starten.
+// Probleem: trades worden pas gesloten om 21:50 → de 21:00 cron vond nooit iets nuttigs.
+// Fix: ghostcheck is nu geïntegreerd in syncPositions() — zie aldaar.
 
 cron.schedule("0 22 * * 1-5", async () => {
   console.log("🌙 22:00 Brussels  -  ghost & shadow hard stop...");
@@ -608,15 +623,20 @@ function getEffectiveRisk(symbol, direction) {
   const type    = getSymbolType(symbol) || "stock";
   const base    = BASE_RISK[type] || 30;
   const baseWithMult = base * dailyRiskMultiplier;
-  let risk = Math.max(baseWithMult * 0.10, baseWithMult / Math.pow(2, count));
+  // [v7.8 fix5] Compound boost geldt voor ALLE trades als de lock positieve EV heeft —
+  // niet enkel de eerste (count===0). Rationale: als het systeem statistisch bewezen is
+  // voor dit pair/sessie, verdient elke trade de boosted risico-allocatie.
+  // De pyramiding-halvering wordt hier bewust uitgeschakeld — 4x is de vaste bodem.
   const curSess = getSessionGMT1();
   const lockKey = `${symbol}__${curSess}`;
   const lock    = tpLocks[lockKey];
-  if (lock && (lock.evAtLock ?? 0) > 0 && count === 0) {
+  if (lock && (lock.evAtLock ?? 0) > 0) {
     const positiveDays  = consecutivePositiveDays[lockKey] || 0;
     const compoundBoost = Math.pow(1.2, positiveDays);
-    risk = base * TP_LOCK_RISK_MULT * compoundBoost * dailyRiskMultiplier;
+    return base * TP_LOCK_RISK_MULT * compoundBoost * dailyRiskMultiplier;
   }
+  // Geen positieve lock → normale pyramiding-halvering
+  let risk = Math.max(baseWithMult * 0.10, baseWithMult / Math.pow(2, count));
   return risk;
 }
 
@@ -947,20 +967,50 @@ async function runShadowSLOptimizer(symbol) {
     });
     const best = evTable.reduce((a, b) => b.ev > a.ev ? b : a);
     const slHits = trades.filter(t => (t.ghostMAE ?? calcMAE(t, t.trueMaxPrice)) >= mult).length;
+    const slHitRate = slHits / trades.length;
+
+    // [v7.8 fix2] Kelly Criterion weighting
+    // Kelly fraction = EV / RR — straft hoge RR met lage winrate af.
+    // Een multiplier met EV=0.30 op 3R (Kelly=0.10) is minder stabiel dan
+    // EV=0.22 op 1.5R (Kelly=0.147) → Kelly kiest de stabielere optie.
+    // Penalty: hoge slHitRate = hoge variance = lagere Kelly score.
+    const kellyFraction = best.rr > 0
+      ? Math.max(0, best.ev / best.rr) * (1 - slHitRate)
+      : 0;
+
     return {
-      slMultiplier: mult, bestEV: best.ev, bestRR: best.rr, bestWinrate: best.winrate,
-      slHitRate: parseFloat(((slHits / trades.length) * 100).toFixed(1)), evTable,
+      slMultiplier: mult,
+      bestEV: best.ev,
+      bestRR: best.rr,
+      bestWinrate: best.winrate,
+      slHitRate: parseFloat((slHitRate * 100).toFixed(1)),
+      kellyFraction: parseFloat(kellyFraction.toFixed(4)),
+      evTable,
     };
   });
-  const bestResult = results.reduce((a, b) => b.bestEV > a.bestEV ? b : a);
-  const previous   = shadowSLResults[symbol];
+
+  // [v7.8 fix2] Selecteer op Kelly-gewogen score ipv enkel hoogste EV
+  // Alleen tussen multipliers met positieve EV — bij negatieve EV → hoogste EV wint nog steeds
+  const positiveEV = results.filter(r => r.bestEV > 0);
+  const bestResult = positiveEV.length > 0
+    ? positiveEV.reduce((a, b) => b.kellyFraction > a.kellyFraction ? b : a)
+    : results.reduce((a, b) => b.bestEV > a.bestEV ? b : a);
+
+  const previous = shadowSLResults[symbol];
   shadowSLResults[symbol] = {
     symbol, best: bestResult, allMultiples: results, tradesUsed: trades.length,
     computedAt: new Date().toISOString(),
   };
-  await saveShadowSLAnalysis(symbol, bestResult.slMultiplier, bestResult.bestEV, bestResult.bestRR, bestResult.bestWinrate, bestResult.slHitRate, trades.length).catch(() => {});
+  await saveShadowSLAnalysis(
+    symbol, bestResult.slMultiplier, bestResult.bestEV, bestResult.bestRR,
+    bestResult.bestWinrate, bestResult.slHitRate, trades.length,
+    bestResult.kellyFraction
+  ).catch(() => {});
   if (previous && previous.best.slMultiplier !== bestResult.slMultiplier) {
-    await logShadowSLChange(symbol, previous.best.slMultiplier, bestResult.slMultiplier, previous.best.bestEV, bestResult.bestEV, trades.length, `recompute`).catch(() => {});
+    await logShadowSLChange(
+      symbol, previous.best.slMultiplier, bestResult.slMultiplier,
+      previous.best.bestEV, bestResult.bestEV, trades.length, `recompute`
+    ).catch(() => {});
   }
 }
 
@@ -1045,7 +1095,31 @@ function getEffectiveSLMultiplier(symbol, session, entryNum, slNum, direction) {
   return { multiplier, slApplied: newSL, info, source };
 }
 
-// -- POSITION SYNC ---------------------------------------------
+// [v7.8 fix4] Insta-SL "spread-killed" logging
+// Trades die meteen SL raken (maxRR ≤ 0.05) krijgen geen ghost maar worden
+// wel gecategoriseerd zodat patronen zichtbaar worden:
+// welk uur, welke sessie, welk symbool gets systematisch spread-killed?
+async function logInstaSL(trade) {
+  try {
+    const { hour } = getBrusselsComponents();
+    const priceData = await fetchCurrentPrice(trade.mt5Symbol || trade.symbol).catch(() => null);
+    const spread = priceData?.spread ?? null;
+    await saveInstaSL({
+      symbol:    trade.symbol,
+      mt5Symbol: trade.mt5Symbol ?? null,
+      session:   trade.session   ?? getSessionGMT1(),
+      direction: trade.direction,
+      entry:     trade.entry,
+      sl:        trade.sl,
+      spread,
+      hourBrussels: hour,
+      closedAt:  trade.closedAt ?? new Date().toISOString(),
+    });
+    console.log(`[insta-sl] ${trade.symbol} spread-killed | spread=${spread} | uur=${hour}:00`);
+  } catch(e) { console.warn("[!] logInstaSL:", e.message); }
+}
+
+
 const ACCOUNT_SYNC_INTERVAL = 5 * 60 * 1000;
 let lastAccountSync = 0;
 
@@ -1089,10 +1163,14 @@ async function syncPositions() {
         if (trade.symbol && trade.direction) decrementTracker(trade.symbol, trade.direction);
         delete openPositions[id];
         console.log(`📦 ${trade.symbol} gesloten | MaxRR: ${maxRR}R | closeReason: ${closeReason}`);
-        // [v7.2] Geen ghost voor insta-SL (nooit bewogen, maxRR ~ 0)
+        // [v7.8 fix1] Ghost check geïntegreerd: na elke close direct controleren of
+        // ghost al loopt. Vervangt de aparte 21:00 cron die te vroeg draaide.
         const isInstaSL = closeReason === "sl" && maxRR <= 0.05;
         if (!isInstaSL) {
           startGhostTracker(closed, closeReason === "manual");
+        } else {
+          // [v7.8 fix4] Insta-SL: geen ghost maar wel spread-killed logging
+          logInstaSL(trade).catch(() => {});
         }
       }
     }
@@ -1109,6 +1187,21 @@ async function syncPositions() {
         if (accountSnapshots.length > MAX_SNAPSHOTS) accountSnapshots.shift();
         saveSnapshot(snap).catch(() => {});
       } catch(e) { console.warn("[!] Snapshot mislukt:", e.message); }
+    }
+    // [v7.8 fix1] Periodieke orphan ghost check — vervangt de 21:00 EOD cron.
+    // Elke sync-cyclus: controleer of er gesloten trades zijn zonder trueMaxRR
+    // die ook geen actieve ghost hebben. Als isGhostActive() → start alsnog.
+    if (isGhostActive()) {
+      for (const trade of closedTrades) {
+        if (trade.trueMaxRR !== null || (trade.maxRR ?? 0) <= 0.05) continue;
+        const alreadyRunning = Object.values(ghostTrackers).some(g => g.trade.id === trade.id);
+        if (alreadyRunning) continue;
+        const closedAt = trade.closedAt ? new Date(trade.closedAt).getTime() : 0;
+        const age = Date.now() - closedAt;
+        if (age < GHOST_DURATION_MS) {
+          startGhostTracker(trade, trade.closeReason === "manual");
+        }
+      }
     }
   } catch(e) { console.warn("[!] syncPositions:", e.message); }
 }
@@ -1589,6 +1682,31 @@ app.get("/analysis/ghost-deep", async (req, res) => {
   res.json({ generated:new Date().toISOString(), ghostFinished:finished.length, ghostPending:pending.length, bySymbolSession:results });
 });
 
+// [v7.8 fix4] Insta-SL spread-killed analyse
+// Toont patronen: welk uur/sessie/symbool wordt systematisch spread-killed?
+app.get("/analysis/insta-sl", async (req, res) => {
+  const { symbol, session } = req.query;
+  try {
+    const rows = await loadInstaSLStats(symbol || null, session || null);
+    // Groepeer per uur voor heatmap
+    const byHour = {};
+    for (const r of rows) {
+      const h = r.hourBrussels ?? "?";
+      if (!byHour[h]) byHour[h] = { hour: h, count: 0, symbols: {} };
+      byHour[h].count++;
+      byHour[h].symbols[r.symbol] = (byHour[h].symbols[r.symbol] || 0) + 1;
+    }
+    const hourHeatmap = Object.values(byHour).sort((a, b) => b.count - a.count);
+    res.json({
+      generated: new Date().toISOString(),
+      filters: { symbol: symbol || "alle", session: session || "alle" },
+      total: rows.length,
+      hourHeatmap,
+      rows,
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get("/analysis/pnl", async (req, res) => {
   const { symbol, session } = req.query;
   let stats = [];
@@ -1942,7 +2060,7 @@ app.get("/dashboard", async (req, res) => {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>FTMO v7.7  -  Nick Verschoot</title>
+<title>FTMO v7.8  -  Nick Verschoot</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Barlow+Condensed:wght@400;600;700;900&display=swap" rel="stylesheet">
 <style>
@@ -2323,7 +2441,7 @@ th.sort-desc::after { content: " ▼"; color: var(--c); font-size: 9px; }
 <div id="refresh-flash"></div>
 
 <header>
-  <div class="logo">FTMO <em>v7.7  -  Nick Verschoot</em></div>
+  <div class="logo">FTMO <em>v7.8  -  Nick Verschoot</em></div>
   <div class="header-mid">
     <div class="htag live">Live</div>
     <div class="htag">Demo Account</div>
@@ -2613,7 +2731,6 @@ ${slTimeRows.length === 0 ? `
 <div class="tbl-wrap" id="cron-section">
   ${[
     { key:'AUTOCLOSE_2150',    label:'21:50 Auto-close',       sched:'Ma-Vr 21:50' },
-    { key:'EOD_GHOST_21:00',  label:'21:00 EOD Ghost check',  sched:'Ma-Vr 21:00' },
     { key:'DAY_END_22:00',    label:'22:00 Ghost hard stop',  sched:'Ma-Vr 22:00' },
     { key:'RECONNECT_02:00',  label:'02:00 Reconnect',        sched:'Dagelijks' },
     { key:'NIGHTLY_OPTIMIZER',label:'03:00 Nightly Optimizer',sched:'Dagelijks' },
