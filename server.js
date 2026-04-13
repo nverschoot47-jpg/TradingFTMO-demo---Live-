@@ -22,6 +22,10 @@
 //     Nu: positieve EV lock -> lots * 4 * 1.2^streak (compound identiek aan andere types).
 //     Verhouding trade1/trade2 (0.25/0.12) blijft behouden.
 //     Zichtbaar in dashboard via forexLotBoost veld in webhook history.
+//  [OK] fix5: MT5 comment veld ingekort tot max 26 karakters
+//     Oud: "FTMO-NV-BUY-USDCAD-TP4R-london" = 31 chars -> HTTP 400 clientId/comment invalid
+//     Nieuw: "NV-B-USDCAD-4R-LON" = ~18-20 chars -> altijd binnen MT5 limiet.
+//     Dit was de oorzaak van alle TIMEOUT/ERROR entries in het dashboard.
 //
 // WIJZIGINGEN v7.8:
 //  [OK] fix1: EOD Ghost Check cron (21:00) verwijderd — geïntegreerd in syncPositions()
@@ -1262,7 +1266,9 @@ async function placeOrder(dir, symbol, entry, sl, lots, session) {
     symbol: mt5Symbol, volume: lots,
     actionType: dir==="buy" ? "ORDER_TYPE_BUY" : "ORDER_TYPE_SELL",
     stopLoss: slPrice, takeProfit: tpPrice,
-    comment: `FTMO-NV-${dir.toUpperCase()}-${symbol}-TP${tpRR}R-${session}`,
+    // [v7.9 fix5] MT5 comment limit ~26 chars. Oud: "FTMO-NV-BUY-USDCAD-TP4R-london" = 31 chars -> HTTP 400.
+    // Nieuw: "NV-B-USDCAD-4R-LON" = max 20 chars -> altijd binnen limiet.
+    comment: `NV-${dir[0].toUpperCase()}-${symbol.slice(0,6)}-${tpRR}R-${session.slice(0,3).toUpperCase()}`,
   };
   // [v7.7 fix] AbortController toegevoegd op de /trade POST
   // Voorheen: geen signal -> fetch kon hangen na Promise.race timeout in placeOrderWithTimeout
