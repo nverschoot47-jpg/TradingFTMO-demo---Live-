@@ -1,8 +1,28 @@
 // ===============================================================
-// TradingView -> MetaApi REST -> MT5  |  FTMO Webhook Server v7.8
+// TradingView -> MetaApi REST -> MT5  |  FTMO Webhook Server v7.9
 // Account : Nick Verschoot  -  FTMO Demo
 // MetaApi : 7cb566c1-be02-415b-ab95-495368f3885c
 // ---------------------------------------------------------------
+// WIJZIGINGEN v7.9:
+//  [OK] fix1: placeOrder: r.ok check toegevoegd op /trade POST fetch
+//     Voorheen: MetaApi 4xx/5xx werd stilzwijgend geparsed als geldig JSON
+//     -> isError triggerde NIET -> order leek te slagen maar positionId was leeg
+//     Nu: !r.ok gooit Error("MetaApi HTTP 4xx: <message>") -> placeOrderWithTimeout
+//     vangt dit correct op en de foutdetails verschijnen in het dashboard.
+//  [OK] fix2: extractMetaApiError() helper toegevoegd voor robuuste error-extractie
+//     Oud: result?.error?.code || result?.retcode  -> miste alle andere velden
+//     Nieuw: ondersteunt { error: { code/id/statusCode } }, { retcode },
+//     { error: "string" }, { message }, { description }, { statusCode }
+//     -> "retry: ?: geen detail" kan niet meer voorkomen in webhook history
+//  [OK] fix3: volledige MetaApi response gelogd bij fouten (eerste poging + retry)
+//     console.error met JSON.stringify(result) zodat exact zichtbaar is welke
+//     veldnamen MetaApi gebruikt -> eenmalig checken in Railway logs = definitieve fix
+//  [OK] fix4: Forex lot boost x4 bij positieve EV lock (lotsize, niet risicobedrag)
+//     Voorheen: forex altijd 0.25L (trade1) / 0.12L (trade2), ongeacht EV-status.
+//     Nu: positieve EV lock -> lots * 4 * 1.2^streak (compound identiek aan andere types).
+//     Verhouding trade1/trade2 (0.25/0.12) blijft behouden.
+//     Zichtbaar in dashboard via forexLotBoost veld in webhook history.
+//
 // WIJZIGINGEN v7.8:
 //  [OK] fix1: EOD Ghost Check cron (21:00) verwijderd — geïntegreerd in syncPositions()
 //     Reden: cron draaide vóór auto-close (21:50) dus vond nooit trades zonder trueMaxRR.
@@ -1257,7 +1277,18 @@ async function placeOrder(dir, symbol, entry, sl, lots, session) {
       signal: ctrl.signal,
     });
     clearTimeout(t);
-    return { result: await r.json(), mt5Symbol, slPrice, body, tpPrice, tpRR };
+    // [v7.9 fix] r.ok check toegevoegd: HTTP 4xx/5xx van MetaApi werden stilzwijgend
+    // als geldig JSON geparsed zonder dat de error herkend werd als fout.
+    // Nu wordt de HTTP status + body als Error gegooid zodat placeOrderWithTimeout
+    // hem correct afhandelt en de foutdetails in het dashboard verschijnen.
+    const data = await r.json();
+    if (!r.ok) {
+      const httpMsg = (typeof data?.message === "string" ? data.message : null)
+                   || (typeof data?.error   === "string" ? data.error   : null)
+                   || `HTTP ${r.status}`;
+      throw new Error(`MetaApi HTTP ${r.status}: ${httpMsg}`);
+    }
+    return { result: data, mt5Symbol, slPrice, body, tpPrice, tpRR };
   } catch(e) { clearTimeout(t); throw e; }
 }
 
@@ -1333,9 +1364,22 @@ app.post("/webhook", async (req, res) => {
 
     // [v7.3] Forex: altijd vaste lotgrootte  -  geen risico-berekening nodig
     // Trade 1 (geen open zelfde richting) = 0.25L, Trade 2 = 0.12L
+    // [v7.9 fix4] Bij positieve EV lock wordt de lotsize x4 verhoogd (niet de risicobedrag).
+    // Compound boost (1.2^streak) wordt bovenop de x4 toegepast, identiek aan andere types.
+    // forexTrade2 (pyramiding) krijgt ook de boost maar behoudt de halveringsverhouding (0.12/0.25).
     let lots;
     if (symType === "forex") {
-      lots = forexTrade2 ? 0.12 : 0.25;
+      const forexLockKey   = `${symbol}__${curSession}`;
+      const forexLock      = tpLocks[forexLockKey];
+      const forexEvPositive = forexLock && (forexLock.evAtLock ?? 0) > 0;
+      const forexStreak    = consecutivePositiveDays[forexLockKey] || 0;
+      const forexCompound  = forexEvPositive ? Math.pow(1.2, forexStreak) : 1.0;
+      const forexBoost     = forexEvPositive ? 4 * forexCompound : 1.0;
+      const baseLots       = forexTrade2 ? 0.12 : 0.25;
+      lots = parseFloat((baseLots * forexBoost).toFixed(2));
+      if (forexEvPositive) {
+        console.log(`[Forex EV boost] ${symbol} ${curSession}: ${baseLots}L x${forexBoost.toFixed(2)} (EV=${(forexLock.evAtLock ?? 0).toFixed(3)}, streak=${forexStreak}) = ${lots}L`);
+      }
     } else {
       lots = calcLots(symbol, entryNum, slApplied, risk);
       if (lots === null) {
@@ -1352,10 +1396,28 @@ app.post("/webhook", async (req, res) => {
       return res.status(200).json({ status:"TIMEOUT", reason: timeoutErr.message });
     }
     let { result, mt5Symbol, slPrice, tpPrice, tpRR } = orderResult;
-    const errCode = result?.error?.code || result?.retcode;
-    const errMsg  = result?.error?.message || result?.comment || "";
-    const isError = result?.error || (errCode && errCode!==10009 && errCode!=="TRADE_RETCODE_DONE");
+
+    // [v7.9 fix] Verbeterde error-extractie: MetaApi gebruikt inconsistente foutstructuren.
+    // Mogelijke formaten: { error: { code, message } }, { retcode, comment },
+    // { error: "string" }, { message, id }, { statusCode, message }, etc.
+    // extractMetaApiError() vangt alle bekende varianten op zodat errCode/errMsg
+    // nooit meer "?" of "geen detail" zijn in het dashboard.
+    function extractMetaApiError(r) {
+      const errObj = r?.error;
+      const code = (typeof errObj === "object" ? (errObj?.code || errObj?.id || errObj?.statusCode) : null)
+                || r?.retcode || r?.id || r?.statusCode;
+      const msg  = (typeof errObj === "string"  ? errObj : errObj?.message)
+                || r?.comment || r?.message || r?.description || "";
+      return { code: code ?? null, msg: String(msg) };
+    }
+
+    const { code: errCode, msg: errMsg } = extractMetaApiError(result);
+    const isError = result?.error != null
+      || (errCode !== null && errCode !== 10009 && errCode !== "TRADE_RETCODE_DONE");
+
     if (isError) {
+      // [v7.9 fix] Log volledige MetaApi response zodat foutstructuur traceerbaar is in Railway logs
+      console.error(`[ERR] MetaApi order mislukt ${symbol}:`, JSON.stringify(result));
       learnFromError(symbol, errCode, errMsg);
       // [v7.3] Forex heeft altijd vaste lots  -  calcLots niet gebruiken bij retry
       const rl = symType === "forex" ? lots : calcLots(symbol, entryNum, slApplied, risk);
@@ -1363,13 +1425,16 @@ app.post("/webhook", async (req, res) => {
         try {
           const retry = await placeOrderWithTimeout(direction, symbol, entryNum, slApplied, rl, curSession);
           result = retry.result; tpPrice = retry.tpPrice; tpRR = retry.tpRR;
-          const retryErr = retry.result?.error || (retry.result?.retcode && retry.result.retcode!==10009 && retry.result.retcode!=="TRADE_RETCODE_DONE");
+          const { code: retryCode, msg: retryMsg } = extractMetaApiError(retry.result);
+          const retryErr = retry.result?.error != null
+            || (retryCode !== null && retryCode !== 10009 && retryCode !== "TRADE_RETCODE_DONE");
           if (retryErr) {
-            const retryCode = retry.result?.error?.code || retry.result?.retcode;
-            const retryMsg  = retry.result?.error?.message || retry.result?.comment || "";
+            // [v7.9 fix] Log ook retry response volledig
+            console.error(`[ERR] MetaApi retry mislukt ${symbol}:`, JSON.stringify(retry.result));
             learnFromError(symbol, retryCode, retryMsg);
-            // [v7.3] Gebruik retry foutcode zodat detail zichtbaar is in dashboard
-            addWebhookHistory({ type:"ERROR", symbol, errCode: retryCode, errMsg: retryMsg, reason: `retry: ${retryCode ?? "?"}: ${retryMsg || errMsg || "geen detail"}` });
+            // [v7.9 fix] reason bevat nu altijd bruikbare details dankzij extractMetaApiError()
+            const detail = retryMsg || errMsg || JSON.stringify(retry.result ?? result ?? "geen response");
+            addWebhookHistory({ type:"ERROR", symbol, errCode: retryCode, errMsg: retryMsg, reason: `retry: ${retryCode ?? "?"}: ${detail}` });
             return res.status(200).json({ status:"ERROR_LEARNED", errCode: retryCode, errMsg: retryMsg });
           }
         } catch(retryTimeout) {
@@ -1393,9 +1458,10 @@ app.post("/webhook", async (req, res) => {
       session: curSession, riskEUR: risk.toFixed(2),
       slAanpassing: slLockInfo, tp: `${tpRR}R @ ${tpPrice}`,
       slAutoApplied: slMult !== 1.0, dailyRiskMult: dailyRiskMultiplier,
+      forexLotBoost: symType === "forex" && lots > (forexTrade2 ? 0.12 : 0.25) ? `x${(lots / (forexTrade2 ? 0.12 : 0.25)).toFixed(2)}` : null,
     });
     res.json({
-      status:"OK", versie:"v7.7",
+      status:"OK", versie:"v7.9",
       direction, tvSymbol:symbol, mt5Symbol, symType, session:curSession,
       entry:entryNum, sl:slPrice, slOriginal:slNum, slMultiplier:slMult, slLockInfo,
       tp: tpPrice, tpRR, lots, risicoEUR:risk.toFixed(2),
@@ -1429,7 +1495,7 @@ app.post("/close", async (req, res) => {
 // ==============================================================
 app.get("/", (req, res) => {
   res.json({
-    status:"online", versie:"ftmo-v7.7",
+    status:"online", versie:"ftmo-v7.9",
     time: getBrusselsDateStr(),
     tracking: {
       openPositions: Object.keys(openPositions).length,
@@ -2994,7 +3060,7 @@ async function start() {
       process.exit(1);
     }
 
-    console.log("🚀 FTMO Webhook Server v7.7  -  opstarten...");
+    console.log("🚀 FTMO Webhook Server v7.9  -  opstarten...");
     await initDB();
 
     const dbTrades = await loadAllTrades();
@@ -3052,7 +3118,7 @@ async function start() {
     }
 
     app.listen(PORT, () => {
-      console.log(`[OK] Server v7.7 luistert op port ${PORT}`);
+      console.log(`[OK] Server v7.9 luistert op port ${PORT}`);
       console.log(`   🔹 Dashboard: /dashboard`);
       console.log(`   🔹 Nieuwe endpoints: /analysis/rr, /analysis/sessions`);
       console.log(`   🔹 Nieuwe endpoints: /research/tp-optimizer, /research/tp-optimizer/sessie`);
