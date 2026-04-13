@@ -1,7 +1,7 @@
 {
   "name": "nv-tradingview-webhook",
-  "version": "7.8.0",
-  "description": "TradingView -> MetaApi REST -> FTMO MT5 | NV v7.8.0 - fixes: EOD ghost cron geïntegreerd in syncPositions, Kelly Criterion shadow optimizer, fijnere RR levels (29), insta-SL spread-killed logging, compound boost alle trades positieve EV lock",
+  "version": "7.9.0",
+  "description": "TradingView -> MetaApi REST -> FTMO MT5 | NV v7.9.0 - fixes: r.ok check op /trade POST, extractMetaApiError() voor robuuste foutextractie, raw MetaApi response logging, forex lot boost x4 bij positieve EV lock",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
