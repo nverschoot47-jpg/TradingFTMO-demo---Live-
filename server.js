@@ -1,9 +1,23 @@
 // ===============================================================
-// TradingView -> MetaApi REST -> MT5  |  FTMO Webhook Server v7.9
+// TradingView -> MetaApi REST -> MT5  |  FTMO Webhook Server v8.0
 // Account : Nick Verschoot  -  FTMO Demo
 // MetaApi : 7cb566c1-be02-415b-ab95-495368f3885c
 // ---------------------------------------------------------------
-// WIJZIGINGEN v7.9:
+// WIJZIGINGEN v8.0:
+//  [OK] fix1: Tijdsvenster blokkering toegevoegd aan webhook handler
+//     Alle orders geblokkeerd (ook buys): 06:55-07:55 (pre-London gap),
+//     11:55-12:55 (lunch volatiliteit), 13:55-15:55 (pre-NY gap)
+//     SELL orders extra geblokkeerd: 09:00-13:00 (ochtend bullish bias)
+//     → TIME_BLOCKED / SELL_BLOCKED_09_13 in webhook history
+//  [OK] fix2: Index SL minimum clamp vóór calcLots (geen spread guard voor indexes)
+//     Probleem: getEffectiveSLMultiplier 0.5x multiplier krimpt slApplied extreem krap.
+//     calcLots probeert dan >MAX_LOTS lots te alloceren → cost check (> effectiveCap*1.5)
+//     faalt → null → trade geblokkeerd. Fix: clamp slApplied naar min 5 punten voor indexes.
+//     Index spread guard bewust uitgeschakeld (indexes nooit spread guard).
+//  [OK] fix3: Stock spread guard verbeterd — reden nu uitgebreider gelogd
+//     spreadPct + maxAllowed zichtbaar in webhook history entry
+//     Reason string toont nu ook max toegestane % voor snellere diagnose.
+//
 //  [OK] fix1: placeOrder: r.ok check toegevoegd op /trade POST fetch
 //     Voorheen: MetaApi 4xx/5xx werd stilzwijgend geparsed als geldig JSON
 //     -> isError triggerde NIET -> order leek te slagen maar positionId was leeg
@@ -1339,6 +1353,23 @@ app.post("/webhook", async (req, res) => {
       addWebhookHistory({ type:"MARKET_CLOSED", symbol, symType });
       return res.status(200).json({ status:"SKIP", reason:`Markt gesloten voor ${symbol}` });
     }
+
+    // [v8.0] Tijdsvenster blokkering
+    // Alle orders geblokkeerd: 06:55-07:55 (pre-London), 11:55-12:55 (lunch), 13:55-15:55 (pre-NY)
+    // SELL orders geblokkeerd: 09:00-13:00 (ochtend bullish bias, buys wel toegestaan)
+    const { hhmm: curHhmm } = getBrusselsComponents();
+    const isTimeBlocked = (curHhmm >= 655  && curHhmm < 755)
+                       || (curHhmm >= 1155 && curHhmm < 1255)
+                       || (curHhmm >= 1355 && curHhmm < 1555);
+    if (isTimeBlocked) {
+      addWebhookHistory({ type:"TIME_BLOCKED", symbol, direction, hhmm: curHhmm });
+      return res.status(200).json({ status:"SKIP", reason:`Geblokkeerd tijdsvenster (${curHhmm})` });
+    }
+    if (direction === "sell" && curHhmm >= 900 && curHhmm < 1300) {
+      addWebhookHistory({ type:"SELL_BLOCKED_09_13", symbol, direction, hhmm: curHhmm });
+      return res.status(200).json({ status:"SKIP", reason:`SELL geblokkeerd 09:00-13:00 (${curHhmm})` });
+    }
+
     let forexHalfRisk = false, forexTrade2 = false;
     if (symType === "forex") {
       const consol = checkForexConsolidation(symbol, direction);
@@ -1349,15 +1380,36 @@ app.post("/webhook", async (req, res) => {
       }
       if (consol.halfRisk) { forexHalfRisk = true; forexTrade2 = true; }
     }
-    const { multiplier: slMult, slApplied, info: slLockInfo } =
+    let { multiplier: slMult, slApplied, info: slLockInfo } =
       getEffectiveSLMultiplier(symbol, curSession, entryNum, slNum, direction);
+
+    // [v8.0] Index SL minimum clamp — GEEN spread guard voor indexes.
+    // Probleem: getEffectiveSLMultiplier kan 0.5x toepassen waardoor slApplied
+    // extreem krap wordt. calcLots tracht dan heel veel lots te geven, hit MAX_LOTS,
+    // en de cost-check (minCost > effectiveCap * 1.5) faalt -> null -> BLOCKED.
+    // Fix: clamp slApplied voor indexes naar minimum 5 punten vóór calcLots.
+    if (symType === "index") {
+      const minStop = Math.max(getMinStop(mt5Sym, "index", entryNum), 5);
+      const slDist  = Math.abs(entryNum - slApplied);
+      if (slDist < minStop) {
+        const prevSL = slApplied;
+        slApplied = direction === "buy"
+          ? parseFloat((entryNum - minStop).toFixed(5))
+          : parseFloat((entryNum + minStop).toFixed(5));
+        console.log(`[Index SL clamp] ${symbol}: ${prevSL} -> ${slApplied} (min ${minStop}pts)`);
+      }
+    }
+
+    // [v8.0] Stock spread guard — blokkeer trades waarbij bid/ask spread > 33% van SL afstand.
+    // Doel: voorkom premature stop-outs door te grote spread t.o.v. de geplaatste SL.
+    // Indexes zijn bewust uitgesloten (geen spread guard voor indexes).
     if (symType === "stock") {
       const priceData = await fetchCurrentPrice(mt5Sym).catch(() => null);
       if (priceData?.spread > 0) {
         const sg = checkSpreadGuard(priceData.spread, entryNum, slApplied);
         if (!sg.ok) {
-          addWebhookHistory({ type:"SPREAD_GUARD_BLOCKED", symbol });
-          return res.status(200).json({ status:"SKIP", reason:`Spread te groot: ${sg.spreadPct}%` });
+          addWebhookHistory({ type:"SPREAD_GUARD_BLOCKED", symbol, spreadPct: sg.spreadPct, maxAllowed: sg.maxAllowed });
+          return res.status(200).json({ status:"SKIP", reason:`Spread te groot: ${sg.spreadPct}% (max ${STOCK_MAX_SPREAD_FRACTION*100}% van SL afstand)` });
         }
       }
     }
@@ -3066,7 +3118,7 @@ async function start() {
       process.exit(1);
     }
 
-    console.log("🚀 FTMO Webhook Server v7.9  -  opstarten...");
+    console.log("🚀 FTMO Webhook Server v8.0  -  opstarten...");
     await initDB();
 
     const dbTrades = await loadAllTrades();
@@ -3124,7 +3176,7 @@ async function start() {
     }
 
     app.listen(PORT, () => {
-      console.log(`[OK] Server v7.9 luistert op port ${PORT}`);
+      console.log(`[OK] Server v8.0 luistert op port ${PORT}`);
       console.log(`   🔹 Dashboard: /dashboard`);
       console.log(`   🔹 Nieuwe endpoints: /analysis/rr, /analysis/sessions`);
       console.log(`   🔹 Nieuwe endpoints: /research/tp-optimizer, /research/tp-optimizer/sessie`);
