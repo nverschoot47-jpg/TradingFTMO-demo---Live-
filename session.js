@@ -1,10 +1,12 @@
 // ===============================================================
-// session.js  v9.0  |  PRONTO-AI
+// session.js  v10.0  |  PRONTO-AI
 //
-// Changes v9.0:
-//  - SYMBOL_CATALOG: only approved symbols (stocks/forex/index/commodity/crypto)
+// Changes v10.0:
+//  - CRYPTO REMOVED entirely (BTCUSD gone)
+//  - Symbol catalog: stocks / forex / index / commodity only
+//  - DEFAULT_RISK_BY_TYPE: easy single place to configure risk %
 //  - Sessions: asia 02:00-08:00 | london 08:00-15:30 | ny 15:30-21:00
-//  - isMarketOpen(): all symbols tradeable 02:00-21:00 mon-fri, NO blocking
+//  - isMarketOpen(): all symbols 02:00-21:00 mon-fri
 //  - getVwapPosition(): above | below based on close vs vwap
 //  - normalizeSymbol() handles BRK.B → BRKB, GOOGL → GOOGL
 // ===============================================================
@@ -16,6 +18,19 @@ const TIMEZONE = "Europe/Brussels";
 const DAYS_MAP = {
   Sunday: 0, Monday: 1, Tuesday: 2, Wednesday: 3,
   Thursday: 4, Friday: 5, Saturday: 6,
+};
+
+// ================================================================
+// ── DEFAULT RISK % PER ASSET TYPE ────────────────────────────────
+// Change these values to adjust default risk for all symbols of
+// that type. Overrideable per-symbol via env RISK_<SYM>=0.002
+// or via the DB symbol_risk_config table.
+// ================================================================
+const DEFAULT_RISK_BY_TYPE = {
+  forex:     0.0015,   // 0.15% per trade
+  stock:     0.0015,   // 0.15% per trade
+  index:     0.0015,   // 0.15% per trade
+  commodity: 0.0015,   // 0.15% per trade
 };
 
 // ── Approved symbol catalog ─────────────────────────────────────
@@ -90,26 +105,23 @@ const SYMBOL_CATALOG = {
   US30USD:   { type: "index",     mt5: "US30.cash"    },
   // ── Commodities ───────────────────────────────────────────────
   XAUUSD:    { type: "commodity", mt5: "XAUUSD"    },
-  // ── Crypto ────────────────────────────────────────────────────
-  BTCUSD:    { type: "crypto",    mt5: "BTCUSD"    },
 };
 
 // ── Aliases for TV symbols that differ from catalog key ─────────
-// Maps incoming TV ticker → canonical catalog key
 const SYMBOL_ALIASES = {
-  "BRK.B": "BRKB",
-  "BRKB":  "BRKB",
-  "GER40":  "DE30EUR",
-  "GER40.cash": "DE30EUR",
-  "UK100":  "UK100GBP",
-  "UK100.cash": "UK100GBP",
-  "NAS100": "NAS100USD",
-  "US100":  "NAS100USD",
-  "US100.cash": "NAS100USD",
-  "US30":   "US30USD",
-  "US30.cash": "US30USD",
-  "GOLD":   "XAUUSD",
-  "GOOG":   "GOOGL",
+  "BRK.B":         "BRKB",
+  "BRKB":          "BRKB",
+  "GER40":         "DE30EUR",
+  "GER40.cash":    "DE30EUR",
+  "UK100":         "UK100GBP",
+  "UK100.cash":    "UK100GBP",
+  "NAS100":        "NAS100USD",
+  "US100":         "NAS100USD",
+  "US100.cash":    "NAS100USD",
+  "US30":          "US30USD",
+  "US30.cash":     "US30USD",
+  "GOLD":          "XAUUSD",
+  "GOOG":          "GOOGL",
 };
 
 // ── Brussels timezone helpers ────────────────────────────────────
@@ -150,9 +162,6 @@ function getBrusselsDateOnly(date) {
 }
 
 // ── Session detection ────────────────────────────────────────────
-// Asia:   02:00 – 08:00  Brussels
-// London: 08:00 – 15:30  Brussels
-// NY:     15:30 – 21:00  Brussels
 function getSession(date) {
   const { hhmm } = getBrusselsComponents(date);
   if (hhmm >= 200  && hhmm < 800)  return "asia";
@@ -162,13 +171,11 @@ function getSession(date) {
 }
 
 // ── Market open check ────────────────────────────────────────────
-// All symbols: 02:00–21:00 mon-fri. NO symbol/direction blocking.
-// Crypto follows same window (BTCUSD is in catalog).
 function isMarketOpen(date = null) {
   const { day, hhmm } = getBrusselsComponents(date);
-  if (day === 0 || day === 6) return false; // weekend
-  if (hhmm < 200)             return false; // before 02:00
-  if (hhmm >= 2100)           return false; // from 21:00
+  if (day === 0 || day === 6) return false;
+  if (hhmm < 200)             return false;
+  if (hhmm >= 2100)           return false;
   return true;
 }
 
@@ -184,18 +191,15 @@ function isGhostActive(date) {
 function isShadowActive(date) { return isGhostActive(date); }
 
 // ── Symbol normalization ─────────────────────────────────────────
-// Returns canonical catalog key (e.g. "BRKB") or null if not allowed.
 function normalizeSymbol(raw) {
   if (!raw) return null;
-  const upper = raw.toString().toUpperCase().trim();
-  // Check alias first
-  if (SYMBOL_ALIASES[upper]) return SYMBOL_ALIASES[upper];
-  // Strip non-alphanumeric for comparison (handles BRK.B → BRKB)
+  const upper    = raw.toString().toUpperCase().trim();
+  if (SYMBOL_ALIASES[upper])    return SYMBOL_ALIASES[upper];
   const stripped = upper.replace(/[^A-Z0-9]/g, "");
   if (SYMBOL_ALIASES[stripped]) return SYMBOL_ALIASES[stripped];
   if (SYMBOL_CATALOG[upper])    return upper;
   if (SYMBOL_CATALOG[stripped]) return stripped;
-  return null; // not in catalog
+  return null;
 }
 
 function getSymbolInfo(raw) {
@@ -205,16 +209,12 @@ function getSymbolInfo(raw) {
 }
 
 // ── VWAP position ────────────────────────────────────────────────
-// Determines if close is above or below VWAP mid line.
-// Uses vwap field from TradingView payload.
 function getVwapPosition(closePrice, vwapMid) {
   if (closePrice == null || vwapMid == null || vwapMid === 0) return "unknown";
   return closePrice >= vwapMid ? "above" : "below";
 }
 
 // ── Optimizer key ────────────────────────────────────────────────
-// Unique key for ghost/shadow/EV lookups.
-// Format: EURUSD_london_buy_above
 function buildOptimizerKey(symbol, session, direction, vwapPos) {
   return `${symbol}_${session}_${direction}_${vwapPos}`;
 }
@@ -229,6 +229,7 @@ const SESSION_LABELS = {
 module.exports = {
   SYMBOL_CATALOG,
   SYMBOL_ALIASES,
+  DEFAULT_RISK_BY_TYPE,
   SESSION_LABELS,
   TIMEZONE,
   getBrusselsComponents,
