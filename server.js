@@ -892,284 +892,1033 @@ app.get("/health", (req, res) => {
   });
 });
 
-// ── Dashboard HTML ────────────────────────────────────────────────
+// ── Dashboard HTML v9.1 ─────────────────────────────────────────
 app.get("/dashboard", (req, res) => {
   res.setHeader("Content-Type", "text/html");
+
+  // Build category matrix for the EV analysis table
+  const SESSIONS = ["asia","london","ny"];
+  const DIRS     = ["buy","sell"];
+  const VWAPS    = ["above","below"];
+
+  const FOREX_SYMBOLS = ["AUDCAD","AUDCHF","AUDNZD","AUDUSD","CADCHF","EURAUD","EURCHF","EURUSD","GBPAUD","GBPNZD","GBPUSD","NZDCAD","NZDCHF","NZDUSD","USDCAD","USDCHF"];
+  const INDEX_SYMBOLS = ["DE30EUR","NAS100USD","UK100GBP","US30USD"];
+  const COMMODITY_SYMBOLS = ["XAUUSD"];
+  const CRYPTO_SYMBOLS = ["BTCUSD"];
+  const STOCK_SYMBOLS = ["AAPL","AMD","AMZN","ARM","ASML","AVGO","AZN","BA","BABA","BAC","BRKB","CSCO","CVX","DIS","FDX","GE","GM","GME","GOOGL","IBM","INTC","JNJ","JPM","KO","LMT","MCD","META","MSFT","MSTR","NFLX","NKE","NVDA","PFE","PLTR","QCOM","SBUX","SNOW","T","TSLA","V","WMT","XOM","ZM"];
+
+  const SESSION_LABEL = { asia: "Asia 02-08", london: "London 08-15:30", ny: "NY 15:30-21" };
+  const SYMBOL_DISPLAY = {
+    DE30EUR:"DAX40 (GER40)", NAS100USD:"NAS100 (US100)", UK100GBP:"UK100 (FTSE)", US30USD:"US30 (Dow)",
+    XAUUSD:"Gold (XAUUSD)", BTCUSD:"Bitcoin (BTC)"
+  };
+
   res.end(`<!DOCTYPE html>
 <html lang="nl">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PRONTO-AI v9.0</title>
+<title>PRONTO-AI v9.1 — Dashboard</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Barlow+Condensed:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
-  :root{--bg:#0a0f1a;--card:#111827;--border:#1e2d42;--text:#e2e8f0;--dim:#64748b;--green:#00e396;--red:#ff4560;--gold:#f0c040;--purple:#a78bfa;--blue:#38bdf8;}
-  *{box-sizing:border-box;margin:0;padding:0;}
-  body{background:var(--bg);color:var(--text);font-family:"Inter",sans-serif;font-size:13px;padding:20px;}
-  h1{font-size:20px;font-weight:700;margin-bottom:4px;}
-  .sub{color:var(--dim);font-size:11px;margin-bottom:20px;}
-  .kpi-row{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:20px;}
-  .kpi{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:16px 20px;min-width:140px;}
-  .kpi-val{font-size:24px;font-weight:700;margin-top:4px;}
-  .kpi-label{color:var(--dim);font-size:11px;}
-  .card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:16px;margin-bottom:16px;overflow-x:auto;}
-  .card h2{font-size:14px;font-weight:600;margin-bottom:12px;color:var(--blue);}
-  table{width:100%;border-collapse:collapse;}
-  th{background:#0d1829;padding:7px 10px;text-align:left;font-size:11px;color:var(--dim);border-bottom:1px solid var(--border);}
-  td{padding:6px 10px;border-bottom:1px solid var(--border);}
-  tr:hover td{background:#131f30;}
-  .c-green{color:var(--green);} .c-red{color:var(--red);} .c-gold{color:var(--gold);} .c-blue{color:var(--blue);} .c-dim{color:var(--dim);}
-  .badge{display:inline-block;padding:2px 7px;border-radius:4px;font-size:10px;font-weight:600;}
-  .b-buy{background:#00e39620;color:var(--green);} .b-sell{background:#ff456020;color:var(--red);}
-  .b-above{background:#38bdf820;color:var(--blue);} .b-below{background:#a78bfa20;color:var(--purple);}
-  .tabs{display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;}
-  .tab{padding:6px 14px;border-radius:6px;border:1px solid var(--border);cursor:pointer;font-size:12px;background:var(--card);}
-  .tab.active{background:var(--blue);color:#0a0f1a;border-color:var(--blue);}
-  #clock{font-size:11px;color:var(--dim);float:right;}
-  .progress{height:4px;background:#1e2d42;border-radius:2px;margin-top:3px;}
-  .progress-bar{height:100%;border-radius:2px;background:var(--green);}
-  .no-data{text-align:center;padding:20px;color:var(--dim);}
-  .section{display:none;} .section.active{display:block;}
-  .refresh{background:none;border:1px solid var(--border);color:var(--dim);border-radius:6px;padding:4px 10px;cursor:pointer;font-size:11px;}
-  .refresh:hover{color:var(--text);}
+:root {
+  --bg:      #080c10;
+  --bg2:     #0c1117;
+  --card:    #0f151c;
+  --border:  #1a2535;
+  --border2: #243348;
+  --text:    #c8d8e8;
+  --dim:     #4a6080;
+  --dim2:    #2a3d55;
+  --green:   #00e5a0;
+  --red:     #ff3d5a;
+  --gold:    #f0c040;
+  --purple:  #b08cff;
+  --blue:    #38c0f8;
+  --cyan:    #00e5d8;
+  --orange:  #ff8c42;
+  --scanline: rgba(0,0,0,0.12);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;background:var(--bg);color:var(--text);font-family:'JetBrains Mono',monospace;font-size:12px;overflow-x:hidden}
+
+/* scanline overlay */
+body::before{content:'';position:fixed;top:0;left:0;width:100%;height:100%;background:repeating-linear-gradient(0deg,transparent,transparent 2px,var(--scanline) 2px,var(--scanline) 4px);pointer-events:none;z-index:9999;opacity:.35}
+
+.layout{display:grid;grid-template-rows:auto auto 1fr;min-height:100vh}
+
+/* ── HEADER ── */
+.header{padding:14px 24px;background:linear-gradient(90deg,#0a1020,#0d1828);border-bottom:1px solid var(--border2);display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:100;backdrop-filter:blur(8px)}
+.header-brand{display:flex;align-items:center;gap:14px}
+.brand-logo{font-family:'Barlow Condensed',sans-serif;font-size:22px;font-weight:800;letter-spacing:2px;color:var(--blue);text-shadow:0 0 24px rgba(56,192,248,0.5)}
+.brand-ver{font-size:10px;color:var(--dim);letter-spacing:1px;margin-top:2px}
+.header-right{display:flex;align-items:center;gap:20px}
+.clock{font-size:14px;color:var(--cyan);letter-spacing:2px;font-weight:500;text-shadow:0 0 12px rgba(0,229,216,0.4)}
+.session-badge{padding:4px 12px;border-radius:3px;font-size:11px;font-weight:700;letter-spacing:1px;font-family:'Barlow Condensed',sans-serif}
+.s-asia{background:#003344;color:var(--cyan);border:1px solid var(--cyan)}
+.s-london{background:#002a00;color:var(--green);border:1px solid var(--green)}
+.s-ny{background:#330022;color:var(--purple);border:1px solid var(--purple)}
+.s-outside{background:#1a1a1a;color:var(--dim);border:1px solid var(--border2)}
+.btn-refresh{background:none;border:1px solid var(--border2);color:var(--dim);padding:5px 12px;border-radius:3px;cursor:pointer;font-family:'JetBrains Mono',monospace;font-size:11px;transition:all .2s}
+.btn-refresh:hover{color:var(--blue);border-color:var(--blue)}
+
+/* ── KPI BAR ── */
+.kpi-bar{display:flex;gap:1px;background:var(--border);border-bottom:1px solid var(--border2);overflow-x:auto}
+.kpi{flex:1;min-width:130px;padding:14px 18px;background:var(--bg2);position:relative;overflow:hidden}
+.kpi::after{content:'';position:absolute;bottom:0;left:0;width:100%;height:2px}
+.kpi-open::after{background:var(--blue)}
+.kpi-ghosts::after{background:var(--purple)}
+.kpi-locks::after{background:var(--gold)}
+.kpi-balance::after{background:var(--green)}
+.kpi-session::after{background:var(--cyan)}
+.kpi-risk::after{background:var(--orange)}
+.kpi-label{font-size:9px;letter-spacing:1.5px;color:var(--dim);text-transform:uppercase;margin-bottom:6px;font-family:'Barlow Condensed',sans-serif}
+.kpi-val{font-size:22px;font-weight:700;line-height:1;font-family:'Barlow Condensed',sans-serif;letter-spacing:1px}
+.kv-blue{color:var(--blue)} .kv-purple{color:var(--purple)} .kv-gold{color:var(--gold)} .kv-green{color:var(--green)} .kv-cyan{color:var(--cyan)} .kv-orange{color:var(--orange)}
+
+/* ── NAV TABS ── */
+.nav{display:flex;gap:2px;padding:10px 16px;background:var(--bg2);border-bottom:1px solid var(--border);overflow-x:auto;flex-wrap:nowrap}
+.nav-tab{padding:6px 16px;border:1px solid var(--border);border-radius:3px;cursor:pointer;font-family:'Barlow Condensed',sans-serif;font-size:12px;font-weight:600;letter-spacing:.5px;color:var(--dim);background:none;transition:all .15s;white-space:nowrap}
+.nav-tab:hover{color:var(--text);border-color:var(--border2)}
+.nav-tab.active{background:var(--blue);color:#060b12;border-color:var(--blue)}
+.nav-tab.active-ev{background:var(--gold);color:#060b12;border-color:var(--gold)}
+
+/* ── MAIN CONTENT ── */
+.main{padding:16px 20px;overflow-y:auto}
+.section{display:none}.section.active{display:block}
+
+/* ── CARDS ── */
+.card{background:var(--card);border:1px solid var(--border);border-radius:4px;margin-bottom:14px;overflow:hidden}
+.card-head{padding:10px 16px;background:linear-gradient(90deg,#0d1828,#0c1520);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
+.card-title{font-family:'Barlow Condensed',sans-serif;font-size:14px;font-weight:700;letter-spacing:1px;color:var(--blue)}
+.card-title.gold{color:var(--gold)}
+.card-title.green{color:var(--green)}
+.card-title.purple{color:var(--purple)}
+.card-meta{font-size:10px;color:var(--dim);letter-spacing:.5px}
+.card-body{overflow-x:auto;padding:0}
+
+/* ── TABLES ── */
+table{width:100%;border-collapse:collapse;font-size:11px}
+th{padding:7px 10px;text-align:left;font-size:9px;letter-spacing:1.2px;color:var(--dim);background:var(--bg2);border-bottom:1px solid var(--border);text-transform:uppercase;font-family:'Barlow Condensed',sans-serif;font-weight:600;white-space:nowrap}
+td{padding:7px 10px;border-bottom:1px solid var(--dim2);vertical-align:middle;white-space:nowrap}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:rgba(56,192,248,0.04)}
+.no-data{text-align:center;padding:30px;color:var(--dim);font-size:11px;letter-spacing:1px}
+
+/* ── COLOR CLASSES ── */
+.c-green{color:var(--green)} .c-red{color:var(--red)} .c-gold{color:var(--gold)} .c-blue{color:var(--blue)} .c-dim{color:var(--dim)} .c-purple{color:var(--purple)} .c-cyan{color:var(--cyan)} .c-orange{color:var(--orange)}
+
+/* ── BADGES ── */
+.badge{display:inline-block;padding:2px 8px;border-radius:2px;font-size:9px;font-weight:700;letter-spacing:.8px;font-family:'Barlow Condensed',sans-serif}
+.b-buy{background:rgba(0,229,160,.15);color:var(--green);border:1px solid rgba(0,229,160,.3)}
+.b-sell{background:rgba(255,61,90,.15);color:var(--red);border:1px solid rgba(255,61,90,.3)}
+.b-above{background:rgba(56,192,248,.15);color:var(--blue);border:1px solid rgba(56,192,248,.3)}
+.b-below{background:rgba(176,140,255,.15);color:var(--purple);border:1px solid rgba(176,140,255,.3)}
+.b-sl{background:rgba(255,61,90,.2);color:var(--red)}
+.b-tp{background:rgba(0,229,160,.2);color:var(--green)}
+.b-manual{background:rgba(240,192,64,.15);color:var(--gold)}
+.b-asia{background:rgba(0,229,216,.1);color:var(--cyan)}
+.b-london{background:rgba(0,229,160,.1);color:var(--green)}
+.b-ny{background:rgba(176,140,255,.1);color:var(--purple)}
+.b-ghost{background:rgba(176,140,255,.2);color:var(--purple);border:1px solid rgba(176,140,255,.4)}
+.b-locked{background:rgba(240,192,64,.2);color:var(--gold);border:1px solid rgba(240,192,64,.4)}
+.b-default{background:rgba(74,96,128,.2);color:var(--dim);border:1px solid var(--border)}
+
+/* ── SL USAGE BAR ── */
+.sl-bar-wrap{display:flex;align-items:center;gap:6px;min-width:100px}
+.sl-bar-bg{height:4px;flex:1;background:var(--dim2);border-radius:2px;overflow:hidden}
+.sl-bar-fill{height:100%;border-radius:2px;background:var(--green);transition:width .3s}
+.sl-bar-fill.warn{background:var(--orange)}
+.sl-bar-fill.danger{background:var(--red)}
+
+/* ── EV MATRIX TABLE (big category table) ── */
+.matrix-wrap{overflow-x:auto;padding:0}
+.matrix-table{min-width:900px;font-size:10px}
+.matrix-table th.grp{background:var(--bg);border-right:1px solid var(--border2)}
+.matrix-table td.cat-label{font-family:'Barlow Condensed',sans-serif;font-size:12px;font-weight:700;color:var(--gold);background:var(--bg2);border-right:1px solid var(--border2);white-space:nowrap;min-width:180px;padding:8px 12px}
+.matrix-table td.sub-label{font-size:10px;color:var(--blue);background:var(--bg2);border-right:1px solid var(--border2);padding:6px 12px;padding-left:20px}
+.matrix-table td.combo{text-align:center;padding:5px 6px;border-right:1px solid var(--dim2)}
+.combo-best-rr{font-size:12px;font-family:'Barlow Condensed',sans-serif;font-weight:700}
+.combo-wr{font-size:9px;color:var(--dim)}
+.combo-ev{font-size:10px;font-weight:600}
+.combo-n{font-size:9px;color:var(--dim)}
+.ev-pos{color:var(--green)} .ev-neg{color:var(--red)} .ev-zero{color:var(--dim)}
+.col-session{text-align:center;font-family:'Barlow Condensed',sans-serif;font-size:11px;font-weight:700;letter-spacing:.5px;padding:6px 8px}
+
+/* ── OPEN TRADES SPECIFIC ── */
+.type-stock{border-left:3px solid var(--blue)}
+.type-forex{border-left:3px solid var(--cyan)}
+.type-index{border-left:3px solid var(--gold)}
+.type-commodity{border-left:3px solid var(--orange)}
+.type-crypto{border-left:3px solid var(--purple)}
+
+/* ── CATEGORY PILL ── */
+.cat-pill{display:inline-block;padding:1px 7px;border-radius:2px;font-size:9px;font-weight:700;letter-spacing:.5px;font-family:'Barlow Condensed',sans-serif}
+.cat-stock{background:rgba(56,192,248,.12);color:var(--blue)}
+.cat-forex{background:rgba(0,229,216,.12);color:var(--cyan)}
+.cat-index{background:rgba(240,192,64,.12);color:var(--gold)}
+.cat-commodity{background:rgba(255,140,66,.12);color:var(--orange)}
+.cat-crypto{background:rgba(176,140,255,.12);color:var(--purple)}
+
+/* ── PNL COLOR ── */
+.pnl-pos{color:var(--green);font-weight:600}
+.pnl-neg{color:var(--red);font-weight:600}
+
+/* ── SECTION GRID ── */
+.section-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+@media(max-width:900px){.section-grid{grid-template-columns:1fr}}
+
+/* ── INFO CALLOUT ── */
+.callout{background:rgba(56,192,248,.07);border:1px solid rgba(56,192,248,.2);border-radius:3px;padding:10px 14px;font-size:10px;color:var(--dim);margin-bottom:12px;letter-spacing:.3px}
+.callout strong{color:var(--blue)}
+
+/* ── FILTER ROW ── */
+.filter-row{display:flex;gap:8px;padding:10px 16px;border-bottom:1px solid var(--border);flex-wrap:wrap;align-items:center}
+.filter-label{font-size:9px;color:var(--dim);letter-spacing:1px;text-transform:uppercase}
+.filter-btn{padding:3px 10px;border:1px solid var(--border);background:none;color:var(--dim);border-radius:2px;cursor:pointer;font-family:'JetBrains Mono',monospace;font-size:10px;transition:all .15s}
+.filter-btn.active{border-color:var(--blue);color:var(--blue);background:rgba(56,192,248,.08)}
+.filter-btn:hover{color:var(--text)}
+
+/* ── HISTORY TYPE COLORS ── */
+.ht-placed{color:var(--green)} .ht-closed{color:var(--blue)} .ht-rejected{color:var(--red)} .ht-error{color:var(--red)} .ht-ghost{color:var(--purple)} .ht-reset{color:var(--gold)} .ht-default{color:var(--dim)}
 </style>
 </head>
 <body>
-<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
-  <div>
-    <h1>🤖 PRONTO-AI v9.0</h1>
-    <div class="sub">TradingView → MetaApi → FTMO MT5 | Ghost + Shadow Optimizer</div>
+<div class="layout">
+
+<!-- HEADER -->
+<div class="header">
+  <div class="header-brand">
+    <div>
+      <div class="brand-logo">PRONTO-AI</div>
+      <div class="brand-ver">v9.1 · TradingView → MetaApi → FTMO MT5</div>
+    </div>
   </div>
-  <div><span id="clock">--:--:--</span> &nbsp;<button class="refresh" onclick="loadAll()">↻ Refresh</button></div>
+  <div class="header-right">
+    <span class="session-badge s-outside" id="hdr-session">—</span>
+    <span class="clock" id="clock">--:--:--</span>
+    <button class="btn-refresh" onclick="loadAll()">↻ REFRESH</button>
+  </div>
 </div>
 
-<div class="kpi-row">
-  <div class="kpi"><div class="kpi-label">Open Positions</div><div class="kpi-val c-blue" id="kpi-open">-</div></div>
-  <div class="kpi"><div class="kpi-label">Active Ghosts</div><div class="kpi-val c-purple" id="kpi-ghosts">-</div></div>
-  <div class="kpi"><div class="kpi-label">TP Locks</div><div class="kpi-val c-gold" id="kpi-locks">-</div></div>
-  <div class="kpi"><div class="kpi-label">Balance</div><div class="kpi-val c-green">€<span id="kpi-balance">-</span></div></div>
-  <div class="kpi"><div class="kpi-label">Session</div><div class="kpi-val" id="kpi-session" style="font-size:15px">-</div></div>
-  <div class="kpi"><div class="kpi-label">Risk Mult</div><div class="kpi-val c-gold" id="kpi-riskMult">-</div></div>
+<!-- KPI BAR -->
+<div class="kpi-bar">
+  <div class="kpi kpi-open"><div class="kpi-label">Open Pos</div><div class="kpi-val kv-blue" id="kpi-open">—</div></div>
+  <div class="kpi kpi-ghosts"><div class="kpi-label">Active Ghosts</div><div class="kpi-val kv-purple" id="kpi-ghosts">—</div></div>
+  <div class="kpi kpi-locks"><div class="kpi-label">TP Locks</div><div class="kpi-val kv-gold" id="kpi-locks">—</div></div>
+  <div class="kpi kpi-balance"><div class="kpi-label">Balance</div><div class="kpi-val kv-green">€<span id="kpi-balance">—</span></div></div>
+  <div class="kpi kpi-session"><div class="kpi-label">Session</div><div class="kpi-val kv-cyan" id="kpi-session" style="font-size:16px;letter-spacing:2px">—</div></div>
+  <div class="kpi kpi-risk"><div class="kpi-label">Risk Mult</div><div class="kpi-val kv-orange" id="kpi-riskMult">—</div></div>
 </div>
 
-<div class="tabs">
-  <button class="tab active" onclick="showTab('positions')">Positions</button>
-  <button class="tab" onclick="showTab('ghosts')">Ghosts</button>
-  <button class="tab" onclick="showTab('ev')">EV Table</button>
-  <button class="tab" onclick="showTab('shadow')">Shadow SL</button>
-  <button class="tab" onclick="showTab('history')">History</button>
-  <button class="tab" onclick="showTab('risk')">Risk Config</button>
+<!-- NAV -->
+<div class="nav">
+  <button class="nav-tab active" onclick="showTab('positions',this)">📊 OPEN TRADES</button>
+  <button class="nav-tab" onclick="showTab('ghosts',this)">👻 GHOSTS</button>
+  <button class="nav-tab" onclick="showTab('ev',this)">📈 EV MATRIX</button>
+  <button class="nav-tab" onclick="showTab('shadow',this)">🌑 SHADOW SL</button>
+  <button class="nav-tab" onclick="showTab('history',this)">📋 HISTORY</button>
+  <button class="nav-tab" onclick="showTab('closed',this)">🗂️ CLOSED TRADES</button>
+  <button class="nav-tab" onclick="showTab('risk',this)">💰 RISK CONFIG</button>
 </div>
 
-<!-- Positions -->
+<!-- ══════════════════════════════════════════════════════════════ -->
+<!-- SECTION: OPEN POSITIONS -->
+<!-- ══════════════════════════════════════════════════════════════ -->
+<div class="main">
+
 <div id="sec-positions" class="section active">
+  <div class="callout">
+    <strong>Open Trades</strong> — Categorie, beste TP RR (ghost EV), actieve ghost delta, % SL gebruikt vanaf entry. Entry/SL van TradingView vs MT5 uitvoering getoond als slippage %.
+  </div>
   <div class="card">
-    <h2>📊 Open Positions</h2>
-    <table><thead>
-      <tr><th>Symbol</th><th>Dir</th><th>VWAP</th><th>Session</th><th>Entry</th><th>SL</th><th>TP (RR)</th><th>Lots</th><th>Risk%</th><th>PnL</th><th>MaxRR</th><th>Ghost</th></tr>
-    </thead><tbody id="pos-body"><tr><td colspan="12" class="no-data">Loading...</td></tr></tbody></table>
+    <div class="card-head">
+      <span class="card-title">📊 OPEN POSITIONS</span>
+      <span class="card-meta" id="pos-count">Loading...</span>
+    </div>
+    <div class="card-body">
+      <table>
+        <thead>
+          <tr>
+            <th>Symbol</th>
+            <th>Cat</th>
+            <th>Dir</th>
+            <th>VWAP</th>
+            <th>Session</th>
+            <th>TV Entry</th>
+            <th>MT5 Entry</th>
+            <th>Slip%</th>
+            <th>SL</th>
+            <th>SL Dist%</th>
+            <th>TP (RR)</th>
+            <th>Best TP Ghost</th>
+            <th>SL Used%</th>
+            <th>PnL</th>
+            <th>MaxRR Live</th>
+            <th>Risk%/Bal</th>
+            <th>Ghost?</th>
+          </tr>
+        </thead>
+        <tbody id="pos-body">
+          <tr><td colspan="17" class="no-data">Loading positions...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- History section below open trades -->
+  <div class="card" style="margin-top:6px">
+    <div class="card-head">
+      <span class="card-title green">🗂️ RECENT CLOSED TRADES (laatste 20)</span>
+      <span class="card-meta">Auto-updated · na close → historiek voor EV matrix</span>
+    </div>
+    <div class="card-body">
+      <table>
+        <thead>
+          <tr>
+            <th>Symbol</th><th>Cat</th><th>Dir</th><th>VWAP</th><th>Session</th>
+            <th>Entry</th><th>SL</th><th>TP RR</th><th>MaxRR</th><th>Ghost MaxRR</th>
+            <th>Close Reason</th><th>PnL</th><th>Closed At</th>
+          </tr>
+        </thead>
+        <tbody id="recent-closed-body">
+          <tr><td colspan="13" class="no-data">Loading...</td></tr>
+        </tbody>
+      </table>
+    </div>
   </div>
 </div>
 
-<!-- Ghosts -->
+<!-- ══════════════════════════════════════════════════════════════ -->
+<!-- SECTION: GHOSTS -->
+<!-- ══════════════════════════════════════════════════════════════ -->
 <div id="sec-ghosts" class="section">
-  <div class="card">
-    <h2>👻 Active Ghost Trackers</h2>
-    <table><thead>
-      <tr><th>Key</th><th>Entry</th><th>Phantom SL</th><th>Max Price</th><th>Max RR</th><th>Elapsed</th></tr>
-    </thead><tbody id="ghost-body"><tr><td colspan="6" class="no-data">Loading...</td></tr></tbody></table>
+  <div class="callout">
+    <strong>Ghost Tracker</strong> — Phantom prijs tracking na trade open. Sluit op phantom SL hit of 23:00. Delta = trueRR − maxRR@close toont hoeveel prijs bewoog NA sluiting.
+  </div>
+  <div class="section-grid">
+    <div class="card">
+      <div class="card-head">
+        <span class="card-title purple">👻 ACTIVE GHOSTS</span>
+        <span class="card-meta" id="ghost-count">—</span>
+      </div>
+      <div class="card-body">
+        <table>
+          <thead>
+            <tr><th>Optimizer Key</th><th>Dir</th><th>Session</th><th>Entry</th><th>Phantom SL</th><th>Max Price</th><th>MaxRR</th><th>% SL Used</th><th>Elapsed</th></tr>
+          </thead>
+          <tbody id="ghost-body">
+            <tr><td colspan="9" class="no-data">No active ghosts</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-head">
+        <span class="card-title gold">📜 GHOST HISTORY (laatste 30)</span>
+        <span class="card-meta">phantom_sl · timeout · outside_window</span>
+      </div>
+      <div class="card-body">
+        <table>
+          <thead>
+            <tr><th>Key</th><th>MaxRR</th><th>TP RR Used</th><th>SL Hit?</th><th>Reden</th><th>Tijd (min)</th><th>Closed</th></tr>
+          </thead>
+          <tbody id="ghost-hist-body">
+            <tr><td colspan="7" class="no-data">Loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
   </div>
 </div>
 
-<!-- EV Table -->
+<!-- ══════════════════════════════════════════════════════════════ -->
+<!-- SECTION: EV MATRIX (grote tabel) -->
+<!-- ══════════════════════════════════════════════════════════════ -->
 <div id="sec-ev" class="section">
+  <div class="callout">
+    <strong>EV Matrix</strong> — Per categorie (Forex, Index, Commodity, Crypto, Stocks) × sessie (Asia/London/NY) × direction (Buy/Sell) × VWAP positie (Above/Below).
+    Toont beste EV RR, winrate, n trades. <strong style="color:var(--gold)">Geel = EV positief en gelockt als TP.</strong>
+  </div>
+
+  <!-- FOREX -->
   <div class="card">
-    <h2>📈 EV Table — Ghost Optimizer Results</h2>
-    <table><thead>
-      <tr><th>Key</th><th>Ghosts</th><th>Best RR</th><th>Best EV</th><th>TP Lock</th><th>EV+</th></tr>
-    </thead><tbody id="ev-body"><tr><td colspan="6" class="no-data">Loading...</td></tr></tbody></table>
+    <div class="card-head">
+      <span class="card-title">🔷 FOREX — Alle Pairs</span>
+      <span class="card-meta">AUDCAD · AUDCHF · AUDNZD · AUDUSD · CADCHF · EURAUD · EURCHF · EURUSD · GBPAUD · GBPNZD · GBPUSD · NZDCAD · NZDCHF · NZDUSD · USDCAD · USDCHF</span>
+    </div>
+    <div class="matrix-wrap">
+      <table class="matrix-table" id="ev-forex"></table>
+    </div>
+  </div>
+
+  <!-- INDEXES -->
+  <div class="card">
+    <div class="card-head">
+      <span class="card-title gold">📊 INDEXEN</span>
+      <span class="card-meta">DAX40 (GER40) · NAS100 (US100) · UK100 (FTSE) · US30 (Dow)</span>
+    </div>
+    <div class="matrix-wrap">
+      <table class="matrix-table" id="ev-index"></table>
+    </div>
+  </div>
+
+  <!-- COMMODITIES -->
+  <div class="card">
+    <div class="card-head">
+      <span class="card-title" style="color:var(--orange)">🥇 COMMODITIES — GOLD (XAUUSD)</span>
+      <span class="card-meta">Asia Buy/Sell × Above/Below VWAP | London Buy/Sell × Above/Below | NY Buy/Sell × Above/Below</span>
+    </div>
+    <div class="matrix-wrap">
+      <table class="matrix-table" id="ev-commodity"></table>
+    </div>
+  </div>
+
+  <!-- CRYPTO -->
+  <div class="card">
+    <div class="card-head">
+      <span class="card-title purple">₿ CRYPTO — BTCUSD</span>
+      <span class="card-meta">Bitcoin · alle sessies</span>
+    </div>
+    <div class="matrix-wrap">
+      <table class="matrix-table" id="ev-crypto"></table>
+    </div>
+  </div>
+
+  <!-- STOCKS -->
+  <div class="card">
+    <div class="card-head">
+      <span class="card-title">📈 STOCKS — Alle Aandelen</span>
+      <span class="card-meta">AAPL · AMD · AMZN · ARM · ASML · AVGO · AZN · BA · BABA · BAC · BRKB · CSCO · CVX · DIS · FDX · GE · GM · GME · GOOGL · IBM · INTC · JNJ · JPM · KO · LMT · MCD · META · MSFT · MSTR · NFLX · NKE · NVDA · PFE · PLTR · QCOM · SBUX · SNOW · T · TSLA · V · WMT · XOM · ZM</span>
+    </div>
+    <div class="matrix-wrap">
+      <table class="matrix-table" id="ev-stocks"></table>
+    </div>
   </div>
 </div>
 
-<!-- Shadow SL -->
+<!-- ══════════════════════════════════════════════════════════════ -->
+<!-- SECTION: SHADOW SL -->
+<!-- ══════════════════════════════════════════════════════════════ -->
 <div id="sec-shadow" class="section">
+  <div class="callout">
+    <strong>Shadow SL Optimizer</strong> — READ ONLY. Analyseert hoe diep de prijs naar SL bewoog (% gebruikt). p99 = aanbevolen SL grootte. Als prijs nooit binnen 70% van SL came → SL te wijd.
+  </div>
   <div class="card">
-    <h2>🌑 Shadow SL Optimizer — READ ONLY</h2>
-    <table><thead>
-      <tr><th>Key</th><th>Snaps</th><th>Pos</th><th>p50%</th><th>p90%</th><th>p99%</th><th>Max%</th><th>Rec. SL%</th><th>Too Wide?</th><th>Saving%</th></tr>
-    </thead><tbody id="shadow-body"><tr><td colspan="10" class="no-data">Loading...</td></tr></tbody></table>
+    <div class="card-head">
+      <span class="card-title purple">🌑 SHADOW SL ANALYSE — per Optimizer Key</span>
+      <span class="card-meta">Per key: symbol × session × direction × vwap_pos</span>
+    </div>
+    <div class="card-body">
+      <table>
+        <thead>
+          <tr>
+            <th>Optimizer Key</th><th>Symbol</th><th>Session</th><th>Dir</th><th>VWAP</th>
+            <th>Snapshots</th><th>Posities</th>
+            <th>p50 SL%</th><th>p90 SL%</th><th>p99 SL%</th><th>Max SL%</th>
+            <th>Rec. SL%</th><th>Te Wijd?</th><th>Besparing%</th>
+          </tr>
+        </thead>
+        <tbody id="shadow-body">
+          <tr><td colspan="14" class="no-data">Loading...</td></tr>
+        </tbody>
+      </table>
+    </div>
   </div>
 </div>
 
-<!-- History -->
+<!-- ══════════════════════════════════════════════════════════════ -->
+<!-- SECTION: HISTORY (webhook log) -->
+<!-- ══════════════════════════════════════════════════════════════ -->
 <div id="sec-history" class="section">
   <div class="card">
-    <h2>📋 Webhook History</h2>
-    <table><thead>
-      <tr><th>Time</th><th>Type</th><th>Symbol</th><th>Dir</th><th>VWAP</th><th>Session</th><th>Key</th><th>Status/Detail</th></tr>
-    </thead><tbody id="hist-body"><tr><td colspan="8" class="no-data">Loading...</td></tr></tbody></table>
+    <div class="card-head">
+      <span class="card-title">📋 WEBHOOK HISTORY (laatste 100)</span>
+      <span class="card-meta">ORDER_PLACED · REJECTED · ERROR · POSITION_CLOSED · NIGHTLY_OPTIMIZER</span>
+    </div>
+    <div class="filter-row">
+      <span class="filter-label">Filter:</span>
+      <button class="filter-btn active" onclick="filterHistory('all',this)">Alle</button>
+      <button class="filter-btn" onclick="filterHistory('ORDER_PLACED',this)">Placed</button>
+      <button class="filter-btn" onclick="filterHistory('POSITION_CLOSED',this)">Closed</button>
+      <button class="filter-btn" onclick="filterHistory('REJECTED',this)">Rejected</button>
+      <button class="filter-btn" onclick="filterHistory('ERROR',this)">Errors</button>
+    </div>
+    <div class="card-body">
+      <table>
+        <thead>
+          <tr><th>Tijd</th><th>Type</th><th>Symbol</th><th>Cat</th><th>Dir</th><th>VWAP</th><th>Session</th><th>Optimizer Key</th><th>Detail</th></tr>
+        </thead>
+        <tbody id="hist-body">
+          <tr><td colspan="9" class="no-data">Loading...</td></tr>
+        </tbody>
+      </table>
+    </div>
   </div>
 </div>
 
-<!-- Risk Config -->
-<div id="sec-risk" class="section">
+<!-- ══════════════════════════════════════════════════════════════ -->
+<!-- SECTION: CLOSED TRADES (full table) -->
+<!-- ══════════════════════════════════════════════════════════════ -->
+<div id="sec-closed" class="section">
+  <div class="callout">
+    <strong>Closed Trades</strong> — Alle afgesloten trades. Reden: tp / sl / manual. MaxRR = beste prijs bereikt voor close. Na close gaan ghost data naar EV matrix.
+  </div>
   <div class="card">
-    <h2>💰 Per-Symbol Risk Config (Railway env vars)</h2>
-    <p style="color:var(--dim);font-size:11px;margin-bottom:10px;">Set <code>RISK_EURUSD=0.002</code> in Railway to override. Shows current effective risk%.</p>
-    <table><thead>
-      <tr><th>Symbol</th><th>Type</th><th>Risk %</th><th>Risk €</th><th>Env Var</th></tr>
-    </thead><tbody id="risk-body"><tr><td colspan="5" class="no-data">Loading...</td></tr></tbody></table>
+    <div class="card-head">
+      <span class="card-title green">🗂️ CLOSED TRADES</span>
+      <span class="card-meta" id="closed-count">—</span>
+    </div>
+    <div class="filter-row">
+      <span class="filter-label">Sessie:</span>
+      <button class="filter-btn active" onclick="filterClosed('session','all',this)">Alle</button>
+      <button class="filter-btn" onclick="filterClosed('session','asia',this)">Asia</button>
+      <button class="filter-btn" onclick="filterClosed('session','london',this)">London</button>
+      <button class="filter-btn" onclick="filterClosed('session','ny',this)">NY</button>
+      &nbsp;
+      <span class="filter-label">Dir:</span>
+      <button class="filter-btn active" onclick="filterClosed('dir','all',this)">Alle</button>
+      <button class="filter-btn" onclick="filterClosed('dir','buy',this)">Buy</button>
+      <button class="filter-btn" onclick="filterClosed('dir','sell',this)">Sell</button>
+    </div>
+    <div class="card-body">
+      <table>
+        <thead>
+          <tr>
+            <th>Symbol</th><th>Cat</th><th>Dir</th><th>VWAP</th><th>Session</th>
+            <th>Entry</th><th>SL</th><th>TP(RR)</th><th>Lots</th><th>Risk%</th>
+            <th>MaxRR</th><th>Close</th><th>PnL</th><th>Opened</th><th>Closed</th>
+          </tr>
+        </thead>
+        <tbody id="closed-body">
+          <tr><td colspan="15" class="no-data">Loading...</td></tr>
+        </tbody>
+      </table>
+    </div>
   </div>
 </div>
+
+<!-- ══════════════════════════════════════════════════════════════ -->
+<!-- SECTION: RISK CONFIG -->
+<!-- ══════════════════════════════════════════════════════════════ -->
+<div id="sec-risk" class="section">
+  <div class="callout">
+    Stel <strong>RISK_EURUSD=0.002</strong> in als Railway env var om per symbol te overschrijven. Fallback: RISK_PCT_FOREX / RISK_PCT_STOCK / RISK_PCT_INDEX / RISK_PCT_COMMODITY / RISK_PCT_CRYPTO.
+  </div>
+  <div class="card">
+    <div class="card-head">
+      <span class="card-title gold">💰 PER-SYMBOL RISK CONFIG</span>
+      <span class="card-meta" id="risk-balance">Balance: —</span>
+    </div>
+    <div class="filter-row">
+      <span class="filter-label">Type:</span>
+      <button class="filter-btn active" onclick="filterRisk('all',this)">Alle</button>
+      <button class="filter-btn" onclick="filterRisk('forex',this)">Forex</button>
+      <button class="filter-btn" onclick="filterRisk('index',this)">Index</button>
+      <button class="filter-btn" onclick="filterRisk('commodity',this)">Commodity</button>
+      <button class="filter-btn" onclick="filterRisk('crypto',this)">Crypto</button>
+      <button class="filter-btn" onclick="filterRisk('stock',this)">Stocks</button>
+    </div>
+    <div class="card-body">
+      <table>
+        <thead>
+          <tr><th>Symbol</th><th>Type</th><th>Risk %</th><th>Risk €</th><th>Env Var</th></tr>
+        </thead>
+        <tbody id="risk-body">
+          <tr><td colspan="5" class="no-data">Loading...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+</div><!-- /main -->
+</div><!-- /layout -->
 
 <script>
-window.__CONFIG__ = ${JSON.stringify({ balance: ACCOUNT_BALANCE, session: getSession(), riskMult: dailyRiskMult })};
+// ── Config injected from server ──────────────────────────────────
+const __CFG__ = \${JSON.stringify({ balance: ACCOUNT_BALANCE, session: getSession(), riskMult: dailyRiskMult })};
 
-function showTab(name) {
+// ── State ─────────────────────────────────────────────────────────
+let _historyData = [];
+let _closedData  = [];
+let _riskData    = [];
+let _closedFilter = { session: 'all', dir: 'all' };
+let _histFilter   = 'all';
+let _riskFilter   = 'all';
+let _evData       = [];
+
+// ── Helpers ───────────────────────────────────────────────────────
+function fmt(v, d=2) { return v != null && !isNaN(v) ? Number(v).toFixed(d) : '—'; }
+function fmtPct(v)   { return v != null ? (v*100).toFixed(2)+'%' : '—'; }
+function fmtN(v)     { return v != null ? Number(v).toLocaleString('nl-BE') : '—'; }
+
+async function sf(url) {
+  try {
+    const r = await fetch(url, { cache: 'no-store' });
+    return r.ok ? r.json() : null;
+  } catch { return null; }
+}
+
+function catPill(type) {
+  if (!type) return '';
+  return '<span class="cat-pill cat-'+type+'">'+type.toUpperCase()+'</span>';
+}
+
+function symType(symbol) {
+  const FOREX=['AUDCAD','AUDCHF','AUDNZD','AUDUSD','CADCHF','EURAUD','EURCHF','EURUSD','GBPAUD','GBPNZD','GBPUSD','NZDCAD','NZDCHF','NZDUSD','USDCAD','USDCHF'];
+  const INDEX=['DE30EUR','NAS100USD','UK100GBP','US30USD'];
+  const COMM=['XAUUSD'];
+  const CRYPT=['BTCUSD'];
+  if (FOREX.includes(symbol)) return 'forex';
+  if (INDEX.includes(symbol)) return 'index';
+  if (COMM.includes(symbol))  return 'commodity';
+  if (CRYPT.includes(symbol)) return 'crypto';
+  return 'stock';
+}
+
+function slBar(pct) {
+  if (pct == null) return '—';
+  const cls = pct >= 80 ? 'danger' : pct >= 50 ? 'warn' : '';
+  return '<div class="sl-bar-wrap"><div class="sl-bar-bg"><div class="sl-bar-fill '+cls+'" style="width:'+Math.min(100,pct)+'%"></div></div><span>'+(+pct).toFixed(0)+'%</span></div>';
+}
+
+function sessionBadge(s) {
+  const m={'asia':'b-asia','london':'b-london','ny':'b-ny'};
+  return '<span class="badge '+(m[s]||'b-default')+'">'+(s||'—').toUpperCase()+'</span>';
+}
+
+function closeReasonBadge(r) {
+  const m={'tp':'b-tp','sl':'b-sl','manual':'b-manual'};
+  return '<span class="badge '+(m[r]||'b-default')+'">'+(r||'—').toUpperCase()+'</span>';
+}
+
+function histType(t) {
+  if (!t) return '<span class="ht-default">—</span>';
+  const m={'ORDER_PLACED':'ht-placed','POSITION_CLOSED':'ht-closed','REJECTED':'ht-rejected','ERROR':'ht-error','GHOST':'ht-ghost','DAILY_RESET':'ht-reset','NIGHTLY_OPTIMIZER':'ht-reset','DUPLICATE_BLOCKED':'ht-ghost'};
+  const cls = Object.keys(m).find(k => t.includes(k));
+  return '<span class="'+(m[cls]||'ht-default')+'">'+t+'</span>';
+}
+
+function shortTs(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  return d.toLocaleTimeString('nl-BE',{timeZone:'Europe/Brussels',hour:'2-digit',minute:'2-digit',second:'2-digit'});
+}
+function shortDate(iso) {
+  if (!iso) return '—';
+  return new Date(iso).toLocaleDateString('nl-BE',{timeZone:'Europe/Brussels',day:'2-digit',month:'2-digit'});
+}
+
+// ── Tab switching ─────────────────────────────────────────────────
+function showTab(name, el) {
   document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
-  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-  document.getElementById('sec-' + name).classList.add('active');
-  event.target.classList.add('active');
+  document.querySelectorAll('.nav-tab').forEach(t => t.classList.remove('active','active-ev'));
+  document.getElementById('sec-'+name).classList.add('active');
+  if (el) el.classList.add(name==='ev' ? 'active-ev' : 'active');
   loadSection(name);
 }
 
-function fmt(v, d=2) { return v != null ? Number(v).toFixed(d) : '-'; }
-function fmtPct(v)   { return v != null ? (v*100).toFixed(2)+'%' : '-'; }
-
-async function sf(url) {
-  try { const r = await fetch(url); return r.ok ? r.json() : null; } catch { return null; }
-}
-
 async function loadSection(name) {
-  if (name === 'positions') await loadPositions();
-  if (name === 'ghosts')    await loadGhosts();
-  if (name === 'ev')        await loadEV();
-  if (name === 'shadow')    await loadShadow();
-  if (name === 'history')   await loadHistory();
-  if (name === 'risk')      await loadRisk();
+  if (name==='positions') { await loadPositions(); await loadRecentClosed(); }
+  if (name==='ghosts')    { await loadGhosts(); await loadGhostHistory(); }
+  if (name==='ev')        await loadEV();
+  if (name==='shadow')    await loadShadow();
+  if (name==='history')   await loadHistory();
+  if (name==='closed')    await loadClosed();
+  if (name==='risk')      await loadRisk();
 }
 
+// ── POSITIONS ─────────────────────────────────────────────────────
 async function loadPositions() {
-  const d = await sf('/live/positions'); if (!d) return;
-  document.getElementById('kpi-open').textContent = d.count;
-  document.getElementById('kpi-balance').textContent = (d.balance||0).toFixed(0);
+  const d = await sf('/live/positions');
+  if (!d) return;
+  document.getElementById('kpi-open').textContent  = d.count;
+  document.getElementById('kpi-balance').textContent= (d.balance||0).toFixed(0);
+  document.getElementById('pos-count').textContent  = d.count + ' open';
+
+  // Fetch EV data to show best ghost TP
+  const evAll = await sf('/ev') || [];
+
   const b = document.getElementById('pos-body');
-  if (!d.positions.length) { b.innerHTML='<tr><td colspan="12" class="no-data">No open positions</td></tr>'; return; }
-  b.innerHTML = d.positions.map(p => \`<tr>
-    <td class="c-blue">\${p.symbol}</td>
-    <td><span class="badge b-\${p.direction}">\${p.direction.toUpperCase()}</span></td>
-    <td><span class="badge b-\${p.vwapPosition}">\${p.vwapPosition}</span></td>
-    <td>\${p.session}</td>
-    <td>\${fmt(p.entry,5)}</td>
-    <td class="c-red">\${fmt(p.sl,5)}</td>
-    <td class="c-green">\${fmt(p.tp,5)} (\${p.tpRR}R)</td>
-    <td>\${p.lots}</td>
-    <td>\${fmtPct(p.riskPct)}</td>
-    <td class="\${(p.currentPnL||0)>=0?'c-green':'c-red'}">\${fmt(p.currentPnL,2)}€</td>
-    <td>\${fmt(p.maxRR,2)}R</td>
-    <td>\${p.isGhosted?'<span class="c-purple">👻</span>':'-'}</td>
-  </tr>\`).join('');
+  if (!d.positions.length) {
+    b.innerHTML='<tr><td colspan="17" class="no-data">Geen open posities</td></tr>';
+    return;
+  }
+  b.innerHTML = d.positions.map(p => {
+    const t    = symType(p.symbol);
+    const ev   = evAll.find(e => e.key === p.optimizerKey);
+    const bestGhostTP = ev?.bestRR != null ? '<span class="c-gold">'+fmt(ev.bestRR,1)+'R</span><br><span class="c-dim" style="font-size:9px">EV='+fmt(ev.bestEV,3)+'</span>' : '<span class="c-dim">< 5 ghosts</span>';
+    const slDistPct = p.slDistPct != null ? p.slDistPct+'%' : '—';
+    const slip = (p.tvEntry && p.entry) ? ((Math.abs(p.entry - p.tvEntry) / p.tvEntry)*100).toFixed(3)+'%' : '—';
+    const tvEntry = p.tvEntry != null ? fmt(p.tvEntry,5) : '—';
+    const pnlCls  = (p.currentPnL||0)>=0 ? 'pnl-pos' : 'pnl-neg';
+    const slUsed  = p.slPctUsed != null ? slBar(p.slPctUsed) : slBar(null);
+
+    return \`<tr class="type-\${t}">
+      <td class="c-blue" style="font-weight:600">\${p.symbol}</td>
+      <td>\${catPill(t)}</td>
+      <td><span class="badge b-\${p.direction}">\${p.direction.toUpperCase()}</span></td>
+      <td><span class="badge b-\${p.vwapPosition}">\${p.vwapPosition}</span></td>
+      <td>\${sessionBadge(p.session)}</td>
+      <td class="c-dim">\${tvEntry}</td>
+      <td>\${fmt(p.entry,5)}</td>
+      <td class="c-dim">\${slip}</td>
+      <td class="c-red">\${fmt(p.sl,5)}</td>
+      <td class="c-dim">\${slDistPct}</td>
+      <td class="c-green">\${fmt(p.tp,5)} <span class="c-gold">(\${p.tpRR||'—'}R)</span></td>
+      <td>\${bestGhostTP}</td>
+      <td>\${slBar(p.slPctUsed)}</td>
+      <td class="\${pnlCls}">\${fmt(p.currentPnL,2)}€</td>
+      <td class="c-cyan">\${fmt(p.maxRR,2)}R</td>
+      <td class="c-gold">\${fmtPct(p.riskPct)}</td>
+      <td>\${p.isGhosted?'<span class="badge b-ghost">👻 GHOST</span>':'<span class="c-dim">—</span>'}</td>
+    </tr>\`;
+  }).join('');
 }
 
-async function loadGhosts() {
-  const d = await sf('/live/ghosts'); if (!d) return;
-  document.getElementById('kpi-ghosts').textContent = d.count;
-  const b = document.getElementById('ghost-body');
-  if (!d.ghosts.length) { b.innerHTML='<tr><td colspan="6" class="no-data">No active ghosts</td></tr>'; return; }
-  b.innerHTML = d.ghosts.map(g => \`<tr>
-    <td style="font-size:10px">\${g.optimizerKey}</td>
-    <td>\${fmt(g.entry,5)}</td>
-    <td class="c-red">\${fmt(g.sl,5)}</td>
-    <td>\${fmt(g.maxPrice,5)}</td>
-    <td class="c-green">\${fmt(g.maxRR,2)}R</td>
-    <td class="c-dim">\${g.elapsedMin}m</td>
-  </tr>\`).join('');
+// ── RECENT CLOSED (under open trades) ─────────────────────────────
+async function loadRecentClosed() {
+  const d = await sf('/trades?limit=20');
+  if (!d) return;
+  const b = document.getElementById('recent-closed-body');
+  if (!d.trades.length) { b.innerHTML='<tr><td colspan="13" class="no-data">Geen gesloten trades</td></tr>'; return; }
+  b.innerHTML = d.trades.map(h => {
+    const t = symType(h.symbol);
+    const pnlCls = (h.currentPnL||0)>=0?'pnl-pos':'pnl-neg';
+    return \`<tr class="type-\${t}">
+      <td class="c-blue">\${h.symbol}</td>
+      <td>\${catPill(t)}</td>
+      <td><span class="badge b-\${h.direction}">\${h.direction?.toUpperCase()}</span></td>
+      <td><span class="badge b-\${h.vwapPosition||'unknown'}">\${h.vwapPosition||'?'}</span></td>
+      <td>\${sessionBadge(h.session)}</td>
+      <td>\${fmt(h.entry,5)}</td>
+      <td class="c-red">\${fmt(h.sl,5)}</td>
+      <td class="c-gold">\${h.tpRRUsed||h.tp||'—'}R</td>
+      <td class="c-cyan">\${fmt(h.maxRR,2)}R</td>
+      <td class="c-purple">\${fmt(h.trueMaxRR,2)}R</td>
+      <td>\${closeReasonBadge(h.closeReason)}</td>
+      <td class="\${pnlCls}">\${fmt(h.currentPnL,2)}€</td>
+      <td class="c-dim">\${shortDate(h.closedAt)} \${shortTs(h.closedAt)}</td>
+    </tr>\`;
+  }).join('');
 }
+
+// ── GHOSTS ────────────────────────────────────────────────────────
+async function loadGhosts() {
+  const d = await sf('/live/ghosts');
+  if (!d) return;
+  document.getElementById('kpi-ghosts').textContent = d.count;
+  document.getElementById('ghost-count').textContent = d.count + ' actief';
+  const b = document.getElementById('ghost-body');
+  if (!d.ghosts.length) { b.innerHTML='<tr><td colspan="9" class="no-data">Geen actieve ghosts</td></tr>'; return; }
+  b.innerHTML = d.ghosts.map(g => {
+    const slPct = g.entry && g.sl ? Math.abs((g.entry-g.sl)/g.entry*100).toFixed(2)+'%' : '—';
+    const maxUsed = g.entry && g.sl && g.maxPrice ? 
+      (Math.abs(g.entry - g.maxPrice) / Math.abs(g.entry - g.sl) * 100).toFixed(0) + '%' : '—';
+    return \`<tr>
+      <td style="font-size:9px;color:var(--dim)">\${g.optimizerKey}</td>
+      <td><span class="badge b-\${g.direction}">\${g.direction?.toUpperCase()}</span></td>
+      <td>\${sessionBadge(g.session)}</td>
+      <td>\${fmt(g.entry,5)}</td>
+      <td class="c-red">\${fmt(g.sl,5)}</td>
+      <td>\${fmt(g.maxPrice,5)}</td>
+      <td class="c-cyan">\${fmt(g.maxRR,2)}R</td>
+      <td>\${slBar(parseFloat(maxUsed))}</td>
+      <td class="c-dim">\${g.elapsedMin}m</td>
+    </tr>\`;
+  }).join('');
+}
+
+async function loadGhostHistory() {
+  const d = await sf('/ghosts/history?limit=30');
+  if (!d) return;
+  const b = document.getElementById('ghost-hist-body');
+  if (!d.rows.length) { b.innerHTML='<tr><td colspan="7" class="no-data">Geen ghost history</td></tr>'; return; }
+  b.innerHTML = d.rows.map(g => {
+    const slHit = g.phantomSLHit ? '<span class="c-red">✓ SL</span>' : '<span class="c-dim">—</span>';
+    return \`<tr>
+      <td style="font-size:9px;color:var(--dim)">\${g.optimizerKey}</td>
+      <td class="c-cyan">\${fmt(g.maxRRBeforeSL,2)}R</td>
+      <td class="c-gold">\${fmt(g.tpRRUsed,1)}R</td>
+      <td>\${slHit}</td>
+      <td class="c-dim">\${g.stopReason||'—'}</td>
+      <td class="c-dim">\${g.timeToSLMin!=null?g.timeToSLMin+'m':'—'}</td>
+      <td class="c-dim" style="font-size:9px">\${shortDate(g.closedAt)} \${shortTs(g.closedAt)}</td>
+    </tr>\`;
+  }).join('');
+}
+
+// ── EV MATRIX ─────────────────────────────────────────────────────
+const SESSIONS_M  = ['asia','london','ny'];
+const DIRS_M      = ['buy','sell'];
+const VWAPS_M     = ['above','below'];
+const SESSION_LBL = { asia:'Asia<br>02–08', london:'London<br>08–15:30', ny:'NY<br>15:30–21' };
 
 async function loadEV() {
-  const d = await sf('/ev'); if (!d) return;
-  document.getElementById('kpi-locks').textContent = d.filter(x=>x.count>=5).length;
-  const b = document.getElementById('ev-body');
-  if (!d.length) { b.innerHTML='<tr><td colspan="6" class="no-data">No ghost data yet</td></tr>'; return; }
-  b.innerHTML = d.map(ev => {
-    const lock = ev.bestRR != null ? (ev.bestEV>0?'<span class="c-green">✓ LOCKED</span>':'<span class="c-gold">Locked</span>') : '<span class="c-dim">Default 1R</span>';
-    const evCls = (ev.bestEV??0)>0?'c-green':(ev.bestEV??0)<0?'c-red':'c-dim';
-    return \`<tr>
-      <td style="font-size:10px">\${ev.key}</td>
-      <td>\${ev.count}</td>
-      <td class="c-gold">\${fmt(ev.bestRR,1)}R</td>
-      <td class="\${evCls}">\${fmt(ev.bestEV,4)}</td>
-      <td>\${lock}</td>
-      <td>\${(ev.bestEV??0)>0?'<span class="c-green">✓</span>':'<span class="c-red">✗</span>'}</td>
-    </tr>\`;
-  }).join('');
-}
+  const d = await sf('/ev');
+  if (!d) return;
+  _evData = d;
+  document.getElementById('kpi-locks').textContent = d.filter(x=>(x.count||0)>=5 && (x.bestEV||0)>0).length;
 
-async function loadShadow() {
-  const d = await sf('/shadow'); if (!d) return;
-  const b = document.getElementById('shadow-body');
-  if (!d.results.length) { b.innerHTML='<tr><td colspan="10" class="no-data">No shadow data yet — needs open positions with snapshots</td></tr>'; return; }
-  b.innerHTML = d.results.map(s => \`<tr>
-    <td style="font-size:10px">\${s.optimizerKey}</td>
-    <td>\${s.snapshotsCount}</td>
-    <td>\${s.positionsCount}</td>
-    <td>\${fmt(s.p50,1)}%</td>
-    <td>\${fmt(s.p90,1)}%</td>
-    <td>\${fmt(s.p99,1)}%</td>
-    <td>\${fmt(s.maxUsed,1)}%</td>
-    <td class="c-gold">\${s.recommendedSlPct!=null?(s.recommendedSlPct*100).toFixed(0)+'%':'-'}</td>
-    <td>\${s.currentSlTooWide?'<span class="c-red">YES ⚠</span>':'<span class="c-green">OK</span>'}</td>
-    <td>\${s.potentialSavingPct!=null?s.potentialSavingPct+'%':'-'}</td>
-  </tr>\`).join('');
-}
+  const FOREX=['AUDCAD','AUDCHF','AUDNZD','AUDUSD','CADCHF','EURAUD','EURCHF','EURUSD','GBPAUD','GBPNZD','GBPUSD','NZDCAD','NZDCHF','NZDUSD','USDCAD','USDCHF'];
+  const INDEX=['DE30EUR','NAS100USD','UK100GBP','US30USD'];
+  const COMM=['XAUUSD'];
+  const CRYPT=['BTCUSD'];
+  const STOCKS=['AAPL','AMD','AMZN','ARM','ASML','AVGO','AZN','BA','BABA','BAC','BRKB','CSCO','CVX','DIS','FDX','GE','GM','GME','GOOGL','IBM','INTC','JNJ','JPM','KO','LMT','MCD','META','MSFT','MSTR','NFLX','NKE','NVDA','PFE','PLTR','QCOM','SBUX','SNOW','T','TSLA','V','WMT','XOM','ZM'];
+  const INDEX_DISPLAY = {DE30EUR:'DAX40',NAS100USD:'NAS100',UK100GBP:'UK100',US30USD:'US30'};
 
-async function loadHistory() {
-  const d = await sf('/history'); if (!d) return;
-  const b = document.getElementById('hist-body');
-  b.innerHTML = d.slice(0,50).map(h => {
-    const t = new Date(h.ts).toLocaleTimeString('nl-BE');
-    return \`<tr>
-      <td class="c-dim">\${t}</td>
-      <td>\${h.type||'-'}</td>
-      <td class="c-blue">\${h.symbol||'-'}</td>
-      <td>\${h.direction?'<span class="badge b-'+h.direction+'">'+h.direction.toUpperCase()+'</span>':'-'}</td>
-      <td>\${h.vwapPosition?'<span class="badge b-'+h.vwapPosition+'">'+h.vwapPosition+'</span>':'-'}</td>
-      <td>\${h.session||'-'}</td>
-      <td style="font-size:9px">\${h.optimizerKey||'-'}</td>
-      <td class="c-dim" style="font-size:10px">\${h.reason||h.entry||''}</td>
-    </tr>\`;
-  }).join('');
-}
+  function renderMatrix(symbols, tableId, displayNames) {
+    const el = document.getElementById(tableId);
+    if (!el) return;
 
-async function loadRisk() {
-  const d = await sf('/risk-config'); if (!d) return;
-  const b = document.getElementById('risk-body');
-  b.innerHTML = d.config.map(c => \`<tr>
-    <td class="c-blue">\${c.symbol}</td>
-    <td class="c-dim">\${c.type}</td>
-    <td class="c-gold">\${(c.riskPct*100).toFixed(3)}%</td>
-    <td>\${c.riskEUR}€</td>
-    <td style="font-size:10px;color:var(--dim)">\${c.envVar}</td>
-  </tr>\`).join('');
-}
+    // Build EV lookup: key -> ev data
+    const lookup = {};
+    for (const ev of _evData) lookup[ev.key] = ev;
 
-async function loadAll() {
-  const h = await sf('/health'); if (h) {
-    document.getElementById('kpi-session').textContent = h.session?.toUpperCase()||'-';
-    document.getElementById('kpi-riskMult').textContent = 'x'+(h.riskMult||1).toFixed(2);
-    document.getElementById('kpi-locks').textContent = h.tpLocks;
+    // Header: symbol | buy-above | buy-below | sell-above | sell-below per session
+    const colGroups = [];
+    for (const s of SESSIONS_M) {
+      for (const dr of DIRS_M) {
+        for (const vw of VWAPS_M) {
+          colGroups.push({s,dr,vw});
+        }
+      }
+    }
+
+    // Simplified 2-level header
+    let thead = '<thead>';
+    // Row 1: sessions spanning 4 cols each
+    thead += '<tr><th class="grp" style="min-width:160px;position:sticky;left:0;z-index:2">Symbol</th>';
+    for (const s of SESSIONS_M) {
+      const lbl = {asia:'🌏 ASIA',london:'🇬🇧 LONDON',ny:'🇺🇸 NY'}[s];
+      thead += \`<th colspan="4" class="col-session" style="border-left:1px solid var(--border2);background:var(--bg2)">\${lbl}</th>\`;
+    }
+    thead += '</tr>';
+    // Row 2: buy/sell × above/below per session
+    thead += '<tr><th class="grp" style="position:sticky;left:0;z-index:2;background:var(--bg2)">↳ bestRR / WR% / EV / n</th>';
+    for (const s of SESSIONS_M) {
+      for (const dr of DIRS_M) {
+        const dc = dr==='buy'?'c-green':'c-red';
+        for (const vw of VWAPS_M) {
+          const vc = vw==='above'?'c-blue':'c-purple';
+          thead += \`<th style="text-align:center;font-size:9px;border-left:\${vw==='above'?'1px solid var(--border2)':'none'}">
+            <span class="\${dc}">\${dr.toUpperCase()}</span><br>
+            <span class="\${vc}" style="font-size:8px">\${vw}</span>
+          </th>\`;
+        }
+      }
+    }
+    thead += '</tr></thead>';
+
+    let tbody = '<tbody>';
+    for (const sym of symbols) {
+      const label = (displayNames && displayNames[sym]) ? displayNames[sym] : sym;
+      tbody += \`<tr><td class="cat-label" style="position:sticky;left:0;z-index:1">\${label}</td>\`;
+      for (const {s,dr,vw} of colGroups) {
+        const key  = sym+'_'+s+'_'+dr+'_'+vw;
+        const ev   = lookup[key];
+        const borderLeft = vw==='above' ? 'border-left:1px solid var(--border2);' : '';
+        if (!ev || !ev.count) {
+          tbody += \`<td class="combo" style="\${borderLeft}"><span class="c-dim" style="font-size:9px">—</span></td>\`;
+        } else {
+          const evPos = (ev.bestEV||0) > 0;
+          const evNeg = (ev.bestEV||0) < 0;
+          const evCls = evPos ? 'ev-pos' : evNeg ? 'ev-neg' : 'ev-zero';
+          const locked = ev.count >= 5 && evPos;
+          const bg = locked ? 'background:rgba(240,192,64,0.07);' : '';
+          const wr = ev.bestRR != null && ev.count > 0 ? '—' : '—'; // WR not in ev endpoint directly
+          tbody += \`<td class="combo" style="\${borderLeft}\${bg}">
+            <div class="combo-best-rr \${evCls}">\${ev.bestRR!=null?fmt(ev.bestRR,1)+'R':'—'}</div>
+            <div class="combo-ev \${evCls}">\${ev.bestEV!=null?fmt(ev.bestEV,3):'—'}</div>
+            <div class="combo-n c-dim">n=\${ev.count||0}\${locked?'<span class="c-gold"> ★</span>':''}</div>
+          </td>\`;
+        }
+      }
+      tbody += '</tr>';
+    }
+    tbody += '</tbody>';
+
+    el.innerHTML = thead + tbody;
   }
-  const activeSection = document.querySelector('.section.active')?.id?.replace('sec-','');
-  if (activeSection) await loadSection(activeSection);
+
+  renderMatrix(FOREX,  'ev-forex',     null);
+  renderMatrix(INDEX,  'ev-index',     {DE30EUR:'DAX40 (GER40)',NAS100USD:'NAS100 (US100)',UK100GBP:'UK100 (FTSE)',US30USD:'US30 (Dow)'});
+  renderMatrix(COMM,   'ev-commodity', {XAUUSD:'Gold (XAUUSD)'});
+  renderMatrix(CRYPT,  'ev-crypto',    {BTCUSD:'Bitcoin (BTCUSD)'});
+  renderMatrix(STOCKS, 'ev-stocks',    null);
 }
 
+// ── SHADOW ────────────────────────────────────────────────────────
+async function loadShadow() {
+  const d = await sf('/shadow');
+  if (!d) return;
+  const b = document.getElementById('shadow-body');
+  if (!d.results.length) { b.innerHTML='<tr><td colspan="14" class="no-data">Geen shadow data — open posities met snapshots nodig</td></tr>'; return; }
+  b.innerHTML = d.results.map(s => {
+    const tooWide = s.currentSlTooWide;
+    return \`<tr>
+      <td style="font-size:9px;color:var(--dim)">\${s.optimizerKey}</td>
+      <td class="c-blue">\${s.symbol||'—'}</td>
+      <td>\${sessionBadge(s.session)}</td>
+      <td><span class="badge b-\${s.direction}">\${(s.direction||'').toUpperCase()}</span></td>
+      <td><span class="badge b-\${s.vwapPosition||'unknown'}">\${s.vwapPosition||'?'}</span></td>
+      <td>\${fmtN(s.snapshotsCount)}</td>
+      <td>\${fmtN(s.positionsCount)}</td>
+      <td>\${fmt(s.p50,1)}%</td>
+      <td>\${fmt(s.p90,1)}%</td>
+      <td class="c-gold">\${fmt(s.p99,1)}%</td>
+      <td class="c-red">\${fmt(s.maxUsed,1)}%</td>
+      <td class="c-cyan">\${s.recommendedSlPct!=null?(s.recommendedSlPct*100).toFixed(0)+'%':'—'}</td>
+      <td>\${tooWide?'<span class="c-red">⚠ TE WIJD</span>':'<span class="c-green">OK</span>'}</td>
+      <td class="c-gold">\${s.potentialSavingPct!=null?s.potentialSavingPct+'%':'—'}</td>
+    </tr>\`;
+  }).join('');
+}
+
+// ── HISTORY ───────────────────────────────────────────────────────
+async function loadHistory() {
+  const d = await sf('/history');
+  if (!d) return;
+  _historyData = d;
+  renderHistory();
+}
+
+function filterHistory(f, el) {
+  _histFilter = f;
+  document.querySelectorAll('#sec-history .filter-btn').forEach(b => b.classList.remove('active'));
+  el.classList.add('active');
+  renderHistory();
+}
+
+function renderHistory() {
+  const data = _histFilter === 'all' ? _historyData : _historyData.filter(h => (h.type||'').includes(_histFilter));
+  const b = document.getElementById('hist-body');
+  if (!data.length) { b.innerHTML='<tr><td colspan="9" class="no-data">Geen events</td></tr>'; return; }
+  b.innerHTML = data.slice(0,100).map(h => {
+    const t = symType(h.symbol||'');
+    return \`<tr>
+      <td class="c-dim">\${shortTs(h.ts)}</td>
+      <td>\${histType(h.type)}</td>
+      <td class="c-blue">\${h.symbol||'—'}</td>
+      <td>\${catPill(t)}</td>
+      <td>\${h.direction?'<span class="badge b-'+h.direction+'">'+h.direction.toUpperCase()+'</span>':'—'}</td>
+      <td>\${h.vwapPosition?'<span class="badge b-'+h.vwapPosition+'">'+h.vwapPosition+'</span>':'—'}</td>
+      <td>\${sessionBadge(h.session)}</td>
+      <td style="font-size:9px;color:var(--dim);max-width:200px;overflow:hidden;text-overflow:ellipsis">\${h.optimizerKey||'—'}</td>
+      <td style="font-size:9px;color:var(--dim)">\${h.reason||h.entry||''}</td>
+    </tr>\`;
+  }).join('');
+}
+
+// ── CLOSED TRADES ─────────────────────────────────────────────────
+async function loadClosed() {
+  const d = await sf('/trades?limit=200');
+  if (!d) return;
+  _closedData = d.trades || [];
+  document.getElementById('closed-count').textContent = d.count + ' trades';
+  renderClosed();
+}
+
+function filterClosed(type, val, el) {
+  _closedFilter[type] = val;
+  // reset active on sibling buttons of same group
+  el.parentElement.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+  el.classList.add('active');
+  renderClosed();
+}
+
+function renderClosed() {
+  let data = _closedData;
+  if (_closedFilter.session !== 'all') data = data.filter(t => t.session === _closedFilter.session);
+  if (_closedFilter.dir    !== 'all') data = data.filter(t => t.direction === _closedFilter.dir);
+  const b = document.getElementById('closed-body');
+  if (!data.length) { b.innerHTML='<tr><td colspan="15" class="no-data">Geen trades</td></tr>'; return; }
+  b.innerHTML = data.map(h => {
+    const t = symType(h.symbol);
+    const pnlCls = (h.currentPnL||0)>=0?'pnl-pos':'pnl-neg';
+    return \`<tr class="type-\${t}">
+      <td class="c-blue" style="font-weight:600">\${h.symbol}</td>
+      <td>\${catPill(t)}</td>
+      <td><span class="badge b-\${h.direction}">\${h.direction?.toUpperCase()}</span></td>
+      <td><span class="badge b-\${h.vwapPosition||'unknown'}">\${h.vwapPosition||'?'}</span></td>
+      <td>\${sessionBadge(h.session)}</td>
+      <td>\${fmt(h.entry,5)}</td>
+      <td class="c-red">\${fmt(h.sl,5)}</td>
+      <td class="c-gold">\${h.tpRRUsed||'—'}R</td>
+      <td>\${fmt(h.lots,2)}</td>
+      <td class="c-gold">\${fmtPct(h.riskPct)}</td>
+      <td class="c-cyan">\${fmt(h.maxRR,2)}R</td>
+      <td>\${closeReasonBadge(h.closeReason)}</td>
+      <td class="\${pnlCls}">\${fmt(h.currentPnL,2)}€</td>
+      <td class="c-dim">\${shortDate(h.openedAt)}</td>
+      <td class="c-dim">\${shortDate(h.closedAt)} \${shortTs(h.closedAt)}</td>
+    </tr>\`;
+  }).join('');
+}
+
+// ── RISK CONFIG ───────────────────────────────────────────────────
+async function loadRisk() {
+  const d = await sf('/risk-config');
+  if (!d) return;
+  _riskData = d.config || [];
+  document.getElementById('risk-balance').textContent = 'Balance: €' + (d.balance||0).toLocaleString('nl-BE');
+  renderRisk();
+}
+
+function filterRisk(f, el) {
+  _riskFilter = f;
+  document.querySelectorAll('#sec-risk .filter-btn').forEach(b => b.classList.remove('active'));
+  el.classList.add('active');
+  renderRisk();
+}
+
+function renderRisk() {
+  let data = _riskData;
+  if (_riskFilter !== 'all') data = data.filter(r => r.type === _riskFilter);
+  const b = document.getElementById('risk-body');
+  b.innerHTML = data.map(c => \`<tr>
+    <td class="c-blue">\${c.symbol}</td>
+    <td>\${catPill(c.type)}</td>
+    <td class="c-gold">\${(c.riskPct*100).toFixed(3)}%</td>
+    <td class="c-green">€\${c.riskEUR}</td>
+    <td style="font-size:9px;color:var(--dim)">\${c.envVar}</td>
+  </tr>\`).join('');
+}
+
+// ── CLOCK & SESSION BADGE ─────────────────────────────────────────
 function updateClock() {
   const d = new Date().toLocaleString('nl-BE',{timeZone:'Europe/Brussels',hour:'2-digit',minute:'2-digit',second:'2-digit'});
   document.getElementById('clock').textContent = d;
 }
-setInterval(updateClock, 1000); updateClock();
-document.addEventListener('DOMContentLoaded', () => { loadAll(); setInterval(loadAll, 30000); });
+setInterval(updateClock, 1000);
+updateClock();
+
+// ── GLOBAL LOAD ───────────────────────────────────────────────────
+async function loadAll() {
+  const h = await sf('/health');
+  if (h) {
+    const s = h.session || 'outside';
+    document.getElementById('kpi-session').textContent  = s.toUpperCase();
+    document.getElementById('kpi-riskMult').textContent = 'x' + (h.riskMult||1).toFixed(2);
+    document.getElementById('kpi-locks').textContent    = h.tpLocks;
+    document.getElementById('kpi-ghosts').textContent   = h.ghosts;
+    document.getElementById('kpi-open').textContent     = h.openPos;
+
+    // Session badge in header
+    const hdrBadge = document.getElementById('hdr-session');
+    hdrBadge.className = 'session-badge s-' + s;
+    hdrBadge.textContent = {asia:'⛩ ASIA',london:'🇬🇧 LONDON',ny:'🇺🇸 NEW YORK',outside:'⏸ OUTSIDE'}[s] || s.toUpperCase();
+  }
+  const active = document.querySelector('.section.active')?.id?.replace('sec-','');
+  if (active) await loadSection(active);
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  loadAll();
+  setInterval(loadAll, 30000);
+});
 </script>
 </body>
 </html>`);
