@@ -1,15 +1,12 @@
 // ===============================================================
-// session.js  -  Timezone + Sessie helpers  |  v7.1
-// Automatische zomer/wintertijd via Intl API (geen hardcoded +1h)
-//   Winter -> CET  = UTC+1
-//   Zomer  -> CEST = UTC+2
+// session.js  v9.0  |  PRONTO-AI
 //
-// Wijzigingen v7.1 (t.o.v. v7.0):
-//  [OK] getBrusselsComponents()  -  accepteert nu ook string/number date input
-//     Fix: was (date instanceof Date) ? date : new Date() -> negeerde strings
-//     Nu:  date ? new Date(date) : new Date()   -  consistent met getBrusselsDateOnly
-//  [OK] isMarketOpen()  -  optionele `date` parameter toegevoegd voor testbaarheid
-//     Voorheen altijd "nu"; nu testbaar met historische of gesimuleerde tijden
+// Changes v9.0:
+//  - SYMBOL_CATALOG: only approved symbols (stocks/forex/index/commodity/crypto)
+//  - Sessions: asia 02:00-08:00 | london 08:00-15:30 | ny 15:30-21:00
+//  - isMarketOpen(): all symbols tradeable 02:00-21:00 mon-fri, NO blocking
+//  - getVwapPosition(): above | below based on close vs vwap
+//  - normalizeSymbol() handles BRK.B → BRKB, GOOGL → GOOGL
 // ===============================================================
 
 "use strict";
@@ -21,17 +18,103 @@ const DAYS_MAP = {
   Thursday: 4, Friday: 5, Saturday: 6,
 };
 
-/**
- * Geeft { day, hhmm, hour, minute } in Brussels lokale tijd terug.
- *
- * @param {Date|string|number|null} date  optioneel, default = now
- */
-function getBrusselsComponents(date) {
-  // [v7.1] Fix: was (date instanceof Date) ? date : new Date()
-  // -> string/number input werd genegeerd, altijd new Date() gebruikt.
-  // Nu consistent met getBrusselsDateOnly().
-  const d = date ? new Date(date) : new Date();
+// ── Approved symbol catalog ─────────────────────────────────────
+// ONLY these symbols are accepted. type determines lot/risk calc.
+// mt5: exact broker symbol string on FTMO MT5.
+const SYMBOL_CATALOG = {
+  // ── Stocks ──────────────────────────────────────────────────
+  AAPL:      { type: "stock",     mt5: "AAPL"      },
+  AMD:       { type: "stock",     mt5: "AMD"       },
+  AMZN:      { type: "stock",     mt5: "AMZN"      },
+  ARM:       { type: "stock",     mt5: "ARM"       },
+  ASML:      { type: "stock",     mt5: "ASML"      },
+  AVGO:      { type: "stock",     mt5: "AVGO"      },
+  AZN:       { type: "stock",     mt5: "AZN"       },
+  BA:        { type: "stock",     mt5: "BA"        },
+  BABA:      { type: "stock",     mt5: "BABA"      },
+  BAC:       { type: "stock",     mt5: "BAC"       },
+  BRKB:      { type: "stock",     mt5: "BRK.B"     },
+  CSCO:      { type: "stock",     mt5: "CSCO"      },
+  CVX:       { type: "stock",     mt5: "CVX"       },
+  DIS:       { type: "stock",     mt5: "DIS"       },
+  FDX:       { type: "stock",     mt5: "FDX"       },
+  GE:        { type: "stock",     mt5: "GE"        },
+  GM:        { type: "stock",     mt5: "GM"        },
+  GME:       { type: "stock",     mt5: "GME"       },
+  GOOGL:     { type: "stock",     mt5: "GOOGL"     },
+  IBM:       { type: "stock",     mt5: "IBM"       },
+  INTC:      { type: "stock",     mt5: "INTC"      },
+  JNJ:       { type: "stock",     mt5: "JNJ"       },
+  JPM:       { type: "stock",     mt5: "JPM"       },
+  KO:        { type: "stock",     mt5: "KO"        },
+  LMT:       { type: "stock",     mt5: "LMT"       },
+  MCD:       { type: "stock",     mt5: "MCD"       },
+  META:      { type: "stock",     mt5: "META"      },
+  MSFT:      { type: "stock",     mt5: "MSFT"      },
+  MSTR:      { type: "stock",     mt5: "MSTR"      },
+  NFLX:      { type: "stock",     mt5: "NFLX"      },
+  NKE:       { type: "stock",     mt5: "NKE"       },
+  NVDA:      { type: "stock",     mt5: "NVDA"      },
+  PFE:       { type: "stock",     mt5: "PFE"       },
+  PLTR:      { type: "stock",     mt5: "PLTR"      },
+  QCOM:      { type: "stock",     mt5: "QCOM"      },
+  SBUX:      { type: "stock",     mt5: "SBUX"      },
+  SNOW:      { type: "stock",     mt5: "SNOW"      },
+  T:         { type: "stock",     mt5: "T"         },
+  TSLA:      { type: "stock",     mt5: "TSLA"      },
+  V:         { type: "stock",     mt5: "V"         },
+  WMT:       { type: "stock",     mt5: "WMT"       },
+  XOM:       { type: "stock",     mt5: "XOM"       },
+  ZM:        { type: "stock",     mt5: "ZM"        },
+  // ── Forex ────────────────────────────────────────────────────
+  AUDCAD:    { type: "forex",     mt5: "AUDCAD"    },
+  AUDCHF:    { type: "forex",     mt5: "AUDCHF"    },
+  AUDNZD:    { type: "forex",     mt5: "AUDNZD"    },
+  AUDUSD:    { type: "forex",     mt5: "AUDUSD"    },
+  CADCHF:    { type: "forex",     mt5: "CADCHF"    },
+  EURAUD:    { type: "forex",     mt5: "EURAUD"    },
+  EURCHF:    { type: "forex",     mt5: "EURCHF"    },
+  EURUSD:    { type: "forex",     mt5: "EURUSD"    },
+  GBPAUD:    { type: "forex",     mt5: "GBPAUD"    },
+  GBPNZD:    { type: "forex",     mt5: "GBPNZD"    },
+  GBPUSD:    { type: "forex",     mt5: "GBPUSD"    },
+  NZDCAD:    { type: "forex",     mt5: "NZDCAD"    },
+  NZDCHF:    { type: "forex",     mt5: "NZDCHF"    },
+  NZDUSD:    { type: "forex",     mt5: "NZDUSD"    },
+  USDCAD:    { type: "forex",     mt5: "USDCAD"    },
+  USDCHF:    { type: "forex",     mt5: "USDCHF"    },
+  // ── Indexes ───────────────────────────────────────────────────
+  DE30EUR:   { type: "index",     mt5: "GER40.cash"   },
+  NAS100USD: { type: "index",     mt5: "US100.cash"   },
+  UK100GBP:  { type: "index",     mt5: "UK100.cash"   },
+  US30USD:   { type: "index",     mt5: "US30.cash"    },
+  // ── Commodities ───────────────────────────────────────────────
+  XAUUSD:    { type: "commodity", mt5: "XAUUSD"    },
+  // ── Crypto ────────────────────────────────────────────────────
+  BTCUSD:    { type: "crypto",    mt5: "BTCUSD"    },
+};
 
+// ── Aliases for TV symbols that differ from catalog key ─────────
+// Maps incoming TV ticker → canonical catalog key
+const SYMBOL_ALIASES = {
+  "BRK.B": "BRKB",
+  "BRKB":  "BRKB",
+  "GER40":  "DE30EUR",
+  "GER40.cash": "DE30EUR",
+  "UK100":  "UK100GBP",
+  "UK100.cash": "UK100GBP",
+  "NAS100": "NAS100USD",
+  "US100":  "NAS100USD",
+  "US100.cash": "NAS100USD",
+  "US30":   "US30USD",
+  "US30.cash": "US30USD",
+  "GOLD":   "XAUUSD",
+  "GOOG":   "GOOGL",
+};
+
+// ── Brussels timezone helpers ────────────────────────────────────
+function getBrusselsComponents(date) {
+  const d = date ? new Date(date) : new Date();
   const parts = new Intl.DateTimeFormat("en-US", {
     timeZone: TIMEZONE,
     weekday:  "long",
@@ -39,22 +122,15 @@ function getBrusselsComponents(date) {
     minute:   "2-digit",
     hour12:   false,
   }).formatToParts(d);
-
-  const get = (type) => parts.find(p => p.type === type)?.value ?? "0";
-
+  const get    = (type) => parts.find(p => p.type === type)?.value ?? "0";
   let hour     = parseInt(get("hour"),   10);
   const minute = parseInt(get("minute"), 10);
   if (hour === 24) hour = 0;
-
   const weekday = get("weekday");
   const day     = DAYS_MAP[weekday] ?? 0;
-
   return { day, hhmm: hour * 100 + minute, hour, minute };
 }
 
-/**
- * Leesbare datum/tijd string in Brussels tijdzone.
- */
 function getBrusselsDateStr() {
   return new Intl.DateTimeFormat("nl-BE", {
     timeZone:  TIMEZONE,
@@ -63,23 +139,8 @@ function getBrusselsDateStr() {
   }).format(new Date());
 }
 
-/**
- * [v7.0] Geeft de huidige (of opgegeven) datum als YYYY-MM-DD
- * in Brussels tijdzone.
- *
- * Vervangt ALLE uses van:
- *   new Date().toISOString().split("T")[0]
- *
- * Reden: UTC midnight != Brussels midnight. Een trade gesloten om
- * 23:30 Brussels (= 21:30 UTC winter) werd onder de verkeerde
- * UTC-dag geboekt. Brussels midnight is de correcte grens.
- *
- * @param {Date|string|number|null} date  optioneel, default = now
- * @returns {string}  "YYYY-MM-DD" in Brussels tijd
- */
 function getBrusselsDateOnly(date) {
   const d = date ? new Date(date) : new Date();
-  // en-CA locale geeft altijd YYYY-MM-DD formaat
   return new Intl.DateTimeFormat("en-CA", {
     timeZone: TIMEZONE,
     year:     "numeric",
@@ -88,105 +149,97 @@ function getBrusselsDateOnly(date) {
   }).format(d);
 }
 
-const SESSION_LABELS = {
-  asia:           "Asia (02:00-08:00)",
-  london:         "London (08:00-15:30)",
-  ny:             "New York (15:30-20:00)",
-  buiten_venster: "Buiten venster",
-};
-
-/**
- * Geeft de handelssessie op basis van een tijdstip (of nu).
- *
- * @param {Date|string|number|null} dateOrStr  optioneel, default = now
- */
-function getSessionGMT1(dateOrStr) {
-  const d = dateOrStr ? new Date(dateOrStr) : new Date();
-  const { hhmm } = getBrusselsComponents(d);
+// ── Session detection ────────────────────────────────────────────
+// Asia:   02:00 – 08:00  Brussels
+// London: 08:00 – 15:30  Brussels
+// NY:     15:30 – 21:00  Brussels
+function getSession(date) {
+  const { hhmm } = getBrusselsComponents(date);
   if (hhmm >= 200  && hhmm < 800)  return "asia";
   if (hhmm >= 800  && hhmm < 1530) return "london";
-  if (hhmm >= 1530 && hhmm < 2000) return "ny";
-  return "buiten_venster";
+  if (hhmm >= 1530 && hhmm < 2100) return "ny";
+  return "outside";
 }
 
-/**
- * Controleert of de markt open is voor nieuwe TRADES (nieuwe orders).
- * Geen nieuwe trades na 20:00  -  geldt voor alle types behalve crypto weekend.
- *
- * Vensters (Brussels tijd):
- *   - Alle types behalve stock: 02:00-20:00 (ma-vr)
- *   - Stocks: alleen 15:30-20:00 (NY venster)
- *   - Crypto: ook weekend 02:00-20:00
- *
- * [v7.1] Optionele `date` parameter voor testbaarheid.
- *
- * @param {string}   type               asset type (bijv. "stock", "crypto", ...)
- * @param {string}   symbol             MT5 symbool
- * @param {Function} isCryptoWeekendFn  functie (symbol) => boolean
- * @param {Date|string|number|null} date optioneel, default = now
- */
-function isMarketOpen(type, symbol, isCryptoWeekendFn, date = null) {
+// ── Market open check ────────────────────────────────────────────
+// All symbols: 02:00–21:00 mon-fri. NO symbol/direction blocking.
+// Crypto follows same window (BTCUSD is in catalog).
+function isMarketOpen(date = null) {
   const { day, hhmm } = getBrusselsComponents(date);
-  const isWE = day === 0 || day === 6;
-
-  if (isWE) {
-    if (!isCryptoWeekendFn(symbol || "")) {
-      console.warn(`🚫 Weekend  -  ${symbol} geblokkeerd`);
-      return false;
-    }
-    if (hhmm < 200 || hhmm >= 2000) {
-      console.warn(`🚫 Weekend crypto buiten 02:00-20:00 (${hhmm})`);
-      return false;
-    }
-    return true;
-  }
-
-  if (hhmm < 200)   { console.warn(`🚫 Voor 02:00 (${hhmm})`);   return false; }
-  if (hhmm >= 2000) { console.warn(`🚫 Na 20:00  -  geen nieuwe trades (${hhmm})`); return false; }
-
-  if (type === "stock" && hhmm < 1530) {
-    console.warn(`🚫 Aandelen buiten 15:30-20:00 (${hhmm})`);
-    return false;
-  }
-
+  if (day === 0 || day === 6) return false; // weekend
+  if (hhmm < 200)             return false; // before 02:00
+  if (hhmm >= 2100)           return false; // from 21:00
   return true;
 }
 
-/**
- * [v5.2] Controleert of ghost tracking nog actief mag zijn.
- * Ghost trading loopt door tot 22:00 (na auto-close van 21:50).
- * Stopt NIET bij 20:00  -  alleen bij SL phantom trigger of 22:00.
- *
- * @param {Date|string|number|null} date  optioneel, default = now
- */
+// Ghost/shadow may run until 23:00 to finalize after-market data
 function isGhostActive(date) {
-  const d = date ? new Date(date) : new Date();
-  const { day, hhmm } = getBrusselsComponents(d);
-  const isWE = day === 0 || day === 6;
-  if (isWE) return false;        // geen ghost in weekend
-  if (hhmm < 200)  return false; // voor dagstart
-  if (hhmm >= 2200) return false; // na 22:00 hard stop
+  const { day, hhmm } = getBrusselsComponents(date ? new Date(date) : new Date());
+  if (day === 0 || day === 6) return false;
+  if (hhmm < 200)             return false;
+  if (hhmm >= 2300)           return false;
   return true;
 }
 
-/**
- * [v5.2] Controleert of shadow optimizer actief mag zijn.
- * Zelfde tijdvenster als ghost: stopt om 22:00.
- *
- * @param {Date|string|number|null} date  optioneel, default = now
- */
-function isShadowActive(date) {
-  return isGhostActive(date);
+function isShadowActive(date) { return isGhostActive(date); }
+
+// ── Symbol normalization ─────────────────────────────────────────
+// Returns canonical catalog key (e.g. "BRKB") or null if not allowed.
+function normalizeSymbol(raw) {
+  if (!raw) return null;
+  const upper = raw.toString().toUpperCase().trim();
+  // Check alias first
+  if (SYMBOL_ALIASES[upper]) return SYMBOL_ALIASES[upper];
+  // Strip non-alphanumeric for comparison (handles BRK.B → BRKB)
+  const stripped = upper.replace(/[^A-Z0-9]/g, "");
+  if (SYMBOL_ALIASES[stripped]) return SYMBOL_ALIASES[stripped];
+  if (SYMBOL_CATALOG[upper])    return upper;
+  if (SYMBOL_CATALOG[stripped]) return stripped;
+  return null; // not in catalog
 }
+
+function getSymbolInfo(raw) {
+  const key = normalizeSymbol(raw);
+  if (!key) return null;
+  return { ...SYMBOL_CATALOG[key], key };
+}
+
+// ── VWAP position ────────────────────────────────────────────────
+// Determines if close is above or below VWAP mid line.
+// Uses vwap field from TradingView payload.
+function getVwapPosition(closePrice, vwapMid) {
+  if (closePrice == null || vwapMid == null || vwapMid === 0) return "unknown";
+  return closePrice >= vwapMid ? "above" : "below";
+}
+
+// ── Optimizer key ────────────────────────────────────────────────
+// Unique key for ghost/shadow/EV lookups.
+// Format: EURUSD_london_buy_above
+function buildOptimizerKey(symbol, session, direction, vwapPos) {
+  return `${symbol}_${session}_${direction}_${vwapPos}`;
+}
+
+const SESSION_LABELS = {
+  asia:    "Asia (02:00–08:00)",
+  london:  "London (08:00–15:30)",
+  ny:      "New York (15:30–21:00)",
+  outside: "Outside window",
+};
 
 module.exports = {
+  SYMBOL_CATALOG,
+  SYMBOL_ALIASES,
+  SESSION_LABELS,
+  TIMEZONE,
   getBrusselsComponents,
   getBrusselsDateStr,
   getBrusselsDateOnly,
-  getSessionGMT1,
+  getSession,
   isMarketOpen,
   isGhostActive,
   isShadowActive,
-  SESSION_LABELS,
-  TIMEZONE,
+  normalizeSymbol,
+  getSymbolInfo,
+  getVwapPosition,
+  buildOptimizerKey,
 };
