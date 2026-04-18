@@ -1,6 +1,16 @@
 // ===============================================================
-// server.js  v10.1  |  PRONTO-AI
+// server.js  v10.2  |  PRONTO-AI
 // TradingView → MetaApi REST → FTMO MT5
+//
+// v10.2 fixes (8 total):
+//  FIX 1 — spread_at_entry saved in closed_trades
+//  FIX 2 — vwap_band_pct saved in closed_trades
+//  FIX 3 — Lots recalc order confirmed correct after enforceMinStop
+//  FIX 4 — Spread guard for stocks (>25% SL dist → close+reject)
+//  FIX 5 — Anti-consolidation forex (sharesCurrency helper)
+//  FIX 6 — Ghost entry log on restart
+//  FIX 7 — GET /signal-stats endpoint
+//  FIX 8 — /shadow/winners route moved ABOVE /shadow/:key
 //
 // v10.1 changes:
 //  - sl_pct: validated as 0 < x <= 0.05 (max 5%), human-readable log
@@ -55,6 +65,7 @@ const {
   logWebhook, loadWebhookHistory,
   logSignal,
   computeEVStats,
+  loadSignalStats,
   loadShadowWinners,
 } = require("./db");
 
@@ -326,6 +337,14 @@ function calcPctSlUsed(direction, entry, sl, currentPrice) {
   return parseFloat((Math.max(0, Math.min(100, (adverse / dist) * 100)).toFixed(2)));
 }
 
+// ── FIX 5: Anti-consolidation helper ────────────────────────────
+function sharesCurrency(a, b) {
+  if (!a || !b || a.length < 6 || b.length < 6) return false;
+  const aBase = a.slice(0, 3), aQuote = a.slice(3, 6);
+  const bBase = b.slice(0, 3), bQuote = b.slice(3, 6);
+  return aBase === bBase || aBase === bQuote || aQuote === bBase || aQuote === bQuote;
+}
+
 // ── Ghost Optimizer ───────────────────────────────────────────────
 function startGhostTracker(pos) {
   const { positionId, symbol, mt5Symbol, session, direction, vwapPosition,
@@ -523,7 +542,11 @@ async function handlePositionClosed(pos) {
   const closeReason = hitTP ? "tp" : maxRR <= 0.05 ? "sl" : "manual";
   const now         = new Date().toISOString();
 
-  const closed = { ...pos, maxRR, hitTP, closeReason, closedAt: now, trueMaxRR: null, trueMaxPrice: null };
+  const closed = {
+    ...pos, maxRR, hitTP, closeReason, closedAt: now, trueMaxRR: null, trueMaxPrice: null,
+    spreadAtEntry: pos.spread ?? null,   // FIX 1
+    vwapBandPct:   pos.vwapBandPct ?? null,  // FIX 2 (explicit)
+  };
   closedTrades.push(closed);
   await saveTrade(closed).catch(() => {});
   await savePnlLog(pos.symbol, pos.session, pos.direction, pos.vwapPosition, maxRR, hitTP, pos.currentPnL ?? 0).catch(() => {});
@@ -558,7 +581,11 @@ async function restorePositionsFromMT5() {
         maxRR: 0, currentPnL: lp.unrealizedProfit ?? 0,
         slPct: null, restoredAfterRestart: true,
       };
-      if (openPositions[id].sl > 0) startGhostTracker(openPositions[id]);
+      if (openPositions[id].sl > 0) {
+        // FIX 6: log exact entry used for ghost after restart
+        console.log(`[Restart] Ghost entry for ${sym} (${id}): entry=${entry} (openPrice=${lp.openPrice ?? "null"}, fallback currentPrice=${lp.currentPrice ?? "null"})`);
+        startGhostTracker(openPositions[id]);
+      }
       restored++;
     }
     console.log(`[Restart] ${restored} position(s) restored from MT5`);
@@ -785,10 +812,31 @@ app.post("/webhook", async (req, res) => {
   if (!global._dupGuard) global._dupGuard = {};
   global._dupGuard[dupKey] = Date.now();
 
+  // ── FIX 5: Anti-consolidation for forex ────────────────────────
+  let halfRiskForex = false;
+  if (assetType === "forex") {
+    const related = Object.values(openPositions).filter(p =>
+      p.direction === direction && sharesCurrency(p.symbol, symKey)
+    );
+    if (related.length >= 3) {
+      const reason = `CONSOLIDATION_BLOCK: ${related.length} related forex ${direction} positions (${related.map(p => p.symbol).join(", ")})`;
+      logEvent({ type: "CONSOLIDATION_BLOCK", symbol: symKey, direction, count: related.length, reason });
+      await logSignal({ symbol: symKey, direction, session, vwapPosition, optimizerKey, tvEntry: closePrice, slPct: slPctRaw, slPctHuman, vwap: vwapMid, vwapBandPct, outcome: "CONSOLIDATION_BLOCK", rejectReason: reason }).catch(() => {});
+      console.log(`[AntiConsolidation] ${symKey}: BLOCKED — ${related.length} related ${direction} positions`);
+      return res.status(200).json({ status: "CONSOLIDATION_BLOCK", reason, related: related.length });
+    }
+    if (related.length >= 1) {
+      halfRiskForex = true;
+      console.log(`[AntiConsolidation] ${symKey}: ${related.length} related ${direction} forex → halfRisk`);
+      logEvent({ type: "HALF_RISK_FOREX", symbol: symKey, direction, relatedCount: related.length });
+    }
+  }
+
   // ── Risk & lots pre-calculation (using TV entry as placeholder) ──
   const riskPct = getSymbolRiskPct(symKey);
   const mult    = getKeyRiskMult(optimizerKey);
-  const riskEUR = await calcRiskEUR(symKey, optimizerKey);
+  let riskEUR   = await calcRiskEUR(symKey, optimizerKey);
+  if (halfRiskForex) riskEUR *= 0.5;   // FIX 5: half risk for consolidation
   const balance = await getLiveBalance();
 
   // Temporary lot calculation using TV entry (will be recalculated after execution)
@@ -860,7 +908,22 @@ app.post("/webhook", async (req, res) => {
 
   const slippage = parseFloat((executionPrice - closePrice).toFixed(5));
 
+  // ── FIX 4: Spread guard for stocks ───────────────────────────────
+  if (assetType === "stock" && spread > 0) {
+    const guardSLDist = Math.abs(executionPrice - calcSLFromPct(direction, executionPrice, slPctRaw));
+    if (guardSLDist > 0 && spread > 0.25 * guardSLDist) {
+      const reason = `SPREAD_GUARD: spread ${spread.toFixed(5)} > 25% of SL dist ${guardSLDist.toFixed(5)} (${(spread / guardSLDist * 100).toFixed(1)}%)`;
+      logEvent({ type: "SPREAD_GUARD_CLOSE", symbol: symKey, direction, positionId, spread, slDist: guardSLDist, reason });
+      await logSignal({ symbol: symKey, direction, session, vwapPosition, optimizerKey, tvEntry: closePrice, slPct: slPctRaw, slPctHuman, vwap: vwapMid, vwapBandPct, outcome: "SPREAD_GUARD_CLOSE", rejectReason: reason }).catch(() => {});
+      console.warn(`[SpreadGuard] ${symKey} ${positionId}: ${reason} — closing position`);
+      try { await closePosition(positionId); } catch (ce) { console.warn(`[SpreadGuard] closePosition failed: ${ce.message}`); }
+      return res.status(200).json({ status: "SPREAD_GUARD_CLOSE", reason, positionId, spread, slDist: guardSLDist });
+    }
+  }
+
   // ── Step C: Calculate SL and TP from real execution price ─────────
+  // FIX 3 CONFIRMED: enforceMinStop runs BEFORE calcLots so lots always
+  // use the actual enforced SL distance, not the raw calculated one.
   let mt5SL = calcSLFromPct(direction, executionPrice, slPctRaw);
   mt5SL     = enforceMinStop(mt5Symbol, direction, executionPrice, mt5SL);
   const mt5TP = calcTPPrice(direction, executionPrice, mt5SL, tpRR);
@@ -915,6 +978,7 @@ app.post("/webhook", async (req, res) => {
     slPct:      slPctRaw, slPctHuman,
     vwap:       vwapMid, vwapBandPct,
     latencyMs,
+    halfRiskForex,
   };
   logEvent(logEntry);
 
@@ -941,7 +1005,7 @@ app.post("/webhook", async (req, res) => {
     sl:  mt5SL, tp: mt5TP, tpRR, rrLabel,
     lots, riskPct, riskEUR, riskMult: mult, optimizerKey,
     spread, bid, ask, balance, latencyMs,
-    slPctHuman, vwapBandPct,
+    slPctHuman, vwapBandPct, halfRiskForex,
   });
 });
 
@@ -1007,22 +1071,21 @@ app.get("/shadow", (req, res) => {
   res.json({ count: results.length, results });
 });
 
+// FIX 8: /shadow/winners BEFORE /shadow/:key — Express matches routes in order.
+// If :key came first it would capture "winners" as the key parameter.
+app.get("/shadow/winners", async (req, res) => {
+  const data = await loadShadowWinners();
+  const rows = Object.entries(data).map(([key, v]) => ({ optimizerKey: key, ...v }));
+  rows.sort((a, b) => a.optimizerKey.localeCompare(b.optimizerKey));
+  res.json({ count: rows.length, winners: rows });
+});
+
 app.get("/shadow/:key", async (req, res) => {
   const key   = decodeURIComponent(req.params.key);
   const local = shadowResults[key];
   if (local) return res.json(local);
   const rows = await loadShadowAnalysis(key);
   res.json(rows[0] ?? { error: "No data yet for this key" });
-});
-
-// Shadow SL percentiles for WINNING trades only (hit_tp=TRUE)
-// Shows how much SL room was used on trades that actually hit TP.
-// Use this to tighten SL without killing winners.
-app.get("/shadow/winners", async (req, res) => {
-  const data = await loadShadowWinners();
-  const rows = Object.entries(data).map(([key, v]) => ({ optimizerKey: key, ...v }));
-  rows.sort((a, b) => a.optimizerKey.localeCompare(b.optimizerKey));
-  res.json({ count: rows.length, winners: rows });
 });
 
 app.get("/tp-locks", (req, res) => {
@@ -1076,13 +1139,20 @@ app.get("/risk-multipliers", (req, res) => {
   res.json({ fixedRiskPct: FIXED_RISK_PCT, multipliers: entries });
 });
 
+// FIX 7: Signal conversion ratio endpoint
+app.get("/signal-stats", async (req, res) => {
+  const stats = await loadSignalStats();
+  if (!stats) return res.status(500).json({ error: "Could not compute signal stats" });
+  res.json(stats);
+});
+
 app.get("/health", async (req, res) => {
   const balance = await getLiveBalance();
   const tradeWindowForex = canOpenNewTrade("EURUSD");
   const tradeWindowStock = canOpenNewTrade("AAPL");
   res.json({
     status:    "ok",
-    version:   "10.1.0",
+    version:   "10.2.0",
     time:      getBrusselsDateStr(),
     openPos:   Object.keys(openPositions).length,
     ghosts:    Object.keys(ghostTrackers).length,
@@ -1116,7 +1186,7 @@ app.get(["/", "/dashboard"], async (req, res) => {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PRONTO-AI v10.1 — Dashboard</title>
+<title>PRONTO-AI v10.2 — Dashboard</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Barlow+Condensed:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
@@ -1244,7 +1314,7 @@ tr.ts{border-left:2px solid rgba(48,184,248,.2)}tr.tf{border-left:2px solid rgba
 <div class="hdr">
   <div>
     <div class="logo">PRONTO-AI</div>
-    <div class="ver">v10.0 · TradingView → MetaApi → FTMO MT5 · Fixed Risk ${(FIXED_RISK_PCT*100).toFixed(3)}% · Default TP 2.0R</div>
+    <div class="ver">v10.2 · TradingView → MetaApi → FTMO MT5 · Fixed Risk ${(FIXED_RISK_PCT*100).toFixed(3)}% · Default TP 2.0R</div>
   </div>
   <div class="hdr-r">
     <span class="sess-badge s-outside" id="hdr-sess">—</span>
@@ -1304,7 +1374,7 @@ tr.ts{border-left:2px solid rgba(48,184,248,.2)}tr.tf{border-left:2px solid rgba
           <th class="srt" onclick="sortTbl('pos-tbl',17)">Risk €</th>
           <th>Opened</th>
         </tr></thead>
-        <tbody id="pos-body"><tr><td colspan="19" class="nodata">Loading…</td></tr></tbody>
+        <tbody id="pos-body"><tr><td colspan="19" class="nodata">No open positions</td></tr></tbody>
       </table>
     </div>
   </div>
@@ -1322,7 +1392,7 @@ tr.ts{border-left:2px solid rgba(48,184,248,.2)}tr.tf{border-left:2px solid rgba
     <div class="info">
       Stocks show <strong>NY session only</strong>. Forex/Index/Commodity show all 3 sessions.
       <strong>SL%(W)</strong> = average max-adverse SL% for <strong>winning trades only</strong> (TP hit) — use this to tighten SL without killing winners.
-      All trades counted from <strong class="hi">18 April 2026</strong> onwards. Default sorted by #trades descending.
+      All trades counted from <strong class="hi">18 April 2026</strong> onwards. Pairs with no data shown dimmed. Default: all pairs shown.
     </div>
     <div class="fbar">
       <span class="fl">Type:</span>
@@ -1345,8 +1415,8 @@ tr.ts{border-left:2px solid rgba(48,184,248,.2)}tr.tf{border-left:2px solid rgba
       <button class="fb" onclick="setOF('vwap','above',this,'ov')">Above</button>
       <button class="fb" onclick="setOF('vwap','below',this,'ov')">Below</button>
       <span class="fl" style="margin-left:5px">Show:</span>
-      <button class="fb" onclick="setOF('zeros','all',this,'oz')">All rows</button>
-      <button class="fb on" onclick="setOF('zeros','traded',this,'oz')">Traded only</button>
+      <button class="fb on" onclick="setOF('zeros','all',this,'oz')">All rows</button>
+      <button class="fb" onclick="setOF('zeros','traded',this,'oz')">Traded only</button>
       <span class="fl" style="margin-left:5px">Symbol:</span>
       <input class="finput" id="ov-sym" placeholder="e.g. EURUSD" oninput="renderOv()">
     </div>
@@ -1380,7 +1450,7 @@ tr.ts{border-left:2px solid rgba(48,184,248,.2)}tr.tf{border-left:2px solid rgba
           <th class="srt" onclick="sortOv('tph')">TP Hits</th>
           <th class="srt" onclick="sortOv('slh')">SL Hits</th>
         </tr></thead>
-        <tbody id="ov-body"><tr><td colspan="18" class="nodata">Loading…</td></tr></tbody>
+        <tbody id="ov-body"><tr><td colspan="18" class="nodata">—</td></tr></tbody>
       </table>
     </div>
   </div>
@@ -1418,7 +1488,7 @@ tr.ts{border-left:2px solid rgba(48,184,248,.2)}tr.tf{border-left:2px solid rgba
           <th>Position ID</th>
           <th>Detail / Reason</th>
         </tr></thead>
-        <tbody id="hist-body"><tr><td colspan="15" class="nodata">Loading…</td></tr></tbody>
+        <tbody id="hist-body"><tr><td colspan="15" class="nodata">—</td></tr></tbody>
       </table>
     </div>
   </div>
@@ -1461,7 +1531,7 @@ tr.ts{border-left:2px solid rgba(48,184,248,.2)}tr.tf{border-left:2px solid rgba
           <th class="srt" onclick="sortTbl('ghh-tbl',7)">Time(min)</th>
           <th class="srt" onclick="sortTbl('ghh-tbl',8)">Closed</th>
         </tr></thead>
-        <tbody id="ghh-body"><tr><td colspan="9" class="nodata">Loading…</td></tr></tbody>
+        <tbody id="ghh-body"><tr><td colspan="9" class="nodata">—</td></tr></tbody>
       </table>
     </div>
   </div>
@@ -1526,7 +1596,7 @@ tr.ts{border-left:2px solid rgba(48,184,248,.2)}tr.tf{border-left:2px solid rgba
           <th class="srt" onclick="sortTbl('sh-tbl',14)">SL%(W) p90</th>
           <th class="srt" onclick="sortTbl('sh-tbl',15)">W Count</th>
         </tr></thead>
-        <tbody id="sh-body"><tr><td colspan="16" class="nodata">Loading…</td></tr></tbody>
+        <tbody id="sh-body"><tr><td colspan="16" class="nodata">—</td></tr></tbody>
       </table>
     </div>
   </div>
@@ -1562,7 +1632,7 @@ tr.ts{border-left:2px solid rgba(48,184,248,.2)}tr.tf{border-left:2px solid rgba
           <th>Lots</th><th>Flags</th>
           <th class="srt" onclick="sortTbl('err-tbl',12)">Closed</th>
         </tr></thead>
-        <tbody id="err-body"><tr><td colspan="13" class="nodata">Loading…</td></tr></tbody>
+        <tbody id="err-body"><tr><td colspan="13" class="nodata">—</td></tr></tbody>
       </table>
     </div>
   </div>
@@ -1601,7 +1671,7 @@ tr.ts{border-left:2px solid rgba(48,184,248,.2)}tr.tf{border-left:2px solid rgba
           <th>Lot Override</th>
           <th>Env Var</th>
         </tr></thead>
-        <tbody id="risk-body"><tr><td colspan="7" class="nodata">Loading…</td></tr></tbody>
+        <tbody id="risk-body"><tr><td colspan="7" class="nodata">—</td></tr></tbody>
       </table>
     </div>
     <div class="subhdr">Lot overrides — set in Railway after SL recalc</div>
@@ -1672,7 +1742,7 @@ function sortTbl(id,col){
 }
 
 // ── Filter state ───────────────────────────────────────────────────
-const OF={type:'all',sess:'all',dir:'all',vwap:'all',zeros:'traded'};
+const OF={type:'all',sess:'all',dir:'all',vwap:'all',zeros:'all'};
 let histF='all',riskF='all';
 function setOF(k,v,el,g){
   OF[k]=v;
@@ -1812,7 +1882,7 @@ function renderOv(){
   document.getElementById('ov-pnl').textContent=(tPnl>=0?'€+':'€')+tPnl.toFixed(2);
   document.getElementById('ov-evp').textContent=tr.filter(r=>r.evPos&&r.ev!=null).length;
   document.getElementById('ov-cd').textContent=tr.length;
-  document.getElementById('ov-meta').textContent=d.length+' combos';
+  document.getElementById('ov-meta').textContent=d.length+' combos ('+(d.filter(r=>r.n>0).length)+' traded)';
   const b=document.getElementById('ov-body');
   if(!d.length){b.innerHTML='<tr><td colspan="18" class="nodata">No combinations match filters</td></tr>';return;}
   b.innerHTML=d.map(r=>{
@@ -2094,7 +2164,7 @@ async function start() {
   const missing = ["META_API_TOKEN", "META_ACCOUNT_ID", "WEBHOOK_SECRET"].filter(k => !process.env[k]);
   if (missing.length) { console.error(`[ERR] Missing env: ${missing.join(", ")}`); process.exit(1); }
 
-  console.log("🚀 PRONTO-AI v10.1 starting...");
+  console.log("🚀 PRONTO-AI v10.2 starting...");
   await initDB();
 
   // Load closed trades
@@ -2146,7 +2216,7 @@ async function start() {
   await restorePositionsFromMT5();
 
   app.listen(PORT, () => {
-    console.log(`[✓] PRONTO-AI v10.1 on port ${PORT}`);
+    console.log(`[✓] PRONTO-AI v10.2 on port ${PORT}`);
     console.log(`   🔹 Dashboard:      / or /dashboard`);
     console.log(`   🔹 Health:         /health`);
     console.log(`   🔹 EV Table:       /ev`);
@@ -2155,6 +2225,8 @@ async function start() {
     console.log(`   🔹 Risk Config:    /risk-config`);
     console.log(`   🔹 Lot Overrides:  /lot-overrides`);
     console.log(`   🔹 Risk Mults:     /risk-multipliers`);
+    console.log(`   🔹 Signal Stats:   /signal-stats`);
+    console.log(`   🔹 Shadow Winners: /shadow/winners`);
     console.log(`   🔹 Webhook:        POST /webhook?secret=<secret>`);
     console.log(`   💵 Fixed risk:     ${(FIXED_RISK_PCT*100).toFixed(3)}% | Balance: €${liveBalance.toFixed(2)}`);
     console.log(`   🕐 Ghost max:      72h (overnight holdings supported)`);
