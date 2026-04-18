@@ -1,5 +1,21 @@
 // ===============================================================
-// db.js  v10.2  |  PRONTO-AI
+// db.js  v10.3  |  PRONTO-AI
+//
+// Changes v10.3 — DATA QUALITY COMPLIANCE (18 April 2026):
+//  - DATE GATE: computeEVStats(), countGhostsByKey() now filter
+//    ghost_trades to opened_at >= '2026-04-18' only.
+//    Pre-compliance trades had missing execution_price / vwap_band_pct
+//    and must not pollute EV or shadow statistics.
+//  - VWAP INTEGRITY: computeEVStats(), countGhostsByKey() now filter
+//    vwap_position IN ('above','below') — 'unknown' keys produce
+//    meaningless optimizer keys and are excluded from all EV maths.
+//  - SL SHADOW — WINNING TRADES ONLY: loadShadowSnapshots() now
+//    JOINs shadow_snapshots with closed_trades WHERE hit_tp = TRUE,
+//    closed_at >= '2026-04-18', vwap_position IN ('above','below').
+//    SL-100% (stopped-out) trades are NEVER fed into shadow percentiles.
+//    Including them would make p99 always approach 100% — useless for
+//    tightening SL recommendations.
+//  - loadShadowWinners() adds same date + VWAP filters.
 //
 // Changes v10.2:
 //  - saveTrade(): INSERT now includes spread_at_entry (FIX 1),
@@ -15,6 +31,12 @@
 //  - signal_log: new table — every inbound TV signal, including rejects
 //  - ghost_trades ON CONFLICT: uses position_id+optimizer_key composite
 // ===============================================================
+
+// ── Data quality compliance date ─────────────────────────────────
+// All ghost, shadow, and EV queries ignore data before this date.
+// Pre-18/04/2026 rows had missing vwap_band_pct / execution_price
+// and must not pollute any optimiser calculation.
+const COMPLIANCE_DATE = '2026-04-18 00:00:00';
 
 "use strict";
 
@@ -443,11 +465,16 @@ async function loadGhostTrades(optimizerKey = null, limitRows = 200) {
 async function countGhostsByKey(optimizerKey) {
   try {
     const r = await pool.query(
+      // DATA QUALITY: only count ghosts from 18/04/2026 onward with valid VWAP.
+      // Pre-compliance rows had missing execution_price and vwap_band_pct.
+      // 'unknown' vwap_position produces meaningless optimizer keys.
       `SELECT COUNT(*) AS cnt FROM ghost_trades
        WHERE optimizer_key=$1
          AND phantom_sl_hit=TRUE
-         AND max_rr_before_sl IS NOT NULL`,
-      [optimizerKey]
+         AND max_rr_before_sl IS NOT NULL
+         AND opened_at >= $2
+         AND vwap_position IN ('above','below')`,
+      [optimizerKey, COMPLIANCE_DATE]
     );
     return parseInt(r.rows[0]?.cnt ?? 0, 10);
   } catch (e) { return 0; }
@@ -471,16 +498,34 @@ async function saveShadowSnapshot(s) {
 
 async function loadShadowSnapshots(optimizerKey, limit = 5000) {
   try {
+    // DATA QUALITY — three hard rules applied here:
+    //
+    // Rule 1 (Date Gate):   only snapshots from positions closed on or after 18/04/2026.
+    //                       Earlier positions had unreliable vwap_band_pct / execution_price.
+    //
+    // Rule 2 (VWAP):        only positions with vwap_position IN ('above','below').
+    //                       'unknown' keys have no VWAP context and must not skew percentiles.
+    //
+    // Rule 3 (Winning only): CRITICAL — only JOIN positions where hit_tp = TRUE.
+    //                        Stopped-out positions (close_reason = 'sl') are EXCLUDED.
+    //                        Including them would push p99 toward ~100% which is useless
+    //                        for recommending a tighter stop-loss.
+    //                        The correct question is: "how far toward SL did winners go?"
     const r = await pool.query(`
       SELECT
-        CAST(pct_sl_used AS FLOAT) AS "pctSlUsed",
-        position_id AS "positionId",
-        snapped_at  AS "snappedAt"
-      FROM shadow_snapshots
-      WHERE optimizer_key = $1
-      ORDER BY snapped_at DESC
+        CAST(ss.pct_sl_used AS FLOAT) AS "pctSlUsed",
+        ss.position_id AS "positionId",
+        ss.snapped_at  AS "snappedAt"
+      FROM shadow_snapshots ss
+      JOIN closed_trades ct ON ss.position_id = ct.position_id
+      WHERE ss.optimizer_key = $1
+        AND ct.hit_tp = TRUE
+        AND ct.close_reason = 'tp'
+        AND ct.closed_at   >= $3
+        AND ct.vwap_position IN ('above','below')
+      ORDER BY ss.snapped_at DESC
       LIMIT $2
-    `, [optimizerKey, limit]);
+    `, [optimizerKey, limit, COMPLIANCE_DATE]);
     return r.rows;
   } catch (e) { return []; }
 }
@@ -737,6 +782,9 @@ async function loadSignalStats() {
 }
 
 // ── Shadow SL analysis for WINNING trades only ─────────────────
+// DATA QUALITY: Only counts winning positions from 18/04/2026 onward
+// with valid VWAP context. SL-100% (stopped-out) trades are never
+// included here — the JOIN with ct.hit_tp=TRUE handles that.
 async function loadShadowWinners() {
   try {
     const r = await pool.query(`
@@ -754,8 +802,11 @@ async function loadShadowWinners() {
       ) mae
       JOIN closed_trades ct ON mae.position_id = ct.position_id
       WHERE ct.hit_tp = TRUE
+        AND ct.close_reason = 'tp'
+        AND ct.closed_at   >= $1
+        AND ct.vwap_position IN ('above','below')
       GROUP BY mae.optimizer_key
-    `);
+    `, [COMPLIANCE_DATE]);
     const map = {};
     for (const row of r.rows) map[row.optimizerKey] = {
       winnerCount:    parseInt(row.winnerCount,  10),
@@ -768,13 +819,21 @@ async function loadShadowWinners() {
 }
 
 // ── EV stats computed from ghost_trades ────────────────────────
+// DATA QUALITY: Only ghost trades from 18/04/2026 onward with valid
+// VWAP context (not 'unknown') are included in EV calculations.
+// Pre-compliance rows had missing execution_price / vwap_band_pct.
+// 'unknown' vwap keys produce meaningless optimizer classifications.
 async function computeEVStats(optimizerKey) {
   try {
     const r = await pool.query(`
       SELECT CAST(max_rr_before_sl AS FLOAT) AS "maxRR"
       FROM ghost_trades
-      WHERE optimizer_key=$1 AND phantom_sl_hit=TRUE AND max_rr_before_sl IS NOT NULL
-    `, [optimizerKey]);
+      WHERE optimizer_key=$1
+        AND phantom_sl_hit=TRUE
+        AND max_rr_before_sl IS NOT NULL
+        AND opened_at >= $2
+        AND vwap_position IN ('above','below')
+    `, [optimizerKey, COMPLIANCE_DATE]);
     const arr = r.rows.map(x => x.maxRR);
     if (arr.length < 1) return { key: optimizerKey, count: 0, rrLevels: [], bestRR: 1.0, bestEV: null };
 
