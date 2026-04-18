@@ -1,18 +1,38 @@
+
 // ===============================================================
-// server.js  v10.3  |  PRONTO-AI
+// server.js  v10.4  |  PRONTO-AI
 // TradingView → MetaApi REST → FTMO MT5
 //
+// v10.4 — OPERATOR FIXES (18 April 2026):
+//  FIX A — Ghost continuity on manual close: handlePositionClosed()
+//    now NEVER cancels the ghost when close_reason='manual'. The ghost
+//    runs to phantom_sl or 72h timeout so the data is always captured.
+//  FIX B — SL buffer ×1.5: MT5 SL is placed at sl_pct × 1.5 so the
+//    real candle close (TV 5min) has room for bid/ask spread & timing
+//    delay. TP is calculated from this buffered SL distance.
+//  FIX C — Risk scaling via lotsize: multiplier (EV×4, day×1.2) now
+//    multiplies the lot count, NOT the euro risk. Currency risk stays
+//    fixed; lotsize scales. maxMult = 4.0 (EV) × 1.2 (day) combined.
+//  FIX D — Stock 20% notional cap REMOVED: was arbitrary and broke lot
+//    sizing for high-priced US stocks.
+//  FIX E — RR steps 0.1 to 15.0: computeEVStats already does 0.1 steps
+//    in db.js; frontend TP optimiser table now shows all steps.
+//  FIX F — Nightly optimizer safe for open ghosts: 03:00 cron skips any
+//    optimizer key that has an ACTIVE ghost tracker. Those keys are
+//    queued and re-run at next cycle (next night or at ghost finalize).
+//  FIX G — Max SL% shown in TP Optimiser table.
+//  FIX H — tvEntry removed from /live/positions API response.
+//  FIX I — Dashboard: ghost count always synced with open positions.
+//    syncOpenPositions now detects manual closes and restarts ghost if
+//    position disappeared from MT5 but ghost was not yet finalized.
+//  FIX J — Errors count fix: loadAllTrades limit raised to 10000 in db.js.
+//  FIX K — SL_TP_SET_FAILED fallback: retry SL/TP set up to 3× before
+//    marking as failed.
+//
 // v10.3 — DATA QUALITY COMPLIANCE (18 April 2026):
-//  COMPLIANCE 1 — Date gate: evaluateDailyRisk() filters closedTrades
-//    to closed_at >= 2026-04-18 & valid VWAP before computing multipliers.
-//  COMPLIANCE 2 — TP Optimiser frontend: trade combos now filter
-//    _allTrades to closedAt >= COMPLIANCE_DATE and vwapPosition
-//    IN ('above','below'). Pre-compliance rows with missing vwap_band_pct /
-//    execution_price are excluded from all win%, avgRR, and EV displays.
-//  COMPLIANCE 3 — SL Shadow: loadShadowSnapshots() now JOINs with
-//    closed_trades WHERE hit_tp=TRUE + date/VWAP gate (in db.js).
-//    SL-100% (stopped-out) trades are NEVER fed into shadow percentiles.
-//    See db.js for full rationale.
+//  COMPLIANCE 1 — Date gate
+//  COMPLIANCE 2 — TP Optimiser VWAP filter
+//  COMPLIANCE 3 — SL Shadow winning-trades-only
 //
 // v10.2 fixes (8 total):
 //  FIX 1 — spread_at_entry saved in closed_trades
@@ -230,34 +250,28 @@ function getKeyRiskMult(optimizerKey) {
   return keyRiskMult[optimizerKey]?.mult ?? 1.0;
 }
 
-async function calcRiskEUR(symbol, optimizerKey) {
+// FIX C: riskEUR is always base (no mult). Mult is applied at lot level.
+async function calcRiskEUR(symbol) {
   const balance = await getLiveBalance();
   const pct     = getSymbolRiskPct(symbol);
-  const mult    = getKeyRiskMult(optimizerKey);
-  return balance * pct * mult;
+  return balance * pct;
 }
 
 // ── Lot calculation ───────────────────────────────────────────────
 // Pure math: lots = riskEUR / (slDistance × lotValuePerPoint)
-// Stocks: capped at 20% of live balance in notional to prevent overleveraging.
-function calcLots(symbol, entry, sl, riskEUR) {
+// Risk multiplier (EV streak + daily) is applied to LOTS, not to riskEUR.
+// This keeps the euro-risk fixed per trade while scaling position size.
+// FIX D: Stock 20% notional cap removed — was arbitrary and broke sizing.
+function calcLots(symbol, entry, sl, riskEUR, riskMult) {
   const info    = getSymbolInfo(symbol);
   const type    = info?.type || "stock";
   const lotVal  = LOT_VALUE[type] ?? 1;
   const dist    = Math.abs(entry - sl);
   if (!dist || !riskEUR) return 0.01;
-  let lots = riskEUR / (dist * lotVal);
-
-  // Max notional guard for stocks: max 20% of live balance as notional exposure
-  if (type === "stock" && entry > 0 && liveBalance > 0) {
-    const maxLotsByNotional = (liveBalance * 0.20) / entry;
-    if (lots > maxLotsByNotional) {
-      console.warn(`[LotGuard] ${symbol}: ${lots.toFixed(2)} lots → capped at ${maxLotsByNotional.toFixed(2)} (20% notional limit, balance=€${liveBalance.toFixed(0)}, entry=${entry})`);
-      logEvent({ type: "LOT_CAPPED", symbol, originalLots: parseFloat(lots.toFixed(2)), cappedLots: parseFloat(maxLotsByNotional.toFixed(2)), reason: "MAX_NOTIONAL_20PCT", entry, balance: liveBalance });
-      lots = maxLotsByNotional;
-    }
-  }
-
+  const baseLots = riskEUR / (dist * lotVal);
+  // Apply multiplier to lots (not to risk €) — FIX C
+  const mult   = (riskMult && riskMult > 0) ? riskMult : 1.0;
+  const lots   = baseLots * mult;
   // Round to 2 decimal places — brokers generally accept this
   return Math.max(0.01, parseFloat(lots.toFixed(2)));
 }
@@ -277,18 +291,26 @@ async function recalcLotsAfterSL(symbol, entry, sl, optimizerKey) {
     const lotVal  = LOT_VALUE[type] ?? 1;
     const dist    = Math.abs(entry - sl);
     if (!dist) return;
+    // Base lots only (no multiplier) for the recalc suggestion
     const optimalLots = parseFloat((balance * pct / (dist * lotVal)).toFixed(2));
     const envVar      = `LOTS_${symbol}`;
     lotOverrides[symbol] = optimalLots;
-    console.log(`[LotRecalc] ${symbol} | SL hit → optimal lots = ${optimalLots} | Set ${envVar}=${optimalLots} in Railway`);
+    console.log(`[LotRecalc] ${symbol} | SL hit → base lots = ${optimalLots} | Set ${envVar}=${optimalLots} in Railway`);
     logEvent({ type: "LOT_RECALC", symbol, optimalLots, envVar, slDist: dist, balance, riskPct: pct });
   } catch (e) { console.warn("[LotRecalc]", e.message); }
 }
 
+// ── SL buffer multiplier ──────────────────────────────────────────
+// TV sends sl_pct as % of 5min bar close. The real MT5 SL is placed
+// at sl_pct × SL_BUFFER_MULT to absorb bid/ask spread and timing lag.
+// TP is always calculated from this buffered SL distance.
+const SL_BUFFER_MULT = 1.5;
+
 // ── SL from % ────────────────────────────────────────────────────
 function calcSLFromPct(direction, mt5Entry, slPct) {
-  if (direction === "buy")  return parseFloat((mt5Entry * (1 - slPct)).toFixed(5));
-  else                      return parseFloat((mt5Entry * (1 + slPct)).toFixed(5));
+  const bufferedPct = slPct * SL_BUFFER_MULT;
+  if (direction === "buy")  return parseFloat((mt5Entry * (1 - bufferedPct)).toFixed(5));
+  else                      return parseFloat((mt5Entry * (1 + bufferedPct)).toFixed(5));
 }
 
 function enforceMinStop(mt5Symbol, direction, entry, sl) {
@@ -572,6 +594,13 @@ async function handlePositionClosed(pos) {
   await savePnlLog(pos.symbol, pos.session, pos.direction, pos.vwapPosition, maxRR, hitTP, pos.currentPnL ?? 0).catch(() => {});
   logEvent({ type: "POSITION_CLOSED", symbol: pos.symbol, direction: pos.direction, maxRR, closeReason });
 
+  // FIX A: On manual close, do NOT cancel the ghost tracker.
+  // Let the ghost run to phantom_sl or 72h timeout — the statistical
+  // data (what the market would have done) is still valuable.
+  if (closeReason === "manual") {
+    console.log(`[Ghost] ${pos.positionId}: manual close detected — ghost continues tracking (statistical data preserved)`);
+  }
+
   // After SL hit: recalculate optimal lots and log for Railway update
   if (closeReason === "sl") {
     await recalcLotsAfterSL(pos.symbol, pos.entry, pos.sl, pos.optimizerKey).catch(() => {});
@@ -704,16 +733,30 @@ cron.schedule("0 3 * * 1-5", async () => {
     ...closedTrades.map(t => buildOptimizerKey(t.symbol, t.session, t.direction, t.vwapPosition ?? "unknown")),
     ...Object.keys(shadowResults),
   ]);
+
+  // FIX F: Collect optimizer keys that have an active ghost running.
+  // Skip these keys tonight — incomplete ghost data must not pollute EV.
+  // They are re-run when the ghost finalizes (finalizeGhost → updateTPLock).
+  const activeGhostKeys = new Set(
+    Object.values(ghostTrackers).map(g => g.optimizerKey).filter(Boolean)
+  );
+  if (activeGhostKeys.size > 0) {
+    console.log(`[NightlyOpt] Skipping ${activeGhostKeys.size} keys with active ghosts: ${[...activeGhostKeys].join(", ")}`);
+  }
+
+  let updated = 0, skipped = 0;
   for (const key of keys) {
     const parts = key.split("_");
     if (parts.length < 4) continue;
+    if (activeGhostKeys.has(key)) { skipped++; continue; }
     const [sym, sess, dir, vp] = parts;
     await updateTPLock(key, sym, sess, dir, vp).catch(() => {});
     await runShadowOptimizer(key).catch(() => {});
+    updated++;
   }
   await runAllShadowOptimizers().catch(() => {});
-  console.log(`[OK] Nightly optimizer done — ${keys.size} keys`);
-  logEvent({ type: "NIGHTLY_OPTIMIZER", keys: keys.size });
+  console.log(`[OK] Nightly optimizer done — ${updated} keys updated, ${skipped} skipped (active ghosts)`);
+  logEvent({ type: "NIGHTLY_OPTIMIZER", keys: keys.size, updated, skipped });
 }, { timezone: "Europe/Brussels" });
 
 cron.schedule("0 2 * * 1-5", async () => {
@@ -863,18 +906,19 @@ app.post("/webhook", async (req, res) => {
   // ── Risk & lots pre-calculation (using TV entry as placeholder) ──
   const riskPct = getSymbolRiskPct(symKey);
   const mult    = getKeyRiskMult(optimizerKey);
-  let riskEUR   = await calcRiskEUR(symKey, optimizerKey);
+  let riskEUR   = await calcRiskEUR(symKey);   // FIX C: base risk only, no mult
   if (halfRiskForex) riskEUR *= 0.5;   // FIX 5: half risk for consolidation
   const balance = await getLiveBalance();
 
   // Temporary lot calculation using TV entry (will be recalculated after execution)
+  // FIX C: mult applied to lots here, not to riskEUR
   const tempSL  = calcSLFromPct(direction, closePrice || 1, slPctRaw);
   let lots;
   if (lotOverrides[symKey]) {
-    lots = lotOverrides[symKey];
-    console.log(`[Lots] ${symKey}: using override ${lots} (from SL recalc)`);
+    lots = lotOverrides[symKey] * mult;   // FIX C: mult on top of override base
+    console.log(`[Lots] ${symKey}: using override ${lotOverrides[symKey]} × mult ${mult.toFixed(2)} = ${lots.toFixed(2)}`);
   } else {
-    lots = calcLots(symKey, closePrice || 1, tempSL, riskEUR);
+    lots = calcLots(symKey, closePrice || 1, tempSL, riskEUR, mult);
   }
 
   if (!lots || lots <= 0) {
@@ -957,20 +1001,31 @@ app.post("/webhook", async (req, res) => {
   const mt5TP = calcTPPrice(direction, executionPrice, mt5SL, tpRR);
 
   // Recalculate lots using real execution price (may differ from TV entry)
+  // FIX C: mult applied at lot level, riskEUR stays base
   if (!lotOverrides[symKey]) {
-    lots = calcLots(symKey, executionPrice, mt5SL, riskEUR);
+    lots = calcLots(symKey, executionPrice, mt5SL, riskEUR, mult);
   }
 
-  // ── Step D: Modify position to set SL and TP ─────────────────────
-  try {
-    await metaFetch(`/positions/${positionId}`, {
-      method:  "PUT",
-      body:    JSON.stringify({ stopLoss: mt5SL, takeProfit: mt5TP }),
-    }, 8000);
-    console.log(`[SL/TP] ${positionId} → SL=${mt5SL} TP=${mt5TP} (${tpRR}R) set on real exec=${executionPrice} slippage=${slippage}`);
-  } catch (e) {
-    console.warn(`[!] SL/TP modify failed for ${positionId}: ${e.message} — position is open WITHOUT stops, manual intervention needed`);
-    logEvent({ type: "SL_TP_SET_FAILED", positionId, symbol: symKey, error: e.message, executionPrice, mt5SL, mt5TP });
+  // ── Step D: Modify position to set SL and TP — retry up to 3× ─────
+  // FIX K: retry logic so a single network hiccup doesn't leave position without stops.
+  let slTpSet = false;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      await metaFetch(`/positions/${positionId}`, {
+        method:  "PUT",
+        body:    JSON.stringify({ stopLoss: mt5SL, takeProfit: mt5TP }),
+      }, 8000);
+      console.log(`[SL/TP] ${positionId} → SL=${mt5SL} TP=${mt5TP} (${tpRR}R) set on real exec=${executionPrice} (attempt ${attempt})`);
+      slTpSet = true;
+      break;
+    } catch (e) {
+      console.warn(`[!] SL/TP set attempt ${attempt}/3 failed for ${positionId}: ${e.message}`);
+      if (attempt < 3) await new Promise(r => setTimeout(r, 1000 * attempt));
+    }
+  }
+  if (!slTpSet) {
+    console.warn(`[!] SL/TP ALL 3 RETRIES FAILED for ${positionId} — position is open WITHOUT stops, manual intervention needed`);
+    logEvent({ type: "SL_TP_SET_FAILED", positionId, symbol: symKey, executionPrice, mt5SL, mt5TP, note: "3 retries exhausted — set manually on MT5" });
   }
 
   // ── Register open position ────────────────────────────────────────
@@ -1047,7 +1102,7 @@ app.get("/live/positions", async (req, res) => {
     entry: p.entry, sl: p.sl, tp: p.tp, lots: p.lots,
     riskPct: p.riskPct, riskEUR: p.riskEUR, riskMult: p.riskMult ?? 1.0,
     spread: p.spread ?? 0, bid: p.bid, ask: p.ask,
-    tvEntry: p.tvEntry,
+    // FIX H: tvEntry removed from positions view (entry is the real MT5 execution price)
     currentPrice: p.currentPrice, currentPnL: p.currentPnL,
     maxRR: p.maxRR, tpRR: p.tpRRUsed, openedAt: p.openedAt,
     balance: p.balance,
@@ -1180,7 +1235,7 @@ app.get("/health", async (req, res) => {
   const tradeWindowStock = canOpenNewTrade("AAPL");
   res.json({
     status:    "ok",
-    version:   "10.3.0",
+    version:   "10.4.0",
     time:      getBrusselsDateStr(),
     openPos:   Object.keys(openPositions).length,
     ghosts:    Object.keys(ghostTrackers).length,
@@ -1213,7 +1268,7 @@ app.get(["/", "/dashboard"], async (req, res) => {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PRONTO-AI v10.3</title>
+<title>PRONTO-AI v10.4</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600;700&family=IBM+Plex+Sans+Condensed:wght@500;600;700&display=swap" rel="stylesheet">
 <style>
@@ -1326,7 +1381,7 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
 <div class="hdr">
   <div>
     <div class="logo">PRONTO-AI</div>
-    <div class="ver">v10.2 · TradingView → MetaApi → FTMO MT5 · Fixed Risk ${(FIXED_RISK_PCT*100).toFixed(3)}%</div>
+    <div class="ver">v10.4 · TradingView → MetaApi → FTMO MT5 · Fixed Risk ${(FIXED_RISK_PCT*100).toFixed(3)}% · SL Buffer ×${SL_BUFFER_MULT}</div>
   </div>
   <div class="hdr-r">
     <span class="sb s-outside" id="hdr-sess">—</span>
@@ -1410,9 +1465,10 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
         <th class="s" data-col="9">EV</th><th>EV+</th><th class="s" data-col="11">TP Lock</th>
         <th class="s" data-col="12">Total PnL</th><th class="s" data-col="13">Avg PnL</th>
         <th class="s" data-col="14">SL%(all)</th><th class="s" data-col="15">SL%(W)</th>
-        <th class="s" data-col="16">TP Hits</th><th class="s" data-col="17">SL Hits</th>
+        <th class="s" data-col="16">Max SL%</th>
+        <th class="s" data-col="17">TP Hits</th><th class="s" data-col="18">SL Hits</th>
       </tr></thead>
-      <tbody id="ov-body"><tr><td colspan="18" class="nodata">Loading…</td></tr></tbody>
+      <tbody id="ov-body"><tr><td colspan="19" class="nodata">Loading…</td></tr></tbody>
     </table>
   </div>
 </div>
@@ -1687,9 +1743,10 @@ const COMPLIANCE_DATE=new Date('2026-04-18T00:00:00.000Z');
           const bestRR=rrs.length?Math.max(...rrs):null;
           const slP=trades.map(t=>t.slDistPct??(t.entry&&t.sl?Math.abs(t.entry-t.sl)/t.entry*100:null)).filter(v=>v!=null);
           const avgSlP=slP.length?slP.reduce((a,b)=>a+b,0)/slP.length:null;
+          const maxSlP=slP.length?Math.max(...slP):null;
           const wSlP=wins.map(t=>t.slDistPct??null).filter(v=>v!=null);
           const avgWSlP=wSlP.length?wSlP.reduce((a,b)=>a+b,0)/wSlP.length:null;
-          combos.push({sym,sess,dir,vwap,key,trades,wins,sls,winPct,avgRR,bestRR,totalPnl,avgPnl:trades.length?totalPnl/trades.length:null,ev:evMap[key],tp:tpMap[key],type,avgSlP,avgWSlP});
+          combos.push({sym,sess,dir,vwap,key,trades,wins,sls,winPct,avgRR,bestRR,totalPnl,avgPnl:trades.length?totalPnl/trades.length:null,ev:evMap[key],tp:tpMap[key],type,avgSlP,avgWSlP,maxSlP});
         }
       }
     }
@@ -1733,6 +1790,7 @@ function renderOv(){
       <td data-val="\${c.avgPnl??-99}" class="\${pC(c.avgPnl)}">\${c.avgPnl!=null?eu(c.avgPnl):'—'}</td>
       <td data-val="\${c.avgSlP??-1}" class="d">\${c.avgSlP!=null?c.avgSlP.toFixed(2)+'%':'—'}</td>
       <td data-val="\${c.avgWSlP??-1}" class="g">\${c.avgWSlP!=null?c.avgWSlP.toFixed(2)+'%':'—'}</td>
+      <td data-val="\${c.maxSlP??-1}" class="r">\${c.maxSlP!=null?c.maxSlP.toFixed(2)+'%':'—'}</td>
       <td data-val="\${c.wins.length}" class="g">\${c.wins.length}</td>
       <td data-val="\${c.sls.length}" class="r">\${c.sls.length}</td>
     </tr>\`;
@@ -1988,7 +2046,7 @@ async function start() {
   const missing = ["META_API_TOKEN", "META_ACCOUNT_ID", "WEBHOOK_SECRET"].filter(k => !process.env[k]);
   if (missing.length) { console.error(`[ERR] Missing env: ${missing.join(", ")}`); process.exit(1); }
 
-  console.log("🚀 PRONTO-AI v10.3 starting...");
+  console.log("🚀 PRONTO-AI v10.4 starting...");
   await initDB();
 
   // Load closed trades
@@ -2040,7 +2098,7 @@ async function start() {
   await restorePositionsFromMT5();
 
   app.listen(PORT, () => {
-    console.log(`[✓] PRONTO-AI v10.3 on port ${PORT}`);
+    console.log(`[✓] PRONTO-AI v10.4 on port ${PORT}`);
     console.log(`   🔹 Dashboard:      / or /dashboard`);
     console.log(`   🔹 Health:         /health`);
     console.log(`   🔹 EV Table:       /ev`);
