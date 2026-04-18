@@ -1,5 +1,12 @@
 // ===============================================================
-// db.js  v10.1  |  PRONTO-AI
+// db.js  v10.2  |  PRONTO-AI
+//
+// Changes v10.2:
+//  - saveTrade(): INSERT now includes spread_at_entry (FIX 1),
+//    vwap_band_pct (FIX 2), execution_price, tv_entry, slippage
+//    ON CONFLICT UPDATE also updates these 5 columns
+//  - loadSignalStats(): new function for GET /signal-stats endpoint
+//    returns total signals, placed count, conversion%, top reject reasons
 //
 // Changes v10.1:
 //  - countGhostsByKey: counts only phantomSLHit=TRUE AND max_rr IS NOT NULL
@@ -27,8 +34,6 @@ async function initDB() {
     await client.query("BEGIN");
 
     // ── symbol_risk_config ──────────────────────────────────────
-    // Per-symbol risk % override. Seeded from env on startup.
-    // UI can show this table so user knows what's active.
     await client.query(`
       CREATE TABLE IF NOT EXISTS symbol_risk_config (
         symbol          TEXT    PRIMARY KEY,
@@ -87,9 +92,6 @@ async function initDB() {
     `);
 
     // ── ghost_trades ─────────────────────────────────────────────
-    // One row per ghost. Ghost is created when the real trade is
-    // placed. It closes when phantom_sl is hit (same SL as real).
-    // max_rr_before_sl = the best RR reached before phantom SL hit.
     await client.query(`
       CREATE TABLE IF NOT EXISTS ghost_trades (
         id                  SERIAL      PRIMARY KEY,
@@ -119,9 +121,6 @@ async function initDB() {
     `);
 
     // ── shadow_snapshots ─────────────────────────────────────────
-    // Price snapshots taken every minute for open positions.
-    // pct_sl_used: 0–100 — how far price moved toward SL as % of SL distance.
-    // 0 = price at entry, 100 = price at SL (or beyond).
     await client.query(`
       CREATE TABLE IF NOT EXISTS shadow_snapshots (
         id              SERIAL      PRIMARY KEY,
@@ -143,10 +142,6 @@ async function initDB() {
     `);
 
     // ── shadow_sl_analysis ───────────────────────────────────────
-    // One row per optimizer_key (symbol_session_direction_vwap).
-    // READ ONLY recommendations — never auto-applied.
-    // recommended_sl_pct: % of original SL distance to use.
-    // p50/p90/p99: percentiles of pct_sl_used distribution.
     await client.query(`
       CREATE TABLE IF NOT EXISTS shadow_sl_analysis (
         optimizer_key         TEXT    PRIMARY KEY,
@@ -168,7 +163,6 @@ async function initDB() {
     `);
 
     // ── tp_config ────────────────────────────────────────────────
-    // Per optimizer_key TP lock from ghost optimizer.
     await client.query(`
       CREATE TABLE IF NOT EXISTS tp_config (
         optimizer_key   TEXT        PRIMARY KEY,
@@ -242,8 +236,6 @@ async function initDB() {
     `);
 
     // ── signal_log ───────────────────────────────────────────────
-    // Every inbound TV signal is recorded here — including rejects.
-    // Use this to measure how many signals fire vs how many execute.
     await client.query(`
       CREATE TABLE IF NOT EXISTS signal_log (
         id              SERIAL      PRIMARY KEY,
@@ -271,7 +263,7 @@ async function initDB() {
     `);
 
     await client.query("COMMIT");
-    console.log("[DB] v10.1 schema OK");
+    console.log("[DB] v10.2 schema OK");
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("[DB] initDB ROLLBACK:", err.message);
@@ -282,6 +274,9 @@ async function initDB() {
 }
 
 // ── closed_trades ──────────────────────────────────────────────
+// FIX 1 + FIX 2: INSERT now includes spread_at_entry, vwap_band_pct,
+// execution_price, tv_entry, slippage — all were missing despite
+// columns existing in the schema.
 async function saveTrade(t) {
   try {
     await pool.query(`
@@ -289,8 +284,9 @@ async function saveTrade(t) {
         (position_id, symbol, mt5_symbol, direction, vwap_position, entry, sl, tp,
          lots, risk_pct, risk_eur, max_price, max_rr, true_max_rr, true_max_price,
          ghost_stop_reason, ghost_finalized_at, session, vwap_at_entry,
-         opened_at, closed_at, sl_multiplier, realized_pnl_eur, hit_tp, close_reason)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
+         opened_at, closed_at, sl_multiplier, realized_pnl_eur, hit_tp, close_reason,
+         spread_at_entry, vwap_band_pct, execution_price, tv_entry, slippage)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30)
       ON CONFLICT (position_id) DO UPDATE SET
         true_max_rr        = EXCLUDED.true_max_rr,
         true_max_price     = EXCLUDED.true_max_price,
@@ -301,7 +297,12 @@ async function saveTrade(t) {
         realized_pnl_eur   = EXCLUDED.realized_pnl_eur,
         hit_tp             = EXCLUDED.hit_tp,
         close_reason       = EXCLUDED.close_reason,
-        sl_multiplier      = EXCLUDED.sl_multiplier
+        sl_multiplier      = EXCLUDED.sl_multiplier,
+        spread_at_entry    = EXCLUDED.spread_at_entry,
+        vwap_band_pct      = EXCLUDED.vwap_band_pct,
+        execution_price    = EXCLUDED.execution_price,
+        tv_entry           = EXCLUDED.tv_entry,
+        slippage           = EXCLUDED.slippage
     `, [
       t.positionId   ?? null,
       t.symbol       ?? "",
@@ -328,6 +329,11 @@ async function saveTrade(t) {
       t.realizedPnlEUR ?? null,
       t.hitTP        ?? false,
       t.closeReason  ?? "manual",
+      t.spreadAtEntry  ?? null,   // FIX 1: spread_at_entry
+      t.vwapBandPct    ?? null,   // FIX 2: vwap_band_pct
+      t.executionPrice ?? null,   // execution_price
+      t.tvEntry        ?? null,   // tv_entry
+      t.slippage       ?? null,   // slippage
     ]);
   } catch (e) { console.warn("[!] saveTrade:", e.message); }
 }
@@ -358,7 +364,12 @@ async function loadAllTrades() {
         CAST(sl_multiplier  AS FLOAT) AS "slMultiplier",
         CAST(realized_pnl_eur AS FLOAT) AS "realizedPnlEUR",
         hit_tp              AS "hitTP",
-        close_reason        AS "closeReason"
+        close_reason        AS "closeReason",
+        CAST(spread_at_entry AS FLOAT) AS "spreadAtEntry",
+        CAST(vwap_band_pct  AS FLOAT) AS "vwapBandPct",
+        CAST(execution_price AS FLOAT) AS "executionPrice",
+        CAST(tv_entry       AS FLOAT) AS "tvEntry",
+        CAST(slippage       AS FLOAT) AS slippage
       FROM closed_trades
       ORDER BY closed_at DESC
       LIMIT 5000
@@ -662,8 +673,6 @@ async function logWebhook(w) {
 }
 
 // ── signal_log ─────────────────────────────────────────────────
-// Called for every inbound webhook — before validation completes.
-// Captures full signal context including rejects.
 async function logSignal(s) {
   try {
     await pool.query(`
@@ -692,10 +701,42 @@ async function loadWebhookHistory(limit = 100) {
   } catch (e) { return []; }
 }
 
+// ── Signal stats — FIX 7 ───────────────────────────────────────
+// Computes signal conversion ratio from signal_log table.
+// Returns: total, placed, conversionPct, byOutcome, topRejectReasons
+async function loadSignalStats() {
+  try {
+    const [totalR, byOutcomeR, rejectR] = await Promise.all([
+      pool.query(`SELECT COUNT(*) AS cnt FROM signal_log`),
+      pool.query(`
+        SELECT outcome, COUNT(*) AS cnt
+        FROM signal_log
+        GROUP BY outcome
+        ORDER BY cnt DESC
+      `),
+      pool.query(`
+        SELECT reject_reason, COUNT(*) AS cnt
+        FROM signal_log
+        WHERE reject_reason IS NOT NULL AND reject_reason != ''
+        GROUP BY reject_reason
+        ORDER BY cnt DESC
+        LIMIT 20
+      `),
+    ]);
+    const totalN  = parseInt(totalR.rows[0]?.cnt ?? 0, 10);
+    const placed  = byOutcomeR.rows.find(r => r.outcome === "PLACED");
+    const placedN = parseInt(placed?.cnt ?? 0, 10);
+    return {
+      total:            totalN,
+      placed:           placedN,
+      conversionPct:    totalN > 0 ? parseFloat((placedN / totalN * 100).toFixed(2)) : 0,
+      byOutcome:        byOutcomeR.rows.map(r => ({ outcome: r.outcome, count: parseInt(r.cnt, 10) })),
+      topRejectReasons: rejectR.rows.map(r => ({ reason: r.reject_reason, count: parseInt(r.cnt, 10) })),
+    };
+  } catch (e) { console.warn("[!] loadSignalStats:", e.message); return null; }
+}
+
 // ── Shadow SL analysis for WINNING trades only ─────────────────
-// Joins shadow_snapshots (max pct_sl_used per position) with
-// closed_trades (hit_tp=TRUE) to show how much SL room was used
-// on trades that actually won — excludes SL-hit trades entirely.
 async function loadShadowWinners() {
   try {
     const r = await pool.query(`
@@ -727,8 +768,6 @@ async function loadShadowWinners() {
 }
 
 // ── EV stats computed from ghost_trades ────────────────────────
-// Computes EV table for a key from ghost_trades DB directly.
-// Returns { key, count, rrLevels: [{rr, winRate, ev}], bestRR, bestEV }
 async function computeEVStats(optimizerKey) {
   try {
     const r = await pool.query(`
@@ -781,6 +820,8 @@ module.exports = {
   loadWebhookHistory,
   // Signal log
   logSignal,
+  // Signal stats — FIX 7
+  loadSignalStats,
   // EV stats
   computeEVStats,
   // Shadow winners (SL% on winning trades only)
