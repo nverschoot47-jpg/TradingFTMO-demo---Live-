@@ -1,5 +1,10 @@
 // ===============================================================
-// db.js  v10.3  |  PRONTO-AI
+// db.js  v10.4  |  PRONTO-AI
+//
+// Changes v10.4:
+//  - loadAllTrades: LIMIT raised 5000 → 10000 (FIX J: errors count
+//    was truncated — existing 3500+ trades now fully loaded on startup).
+//  - initDB: schema log updated to v10.4.
 //
 // Changes v10.3 — DATA QUALITY COMPLIANCE (18 April 2026):
 //  - DATE GATE: computeEVStats(), countGhostsByKey() now filter
@@ -285,7 +290,7 @@ async function initDB() {
     `);
 
     await client.query("COMMIT");
-    console.log("[DB] v10.2 schema OK");
+    console.log("[DB] v10.4 schema OK");
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("[DB] initDB ROLLBACK:", err.message);
@@ -394,7 +399,7 @@ async function loadAllTrades() {
         CAST(slippage       AS FLOAT) AS slippage
       FROM closed_trades
       ORDER BY closed_at DESC
-      LIMIT 5000
+      LIMIT 10000
     `);
     return r.rows;
   } catch (e) { console.warn("[!] loadAllTrades:", e.message); return []; }
