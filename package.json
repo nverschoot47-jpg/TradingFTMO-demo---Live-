@@ -1,7 +1,7 @@
 {
   "name": "nv-tradingview-webhook",
-  "version": "10.3.0",
-  "description": "TradingView → MetaApi REST → FTMO MT5 | PRONTO-AI v10.3 — data quality compliance 18/04/2026, date gate, VWAP integrity, SL shadow winning-trades-only filter",
+  "version": "10.4.0",
+  "description": "TradingView → MetaApi REST → FTMO MT5 | PRONTO-AI v10.4 — ghost continuity on manual close, SL×1.5 buffer, lotsize-based risk scaling, stock cap removed, nightly optimizer safe for open ghosts, SL/TP retry ×3, Max SL% in dashboard",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
