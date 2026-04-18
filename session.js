@@ -1,10 +1,11 @@
 // ===============================================================
-// session.js  v10.2  |  PRONTO-AI
+// session.js  v10.4  |  PRONTO-AI
+//
+// Changes v10.4:
+//  - Version bump — no logic changes in this file
+//  - SL_BUFFER_MULT constant (1.5) lives in server.js
 //
 // Changes v10.2:
-//  - Version bump — no logic changes in this file
-//
-// Changes v10.1:
 //  - canOpenNewTrade(symbol): replaces isMarketOpen() for new trades
 //    * Stocks: only 16:00–21:00 Brussels (NY market hours)
 //    * Forex/Index/Commodity: 02:00–21:00 Brussels mon-fri
