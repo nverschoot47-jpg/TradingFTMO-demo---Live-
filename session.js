@@ -1,14 +1,13 @@
 // ===============================================================
-// session.js  v10.0  |  PRONTO-AI
+// session.js  v10.1  |  PRONTO-AI
 //
-// Changes v10.0:
-//  - CRYPTO REMOVED entirely (BTCUSD gone)
-//  - Symbol catalog: stocks / forex / index / commodity only
-//  - DEFAULT_RISK_BY_TYPE: easy single place to configure risk %
-//  - Sessions: asia 02:00-08:00 | london 08:00-15:30 | ny 15:30-21:00
-//  - isMarketOpen(): all symbols 02:00-21:00 mon-fri
-//  - getVwapPosition(): above | below based on close vs vwap
-//  - normalizeSymbol() handles BRK.B → BRKB, GOOGL → GOOGL
+// Changes v10.1:
+//  - canOpenNewTrade(symbol): replaces isMarketOpen() for new trades
+//    * Stocks: only 16:00–21:00 Brussels (NY market hours)
+//    * Forex/Index/Commodity: 02:00–21:00 Brussels mon-fri
+//    * isMarketOpen() kept as alias for monitoring/ghost checks
+//  - isMonitoringActive(): true mon-fri (allows overnight holding)
+//  - Ghost/shadow monitoring continues through night for open pos
 // ===============================================================
 
 "use strict";
@@ -170,7 +169,7 @@ function getSession(date) {
   return "outside";
 }
 
-// ── Market open check ────────────────────────────────────────────
+// ── Market open check (kept for backward compat / monitoring) ────
 function isMarketOpen(date = null) {
   const { day, hhmm } = getBrusselsComponents(date);
   if (day === 0 || day === 6) return false;
@@ -179,16 +178,52 @@ function isMarketOpen(date = null) {
   return true;
 }
 
-// Ghost/shadow may run until 23:00 to finalize after-market data
-function isGhostActive(date) {
-  const { day, hhmm } = getBrusselsComponents(date ? new Date(date) : new Date());
-  if (day === 0 || day === 6) return false;
-  if (hhmm < 200)             return false;
-  if (hhmm >= 2300)           return false;
-  return true;
+// ── Can a NEW trade be opened? ───────────────────────────────────
+// Stocks:              16:00–21:00 Brussels only (NYSE/NASDAQ open)
+// Forex/Index/Commodity: 02:00–21:00 Brussels mon-fri
+// Returns { allowed: boolean, reason: string }
+function canOpenNewTrade(rawSymbol, date = null) {
+  const { day, hhmm } = getBrusselsComponents(date);
+  if (day === 0 || day === 6) return { allowed: false, reason: "WEEKEND" };
+
+  // Resolve asset type
+  const upper   = rawSymbol ? rawSymbol.toString().toUpperCase().trim() : "";
+  const aliased = SYMBOL_ALIASES[upper] ?? upper;
+  const info    = SYMBOL_CATALOG[aliased] ?? null;
+  const type    = info?.type ?? "unknown";
+
+  if (type === "stock") {
+    // Stocks: only during NY session (16:00–21:00 Brussels)
+    if (hhmm < 1600 || hhmm >= 2100) {
+      return {
+        allowed: false,
+        reason:  `STOCK_OUTSIDE_MARKET: ${hhmm} (stocks need 1600–2100 Brussels)`,
+      };
+    }
+  } else {
+    // Forex, index, commodity: 02:00–21:00
+    if (hhmm < 200 || hhmm >= 2100) {
+      return {
+        allowed: false,
+        reason:  `OUTSIDE_WINDOW: ${hhmm} (need 0200–2100 Brussels)`,
+      };
+    }
+  }
+
+  return { allowed: true, reason: null };
 }
 
-function isShadowActive(date) { return isGhostActive(date); }
+// ── Monitoring active? (ghost + shadow + position sync) ──────────
+// True on weekdays regardless of time — allows overnight holdings.
+function isMonitoringActive(date = null) {
+  const { day } = getBrusselsComponents(date);
+  return day !== 0 && day !== 6; // pause only on weekend
+}
+
+// Kept as alias — ghost tracker uses isMonitoringActive internally now
+function isGhostActive(date) { return isMonitoringActive(date); }
+
+function isShadowActive(date) { return isMonitoringActive(date); }
 
 // ── Symbol normalization ─────────────────────────────────────────
 function normalizeSymbol(raw) {
@@ -237,6 +272,8 @@ module.exports = {
   getBrusselsDateOnly,
   getSession,
   isMarketOpen,
+  canOpenNewTrade,
+  isMonitoringActive,
   isGhostActive,
   isShadowActive,
   normalizeSymbol,
