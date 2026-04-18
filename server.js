@@ -1,6 +1,18 @@
 // ===============================================================
-// server.js  v10.2  |  PRONTO-AI
+// server.js  v10.3  |  PRONTO-AI
 // TradingView → MetaApi REST → FTMO MT5
+//
+// v10.3 — DATA QUALITY COMPLIANCE (18 April 2026):
+//  COMPLIANCE 1 — Date gate: evaluateDailyRisk() filters closedTrades
+//    to closed_at >= 2026-04-18 & valid VWAP before computing multipliers.
+//  COMPLIANCE 2 — TP Optimiser frontend: trade combos now filter
+//    _allTrades to closedAt >= COMPLIANCE_DATE and vwapPosition
+//    IN ('above','below'). Pre-compliance rows with missing vwap_band_pct /
+//    execution_price are excluded from all win%, avgRR, and EV displays.
+//  COMPLIANCE 3 — SL Shadow: loadShadowSnapshots() now JOINs with
+//    closed_trades WHERE hit_tp=TRUE + date/VWAP gate (in db.js).
+//    SL-100% (stopped-out) trades are NEVER fed into shadow percentiles.
+//    See db.js for full rationale.
 //
 // v10.2 fixes (8 total):
 //  FIX 1 — spread_at_entry saved in closed_trades
@@ -96,6 +108,14 @@ const GHOST_MAX_MS            = 72 * 3600 * 1000;  // 72h — supports overnight
 
 // Minimum ghost samples before daily risk multiplier activates
 const MULT_MIN_SAMPLE = 30;
+
+// ── Data quality compliance date ─────────────────────────────────
+// Trades, ghost records, and shadow snapshots before this date had
+// missing vwap_band_pct / execution_price and must not be used in
+// any optimiser, EV, shadow, or daily-risk-multiplier calculation.
+// Applied in: evaluateDailyRisk(), frontend TP Optimiser combo filter.
+// DB-level filters are in db.js (computeEVStats, loadShadowSnapshots, etc.)
+const COMPLIANCE_DATE_MS = new Date("2026-04-18T00:00:00.000Z").getTime();
 
 // Min stop distances per MT5 symbol (prevents too-tight SL rejection)
 const MIN_STOP = {
@@ -622,7 +642,15 @@ async function takeShadowSnapshots() {
 async function evaluateDailyRisk() {
   try {
     const todayStr = getBrusselsDateOnly();
-    const todayT   = closedTrades.filter(t => t.closedAt && getBrusselsDateOnly(t.closedAt) === todayStr);
+    // COMPLIANCE: only count trades on/after 18-Apr-2026 with valid VWAP.
+    // Pre-compliance rows had missing execution_price / vwap_band_pct and
+    // must not inflate or deflate the daily multiplier streak.
+    const todayT   = closedTrades.filter(t =>
+      t.closedAt &&
+      getBrusselsDateOnly(t.closedAt) === todayStr &&
+      new Date(t.closedAt).getTime() >= COMPLIANCE_DATE_MS &&
+      (t.vwapPosition === "above" || t.vwapPosition === "below")
+    );
     const totalPnl = todayT.reduce((s, t) => s + (t.currentPnL ?? 0), 0);
 
     // Group today's trades by optimizer key
@@ -1152,7 +1180,7 @@ app.get("/health", async (req, res) => {
   const tradeWindowStock = canOpenNewTrade("AAPL");
   res.json({
     status:    "ok",
-    version:   "10.2.0",
+    version:   "10.3.0",
     time:      getBrusselsDateStr(),
     openPos:   Object.keys(openPositions).length,
     ghosts:    Object.keys(ghostTrackers).length,
@@ -1185,7 +1213,7 @@ app.get(["/", "/dashboard"], async (req, res) => {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PRONTO-AI v10.2</title>
+<title>PRONTO-AI v10.3</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600;700&family=IBM+Plex+Sans+Condensed:wght@500;600;700&display=swap" rel="stylesheet">
 <style>
@@ -1644,7 +1672,11 @@ async function loadOverview(){
       for(const dir of['buy','sell']){
         for(const vwap of['above','below']){
           const key=sym+'_'+sess+'_'+dir+'_'+vwap;
-          const trades=_allTrades.filter(t=>t.symbol===sym&&t.session===sess&&t.direction===dir&&(t.vwapPosition||'unknown')===vwap);
+// COMPLIANCE: only trades from 18-Apr-2026 onward with valid VWAP.
+// vwap is always 'above'|'below' here, so the vwapPosition===vwap
+// check automatically excludes 'unknown' positions.
+const COMPLIANCE_DATE=new Date('2026-04-18T00:00:00.000Z');
+          const trades=_allTrades.filter(t=>t.symbol===sym&&t.session===sess&&t.direction===dir&&t.vwapPosition===vwap&&t.closedAt&&new Date(t.closedAt)>=COMPLIANCE_DATE);
           const wins=trades.filter(t=>t.closeReason==='tp');
           const sls=trades.filter(t=>t.closeReason==='sl');
           const pnls=trades.map(t=>t.realizedPnlEUR??t.currentPnL??0);
@@ -1956,7 +1988,7 @@ async function start() {
   const missing = ["META_API_TOKEN", "META_ACCOUNT_ID", "WEBHOOK_SECRET"].filter(k => !process.env[k]);
   if (missing.length) { console.error(`[ERR] Missing env: ${missing.join(", ")}`); process.exit(1); }
 
-  console.log("🚀 PRONTO-AI v10.2 starting...");
+  console.log("🚀 PRONTO-AI v10.3 starting...");
   await initDB();
 
   // Load closed trades
@@ -2008,7 +2040,7 @@ async function start() {
   await restorePositionsFromMT5();
 
   app.listen(PORT, () => {
-    console.log(`[✓] PRONTO-AI v10.2 on port ${PORT}`);
+    console.log(`[✓] PRONTO-AI v10.3 on port ${PORT}`);
     console.log(`   🔹 Dashboard:      / or /dashboard`);
     console.log(`   🔹 Health:         /health`);
     console.log(`   🔹 EV Table:       /ev`);
