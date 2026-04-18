@@ -1,17 +1,12 @@
 // ===============================================================
-// db.js  v9.0  |  PRONTO-AI
+// db.js  v10.1  |  PRONTO-AI
 //
-// Changes v9.0:
-//  - ghost_trades: new table — ghost starts at trade placement,
-//    closes on phantom_sl hit, records max_rr_before_sl
-//  - shadow_snapshots: price snapshots per open position
-//    recording pct_sl_used (how deep toward SL price went)
-//  - shadow_sl_analysis: keyed by (symbol, session, direction, vwap_pos)
-//    instead of symbol only — one shadow optimizer per key
-//  - symbol_risk_config: per-symbol risk_pct override
-//  - closed_trades: added vwap_position column
-//  - tp_config: keyed by (symbol, session, direction, vwap_pos)
-//  - Removed: forex_consolidation_log (no consolidation blocking)
+// Changes v10.1:
+//  - countGhostsByKey: counts only phantomSLHit=TRUE AND max_rr IS NOT NULL
+//  - closed_trades: added slippage, execution_price, vwap_band_pct columns
+//  - webhook_history: added latency_ms, tv_entry, execution_price columns
+//  - signal_log: new table — every inbound TV signal, including rejects
+//  - ghost_trades ON CONFLICT: uses position_id+optimizer_key composite
 // ===============================================================
 
 "use strict";
@@ -84,6 +79,11 @@ async function initDB() {
       ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS realized_pnl_eur NUMERIC;
       ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS hit_tp         BOOLEAN DEFAULT FALSE;
       ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS close_reason   TEXT    DEFAULT 'manual';
+      ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS execution_price NUMERIC;
+      ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS tv_entry       NUMERIC;
+      ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS slippage       NUMERIC;
+      ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS vwap_band_pct  NUMERIC;
+      ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS spread_at_entry NUMERIC;
     `);
 
     // ── ghost_trades ─────────────────────────────────────────────
@@ -217,27 +217,61 @@ async function initDB() {
     // ── webhook_history ──────────────────────────────────────────
     await client.query(`
       CREATE TABLE IF NOT EXISTS webhook_history (
-        id          SERIAL      PRIMARY KEY,
-        ts          TIMESTAMPTZ DEFAULT NOW(),
-        symbol      TEXT,
-        direction   TEXT,
-        session     TEXT,
-        vwap_pos    TEXT,
-        action      TEXT,
-        status      TEXT,
-        reason      TEXT,
-        position_id TEXT,
-        entry       NUMERIC,
-        sl          NUMERIC,
-        tp          NUMERIC,
-        lots        NUMERIC,
-        risk_pct    NUMERIC,
+        id            SERIAL      PRIMARY KEY,
+        ts            TIMESTAMPTZ DEFAULT NOW(),
+        symbol        TEXT,
+        direction     TEXT,
+        session       TEXT,
+        vwap_pos      TEXT,
+        action        TEXT,
+        status        TEXT,
+        reason        TEXT,
+        position_id   TEXT,
+        entry         NUMERIC,
+        sl            NUMERIC,
+        tp            NUMERIC,
+        lots          NUMERIC,
+        risk_pct      NUMERIC,
         optimizer_key TEXT
       );
+      ALTER TABLE webhook_history ADD COLUMN IF NOT EXISTS latency_ms       INTEGER;
+      ALTER TABLE webhook_history ADD COLUMN IF NOT EXISTS tv_entry         NUMERIC;
+      ALTER TABLE webhook_history ADD COLUMN IF NOT EXISTS execution_price  NUMERIC;
+      ALTER TABLE webhook_history ADD COLUMN IF NOT EXISTS slippage         NUMERIC;
+      ALTER TABLE webhook_history ADD COLUMN IF NOT EXISTS vwap_band_pct    NUMERIC;
+    `);
+
+    // ── signal_log ───────────────────────────────────────────────
+    // Every inbound TV signal is recorded here — including rejects.
+    // Use this to measure how many signals fire vs how many execute.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS signal_log (
+        id              SERIAL      PRIMARY KEY,
+        received_at     TIMESTAMPTZ DEFAULT NOW(),
+        symbol          TEXT,
+        direction       TEXT,
+        session         TEXT,
+        vwap_position   TEXT,
+        optimizer_key   TEXT,
+        tv_entry        NUMERIC,
+        sl_pct          NUMERIC,
+        sl_pct_human    TEXT,
+        vwap            NUMERIC,
+        vwap_upper      NUMERIC,
+        vwap_lower      NUMERIC,
+        vwap_band_pct   NUMERIC,
+        outcome         TEXT,
+        reject_reason   TEXT,
+        latency_ms      INTEGER,
+        position_id     TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_signal_log_ts     ON signal_log (received_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_signal_log_sym    ON signal_log (symbol);
+      CREATE INDEX IF NOT EXISTS idx_signal_log_key    ON signal_log (optimizer_key);
     `);
 
     await client.query("COMMIT");
-    console.log("[DB] v9.0 schema OK");
+    console.log("[DB] v10.1 schema OK");
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("[DB] initDB ROLLBACK:", err.message);
@@ -398,7 +432,10 @@ async function loadGhostTrades(optimizerKey = null, limitRows = 200) {
 async function countGhostsByKey(optimizerKey) {
   try {
     const r = await pool.query(
-      `SELECT COUNT(*) AS cnt FROM ghost_trades WHERE optimizer_key=$1 AND phantom_sl_hit=TRUE`,
+      `SELECT COUNT(*) AS cnt FROM ghost_trades
+       WHERE optimizer_key=$1
+         AND phantom_sl_hit=TRUE
+         AND max_rr_before_sl IS NOT NULL`,
       [optimizerKey]
     );
     return parseInt(r.rows[0]?.cnt ?? 0, 10);
@@ -610,13 +647,38 @@ async function logWebhook(w) {
     await pool.query(`
       INSERT INTO webhook_history
         (symbol, direction, session, vwap_pos, action, status, reason, position_id,
-         entry, sl, tp, lots, risk_pct, optimizer_key)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+         entry, sl, tp, lots, risk_pct, optimizer_key,
+         latency_ms, tv_entry, execution_price, slippage, vwap_band_pct)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
     `, [
-      w.symbol ?? null, w.direction ?? null, w.session ?? null, w.vwapPos ?? null,
-      w.action ?? null, w.status ?? null, w.reason ?? null, w.positionId ?? null,
-      w.entry ?? null, w.sl ?? null, w.tp ?? null, w.lots ?? null,
-      w.riskPct ?? null, w.optimizerKey ?? null,
+      w.symbol        ?? null, w.direction    ?? null, w.session    ?? null, w.vwapPos      ?? null,
+      w.action        ?? null, w.status       ?? null, w.reason     ?? null, w.positionId   ?? null,
+      w.entry         ?? null, w.sl           ?? null, w.tp         ?? null, w.lots         ?? null,
+      w.riskPct       ?? null, w.optimizerKey ?? null,
+      w.latencyMs     ?? null, w.tvEntry      ?? null, w.executionPrice ?? null,
+      w.slippage      ?? null, w.vwapBandPct  ?? null,
+    ]);
+  } catch (e) { /* non-critical */ }
+}
+
+// ── signal_log ─────────────────────────────────────────────────
+// Called for every inbound webhook — before validation completes.
+// Captures full signal context including rejects.
+async function logSignal(s) {
+  try {
+    await pool.query(`
+      INSERT INTO signal_log
+        (symbol, direction, session, vwap_position, optimizer_key,
+         tv_entry, sl_pct, sl_pct_human, vwap, vwap_upper, vwap_lower,
+         vwap_band_pct, outcome, reject_reason, latency_ms, position_id)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+    `, [
+      s.symbol         ?? null, s.direction    ?? null, s.session      ?? null,
+      s.vwapPosition   ?? null, s.optimizerKey ?? null,
+      s.tvEntry        ?? null, s.slPct        ?? null, s.slPctHuman   ?? null,
+      s.vwap           ?? null, s.vwapUpper    ?? null, s.vwapLower    ?? null,
+      s.vwapBandPct    ?? null, s.outcome      ?? null, s.rejectReason ?? null,
+      s.latencyMs      ?? null, s.positionId   ?? null,
     ]);
   } catch (e) { /* non-critical */ }
 }
@@ -717,6 +779,8 @@ module.exports = {
   // Webhook history
   logWebhook,
   loadWebhookHistory,
+  // Signal log
+  logSignal,
   // EV stats
   computeEVStats,
   // Shadow winners (SL% on winning trades only)
