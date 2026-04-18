@@ -1,5 +1,8 @@
 // ===============================================================
-// session.js  v10.1  |  PRONTO-AI
+// session.js  v10.2  |  PRONTO-AI
+//
+// Changes v10.2:
+//  - Version bump — no logic changes in this file
 //
 // Changes v10.1:
 //  - canOpenNewTrade(symbol): replaces isMarketOpen() for new trades
