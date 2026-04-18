@@ -1,7 +1,7 @@
 {
   "name": "nv-tradingview-webhook",
-  "version": "10.2.0",
-  "description": "TradingView → MetaApi REST → FTMO MT5 | PRONTO-AI v10.2 — spread_at_entry/vwap_band_pct in DB, spread guard stocks, anti-consolidation forex, ghost restart log, signal-stats endpoint, shadow/winners route fix",
+  "version": "10.3.0",
+  "description": "TradingView → MetaApi REST → FTMO MT5 | PRONTO-AI v10.3 — data quality compliance 18/04/2026, date gate, VWAP integrity, SL shadow winning-trades-only filter",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
