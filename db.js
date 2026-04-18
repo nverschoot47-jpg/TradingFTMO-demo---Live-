@@ -630,6 +630,40 @@ async function loadWebhookHistory(limit = 100) {
   } catch (e) { return []; }
 }
 
+// ── Shadow SL analysis for WINNING trades only ─────────────────
+// Joins shadow_snapshots (max pct_sl_used per position) with
+// closed_trades (hit_tp=TRUE) to show how much SL room was used
+// on trades that actually won — excludes SL-hit trades entirely.
+async function loadShadowWinners() {
+  try {
+    const r = await pool.query(`
+      SELECT
+        mae.optimizer_key        AS "optimizerKey",
+        COUNT(DISTINCT mae.position_id) AS "winnerCount",
+        CAST(AVG(mae.max_pct)    AS FLOAT) AS "avgMaxSlUsed",
+        CAST(PERCENTILE_CONT(0.50) WITHIN GROUP(ORDER BY mae.max_pct) AS FLOAT) AS "p50",
+        CAST(PERCENTILE_CONT(0.90) WITHIN GROUP(ORDER BY mae.max_pct) AS FLOAT) AS "p90"
+      FROM (
+        SELECT position_id, optimizer_key,
+               MAX(CAST(pct_sl_used AS FLOAT)) AS max_pct
+        FROM shadow_snapshots
+        GROUP BY position_id, optimizer_key
+      ) mae
+      JOIN closed_trades ct ON mae.position_id = ct.position_id
+      WHERE ct.hit_tp = TRUE
+      GROUP BY mae.optimizer_key
+    `);
+    const map = {};
+    for (const row of r.rows) map[row.optimizerKey] = {
+      winnerCount:    parseInt(row.winnerCount,  10),
+      avgMaxSlUsed:   row.avgMaxSlUsed,
+      p50:            row.p50,
+      p90:            row.p90,
+    };
+    return map;
+  } catch (e) { console.warn('[!] loadShadowWinners:', e.message); return {}; }
+}
+
 // ── EV stats computed from ghost_trades ────────────────────────
 // Computes EV table for a key from ghost_trades DB directly.
 // Returns { key, count, rrLevels: [{rr, winRate, ev}], bestRR, bestEV }
@@ -685,4 +719,6 @@ module.exports = {
   loadWebhookHistory,
   // EV stats
   computeEVStats,
+  // Shadow winners (SL% on winning trades only)
+  loadShadowWinners,
 };
