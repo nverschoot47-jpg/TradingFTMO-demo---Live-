@@ -1,7 +1,7 @@
 {
   "name": "nv-tradingview-webhook",
-  "version": "9.0.0",
-  "description": "TradingView → MetaApi REST → FTMO MT5 | NV v9.0 — per-symbol risk, vwap split, ghost/shadow per key, no blocking",
+  "version": "10.1.0",
+  "description": "TradingView → MetaApi REST → FTMO MT5 | PRONTO-AI v10.1 — market order first, exec price SL/TP, overnight ghosts, canOpenNewTrade per asset type",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
