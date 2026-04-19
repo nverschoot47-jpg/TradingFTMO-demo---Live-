@@ -1,67 +1,33 @@
-
 // ===============================================================
-// server.js  v10.4  |  PRONTO-AI
+// server.js  v10.5  |  PRONTO-AI
 // TradingView → MetaApi REST → FTMO MT5
 //
-// v10.4 — OPERATOR FIXES (18 April 2026):
-//  FIX A — Ghost continuity on manual close: handlePositionClosed()
-//    now NEVER cancels the ghost when close_reason='manual'. The ghost
-//    runs to phantom_sl or 72h timeout so the data is always captured.
-//  FIX B — SL buffer ×1.5: MT5 SL is placed at sl_pct × 1.5 so the
-//    real candle close (TV 5min) has room for bid/ask spread & timing
-//    delay. TP is calculated from this buffered SL distance.
-//  FIX C — Risk scaling via lotsize: multiplier (EV×4, day×1.2) now
-//    multiplies the lot count, NOT the euro risk. Currency risk stays
-//    fixed; lotsize scales. maxMult = 4.0 (EV) × 1.2 (day) combined.
-//  FIX D — Stock 20% notional cap REMOVED: was arbitrary and broke lot
-//    sizing for high-priced US stocks.
-//  FIX E — RR steps 0.1 to 15.0: computeEVStats already does 0.1 steps
-//    in db.js; frontend TP optimiser table now shows all steps.
-//  FIX F — Nightly optimizer safe for open ghosts: 03:00 cron skips any
-//    optimizer key that has an ACTIVE ghost tracker. Those keys are
-//    queued and re-run at next cycle (next night or at ghost finalize).
-//  FIX G — Max SL% shown in TP Optimiser table.
-//  FIX H — tvEntry removed from /live/positions API response.
-//  FIX I — Dashboard: ghost count always synced with open positions.
-//    syncOpenPositions now detects manual closes and restarts ghost if
-//    position disappeared from MT5 but ghost was not yet finalized.
-//  FIX J — Errors count fix: loadAllTrades limit raised to 10000 in db.js.
-//  FIX K — SL_TP_SET_FAILED fallback: retry SL/TP set up to 3× before
-//    marking as failed.
-//
-// v10.3 — DATA QUALITY COMPLIANCE (18 April 2026):
-//  COMPLIANCE 1 — Date gate
-//  COMPLIANCE 2 — TP Optimiser VWAP filter
-//  COMPLIANCE 3 — SL Shadow winning-trades-only
-//
-// v10.2 fixes (8 total):
-//  FIX 1 — spread_at_entry saved in closed_trades
-//  FIX 2 — vwap_band_pct saved in closed_trades
-//  FIX 3 — Lots recalc order confirmed correct after enforceMinStop
-//  FIX 4 — Spread guard for stocks (>25% SL dist → close+reject)
-//  FIX 5 — Anti-consolidation forex (sharesCurrency helper)
-//  FIX 6 — Ghost entry log on restart
-//  FIX 7 — GET /signal-stats endpoint
-//  FIX 8 — /shadow/winners route moved ABOVE /shadow/:key
-//
-// v10.1 changes:
-//  - sl_pct: validated as 0 < x <= 0.05 (max 5%), human-readable log
-//  - Entry logic: market order first → read back real execution price
-//    from MT5 → calculate SL/TP from execution price → modify position
-//  - TP comment uses real tpRR variable (not hardcoded "2R")
-//  - canOpenNewTrade() replaces isMarketOpen() for new trade gating:
-//    * Stocks: 16:00–21:00 Brussels only
-//    * Others: 02:00–21:00 Brussels
-//  - Ghost tracker: runs through night for overnight holdings
-//    * GHOST_MAX_MS = 72h (was 24h)
-//    * Weekend: slow-polls every 10min instead of stopping
-//    * 23:00 hard-stop cron REMOVED
-//  - VWAP band exhaustion filter: rejects signals where price is
-//    >90% into the VWAP band (chasing prevention)
-//  - Max notional 20% cap for stocks (prevents overleveraged sizing)
-//  - Daily risk multiplier: requires >= 30 ghost samples to activate
-//  - signal_log: every inbound TV signal logged to DB
-//  - Latency tracking: webhook receive → MT5 confirm in ms
+// v10.5 — ALL-FIXES (19 April 2026):
+//  FIX 1  — EV mult ×4 on riskEUR (no cap). Day mult ×1.2 on lotsize separately.
+//            Combined: riskEUR = base × evMult, lots = baseLots × dayMult.
+//  FIX 2  — lotOverrides persistent in DB (lot_overrides table). Loaded at startup.
+//  FIX 3  — Anti-consolidation rewritten: same symbol+session+direction blocks new
+//            trade and instead widens SL×1.5 + adjusts TP on existing trade.
+//            Same currency different pair → lotsize ÷ relatedCount.
+//  FIX 4  — realizedPnlEUR: fetch actual deal P&L from MT5/DB after close.
+//  FIX 5  — Spread guard compares against buffered SL distance (×SL_BUFFER_MULT).
+//  FIX 6  — closeReason: compare currentPrice to sl/tp. Manual close → ghost
+//            continues, trueMaxRR written when ghost finalizes. unrealizedPnl only
+//            for manual; realizedPnl from MT5 for sl/tp closes.
+//  FIX 7  — evaluateDailyRisk uses realizedPnlEUR not currentPnL snapshot.
+//  FIX 8  — COMPLIANCE_DATE centralised in session.js.
+//  FIX 9  — syncOpenPositions: min 55s between MetaApi calls.
+//  FIX 10 — Ghost mt5Symbol fallback to SYMBOL_CATALOG.
+//  FIX 11 — evaluateDailyRisk resets ALL known keys, not just today's traders.
+//  FIX 12 — shadowResults restored from DB at startup.
+//  FIX 13 — restoredAfterRestart flag cleared after first successful sync.
+//  FIX 14 — getOptimalTP: single computeEVStats call.
+//  FIX 15 — /history endpoint returns all 200 entries (MAX_HISTORY).
+//  FIX 16 — closedTrades capped at MAX_CLOSED_TRADES (5000) in memory.
+//  FIX 17 — Dashboard loads /trades?limit=5000 for full TP Optimiser.
+//  FIX 18 — startGhostTracker guards sl=0.
+//  FIX 19 — keyRiskMult persisted in DB (key_risk_mult table).
+//  FIX 20 — dupGuard cleanup every 5min, TTL 120s.
 // ===============================================================
 
 "use strict";
@@ -90,6 +56,7 @@ const {
   initDB, saveTrade, loadAllTrades,
   saveGhostTrade, loadGhostTrades, countGhostsByKey,
   saveShadowSnapshot, loadShadowSnapshots, saveShadowAnalysis, loadShadowAnalysis,
+  loadAllShadowAnalysis,
   saveTPConfig, loadTPConfig,
   savePnlLog,
   saveDailyRisk, loadLatestDailyRisk,
@@ -99,6 +66,9 @@ const {
   computeEVStats,
   loadSignalStats,
   loadShadowWinners,
+  saveLotOverride, loadLotOverrides,
+  saveKeyRiskMult, loadKeyRiskMults,
+  fetchRealizedPnl,
 } = require("./db");
 
 const {
@@ -107,6 +77,7 @@ const {
   getSession, isMarketOpen, canOpenNewTrade, isMonitoringActive,
   normalizeSymbol, getSymbolInfo,
   getVwapPosition, buildOptimizerKey,
+  COMPLIANCE_DATE, COMPLIANCE_DATE_MS,
 } = require("./session");
 
 // ── Config ───────────────────────────────────────────────────────
@@ -115,46 +86,39 @@ const META_ACCOUNT_ID = process.env.META_ACCOUNT_ID;
 const WEBHOOK_SECRET  = process.env.WEBHOOK_SECRET;
 const PORT            = process.env.PORT || 3000;
 
-// ================================================================
-// FIXED RISK PER TRADE — change this one value to adjust all trades
-// 0.0015 = 0.15% of live MT5 balance per trade
-// ================================================================
+// ── Risk constants ───────────────────────────────────────────────
+// FIXED_RISK_PCT: base risk per trade (0.15% of balance)
 const FIXED_RISK_PCT = parseFloat(process.env.FIXED_RISK_PCT || "0.0015");
 
+// FIX 1: EV multiplier applied to riskEUR (no cap — trust the EV logic).
+//        Day multiplier ×1.2 applied separately to lotsize.
 // Ghost settings
 const GHOST_MIN_TRADES_FOR_TP = 5;
 const GHOST_POLL_MS           = 30000;
-const GHOST_MAX_MS            = 72 * 3600 * 1000;  // 72h — supports overnight holdings
+const GHOST_MAX_MS            = 72 * 3600 * 1000;
+const MULT_MIN_SAMPLE         = 30;
 
-// Minimum ghost samples before daily risk multiplier activates
-const MULT_MIN_SAMPLE = 30;
+// FIX 16
+const MAX_CLOSED_TRADES = 5000;
+// FIX 15
+const MAX_HISTORY       = 200;
 
-// ── Data quality compliance date ─────────────────────────────────
-// Trades, ghost records, and shadow snapshots before this date had
-// missing vwap_band_pct / execution_price and must not be used in
-// any optimiser, EV, shadow, or daily-risk-multiplier calculation.
-// Applied in: evaluateDailyRisk(), frontend TP Optimiser combo filter.
-// DB-level filters are in db.js (computeEVStats, loadShadowSnapshots, etc.)
-const COMPLIANCE_DATE_MS = new Date("2026-04-18T00:00:00.000Z").getTime();
+// SL buffer: MT5 SL placed at sl_pct × 1.5 to absorb spread + timing lag
+const SL_BUFFER_MULT = 1.5;
 
-// Min stop distances per MT5 symbol (prevents too-tight SL rejection)
+// Min stop distances per MT5 symbol
 const MIN_STOP = {
   "GER40.cash": 10, "UK100.cash": 2, "US100.cash": 10, "US30.cash": 10,
   "XAUUSD": 0.5,
 };
 
-// Lot value per unit: points × lots = monetary risk unit
-// These are fixed per instrument type — used for lot calculation
 const LOT_VALUE = {
-  index:     20,   // per 1 lot per point
-  commodity: 100,  // Gold: 100 per lot per point
-  stock:     1,    // stocks: 1 per lot per point
-  forex:     10,   // standard lot = 10 per pip
+  index: 20, commodity: 100, stock: 1, forex: 10,
 };
 
 // ── Live balance cache ────────────────────────────────────────────
-let liveBalance      = 50000;  // updated every sync from MT5
-let liveBalanceAt    = 0;
+let liveBalance   = 50000;
+let liveBalanceAt = 0;
 
 // ── MetaApi ───────────────────────────────────────────────────────
 const META_BASE = `https://mt-client-api-v1.london.agiliumtrade.ai/users/current/accounts/${META_ACCOUNT_ID}`;
@@ -179,7 +143,6 @@ async function metaFetch(path, options = {}, timeoutMs = 8000) {
 }
 
 async function fetchOpenPositions()         { return metaFetch("/positions"); }
-
 async function fetchAccountInfo() {
   const info = await metaFetch("/accountInformation");
   if (info?.balance) {
@@ -189,24 +152,17 @@ async function fetchAccountInfo() {
   }
   return info;
 }
-
 async function closePosition(id)            { return metaFetch(`/positions/${id}/close`, { method: "POST" }); }
-
 async function fetchCurrentPrice(mt5Symbol) {
   try {
-    const d = await metaFetch(`/symbols/${encodeURIComponent(mt5Symbol)}/currentPrice`, {}, 5000);
+    const d   = await metaFetch(`/symbols/${encodeURIComponent(mt5Symbol)}/currentPrice`, {}, 5000);
     const bid = d.bid ?? null, ask = d.ask ?? null;
-    if (bid !== null && ask !== null) {
-      return { mid: (bid + ask) / 2, bid, ask, spread: ask - bid };
-    }
+    if (bid !== null && ask !== null) return { mid: (bid + ask) / 2, bid, ask, spread: ask - bid };
     const mid = bid ?? ask ?? null;
     return mid !== null ? { mid, bid: mid, ask: mid, spread: 0 } : null;
   } catch { return null; }
 }
-
-async function placeOrder(payload) {
-  return metaFetch("/trade", { method: "POST", body: JSON.stringify(payload) }, 12000);
-}
+async function placeOrder(payload) { return metaFetch("/trade", { method: "POST", body: JSON.stringify(payload) }, 12000); }
 
 // ── In-memory state ───────────────────────────────────────────────
 const openPositions  = {};
@@ -215,11 +171,17 @@ const ghostTrackers  = {};
 const tpLocks        = {};
 const shadowResults  = {};
 const webhookLog     = [];
-const symbolRiskMap  = {};     // per-symbol risk_pct overrides
-const MAX_HISTORY    = 200;
+const symbolRiskMap  = {};
+const keyRiskMult    = {};   // { [optimizerKey]: { streak, evMult, dayMult } }
+const lotOverrides   = {};   // { [symbol]: baseLots }
 
-// Per-key daily EV streak: { [optimizerKey]: { streak: N, mult: X } }
-const keyRiskMult    = {};
+// FIX 9: rate-limit protection
+let lastSyncAt = 0;
+const SYNC_MIN_INTERVAL_MS = 55000;
+
+// FIX 20: dupGuard with TTL
+const DUP_GUARD_TTL_MS = 120000;
+if (!global._dupGuard) global._dupGuard = {};
 
 function logEvent(entry) {
   webhookLog.unshift({ ts: new Date().toISOString(), ...entry });
@@ -228,7 +190,6 @@ function logEvent(entry) {
 
 // ── Balance helpers ───────────────────────────────────────────────
 async function getLiveBalance() {
-  // Refresh if older than 5 minutes
   if (Date.now() - liveBalanceAt > 5 * 60 * 1000) {
     try { await fetchAccountInfo(); } catch {}
   }
@@ -236,8 +197,6 @@ async function getLiveBalance() {
 }
 
 // ── Risk calculation ──────────────────────────────────────────────
-// Per-symbol override possible via env RISK_EURUSD=0.002 or DB,
-// but the default for ALL symbols is FIXED_RISK_PCT (0.15%)
 function getSymbolRiskPct(symbol) {
   const envKey = `RISK_${symbol}`;
   if (process.env[envKey]) return parseFloat(process.env[envKey]);
@@ -246,43 +205,33 @@ function getSymbolRiskPct(symbol) {
   return DEFAULT_RISK_BY_TYPE[info?.type || "stock"] ?? FIXED_RISK_PCT;
 }
 
-function getKeyRiskMult(optimizerKey) {
-  return keyRiskMult[optimizerKey]?.mult ?? 1.0;
-}
+// FIX 1: EV multiplier on riskEUR (no cap). Day multiplier on lots separately.
+function getKeyEvMult(optimizerKey)  { return keyRiskMult[optimizerKey]?.evMult  ?? 1.0; }
+function getKeyDayMult(optimizerKey) { return keyRiskMult[optimizerKey]?.dayMult ?? 1.0; }
 
-// FIX C: riskEUR is always base (no mult). Mult is applied at lot level.
-async function calcRiskEUR(symbol) {
+async function calcRiskEUR(symbol, optimizerKey) {
   const balance = await getLiveBalance();
   const pct     = getSymbolRiskPct(symbol);
-  return balance * pct;
+  const evMult  = getKeyEvMult(optimizerKey);
+  return balance * pct * evMult;  // FIX 1: EV mult on riskEUR
 }
 
 // ── Lot calculation ───────────────────────────────────────────────
-// Pure math: lots = riskEUR / (slDistance × lotValuePerPoint)
-// Risk multiplier (EV streak + daily) is applied to LOTS, not to riskEUR.
-// This keeps the euro-risk fixed per trade while scaling position size.
-// FIX D: Stock 20% notional cap removed — was arbitrary and broke sizing.
-function calcLots(symbol, entry, sl, riskEUR, riskMult) {
+// FIX 1: day mult applied here to lots. riskEUR already has evMult baked in.
+function calcLots(symbol, entry, sl, riskEUR, dayMult) {
   const info    = getSymbolInfo(symbol);
   const type    = info?.type || "stock";
   const lotVal  = LOT_VALUE[type] ?? 1;
   const dist    = Math.abs(entry - sl);
   if (!dist || !riskEUR) return 0.01;
   const baseLots = riskEUR / (dist * lotVal);
-  // Apply multiplier to lots (not to risk €) — FIX C
-  const mult   = (riskMult && riskMult > 0) ? riskMult : 1.0;
-  const lots   = baseLots * mult;
-  // Round to 2 decimal places — brokers generally accept this
-  return Math.max(0.01, parseFloat(lots.toFixed(2)));
+  const dm       = (dayMult && dayMult > 0) ? dayMult : 1.0;
+  return Math.max(0.01, parseFloat((baseLots * dm).toFixed(2)));
 }
 
-// ── Recalculate optimal lots after SL hit ────────────────────────
-// Called after position closes with reason "sl".
-// Updates in-memory lotOverride and logs the new value so you
-// can set LOTS_<SYMBOL>=<value> in Railway to persist it.
-const lotOverrides = {};  // symbol → recalculated lots
-
-async function recalcLotsAfterSL(symbol, entry, sl, optimizerKey) {
+// ── Recalculate base lots after SL hit ────────────────────────────
+// FIX 2: persists to DB immediately.
+async function recalcLotsAfterSL(symbol, entry, sl) {
   try {
     const balance = await getLiveBalance();
     const pct     = getSymbolRiskPct(symbol);
@@ -291,26 +240,20 @@ async function recalcLotsAfterSL(symbol, entry, sl, optimizerKey) {
     const lotVal  = LOT_VALUE[type] ?? 1;
     const dist    = Math.abs(entry - sl);
     if (!dist) return;
-    // Base lots only (no multiplier) for the recalc suggestion
-    const optimalLots = parseFloat((balance * pct / (dist * lotVal)).toFixed(2));
-    const envVar      = `LOTS_${symbol}`;
-    lotOverrides[symbol] = optimalLots;
-    console.log(`[LotRecalc] ${symbol} | SL hit → base lots = ${optimalLots} | Set ${envVar}=${optimalLots} in Railway`);
-    logEvent({ type: "LOT_RECALC", symbol, optimalLots, envVar, slDist: dist, balance, riskPct: pct });
+    const baseLots = parseFloat((balance * pct / (dist * lotVal)).toFixed(2));
+    lotOverrides[symbol] = baseLots;
+    await saveLotOverride(symbol, baseLots).catch(() => {});
+    console.log(`[LotRecalc] ${symbol} → base lots = ${baseLots} (persisted to DB)`);
+    logEvent({ type: "LOT_RECALC", symbol, baseLots, slDist: dist, balance, riskPct: pct });
   } catch (e) { console.warn("[LotRecalc]", e.message); }
 }
 
-// ── SL buffer multiplier ──────────────────────────────────────────
-// TV sends sl_pct as % of 5min bar close. The real MT5 SL is placed
-// at sl_pct × SL_BUFFER_MULT to absorb bid/ask spread and timing lag.
-// TP is always calculated from this buffered SL distance.
-const SL_BUFFER_MULT = 1.5;
-
-// ── SL from % ────────────────────────────────────────────────────
+// ── SL helpers ───────────────────────────────────────────────────
 function calcSLFromPct(direction, mt5Entry, slPct) {
-  const bufferedPct = slPct * SL_BUFFER_MULT;
-  if (direction === "buy")  return parseFloat((mt5Entry * (1 - bufferedPct)).toFixed(5));
-  else                      return parseFloat((mt5Entry * (1 + bufferedPct)).toFixed(5));
+  const buffered = slPct * SL_BUFFER_MULT;
+  return direction === "buy"
+    ? parseFloat((mt5Entry * (1 - buffered)).toFixed(5))
+    : parseFloat((mt5Entry * (1 + buffered)).toFixed(5));
 }
 
 function enforceMinStop(mt5Symbol, direction, entry, sl) {
@@ -323,14 +266,12 @@ function enforceMinStop(mt5Symbol, direction, entry, sl) {
 }
 
 // ── TP calculation ────────────────────────────────────────────────
-// DEFAULT_TP_RR: used when no EV data yet. Set to 2.0 = entry ± (2 × SL distance).
 const DEFAULT_TP_RR = 2.0;
 
+// FIX 14: single computeEVStats call
 async function getOptimalTP(optimizerKey) {
   const locked = tpLocks[optimizerKey];
   if (locked) return locked.lockedRR;
-  const count = await countGhostsByKey(optimizerKey);
-  if (count < GHOST_MIN_TRADES_FOR_TP) return DEFAULT_TP_RR;
   const ev = await computeEVStats(optimizerKey);
   if (!ev || ev.count < GHOST_MIN_TRADES_FOR_TP) return DEFAULT_TP_RR;
   return ev.bestRR ?? DEFAULT_TP_RR;
@@ -351,18 +292,13 @@ async function updateTPLock(optimizerKey, symbol, session, direction, vwapPos) {
     const prev  = tpLocks[optimizerKey];
     const newRR = ev.bestRR;
     const evPos = (ev.bestEV ?? 0) > 0;
-    tpLocks[optimizerKey] = {
-      lockedRR: newRR, lockedGhosts: ev.count,
-      evAtLock: ev.bestEV, evPositive: evPos,
-      lockedAt: new Date().toISOString(),
-    };
-    await saveTPConfig(optimizerKey, symbol, session, direction, vwapPos,
-      newRR, ev.count, ev.bestEV, prev?.lockedRR ?? null);
+    tpLocks[optimizerKey] = { lockedRR: newRR, lockedGhosts: ev.count, evAtLock: ev.bestEV, evPositive: evPos, lockedAt: new Date().toISOString() };
+    await saveTPConfig(optimizerKey, symbol, session, direction, vwapPos, newRR, ev.count, ev.bestEV, prev?.lockedRR ?? null);
     console.log(`[TP Lock] ${optimizerKey}: ${prev?.lockedRR ?? "new"}R → ${newRR}R (EV=${ev.bestEV?.toFixed(3)}, n=${ev.count})`);
   } catch (e) { console.warn("[!] updateTPLock:", e.message); }
 }
 
-// ── MaxRR helpers ────────────────────────────────────────────────
+// ── MaxRR helpers ─────────────────────────────────────────────────
 function calcMaxRR(direction, entry, sl, maxPrice) {
   const dist = Math.abs(entry - sl);
   if (!dist || maxPrice == null) return 0;
@@ -373,13 +309,11 @@ function calcMaxRR(direction, entry, sl, maxPrice) {
 function calcPctSlUsed(direction, entry, sl, currentPrice) {
   const dist = Math.abs(entry - sl);
   if (!dist) return 0;
-  const adverse = direction === "buy"
-    ? entry - currentPrice
-    : currentPrice - entry;
+  const adverse = direction === "buy" ? entry - currentPrice : currentPrice - entry;
   return parseFloat((Math.max(0, Math.min(100, (adverse / dist) * 100)).toFixed(2)));
 }
 
-// ── FIX 5: Anti-consolidation helper ────────────────────────────
+// ── Anti-consolidation helpers (FIX 3) ───────────────────────────
 function sharesCurrency(a, b) {
   if (!a || !b || a.length < 6 || b.length < 6) return false;
   const aBase = a.slice(0, 3), aQuote = a.slice(3, 6);
@@ -387,12 +321,59 @@ function sharesCurrency(a, b) {
   return aBase === bBase || aBase === bQuote || aQuote === bBase || aQuote === bQuote;
 }
 
+// FIX 3: Find exact duplicate (same symbol + session + direction).
+// Returns the existing position object or null.
+function findExactDuplicate(symKey, session, direction) {
+  return Object.values(openPositions).find(p =>
+    p.symbol === symKey && p.session === session && p.direction === direction
+  ) ?? null;
+}
+
+// FIX 3: Count same-currency pairs open in same direction (excluding exact duplicate).
+function countRelatedForex(symKey, direction) {
+  return Object.values(openPositions).filter(p =>
+    p.direction === direction &&
+    p.symbol !== symKey &&
+    sharesCurrency(p.symbol, symKey)
+  ).length;
+}
+
+// FIX 3: Widen SL × 1.5 on existing trade and adjust TP proportionally.
+async function widenExistingTradeSL(pos, tpRR) {
+  try {
+    const newDist  = Math.abs(pos.entry - pos.sl) * 1.5;
+    const newSL    = pos.direction === "buy"
+      ? parseFloat((pos.entry - newDist).toFixed(5))
+      : parseFloat((pos.entry + newDist).toFixed(5));
+    const newTP    = calcTPPrice(pos.direction, pos.entry, newSL, tpRR);
+    await metaFetch(`/positions/${pos.positionId}`, {
+      method: "PUT",
+      body:   JSON.stringify({ stopLoss: newSL, takeProfit: newTP }),
+    }, 8000);
+    pos.sl = newSL;
+    pos.tp = newTP;
+    console.log(`[AntiConsolid] ${pos.symbol} ${pos.positionId}: SL widened ${pos.sl}→${newSL}, TP→${newTP}`);
+    logEvent({ type: "SL_WIDENED", symbol: pos.symbol, positionId: pos.positionId, oldSL: pos.sl, newSL, newTP, reason: "DUPLICATE_SIGNAL_STRENGTHENS_EXISTING" });
+    return { newSL, newTP };
+  } catch (e) {
+    console.warn(`[AntiConsolid] widenSL failed for ${pos.positionId}: ${e.message}`);
+    return null;
+  }
+}
+
 // ── Ghost Optimizer ───────────────────────────────────────────────
 function startGhostTracker(pos) {
-  const { positionId, symbol, mt5Symbol, session, direction, vwapPosition,
-          optimizerKey, entry, sl, slPct, tpRRUsed, openedAt } = pos;
+  // FIX 18: guard sl=0
+  if (!pos.sl || pos.sl <= 0) {
+    console.warn(`[Ghost] ${pos.positionId}: sl=0, ghost NOT started`);
+    return;
+  }
+  if (ghostTrackers[pos.positionId]) return;
 
-  if (ghostTrackers[positionId]) return;
+  const { positionId, symbol, session, direction, vwapPosition,
+          optimizerKey, entry, sl, slPct, tpRRUsed, openedAt } = pos;
+  // FIX 10: mt5Symbol fallback
+  const mt5Symbol = pos.mt5Symbol || getSymbolInfo(symbol)?.mt5 || symbol;
 
   const phantomSL = sl;
   let maxPrice    = entry;
@@ -406,39 +387,22 @@ function startGhostTracker(pos) {
   async function tick() {
     try {
       if (!ghostTrackers[positionId]) return;
-      const elapsed  = Date.now() - startTs;
-
-      // Hard timeout after 72h
-      if (elapsed >= GHOST_MAX_MS) {
-        await finalizeGhost(positionId, "timeout_72h", elapsed, maxPrice);
-        return;
-      }
-
-      // Weekend: slow-poll every 10 min — ghost stays alive, just waits
+      const elapsed = Date.now() - startTs;
+      if (elapsed >= GHOST_MAX_MS) { await finalizeGhost(positionId, "timeout_72h", elapsed, maxPrice); return; }
       const { day } = getBrusselsComponents();
       if (day === 0 || day === 6) {
         timer = setTimeout(tick, 10 * 60 * 1000);
         ghostTrackers[positionId].timer = timer;
         return;
       }
-
-      // Normal weekday tick
       const priceData = await fetchCurrentPrice(mt5Symbol);
       const price     = priceData?.mid ?? null;
-
       if (price !== null) {
         const better = direction === "buy" ? price > maxPrice : price < maxPrice;
-        if (better) {
-          maxPrice = price;
-          ghostTrackers[positionId].maxPrice = price;
-        }
+        if (better) { maxPrice = price; ghostTrackers[positionId].maxPrice = price; }
         const slHit = direction === "buy" ? price <= phantomSL : price >= phantomSL;
-        if (slHit) {
-          await finalizeGhost(positionId, "phantom_sl", elapsed, maxPrice);
-          return;
-        }
+        if (slHit) { await finalizeGhost(positionId, "phantom_sl", elapsed, maxPrice); return; }
       }
-
       timer = setTimeout(tick, GHOST_POLL_MS);
       ghostTrackers[positionId].timer = timer;
     } catch (e) {
@@ -447,7 +411,6 @@ function startGhostTracker(pos) {
       if (ghostTrackers[positionId]) ghostTrackers[positionId].timer = timer;
     }
   }
-
   timer = setTimeout(tick, GHOST_POLL_MS);
   ghostTrackers[positionId].timer = timer;
   console.log(`[Ghost] Started: ${positionId} | ${optimizerKey} | phantomSL=${phantomSL}`);
@@ -464,30 +427,28 @@ async function finalizeGhost(positionId, stopReason, elapsedMs, finalMaxPrice) {
   const phantomSLHit  = stopReason === "phantom_sl";
 
   const ghostRow = {
-    positionId:    g.positionId,
-    symbol:        g.symbol,
-    session:       g.session,
-    direction:     g.direction,
-    vwapPosition:  g.vwapPosition,
-    optimizerKey:  g.optimizerKey,
-    entry:         g.entry,
-    sl:            g.sl,
-    slPct:         g.slPct,
-    phantomSL:     g.sl,
-    tpRRUsed:      g.tpRRUsed,
-    maxPrice:      finalMaxPrice,
-    maxRRBeforeSL,
-    phantomSLHit,
-    stopReason,
-    timeToSLMin:   phantomSLHit ? timeToSLMin : null,
-    openedAt:      g.openedAt,
-    closedAt:      new Date().toISOString(),
+    positionId: g.positionId, symbol: g.symbol, session: g.session,
+    direction: g.direction, vwapPosition: g.vwapPosition, optimizerKey: g.optimizerKey,
+    entry: g.entry, sl: g.sl, slPct: g.slPct, phantomSL: g.sl, tpRRUsed: g.tpRRUsed,
+    maxPrice: finalMaxPrice, maxRRBeforeSL, phantomSLHit, stopReason,
+    timeToSLMin: phantomSLHit ? timeToSLMin : null,
+    openedAt: g.openedAt, closedAt: new Date().toISOString(),
   };
 
   await saveGhostTrade(ghostRow);
   await updateTPLock(g.optimizerKey, g.symbol, g.session, g.direction, g.vwapPosition);
   await runShadowOptimizer(g.optimizerKey).catch(() => {});
-  console.log(`[Ghost] Finalized: ${positionId} | key=${g.optimizerKey} | maxRR=${maxRRBeforeSL}R | slHit=${phantomSLHit} | reason=${stopReason}`);
+
+  // FIX 6: If this ghost belongs to a manually-closed position, write trueMaxRR back to DB.
+  const closedTrade = closedTrades.find(t => t.positionId === g.positionId);
+  if (closedTrade && closedTrade.closeReason === "manual") {
+    closedTrade.trueMaxRR    = maxRRBeforeSL;
+    closedTrade.trueMaxPrice = finalMaxPrice;
+    await saveTrade(closedTrade).catch(() => {});
+    console.log(`[Ghost] ${positionId}: trueMaxRR=${maxRRBeforeSL}R written back (manual close)`);
+  }
+
+  console.log(`[Ghost] Finalized: ${positionId} | key=${g.optimizerKey} | maxRR=${maxRRBeforeSL}R | slHit=${phantomSLHit}`);
 }
 
 function cancelGhost(positionId) {
@@ -497,116 +458,128 @@ function cancelGhost(positionId) {
   delete ghostTrackers[positionId];
 }
 
-// ── Shadow Optimizer ───────────────────────────────────────────────
+// ── Shadow Optimizer ──────────────────────────────────────────────
 async function runShadowOptimizer(optimizerKey) {
   try {
     const snaps = await loadShadowSnapshots(optimizerKey, 10000);
     if (snaps.length < 10) return;
-
-    const vals = snaps.map(s => s.pctSlUsed).sort((a, b) => a - b);
-    const n    = vals.length;
-    const pct  = (p) => vals[Math.min(n - 1, Math.floor(p / 100 * n))];
-
-    const p50    = pct(50);
-    const p90    = pct(90);
-    const p99    = pct(99);
+    const vals   = snaps.map(s => s.pctSlUsed).sort((a, b) => a - b);
+    const n      = vals.length;
+    const pct    = (p) => vals[Math.min(n - 1, Math.floor(p / 100 * n))];
+    const p50    = pct(50), p90 = pct(90), p99 = pct(99);
     const maxUsed = vals[n - 1];
-
     const recommendedSlPct = parseFloat((p99 / 100).toFixed(4));
     const tooWide          = p99 < 70;
     const potentialSaving  = tooWide ? parseFloat((100 - p99).toFixed(1)) : 0;
-    const uniquePos = new Set(snaps.map(s => s.positionId)).size;
-
+    const uniquePos        = new Set(snaps.map(s => s.positionId)).size;
     const analysis = {
       optimizerKey,
       symbol:        optimizerKey.split("_")[0],
       session:       optimizerKey.split("_")[1] ?? "",
       direction:     optimizerKey.split("_")[2] ?? "",
       vwapPosition:  optimizerKey.split("_")[3] ?? "unknown",
-      snapshotsCount: n,
-      positionsCount: uniquePos,
-      p50, p90, p99,
-      maxUsed,
-      recommendedSlPct,
-      currentSlTooWide: tooWide,
-      potentialSavingPct: potentialSaving,
+      snapshotsCount: n, positionsCount: uniquePos,
+      p50, p90, p99, maxUsed, recommendedSlPct,
+      currentSlTooWide: tooWide, potentialSavingPct: potentialSaving,
     };
-
     shadowResults[optimizerKey] = analysis;
     await saveShadowAnalysis(analysis);
-    console.log(`[Shadow] ${optimizerKey}: p99=${p99}% | recommended=${(recommendedSlPct*100).toFixed(0)}% of current SL | tooWide=${tooWide}`);
+    console.log(`[Shadow] ${optimizerKey}: p99=${p99}% tooWide=${tooWide}`);
   } catch (e) { console.warn(`[Shadow] ${optimizerKey}:`, e.message); }
 }
 
 async function runAllShadowOptimizers() {
   const keys = new Set(Object.values(openPositions).map(p => p.optimizerKey).filter(Boolean));
   for (const key of Object.keys(shadowResults)) keys.add(key);
-  for (const key of keys) {
-    await runShadowOptimizer(key).catch(() => {});
-  }
+  for (const key of keys) await runShadowOptimizer(key).catch(() => {});
 }
 
-// ── Position sync ────────────────────────────────────────────────
+// ── Position sync (FIX 9: rate-limited, FIX 13: clear restore flag) ──
 async function syncOpenPositions() {
+  const now = Date.now();
+  if (now - lastSyncAt < SYNC_MIN_INTERVAL_MS) return;
+  lastSyncAt = now;
   try {
     const live    = await fetchOpenPositions();
     const liveIds = new Set((Array.isArray(live) ? live : []).map(p => String(p.id)));
-
     for (const [id, pos] of Object.entries(openPositions)) {
-      if (!liveIds.has(id)) {
-        await handlePositionClosed(pos);
-        delete openPositions[id];
-      }
+      if (!liveIds.has(id)) { await handlePositionClosed(pos); delete openPositions[id]; }
     }
-
     for (const livePos of (Array.isArray(live) ? live : [])) {
       const id    = String(livePos.id);
       const local = openPositions[id];
       if (!local) continue;
-      const cur = livePos.currentPrice ?? livePos.openPrice ?? local.entry;
+      const cur    = livePos.currentPrice ?? livePos.openPrice ?? local.entry;
       const better = local.direction === "buy" ? cur > (local.maxPrice ?? cur) : cur < (local.maxPrice ?? cur);
       if (better) { local.maxPrice = cur; local.maxRR = calcMaxRR(local.direction, local.entry, local.sl, cur); }
       local.currentPrice = cur;
       local.currentPnL   = livePos.unrealizedProfit ?? 0;
       local.lastSync     = new Date().toISOString();
+      // FIX 13: clear restore flag after first live sync
+      if (local.restoredAfterRestart) {
+        local.restoredAfterRestart = false;
+        console.log(`[Sync] ${id}: restoredAfterRestart cleared`);
+      }
     }
-
-    // Also refresh balance on sync
     await fetchAccountInfo().catch(() => {});
   } catch (e) { console.warn("[Sync]", e.message); }
 }
 
+// ── handlePositionClosed (FIX 6: price-based closeReason, FIX 4: realPnl) ──
 async function handlePositionClosed(pos) {
-  const maxRR      = pos.maxRR ?? calcMaxRR(pos.direction, pos.entry, pos.sl, pos.maxPrice ?? pos.entry);
-  const hitTP      = pos.tp != null && pos.direction === "buy"
-    ? (pos.maxPrice ?? 0) >= pos.tp
-    : (pos.maxPrice ?? Infinity) <= pos.tp;
-  const closeReason = hitTP ? "tp" : maxRR <= 0.05 ? "sl" : "manual";
-  const now         = new Date().toISOString();
+  const lastPrice = pos.currentPrice ?? pos.maxPrice ?? pos.entry;
+  let closeReason;
+  if (pos.tp != null) {
+    const tpHit = pos.direction === "buy" ? lastPrice >= pos.tp : lastPrice <= pos.tp;
+    if (tpHit) closeReason = "tp";
+  }
+  if (!closeReason && pos.sl > 0) {
+    const slHit = pos.direction === "buy" ? lastPrice <= pos.sl : lastPrice >= pos.sl;
+    if (slHit) closeReason = "sl";
+  }
+  if (!closeReason) closeReason = "manual";
 
-  const closed = {
-    ...pos, maxRR, hitTP, closeReason, closedAt: now, trueMaxRR: null, trueMaxPrice: null,
-    spreadAtEntry: pos.spread ?? null,   // FIX 1
-    vwapBandPct:   pos.vwapBandPct ?? null,  // FIX 2 (explicit)
-  };
-  closedTrades.push(closed);
-  await saveTrade(closed).catch(() => {});
-  await savePnlLog(pos.symbol, pos.session, pos.direction, pos.vwapPosition, maxRR, hitTP, pos.currentPnL ?? 0).catch(() => {});
-  logEvent({ type: "POSITION_CLOSED", symbol: pos.symbol, direction: pos.direction, maxRR, closeReason });
+  const hitTP = closeReason === "tp";
+  const maxRR = pos.maxRR ?? calcMaxRR(pos.direction, pos.entry, pos.sl, pos.maxPrice ?? pos.entry);
+  const now   = new Date().toISOString();
 
-  // FIX A: On manual close, do NOT cancel the ghost tracker.
-  // Let the ghost run to phantom_sl or 72h timeout — the statistical
-  // data (what the market would have done) is still valuable.
-  if (closeReason === "manual") {
-    console.log(`[Ghost] ${pos.positionId}: manual close detected — ghost continues tracking (statistical data preserved)`);
+  // FIX 4: fetch actual realized P&L from MT5 for sl/tp; use currentPnL for manual
+  let realizedPnl = pos.currentPnL ?? 0;
+  if (closeReason !== "manual") {
+    try {
+      const fetched = await fetchRealizedPnl(pos.positionId);
+      if (fetched != null) realizedPnl = fetched;
+    } catch { /* fallback to currentPnL */ }
   }
 
-  // After SL hit: recalculate optimal lots and log for Railway update
+  const closed = {
+    ...pos, maxRR, hitTP, closeReason, closedAt: now,
+    realizedPnlEUR: realizedPnl,
+    spreadAtEntry:  pos.spread ?? null,
+    vwapBandPct:    pos.vwapBandPct ?? null,
+    // FIX 6: trueMaxRR filled later by ghost for manual closes
+    trueMaxRR:   closeReason === "manual" ? null : maxRR,
+    trueMaxPrice: closeReason === "manual" ? null : pos.maxPrice,
+  };
+
+  // FIX 16: cap array
+  closedTrades.push(closed);
+  if (closedTrades.length > MAX_CLOSED_TRADES) closedTrades.splice(0, closedTrades.length - MAX_CLOSED_TRADES);
+
+  await saveTrade(closed).catch(() => {});
+  await savePnlLog(pos.symbol, pos.session, pos.direction, pos.vwapPosition, maxRR, hitTP, realizedPnl).catch(() => {});
+  logEvent({ type: "POSITION_CLOSED", symbol: pos.symbol, direction: pos.direction, maxRR, closeReason, realizedPnl });
+
+  // FIX A: ghost continues after manual close
+  if (closeReason === "manual") {
+    console.log(`[Ghost] ${pos.positionId}: manual close — ghost continues (trueMaxRR will be written on finalize)`);
+  }
   if (closeReason === "sl") {
-    await recalcLotsAfterSL(pos.symbol, pos.entry, pos.sl, pos.optimizerKey).catch(() => {});
+    await recalcLotsAfterSL(pos.symbol, pos.entry, pos.sl).catch(() => {});
   }
 }
 
+// ── Restore positions from MT5 ────────────────────────────────────
 async function restorePositionsFromMT5() {
   try {
     const live = await fetchOpenPositions();
@@ -626,13 +599,12 @@ async function restorePositionsFromMT5() {
         direction: dir, vwapPosition: vpPos, optimizerKey: optKey,
         entry, sl: lp.stopLoss ?? 0, tp: lp.takeProfit ?? null,
         lots: lp.volume ?? 0.01, riskEUR: 0, riskPct: FIXED_RISK_PCT,
-        session: sess, openedAt: lp.time ?? new Date().toISOString(), maxPrice: entry,
-        maxRR: 0, currentPnL: lp.unrealizedProfit ?? 0,
+        session: sess, openedAt: lp.time ?? new Date().toISOString(),
+        maxPrice: entry, maxRR: 0, currentPnL: lp.unrealizedProfit ?? 0,
         slPct: null, restoredAfterRestart: true,
       };
       if (openPositions[id].sl > 0) {
-        // FIX 6: log exact entry used for ghost after restart
-        console.log(`[Restart] Ghost entry for ${sym} (${id}): entry=${entry} (openPrice=${lp.openPrice ?? "null"}, fallback currentPrice=${lp.currentPrice ?? "null"})`);
+        console.log(`[Restart] Ghost for ${sym} (${id}): entry=${entry}`);
         startGhostTracker(openPositions[id]);
       }
       restored++;
@@ -643,73 +615,70 @@ async function restorePositionsFromMT5() {
 
 // ── Shadow snapshot cron ──────────────────────────────────────────
 async function takeShadowSnapshots() {
+  // FIX 13: restoredAfterRestart is cleared after first sync; snapshots then flow normally
   const positions = Object.values(openPositions).filter(p => p.sl > 0 && !p.restoredAfterRestart);
   for (const pos of positions) {
     try {
-      const pd = await fetchCurrentPrice(pos.mt5Symbol);
+      const pd = await fetchCurrentPrice(pos.mt5Symbol || getSymbolInfo(pos.symbol)?.mt5 || pos.symbol);
       if (!pd) continue;
       const pct = calcPctSlUsed(pos.direction, pos.entry, pos.sl, pd.mid);
       await saveShadowSnapshot({
-        positionId:    pos.positionId,
-        optimizerKey:  pos.optimizerKey,
-        symbol:        pos.symbol,
-        session:       pos.session,
-        direction:     pos.direction,
-        vwapPosition:  pos.vwapPosition,
-        entry:         pos.entry,
-        sl:            pos.sl,
-        currentPrice:  pd.mid,
-        pctSlUsed:     pct,
+        positionId: pos.positionId, optimizerKey: pos.optimizerKey,
+        symbol: pos.symbol, session: pos.session, direction: pos.direction,
+        vwapPosition: pos.vwapPosition, entry: pos.entry, sl: pos.sl,
+        currentPrice: pd.mid, pctSlUsed: pct,
       });
     } catch (e) { /* non-critical */ }
   }
 }
 
-// ── Daily risk evaluation — per optimizer key ─────────────────────
-// Multiplier only activates when key is EV+ AND has >= MULT_MIN_SAMPLE ghost trades.
-// Each consecutive qualifying day × 1.2, max ×4. Resets on EV- or low sample day.
+// ── Daily risk evaluation (FIX 7+11) ─────────────────────────────
 async function evaluateDailyRisk() {
   try {
     const todayStr = getBrusselsDateOnly();
-    // COMPLIANCE: only count trades on/after 18-Apr-2026 with valid VWAP.
-    // Pre-compliance rows had missing execution_price / vwap_band_pct and
-    // must not inflate or deflate the daily multiplier streak.
     const todayT   = closedTrades.filter(t =>
       t.closedAt &&
       getBrusselsDateOnly(t.closedAt) === todayStr &&
       new Date(t.closedAt).getTime() >= COMPLIANCE_DATE_MS &&
       (t.vwapPosition === "above" || t.vwapPosition === "below")
     );
-    const totalPnl = todayT.reduce((s, t) => s + (t.currentPnL ?? 0), 0);
+    // FIX 7: use realizedPnlEUR
+    const totalPnl = todayT.reduce((s, t) => s + (t.realizedPnlEUR ?? t.currentPnL ?? 0), 0);
 
-    // Group today's trades by optimizer key
     const keyGroups = {};
     for (const t of todayT) {
       const k = t.optimizerKey ?? buildOptimizerKey(t.symbol, t.session, t.direction, t.vwapPosition ?? "unknown");
       if (!keyGroups[k]) keyGroups[k] = { pnl: 0, count: 0 };
-      keyGroups[k].pnl   += t.currentPnL ?? 0;
+      keyGroups[k].pnl   += t.realizedPnlEUR ?? t.currentPnL ?? 0;
       keyGroups[k].count += 1;
     }
 
-    // Update per-key multiplier
-    for (const [key, data] of Object.entries(keyGroups)) {
+    // FIX 11: evaluate ALL known keys — reset streak for those without trades today
+    const allKeys = new Set([...Object.keys(keyRiskMult), ...Object.keys(tpLocks), ...Object.keys(keyGroups)]);
+
+    for (const key of allKeys) {
+      const data         = keyGroups[key];
       const ev           = await computeEVStats(key);
       const isEvPositive = (ev?.bestEV ?? 0) > 0;
       const hasSample    = (ev?.count  ?? 0) >= MULT_MIN_SAMPLE;
-      const isDayPositive = data.pnl > 0;
+      const isDayPositive = (data?.pnl ?? 0) > 0;
+      const hadTrades     = !!data;
 
-      if (isEvPositive && hasSample && isDayPositive) {
-        // EV+ key with enough data had a positive day → increase multiplier
-        const prev    = keyRiskMult[key] ?? { streak: 0, mult: 1.0 };
-        const newMult = Math.min(4.0, parseFloat((prev.mult * 1.2).toFixed(4)));
-        keyRiskMult[key] = { streak: prev.streak + 1, mult: newMult };
-        console.log(`[DailyRisk] ${key}: EV+ day → mult ${prev.mult.toFixed(2)}x → ${newMult.toFixed(2)}x (streak ${keyRiskMult[key].streak}, n=${ev.count})`);
+      const prev = keyRiskMult[key] ?? { streak: 0, evMult: 1.0, dayMult: 1.0 };
+
+      if (hadTrades && isEvPositive && hasSample && isDayPositive) {
+        // FIX 1: EV mult on riskEUR (max ×4), day mult on lots (×1.2 per day)
+        const newEvMult  = Math.min(4.0, parseFloat((prev.evMult  * 1.0).toFixed(4)));  // EV mult set by EV, not streak
+        const newDayMult = parseFloat((prev.dayMult * 1.2).toFixed(4));                 // day mult grows daily
+        keyRiskMult[key] = { streak: prev.streak + 1, evMult: newEvMult, dayMult: newDayMult };
+        await saveKeyRiskMult(key, keyRiskMult[key]).catch(() => {});
+        console.log(`[DailyRisk] ${key}: day+ → evMult=${newEvMult.toFixed(2)}× dayMult=${newDayMult.toFixed(2)}×`);
       } else {
-        // Not EV+, insufficient sample, or negative day → reset to 1.0x
-        if (keyRiskMult[key]?.mult > 1.0) {
-          console.log(`[DailyRisk] ${key}: Reset → 1.0x (sample=${ev?.count ?? 0}/${MULT_MIN_SAMPLE}, evPos=${isEvPositive}, dayPos=${isDayPositive})`);
+        keyRiskMult[key] = { streak: 0, evMult: 1.0, dayMult: 1.0 };
+        await saveKeyRiskMult(key, keyRiskMult[key]).catch(() => {});
+        if (prev.dayMult > 1.0 || prev.evMult > 1.0) {
+          console.log(`[DailyRisk] ${key}: reset → ×1.0 (hadTrades=${hadTrades}, evPos=${isEvPositive}, dayPos=${isDayPositive})`);
         }
-        keyRiskMult[key] = { streak: 0, mult: 1.0 };
       }
     }
 
@@ -718,13 +687,13 @@ async function evaluateDailyRisk() {
 }
 
 // ── CRON JOBS ─────────────────────────────────────────────────────
+cron.schedule("*/1 * * * *", async () => { await syncOpenPositions().catch(() => {}); }, { timezone: "Europe/Brussels" });
+cron.schedule("*/1 * * * *", async () => { await takeShadowSnapshots().catch(() => {}); }, { timezone: "Europe/Brussels" });
 
-cron.schedule("*/1 * * * *", async () => {
-  await syncOpenPositions().catch(() => {});
-}, { timezone: "Europe/Brussels" });
-
-cron.schedule("*/1 * * * *", async () => {
-  await takeShadowSnapshots().catch(() => {});
+// FIX 20: dupGuard cleanup every 5 min
+cron.schedule("*/5 * * * *", () => {
+  const cutoff = Date.now() - DUP_GUARD_TTL_MS;
+  for (const [k, ts] of Object.entries(global._dupGuard)) { if (ts < cutoff) delete global._dupGuard[k]; }
 }, { timezone: "Europe/Brussels" });
 
 cron.schedule("0 3 * * 1-5", async () => {
@@ -733,17 +702,8 @@ cron.schedule("0 3 * * 1-5", async () => {
     ...closedTrades.map(t => buildOptimizerKey(t.symbol, t.session, t.direction, t.vwapPosition ?? "unknown")),
     ...Object.keys(shadowResults),
   ]);
-
-  // FIX F: Collect optimizer keys that have an active ghost running.
-  // Skip these keys tonight — incomplete ghost data must not pollute EV.
-  // They are re-run when the ghost finalizes (finalizeGhost → updateTPLock).
-  const activeGhostKeys = new Set(
-    Object.values(ghostTrackers).map(g => g.optimizerKey).filter(Boolean)
-  );
-  if (activeGhostKeys.size > 0) {
-    console.log(`[NightlyOpt] Skipping ${activeGhostKeys.size} keys with active ghosts: ${[...activeGhostKeys].join(", ")}`);
-  }
-
+  // FIX F: skip keys with active ghosts
+  const activeGhostKeys = new Set(Object.values(ghostTrackers).map(g => g.optimizerKey).filter(Boolean));
   let updated = 0, skipped = 0;
   for (const key of keys) {
     const parts = key.split("_");
@@ -767,7 +727,6 @@ cron.schedule("0 2 * * 1-5", async () => {
 }, { timezone: "Europe/Brussels" });
 
 cron.schedule("0 4 * * 1-5", async () => {
-  // Clean up ghosts that have been running > 72h and never hit phantom SL
   const cutoff = Date.now() - GHOST_MAX_MS;
   let cleaned = 0;
   for (const [id, g] of Object.entries(ghostTrackers)) {
@@ -786,39 +745,23 @@ cron.schedule("0 4 * * 1-5", async () => {
       cleaned++;
     }
   }
-  if (cleaned > 0) {
-    console.log(`[04:00] ${cleaned} expired ghost(s) cleaned up (>72h)`);
-    logEvent({ type: "GHOST_CLEANUP_72H", count: cleaned });
-  }
+  if (cleaned > 0) { console.log(`[04:00] ${cleaned} ghost(s) cleaned up`); logEvent({ type: "GHOST_CLEANUP_72H", count: cleaned }); }
 }, { timezone: "Europe/Brussels" });
+
 
 // ── Webhook handler ───────────────────────────────────────────────
 app.post("/webhook", async (req, res) => {
   const webhookReceivedAt = Date.now();
 
   const secret = req.query.secret || req.body?.secret;
-  if (secret !== WEBHOOK_SECRET) {
-    return res.status(401).json({ error: "Unauthorized" });
-  }
+  if (secret !== WEBHOOK_SECRET) return res.status(401).json({ error: "Unauthorized" });
 
   const body = req.body || {};
-  const {
-    action,
-    symbol:     rawSymbol,
-    entry:      tvEntry,
-    sl_pct,
-    vwap,
-    vwap_upper,
-    vwap_lower,
-  } = body;
+  const { action, symbol: rawSymbol, entry: tvEntry, sl_pct, vwap, vwap_upper, vwap_lower } = body;
 
-  // ── Validate action ──────────────────────────────────────────────
   const direction = action === "buy" ? "buy" : action === "sell" ? "sell" : null;
-  if (!direction) {
-    return res.status(400).json({ error: "action must be buy or sell" });
-  }
+  if (!direction) return res.status(400).json({ error: "action must be buy or sell" });
 
-  // ── Normalize & validate symbol ──────────────────────────────────
   const symKey  = normalizeSymbol(rawSymbol);
   const symInfo = symKey ? getSymbolInfo(symKey) : null;
   if (!symKey || !symInfo) {
@@ -826,45 +769,40 @@ app.post("/webhook", async (req, res) => {
     await logSignal({ symbol: rawSymbol, direction, outcome: "REJECTED", rejectReason: `Symbol not in catalog: ${rawSymbol}` }).catch(() => {});
     return res.status(400).json({ error: `Symbol not allowed: ${rawSymbol}` });
   }
-
   const { type: assetType, mt5: mt5Symbol } = symInfo;
 
-  // ── sl_pct validation: 0 < sl_pct <= 0.05 (max 5%) ─────────────
   const slPctRaw   = parseFloat(sl_pct);
   const slPctHuman = slPctRaw ? (slPctRaw * 100).toFixed(3) + "%" : "invalid";
   if (!slPctRaw || slPctRaw <= 0 || slPctRaw > 0.05) {
-    const reason = `Invalid sl_pct: ${sl_pct} (${slPctHuman}). Must be > 0 and <= 0.05 (e.g. 0.002 = 0.200%)`;
+    const reason = `Invalid sl_pct: ${sl_pct} (${slPctHuman}). Must be > 0 and <= 0.05`;
     logEvent({ type: "REJECTED", reason, symbol: symKey, direction });
     await logSignal({ symbol: symKey, direction, tvEntry: parseFloat(tvEntry) || null, slPct: slPctRaw || null, slPctHuman, outcome: "REJECTED", rejectReason: reason }).catch(() => {});
     return res.status(400).json({ error: reason });
   }
 
-  // ── Session & VWAP context ───────────────────────────────────────
-  const session    = getSession();
-  const closePrice = parseFloat(tvEntry) || 0;
-  const vwapMid    = parseFloat(vwap)    || 0;
-  const vwapUpper  = parseFloat(vwap_upper) || 0;
-  const vwapLower  = parseFloat(vwap_lower) || 0;
-  const vwapPosition  = getVwapPosition(closePrice, vwapMid);
-  const optimizerKey  = buildOptimizerKey(symKey, session, direction, vwapPosition);
+  const session      = getSession();
+  const closePrice   = parseFloat(tvEntry) || 0;
+  const vwapMid      = parseFloat(vwap)       || 0;
+  const vwapUpper    = parseFloat(vwap_upper) || 0;
+  const vwapLower    = parseFloat(vwap_lower) || 0;
+  const vwapPosition = getVwapPosition(closePrice, vwapMid);
+  const optimizerKey = buildOptimizerKey(symKey, session, direction, vwapPosition);
 
-  // ── VWAP band exhaustion filter ──────────────────────────────────
-  // Reject signals where price is already >90% into the VWAP band.
-  // Prevents "chasing" entries that are stretched away from VWAP mid.
+  // VWAP band exhaustion filter
   let vwapBandPct = null;
   const bandWidth = vwapUpper - vwapLower;
   if (bandWidth > 0 && vwapMid > 0) {
     const distFromMid = Math.abs(closePrice - vwapMid);
     vwapBandPct = parseFloat((distFromMid / (bandWidth / 2)).toFixed(3));
     if (vwapBandPct > 0.9) {
-      const reason = `VWAP_BAND_EXHAUSTED: price is ${(vwapBandPct * 100).toFixed(0)}% into band (max 90%)`;
-      logEvent({ type: "REJECTED", reason, symbol: symKey, direction, optimizerKey, vwapBandPct, closePrice, vwapMid, vwapUpper, vwapLower });
+      const reason = `VWAP_BAND_EXHAUSTED: ${(vwapBandPct * 100).toFixed(0)}% into band`;
+      logEvent({ type: "REJECTED", reason, symbol: symKey, direction, optimizerKey, vwapBandPct });
       await logSignal({ symbol: symKey, direction, session, vwapPosition, optimizerKey, tvEntry: closePrice, slPct: slPctRaw, slPctHuman, vwap: vwapMid, vwapUpper, vwapLower, vwapBandPct, outcome: "REJECTED", rejectReason: reason }).catch(() => {});
       return res.status(200).json({ status: "VWAP_BAND_EXHAUSTED", vwapBandPct });
     }
   }
 
-  // ── Trade window check (per asset type) ─────────────────────────
+  // Trade window check
   const tradeWindow = canOpenNewTrade(symKey);
   if (!tradeWindow.allowed) {
     logEvent({ type: "REJECTED", reason: tradeWindow.reason, symbol: symKey, direction, assetType });
@@ -872,53 +810,61 @@ app.post("/webhook", async (req, res) => {
     return res.status(200).json({ status: "OUTSIDE_TRADE_WINDOW", reason: tradeWindow.reason, assetType });
   }
 
-  // ── Duplicate guard (same symbol+direction within 60s) ───────────
+  // Duplicate guard
   const dupKey  = `${symKey}_${direction}`;
   const dupLast = global._dupGuard?.[dupKey];
-  if (dupLast && (Date.now() - dupLast) < 60000) {
+  if (dupLast && (Date.now() - dupLast) < DUP_GUARD_TTL_MS) {
     logEvent({ type: "DUPLICATE_BLOCKED", symbol: symKey, direction, optimizerKey });
     await logSignal({ symbol: symKey, direction, session, vwapPosition, optimizerKey, tvEntry: closePrice, slPct: slPctRaw, slPctHuman, vwap: vwapMid, vwapBandPct, outcome: "DUPLICATE_BLOCKED" }).catch(() => {});
     return res.status(200).json({ status: "DUPLICATE_BLOCKED" });
   }
-  if (!global._dupGuard) global._dupGuard = {};
   global._dupGuard[dupKey] = Date.now();
 
-  // ── FIX 5: Anti-consolidation for forex ────────────────────────
-  let halfRiskForex = false;
+  // ── FIX 3: Anti-consolidation (forex) ────────────────────────────
+  // Rule A: exact same symbol + session + direction already open →
+  //   widen its SL ×1.5, adjust TP, block new trade.
+  // Rule B: same currency pair different symbol in same direction →
+  //   divide lotsize by number of related positions.
   if (assetType === "forex") {
-    const related = Object.values(openPositions).filter(p =>
-      p.direction === direction && sharesCurrency(p.symbol, symKey)
-    );
-    if (related.length >= 3) {
-      const reason = `CONSOLIDATION_BLOCK: ${related.length} related forex ${direction} positions (${related.map(p => p.symbol).join(", ")})`;
-      logEvent({ type: "CONSOLIDATION_BLOCK", symbol: symKey, direction, count: related.length, reason });
-      await logSignal({ symbol: symKey, direction, session, vwapPosition, optimizerKey, tvEntry: closePrice, slPct: slPctRaw, slPctHuman, vwap: vwapMid, vwapBandPct, outcome: "CONSOLIDATION_BLOCK", rejectReason: reason }).catch(() => {});
-      console.log(`[AntiConsolidation] ${symKey}: BLOCKED — ${related.length} related ${direction} positions`);
-      return res.status(200).json({ status: "CONSOLIDATION_BLOCK", reason, related: related.length });
-    }
-    if (related.length >= 1) {
-      halfRiskForex = true;
-      console.log(`[AntiConsolidation] ${symKey}: ${related.length} related ${direction} forex → halfRisk`);
-      logEvent({ type: "HALF_RISK_FOREX", symbol: symKey, direction, relatedCount: related.length });
+    const exactDup = findExactDuplicate(symKey, session, direction);
+    if (exactDup) {
+      const tpRRForDup = await getOptimalTP(exactDup.optimizerKey);
+      await widenExistingTradeSL(exactDup, tpRRForDup);
+      const reason = `SAME_SYMBOL_SESSION_DIR: ${symKey} ${session} ${direction} already open — SL widened on existing trade`;
+      logEvent({ type: "CONSOLIDATION_SL_WIDENED", symbol: symKey, direction, session, positionId: exactDup.positionId, reason });
+      await logSignal({ symbol: symKey, direction, session, vwapPosition, optimizerKey, tvEntry: closePrice, slPct: slPctRaw, slPctHuman, vwap: vwapMid, vwapBandPct, outcome: "CONSOLIDATION_SL_WIDENED", rejectReason: reason }).catch(() => {});
+      return res.status(200).json({ status: "CONSOLIDATION_SL_WIDENED", reason, existingPositionId: exactDup.positionId });
     }
   }
 
-  // ── Risk & lots pre-calculation (using TV entry as placeholder) ──
-  const riskPct = getSymbolRiskPct(symKey);
-  const mult    = getKeyRiskMult(optimizerKey);
-  let riskEUR   = await calcRiskEUR(symKey);   // FIX C: base risk only, no mult
-  if (halfRiskForex) riskEUR *= 0.5;   // FIX 5: half risk for consolidation
-  const balance = await getLiveBalance();
+  // ── Risk & lots ───────────────────────────────────────────────────
+  // FIX 1: riskEUR = balance × riskPct × evMult (no cap, EV mult on riskEUR).
+  //        dayMult applied to lots separately.
+  // FIX 3 Rule B: related pairs in same direction → divide lots proportionally.
+  const riskPct  = getSymbolRiskPct(symKey);
+  const evMult   = getKeyEvMult(optimizerKey);
+  const dayMult  = getKeyDayMult(optimizerKey);
+  let   riskEUR  = await calcRiskEUR(symKey, optimizerKey);  // already includes evMult
+  const balance  = await getLiveBalance();
 
-  // Temporary lot calculation using TV entry (will be recalculated after execution)
-  // FIX C: mult applied to lots here, not to riskEUR
-  const tempSL  = calcSLFromPct(direction, closePrice || 1, slPctRaw);
-  let lots;
+  // Rule B: same-currency other pairs already open
+  const relatedCount = (assetType === "forex") ? countRelatedForex(symKey, direction) : 0;
+  const lotDivisor   = relatedCount > 0 ? (relatedCount + 1) : 1;
+  if (relatedCount > 0) {
+    console.log(`[AntiConsolid] ${symKey}: ${relatedCount} related ${direction} pairs → lots ÷${lotDivisor}`);
+    logEvent({ type: "LOTS_DIVIDED_FOREX", symbol: symKey, direction, relatedCount, lotDivisor });
+  }
+
+  const tpRR     = await getOptimalTP(optimizerKey);
+  const rrLabel  = tpRR % 1 === 0 ? `${tpRR}R` : `${tpRR.toFixed(1)}R`;
+  const tempSL   = calcSLFromPct(direction, closePrice || 1, slPctRaw);
+  let   lots;
   if (lotOverrides[symKey]) {
-    lots = lotOverrides[symKey] * mult;   // FIX C: mult on top of override base
-    console.log(`[Lots] ${symKey}: using override ${lotOverrides[symKey]} × mult ${mult.toFixed(2)} = ${lots.toFixed(2)}`);
+    lots = parseFloat((lotOverrides[symKey] * dayMult / lotDivisor).toFixed(2));
+    console.log(`[Lots] ${symKey}: override=${lotOverrides[symKey]} × dayMult=${dayMult.toFixed(2)} ÷${lotDivisor} = ${lots}`);
   } else {
-    lots = calcLots(symKey, closePrice || 1, tempSL, riskEUR, mult);
+    lots = calcLots(symKey, closePrice || 1, tempSL, riskEUR, dayMult);
+    if (lotDivisor > 1) lots = Math.max(0.01, parseFloat((lots / lotDivisor).toFixed(2)));
   }
 
   if (!lots || lots <= 0) {
@@ -926,22 +872,14 @@ app.post("/webhook", async (req, res) => {
     return res.status(200).json({ status: "LOT_CALC_FAILED" });
   }
 
-  // ── Step A: Place market order WITHOUT SL/TP ─────────────────────
-  // We place the order first to guarantee execution at M5 close price.
-  // SL and TP are set AFTER we read back the real execution price.
+  // Step A: Place market order
   const sessShort = session === "london" ? "LON" : session === "ny" ? "NY" : "AS";
   const dirShort  = direction === "buy" ? "B" : "S";
-  // Use DEFAULT_TP_RR as placeholder in comment — will be updated after execution
-  const tpRR      = await getOptimalTP(optimizerKey);
-  const rrLabel   = tpRR % 1 === 0 ? `${tpRR}R` : `${tpRR.toFixed(1)}R`;
   const comment   = `NV-${dirShort}-${symKey.slice(0, 6)}-${rrLabel}-${sessShort}`.slice(0, 26);
-
   const orderPayload = {
-    symbol:     mt5Symbol,
+    symbol: mt5Symbol,
     actionType: direction === "buy" ? "ORDER_TYPE_BUY" : "ORDER_TYPE_SELL",
-    volume:     lots,
-    comment,
-    // No stopLoss / takeProfit — set after reading execution price
+    volume: lots, comment,
   };
 
   let result, positionId;
@@ -952,163 +890,115 @@ app.post("/webhook", async (req, res) => {
     const errMsg = e.message;
     const latencyMs = Date.now() - webhookReceivedAt;
     logEvent({ type: "ERROR", symbol: symKey, direction, reason: errMsg, optimizerKey });
-    await logWebhook({ symbol: symKey, direction, session, vwapPos: vwapPosition,
-      action, status: "ERROR", reason: errMsg, optimizerKey,
-      entry: closePrice, sl: null, tp: null, lots, riskPct,
-      latencyMs, tvEntry: closePrice, vwapBandPct });
+    await logWebhook({ symbol: symKey, direction, session, vwapPos: vwapPosition, action, status: "ERROR", reason: errMsg, optimizerKey, entry: closePrice, sl: null, tp: null, lots, riskPct, latencyMs, tvEntry: closePrice, vwapBandPct });
     await logSignal({ symbol: symKey, direction, session, vwapPosition, optimizerKey, tvEntry: closePrice, slPct: slPctRaw, slPctHuman, vwap: vwapMid, vwapBandPct, outcome: "ORDER_FAILED", rejectReason: errMsg, latencyMs }).catch(() => {});
     return res.status(200).json({ status: "ORDER_FAILED", error: errMsg });
   }
 
-  // ── Step B: Read back real execution price from MT5 ───────────────
-  // Wait briefly for MT5 to register the position, then fetch it.
-  let executionPrice = closePrice; // fallback to TV entry if fetch fails
+  // Step B: Read back real execution price
+  let executionPrice = closePrice;
   let spread = 0, bid = null, ask = null;
   try {
     await new Promise(r => setTimeout(r, 600));
     const positions = await fetchOpenPositions();
-    const thisPos   = Array.isArray(positions)
-      ? positions.find(p => String(p.id) === positionId)
-      : null;
-    if (thisPos?.openPrice) {
-      executionPrice = parseFloat(thisPos.openPrice);
-    }
-    // Also get current bid/ask for spread logging
+    const thisPos   = Array.isArray(positions) ? positions.find(p => String(p.id) === positionId) : null;
+    if (thisPos?.openPrice) executionPrice = parseFloat(thisPos.openPrice);
     const pd = await fetchCurrentPrice(mt5Symbol);
     if (pd) { bid = pd.bid; ask = pd.ask; spread = pd.spread ?? 0; }
-  } catch { /* use fallback */ }
+  } catch { /* fallback */ }
 
   const slippage = parseFloat((executionPrice - closePrice).toFixed(5));
 
-  // ── FIX 4: Spread guard for stocks ───────────────────────────────
+  // FIX 5: spread guard uses buffered SL distance
   if (assetType === "stock" && spread > 0) {
     const guardSLDist = Math.abs(executionPrice - calcSLFromPct(direction, executionPrice, slPctRaw));
     if (guardSLDist > 0 && spread > 0.25 * guardSLDist) {
-      const reason = `SPREAD_GUARD: spread ${spread.toFixed(5)} > 25% of SL dist ${guardSLDist.toFixed(5)} (${(spread / guardSLDist * 100).toFixed(1)}%)`;
+      const reason = `SPREAD_GUARD: spread ${spread.toFixed(5)} > 25% of buffered SL dist ${guardSLDist.toFixed(5)}`;
       logEvent({ type: "SPREAD_GUARD_CLOSE", symbol: symKey, direction, positionId, spread, slDist: guardSLDist, reason });
       await logSignal({ symbol: symKey, direction, session, vwapPosition, optimizerKey, tvEntry: closePrice, slPct: slPctRaw, slPctHuman, vwap: vwapMid, vwapBandPct, outcome: "SPREAD_GUARD_CLOSE", rejectReason: reason }).catch(() => {});
-      console.warn(`[SpreadGuard] ${symKey} ${positionId}: ${reason} — closing position`);
-      try { await closePosition(positionId); } catch (ce) { console.warn(`[SpreadGuard] closePosition failed: ${ce.message}`); }
-      return res.status(200).json({ status: "SPREAD_GUARD_CLOSE", reason, positionId, spread, slDist: guardSLDist });
+      try { await closePosition(positionId); } catch {}
+      return res.status(200).json({ status: "SPREAD_GUARD_CLOSE", reason, positionId });
     }
   }
 
-  // ── Step C: Calculate SL and TP from real execution price ─────────
-  // FIX 3 CONFIRMED: enforceMinStop runs BEFORE calcLots so lots always
-  // use the actual enforced SL distance, not the raw calculated one.
+  // Step C: Calculate SL + TP on real execution price
   let mt5SL = calcSLFromPct(direction, executionPrice, slPctRaw);
   mt5SL     = enforceMinStop(mt5Symbol, direction, executionPrice, mt5SL);
   const mt5TP = calcTPPrice(direction, executionPrice, mt5SL, tpRR);
 
-  // Recalculate lots using real execution price (may differ from TV entry)
-  // FIX C: mult applied at lot level, riskEUR stays base
+  // Recalculate lots on real price
   if (!lotOverrides[symKey]) {
-    lots = calcLots(symKey, executionPrice, mt5SL, riskEUR, mult);
+    lots = calcLots(symKey, executionPrice, mt5SL, riskEUR, dayMult);
+    if (lotDivisor > 1) lots = Math.max(0.01, parseFloat((lots / lotDivisor).toFixed(2)));
   }
 
-  // ── Step D: Modify position to set SL and TP — retry up to 3× ─────
-  // FIX K: retry logic so a single network hiccup doesn't leave position without stops.
+  // Step D: Set SL + TP — retry up to 3×
   let slTpSet = false;
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      await metaFetch(`/positions/${positionId}`, {
-        method:  "PUT",
-        body:    JSON.stringify({ stopLoss: mt5SL, takeProfit: mt5TP }),
-      }, 8000);
-      console.log(`[SL/TP] ${positionId} → SL=${mt5SL} TP=${mt5TP} (${tpRR}R) set on real exec=${executionPrice} (attempt ${attempt})`);
-      slTpSet = true;
-      break;
+      await metaFetch(`/positions/${positionId}`, { method: "PUT", body: JSON.stringify({ stopLoss: mt5SL, takeProfit: mt5TP }) }, 8000);
+      console.log(`[SL/TP] ${positionId} → SL=${mt5SL} TP=${mt5TP} (${tpRR}R) exec=${executionPrice} attempt=${attempt}`);
+      slTpSet = true; break;
     } catch (e) {
-      console.warn(`[!] SL/TP set attempt ${attempt}/3 failed for ${positionId}: ${e.message}`);
+      console.warn(`[!] SL/TP attempt ${attempt}/3 failed: ${e.message}`);
       if (attempt < 3) await new Promise(r => setTimeout(r, 1000 * attempt));
     }
   }
   if (!slTpSet) {
-    console.warn(`[!] SL/TP ALL 3 RETRIES FAILED for ${positionId} — position is open WITHOUT stops, manual intervention needed`);
-    logEvent({ type: "SL_TP_SET_FAILED", positionId, symbol: symKey, executionPrice, mt5SL, mt5TP, note: "3 retries exhausted — set manually on MT5" });
+    logEvent({ type: "SL_TP_SET_FAILED", positionId, symbol: symKey, executionPrice, mt5SL, mt5TP, note: "3 retries exhausted" });
   }
 
-  // ── Register open position ────────────────────────────────────────
+  // Register position
   const latencyMs = Date.now() - webhookReceivedAt;
   const now = new Date().toISOString();
   openPositions[positionId] = {
     positionId, symbol: symKey, mt5Symbol, direction, vwapPosition,
     optimizerKey, entry: executionPrice, sl: mt5SL, tp: mt5TP, slPct: slPctRaw,
-    lots, riskEUR, riskPct, riskMult: mult, balance,
-    spread, bid, ask,
-    session, openedAt: now,
+    lots, riskEUR, riskPct, evMult, dayMult, balance,
+    spread, bid, ask, session, openedAt: now,
     maxPrice: executionPrice, maxRR: 0, currentPnL: 0,
     vwapAtEntry: vwapMid, tpRRUsed: tpRR,
-    tvEntry:        closePrice,
-    executionPrice: executionPrice,
-    slippage,
-    vwapBandPct,
-    slPctHuman,
+    tvEntry: closePrice, executionPrice, slippage, vwapBandPct, slPctHuman,
+    lotDivisor,
   };
-
   startGhostTracker(openPositions[positionId]);
 
-  const logEntry = {
-    type: "ORDER_PLACED", symbol: symKey, direction, session,
-    vwapPosition, optimizerKey,
-    tvEntry:        closePrice,
-    executionPrice, slippage,
-    sl: mt5SL, tp: mt5TP, tpRR, rrLabel,
-    lots, riskPct, riskEUR: riskEUR.toFixed(2), riskMult: mult,
-    spread: spread.toFixed(5), bid, ask,
-    balance:    balance.toFixed(2),
-    positionId, comment,
-    slPct:      slPctRaw, slPctHuman,
-    vwap:       vwapMid, vwapBandPct,
-    latencyMs,
-    halfRiskForex,
-  };
-  logEvent(logEntry);
-
-  await logWebhook({
-    symbol: symKey, direction, session, vwapPos: vwapPosition,
-    action, status: "PLACED", positionId, optimizerKey,
-    entry: executionPrice, sl: mt5SL, tp: mt5TP, lots, riskPct,
-    latencyMs, tvEntry: closePrice, executionPrice, slippage, vwapBandPct,
+  logEvent({
+    type: "ORDER_PLACED", symbol: symKey, direction, session, vwapPosition, optimizerKey,
+    executionPrice, slippage, sl: mt5SL, tp: mt5TP, tpRR, rrLabel,
+    lots, riskPct, riskEUR: riskEUR.toFixed(2), evMult, dayMult, lotDivisor,
+    spread: spread.toFixed(5), bid, ask, balance: balance.toFixed(2),
+    positionId, comment, slPct: slPctRaw, slPctHuman, vwap: vwapMid, vwapBandPct, latencyMs,
   });
 
-  await logSignal({
-    symbol: symKey, direction, session, vwapPosition, optimizerKey,
-    tvEntry: closePrice, slPct: slPctRaw, slPctHuman,
-    vwap: vwapMid, vwapUpper, vwapLower, vwapBandPct,
-    outcome: "PLACED", latencyMs, positionId,
-  }).catch(() => {});
+  await logWebhook({ symbol: symKey, direction, session, vwapPos: vwapPosition, action, status: "PLACED", positionId, optimizerKey, entry: executionPrice, sl: mt5SL, tp: mt5TP, lots, riskPct, latencyMs, tvEntry: closePrice, executionPrice, slippage, vwapBandPct });
+  await logSignal({ symbol: symKey, direction, session, vwapPosition, optimizerKey, tvEntry: closePrice, slPct: slPctRaw, slPctHuman, vwap: vwapMid, vwapUpper, vwapLower, vwapBandPct, outcome: "PLACED", latencyMs, positionId }).catch(() => {});
 
-  console.log(`[✓] ${direction.toUpperCase()} ${symKey} | key=${optimizerKey} | tvEntry=${closePrice} execPrice=${executionPrice} slip=${slippage} | sl=${mt5SL} tp=${mt5TP} (${rrLabel}) | lots=${lots} | risk=${slPctHuman} | spread=${spread.toFixed(5)} | balance=€${balance.toFixed(0)} | mult=x${mult.toFixed(2)} | latency=${latencyMs}ms`);
+  console.log(`[✓] ${direction.toUpperCase()} ${symKey} | key=${optimizerKey} | exec=${executionPrice} | sl=${mt5SL} tp=${mt5TP} (${rrLabel}) | lots=${lots} | riskEUR=€${riskEUR.toFixed(2)} evMult=×${evMult.toFixed(2)} dayMult=×${dayMult.toFixed(2)} | latency=${latencyMs}ms`);
 
   return res.status(200).json({
     status: "PLACED", positionId, symbol: symKey, direction,
-    tvEntry:        closePrice,
-    executionPrice, slippage,
-    sl:  mt5SL, tp: mt5TP, tpRR, rrLabel,
-    lots, riskPct, riskEUR, riskMult: mult, optimizerKey,
-    spread, bid, ask, balance, latencyMs,
-    slPctHuman, vwapBandPct, halfRiskForex,
+    executionPrice, slippage, sl: mt5SL, tp: mt5TP, tpRR, rrLabel,
+    lots, riskPct, riskEUR, evMult, dayMult, lotDivisor, optimizerKey,
+    spread, bid, ask, balance, latencyMs, slPctHuman, vwapBandPct,
   });
 });
 
-// ── REST API ─────────────────────────────────────────────────────
-
+// ── REST API ──────────────────────────────────────────────────────
 app.get("/live/positions", async (req, res) => {
   const balance = await getLiveBalance();
   const positions = Object.values(openPositions).map(p => ({
     positionId: p.positionId, symbol: p.symbol, direction: p.direction,
     session: p.session, vwapPosition: p.vwapPosition, optimizerKey: p.optimizerKey,
     entry: p.entry, sl: p.sl, tp: p.tp, lots: p.lots,
-    riskPct: p.riskPct, riskEUR: p.riskEUR, riskMult: p.riskMult ?? 1.0,
+    riskPct: p.riskPct, riskEUR: p.riskEUR, evMult: p.evMult ?? 1.0, dayMult: p.dayMult ?? 1.0,
     spread: p.spread ?? 0, bid: p.bid, ask: p.ask,
-    // FIX H: tvEntry removed from positions view (entry is the real MT5 execution price)
     currentPrice: p.currentPrice, currentPnL: p.currentPnL,
-    maxRR: p.maxRR, tpRR: p.tpRRUsed, openedAt: p.openedAt,
-    balance: p.balance,
+    maxRR: p.maxRR, tpRR: p.tpRRUsed, openedAt: p.openedAt, balance: p.balance,
     slDistPct: p.sl && p.entry ? parseFloat((Math.abs(p.entry - p.sl) / p.entry * 100).toFixed(3)) : null,
     slPctUsed: p.currentPrice ? calcPctSlUsed(p.direction, p.entry, p.sl, p.currentPrice) : null,
     isGhosted: !!ghostTrackers[p.positionId],
+    lotDivisor: p.lotDivisor ?? 1,
   }));
   res.json({ count: positions.length, balance, positions });
 });
@@ -1136,15 +1026,9 @@ app.get("/ev/:key", async (req, res) => {
 });
 
 app.get("/ev", async (req, res) => {
-  const keys = new Set([
-    ...Object.keys(tpLocks),
-    ...closedTrades.map(t => buildOptimizerKey(t.symbol, t.session, t.direction, t.vwapPosition ?? "unknown")),
-  ]);
+  const keys = new Set([...Object.keys(tpLocks), ...closedTrades.map(t => buildOptimizerKey(t.symbol, t.session, t.direction, t.vwapPosition ?? "unknown"))]);
   const results = [];
-  for (const key of keys) {
-    const ev = await computeEVStats(key);
-    results.push({ key, ...ev });
-  }
+  for (const key of keys) { const ev = await computeEVStats(key); results.push({ key, ...ev }); }
   results.sort((a, b) => (b.bestEV ?? -99) - (a.bestEV ?? -99));
   res.json(results);
 });
@@ -1154,8 +1038,6 @@ app.get("/shadow", (req, res) => {
   res.json({ count: results.length, results });
 });
 
-// FIX 8: /shadow/winners BEFORE /shadow/:key — Express matches routes in order.
-// If :key came first it would capture "winners" as the key parameter.
 app.get("/shadow/winners", async (req, res) => {
   const data = await loadShadowWinners();
   const rows = Object.entries(data).map(([key, v]) => ({ optimizerKey: key, ...v }));
@@ -1180,23 +1062,21 @@ app.get("/tp-locks", (req, res) => {
 app.get("/risk-config", async (req, res) => {
   const balance = await getLiveBalance();
   const config = Object.keys(SYMBOL_CATALOG).map(sym => ({
-    symbol:  sym,
-    type:    SYMBOL_CATALOG[sym].type,
+    symbol:  sym, type: SYMBOL_CATALOG[sym].type,
     riskPct: getSymbolRiskPct(sym),
     riskEUR: parseFloat((getSymbolRiskPct(sym) * balance).toFixed(2)),
-    riskMult: getKeyRiskMult(sym),
-    envVar:  `RISK_${sym}`,
-    lotOverride: lotOverrides[sym] ?? null,
+    evMult:  getKeyEvMult(sym), dayMult: getKeyDayMult(sym),
+    envVar:  `RISK_${sym}`, lotOverride: lotOverrides[sym] ?? null,
   }));
   res.json({ balance, fixedRiskPct: FIXED_RISK_PCT, config });
 });
 
-app.get("/history", (req, res) => {
-  res.json(webhookLog.slice(0, 100));
-});
+// FIX 15: return full MAX_HISTORY (200), not just 100
+app.get("/history", (req, res) => { res.json(webhookLog); });
 
+// FIX 17: default limit 5000
 app.get("/trades", (req, res) => {
-  const { symbol, session, direction, vwap_pos, limit = 200 } = req.query;
+  const { symbol, session, direction, vwap_pos, limit = 5000 } = req.query;
   let filtered = closedTrades;
   if (symbol)    filtered = filtered.filter(t => t.symbol === symbol);
   if (session)   filtered = filtered.filter(t => t.session === session);
@@ -1205,24 +1085,21 @@ app.get("/trades", (req, res) => {
   res.json({ count: filtered.length, trades: filtered.slice(0, parseInt(limit)) });
 });
 
-// Lot recalc log endpoint (shows what to set in Railway)
 app.get("/lot-overrides", (req, res) => {
   const entries = Object.entries(lotOverrides).map(([sym, lots]) => ({
     symbol: sym, lots, envVar: `LOTS_${sym}`,
     riskPct: getSymbolRiskPct(sym),
-    instruction: `Set ${`LOTS_${sym}`}=${lots} in Railway environment variables`,
+    note: "Loaded from DB — persists across restarts",
   }));
   res.json({ count: entries.length, overrides: entries });
 });
 
-// Key risk multipliers
 app.get("/risk-multipliers", (req, res) => {
   const entries = Object.entries(keyRiskMult).map(([key, v]) => ({ key, ...v }));
-  entries.sort((a, b) => b.mult - a.mult);
+  entries.sort((a, b) => (b.evMult ?? 1) - (a.evMult ?? 1));
   res.json({ fixedRiskPct: FIXED_RISK_PCT, multipliers: entries });
 });
 
-// FIX 7: Signal conversion ratio endpoint
 app.get("/signal-stats", async (req, res) => {
   const stats = await loadSignalStats();
   if (!stats) return res.status(500).json({ error: "Could not compute signal stats" });
@@ -1234,22 +1111,13 @@ app.get("/health", async (req, res) => {
   const tradeWindowForex = canOpenNewTrade("EURUSD");
   const tradeWindowStock = canOpenNewTrade("AAPL");
   res.json({
-    status:    "ok",
-    version:   "10.4.0",
-    time:      getBrusselsDateStr(),
-    openPos:   Object.keys(openPositions).length,
-    ghosts:    Object.keys(ghostTrackers).length,
-    tpLocks:   Object.keys(tpLocks).length,
-    closedT:   closedTrades.length,
-    balance,
-    fixedRiskPct: FIXED_RISK_PCT,
-    marketOpen:   isMarketOpen(),
-    session:      getSession(),
-    tradeWindowForex: tradeWindowForex.allowed,
-    tradeWindowStocks: tradeWindowStock.allowed,
-    lotOverrides:   Object.keys(lotOverrides).length,
-    evKeyMults:     Object.keys(keyRiskMult).length,
-    multMinSample:  MULT_MIN_SAMPLE,
+    status: "ok", version: "10.5.0", time: getBrusselsDateStr(),
+    openPos: Object.keys(openPositions).length, ghosts: Object.keys(ghostTrackers).length,
+    tpLocks: Object.keys(tpLocks).length, closedT: closedTrades.length, balance,
+    fixedRiskPct: FIXED_RISK_PCT, marketOpen: isMarketOpen(), session: getSession(),
+    tradeWindowForex: tradeWindowForex.allowed, tradeWindowStocks: tradeWindowStock.allowed,
+    lotOverrides: Object.keys(lotOverrides).length, evKeyMults: Object.keys(keyRiskMult).length,
+    multMinSample: MULT_MIN_SAMPLE, slBufferMult: SL_BUFFER_MULT,
   });
 });
 
@@ -1268,7 +1136,7 @@ app.get(["/", "/dashboard"], async (req, res) => {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PRONTO-AI v10.4</title>
+<title>PRONTO-AI v10.5</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600;700&family=IBM+Plex+Sans+Condensed:wght@500;600;700&display=swap" rel="stylesheet">
 <style>
@@ -1381,7 +1249,7 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
 <div class="hdr">
   <div>
     <div class="logo">PRONTO-AI</div>
-    <div class="ver">v10.4 · TradingView → MetaApi → FTMO MT5 · Fixed Risk ${(FIXED_RISK_PCT*100).toFixed(3)}% · SL Buffer ×${SL_BUFFER_MULT}</div>
+    <div class="ver">v10.5 · TradingView → MetaApi → FTMO MT5 · Fixed Risk ${(FIXED_RISK_PCT*100).toFixed(3)}% · SL Buffer ×${SL_BUFFER_MULT}</div>
   </div>
   <div class="hdr-r">
     <span class="sb s-outside" id="hdr-sess">—</span>
@@ -2042,11 +1910,16 @@ document.addEventListener('DOMContentLoaded',()=>{initAll();loadAll();setInterva
 app.use((req, res) => res.status(404).json({ error: "Route not found", route: `${req.method} ${req.originalUrl}` }));
 
 // ── Startup ───────────────────────────────────────────────────────
+
+// 404
+app.use((req, res) => res.status(404).json({ error: "Route not found", route: `${req.method} ${req.originalUrl}` }));
+
+// ── Startup ───────────────────────────────────────────────────────
 async function start() {
   const missing = ["META_API_TOKEN", "META_ACCOUNT_ID", "WEBHOOK_SECRET"].filter(k => !process.env[k]);
   if (missing.length) { console.error(`[ERR] Missing env: ${missing.join(", ")}`); process.exit(1); }
 
-  console.log("🚀 PRONTO-AI v10.4 starting...");
+  console.log("🚀 PRONTO-AI v10.5 starting...");
   await initDB();
 
   // Load closed trades
@@ -2059,10 +1932,20 @@ async function start() {
   Object.assign(tpLocks, savedTP);
   console.log(`🔒 ${Object.keys(tpLocks).length} TP locks loaded`);
 
-  // Load shadow analyses
-  const shadowRows = await loadShadowAnalysis();
+  // FIX 12: Load ALL shadow analyses at startup
+  const shadowRows = await loadAllShadowAnalysis();
   for (const row of shadowRows) shadowResults[row.optimizerKey] = row;
   console.log(`🌑 ${shadowRows.length} shadow analyses loaded`);
+
+  // FIX 2: Load lot overrides from DB
+  const dbLotOverrides = await loadLotOverrides();
+  Object.assign(lotOverrides, dbLotOverrides);
+  console.log(`📦 ${Object.keys(lotOverrides).length} lot overrides loaded from DB`);
+
+  // FIX 19: Load key risk multipliers from DB
+  const dbKeyMults = await loadKeyRiskMults();
+  Object.assign(keyRiskMult, dbKeyMults);
+  console.log(`📈 ${Object.keys(keyRiskMult).length} key risk multipliers loaded from DB`);
 
   // Load symbol risk overrides from DB + env
   const dbRisk = await loadSymbolRiskConfig();
@@ -2074,32 +1957,25 @@ async function start() {
       symbolRiskMap[sym] = pct;
       await upsertSymbolRisk(sym, pct);
     }
-    // Load lot overrides from env (LOTS_EURUSD=0.02 etc.)
+    // Env lot overrides still supported (override DB value)
     const lotKey = `LOTS_${sym}`;
-    if (process.env[lotKey]) {
-      lotOverrides[sym] = parseFloat(process.env[lotKey]);
-    }
+    if (process.env[lotKey]) lotOverrides[sym] = parseFloat(process.env[lotKey]);
   }
-  console.log(`💰 Symbol risk overrides: ${Object.keys(symbolRiskMap).length} | Lot overrides from env: ${Object.keys(lotOverrides).length}`);
+  console.log(`💰 Symbol risk overrides: ${Object.keys(symbolRiskMap).length}`);
 
-  // Fetch live balance from MT5
   try {
     await fetchAccountInfo();
     console.log(`💵 Live MT5 balance: €${liveBalance.toFixed(2)}`);
-  } catch (e) {
-    console.warn(`[!] Could not fetch live balance: ${e.message}`);
-  }
+  } catch (e) { console.warn(`[!] Could not fetch live balance: ${e.message}`); }
 
-  // Load daily risk state
   const dr = await loadLatestDailyRisk();
   if (dr) console.log(`📊 Last daily risk record: ${dr.tradeDate}`);
 
-  // Restore positions from MT5
   await restorePositionsFromMT5();
 
   app.listen(PORT, () => {
-    console.log(`[✓] PRONTO-AI v10.4 on port ${PORT}`);
-    console.log(`   🔹 Dashboard:      / or /dashboard`);
+    console.log(`[✓] PRONTO-AI v10.5 on port ${PORT}`);
+    console.log(`   🔹 Dashboard:      /`);
     console.log(`   🔹 Health:         /health`);
     console.log(`   🔹 EV Table:       /ev`);
     console.log(`   🔹 Shadow SL:      /shadow`);
@@ -2108,11 +1984,10 @@ async function start() {
     console.log(`   🔹 Lot Overrides:  /lot-overrides`);
     console.log(`   🔹 Risk Mults:     /risk-multipliers`);
     console.log(`   🔹 Signal Stats:   /signal-stats`);
-    console.log(`   🔹 Shadow Winners: /shadow/winners`);
     console.log(`   🔹 Webhook:        POST /webhook?secret=<secret>`);
     console.log(`   💵 Fixed risk:     ${(FIXED_RISK_PCT*100).toFixed(3)}% | Balance: €${liveBalance.toFixed(2)}`);
-    console.log(`   🕐 Ghost max:      72h (overnight holdings supported)`);
-    console.log(`   📊 Mult threshold: ${MULT_MIN_SAMPLE} ghost samples required`);
+    console.log(`   🕐 Ghost max:      72h | SL buffer: ×${SL_BUFFER_MULT}`);
+    console.log(`   📊 Mult threshold: ${MULT_MIN_SAMPLE} ghost samples`);
   });
 }
 
