@@ -1,12 +1,20 @@
 // ===============================================================
-// db.js  v10.4  |  PRONTO-AI
+// db.js  v10.5  |  PRONTO-AI
 //
-// Changes v10.4:
-//  - loadAllTrades: LIMIT raised 5000 → 10000 (FIX J: errors count
-//    was truncated — existing 3500+ trades now fully loaded on startup).
-//  - initDB: schema log updated to v10.4.
+// Changes v10.5:
+//  - COMPLIANCE_DATE imported from session.js (FIX 8).
+//  - lot_overrides table: saveLotOverride(), loadLotOverrides() (FIX 2).
+//  - key_risk_mult table: saveKeyRiskMult(), loadKeyRiskMults() (FIX 19).
+//  - fetchRealizedPnl(): queries deals table for actual closed P&L (FIX 4).
+//  - loadAllShadowAnalysis(): load all shadow analyses at startup (FIX 12).
+//  - loadAllTrades: LIMIT raised to 10000 (FIX J from v10.4).
 //
-// Changes v10.3 — DATA QUALITY COMPLIANCE (18 April 2026):
+// Changes v10.4 — loadAllTrades LIMIT 5000→10000 (FIX J).
+// Changes v10.3 — DATA QUALITY COMPLIANCE (18 April 2026).
+// ===============================================================
+
+// FIX 8: COMPLIANCE_DATE from single source of truth
+const { COMPLIANCE_DATE, COMPLIANCE_DATE_MS } = require('./session');
 //  - DATE GATE: computeEVStats(), countGhostsByKey() now filter
 //    ghost_trades to opened_at >= '2026-04-18' only.
 //    Pre-compliance trades had missing execution_price / vwap_band_pct
@@ -37,11 +45,7 @@
 //  - ghost_trades ON CONFLICT: uses position_id+optimizer_key composite
 // ===============================================================
 
-// ── Data quality compliance date ─────────────────────────────────
-// All ghost, shadow, and EV queries ignore data before this date.
-// Pre-18/04/2026 rows had missing vwap_band_pct / execution_price
-// and must not pollute any optimiser calculation.
-const COMPLIANCE_DATE = '2026-04-18 00:00:00';
+// (COMPLIANCE_DATE imported from session.js above)
 
 "use strict";
 
@@ -289,8 +293,27 @@ async function initDB() {
       CREATE INDEX IF NOT EXISTS idx_signal_log_key    ON signal_log (optimizer_key);
     `);
 
+    // ── lot_overrides (FIX 2: persistent lot overrides) ─────────────
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS lot_overrides (
+        symbol      TEXT        PRIMARY KEY,
+        base_lots   NUMERIC     NOT NULL,
+        updated_at  TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+
+    // ── key_risk_mult (FIX 19: persistent EV streak multipliers) ────
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS key_risk_mult (
+        optimizer_key TEXT        PRIMARY KEY,
+        streak        INTEGER     NOT NULL DEFAULT 0,
+        mult          NUMERIC     NOT NULL DEFAULT 1.0,
+        updated_at    TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+
     await client.query("COMMIT");
-    console.log("[DB] v10.4 schema OK");
+    console.log("[DB] v10.5 schema OK");
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("[DB] initDB ROLLBACK:", err.message);
@@ -854,6 +877,89 @@ async function computeEVStats(optimizerKey) {
   } catch (e) { return { key: optimizerKey, count: 0, rrLevels: [], bestRR: 1.0, bestEV: null }; }
 }
 
+// ── lot_overrides (FIX 2) ──────────────────────────────────────
+async function saveLotOverride(symbol, baseLots) {
+  try {
+    await pool.query(`
+      INSERT INTO lot_overrides (symbol, base_lots, updated_at)
+      VALUES ($1, $2, NOW())
+      ON CONFLICT (symbol) DO UPDATE SET base_lots=$2, updated_at=NOW()
+    `, [symbol, baseLots]);
+  } catch (e) { console.warn('[!] saveLotOverride:', e.message); }
+}
+
+async function loadLotOverrides() {
+  try {
+    const r = await pool.query(`SELECT symbol, CAST(base_lots AS FLOAT) AS base_lots FROM lot_overrides`);
+    const map = {};
+    for (const row of r.rows) map[row.symbol] = row.base_lots;
+    return map;
+  } catch (e) { console.warn('[!] loadLotOverrides:', e.message); return {}; }
+}
+
+// ── key_risk_mult (FIX 19) ─────────────────────────────────────
+async function saveKeyRiskMult(optimizerKey, { streak, mult }) {
+  try {
+    await pool.query(`
+      INSERT INTO key_risk_mult (optimizer_key, streak, mult, updated_at)
+      VALUES ($1, $2, $3, NOW())
+      ON CONFLICT (optimizer_key) DO UPDATE SET streak=$2, mult=$3, updated_at=NOW()
+    `, [optimizerKey, streak, mult]);
+  } catch (e) { console.warn('[!] saveKeyRiskMult:', e.message); }
+}
+
+async function loadKeyRiskMults() {
+  try {
+    const r = await pool.query(`SELECT optimizer_key, streak, CAST(mult AS FLOAT) AS mult FROM key_risk_mult`);
+    const map = {};
+    for (const row of r.rows) map[row.optimizer_key] = { streak: row.streak, mult: row.mult };
+    return map;
+  } catch (e) { console.warn('[!] loadKeyRiskMults:', e.message); return {}; }
+}
+
+// ── fetchRealizedPnl (FIX 4) ───────────────────────────────────
+// Tries to get the actual realized P&L for a closed position from
+// the MetaApi deals history. Falls back to null if not available.
+// Note: this queries the deals table if it exists in the DB schema.
+// In practice the caller catches errors and falls back to currentPnL.
+async function fetchRealizedPnl(positionId) {
+  try {
+    const r = await pool.query(`
+      SELECT SUM(CAST(profit AS FLOAT)) AS realized_pnl
+      FROM deals
+      WHERE position_id = $1
+    `, [positionId]);
+    const val = r.rows[0]?.realized_pnl;
+    return val != null ? parseFloat(val) : null;
+  } catch {
+    // deals table may not exist — non-critical, return null
+    return null;
+  }
+}
+
+// ── loadAllShadowAnalysis (FIX 12: load all keys at startup) ───
+async function loadAllShadowAnalysis() {
+  try {
+    const r = await pool.query(`SELECT * FROM shadow_sl_analysis ORDER BY optimizer_key`);
+    return r.rows.map(row => ({
+      optimizerKey:        row.optimizer_key,
+      symbol:              row.symbol,
+      session:             row.session,
+      direction:           row.direction,
+      vwapPosition:        row.vwap_position,
+      snapshotsCount:      row.snapshots_count,
+      positionsCount:      row.positions_count,
+      p50:                 row.p50_sl_used   != null ? parseFloat(row.p50_sl_used)  : null,
+      p90:                 row.p90_sl_used   != null ? parseFloat(row.p90_sl_used)  : null,
+      p99:                 row.p99_sl_used   != null ? parseFloat(row.p99_sl_used)  : null,
+      maxUsed:             row.max_sl_used   != null ? parseFloat(row.max_sl_used)  : null,
+      recommendedSlPct:    row.recommended_sl_pct != null ? parseFloat(row.recommended_sl_pct) : null,
+      currentSlTooWide:    row.current_sl_too_wide,
+      potentialSavingPct:  row.potential_saving_pct != null ? parseFloat(row.potential_saving_pct) : null,
+    }));
+  } catch (e) { console.warn('[!] loadAllShadowAnalysis:', e.message); return []; }
+}
+
 module.exports = {
   initDB,
   // Trades
@@ -868,6 +974,7 @@ module.exports = {
   loadShadowSnapshots,
   saveShadowAnalysis,
   loadShadowAnalysis,
+  loadAllShadowAnalysis,     // FIX 12
   // TP config
   saveTPConfig,
   loadTPConfig,
@@ -879,15 +986,23 @@ module.exports = {
   // Symbol risk
   upsertSymbolRisk,
   loadSymbolRiskConfig,
+  // Lot overrides (FIX 2)
+  saveLotOverride,
+  loadLotOverrides,
+  // Key risk multipliers (FIX 19)
+  saveKeyRiskMult,
+  loadKeyRiskMults,
+  // Realized P&L (FIX 4)
+  fetchRealizedPnl,
   // Webhook history
   logWebhook,
   loadWebhookHistory,
   // Signal log
   logSignal,
-  // Signal stats — FIX 7
+  // Signal stats
   loadSignalStats,
   // EV stats
   computeEVStats,
-  // Shadow winners (SL% on winning trades only)
+  // Shadow winners
   loadShadowWinners,
 };
