@@ -1,5 +1,5 @@
 // ===============================================================
-// db.js  v10.6  |  PRONTO-AI
+// db.js  v10.7  |  PRONTO-AI
 //
 // Changes v10.6:
 //  - key_risk_mult schema uitgebreid: ev_mult + day_mult kolommen.
@@ -151,8 +151,12 @@ async function initDB() {
         time_to_sl_min      INTEGER,
         opened_at           TIMESTAMPTZ,
         closed_at           TIMESTAMPTZ,
-        created_at          TIMESTAMPTZ DEFAULT NOW()
+        created_at          TIMESTAMPTZ DEFAULT NOW(),
+        sl_changes          INTEGER     DEFAULT 0,
+        tp_changes          INTEGER     DEFAULT 0
       );
+      ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS sl_changes INTEGER DEFAULT 0;
+      ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS tp_changes INTEGER DEFAULT 0;
       CREATE INDEX IF NOT EXISTS idx_ghost_trades_key     ON ghost_trades (optimizer_key);
       CREATE INDEX IF NOT EXISTS idx_ghost_trades_symbol  ON ghost_trades (symbol);
       CREATE INDEX IF NOT EXISTS idx_ghost_trades_closed  ON ghost_trades (closed_at);
@@ -337,8 +341,35 @@ async function initDB() {
       );
     `);
 
+    // ── spread_log (v10.7: bid/ask spread per symbool + tijdstip) ───
+    // Slaat spread op bij elke order voor latere tijdzone analyse.
+    // Kolommen: symbol, mt5_symbol, session, hour_brussels, bid, ask,
+    //           spread_abs (ask-bid), spread_pct ((ask-bid)/bid),
+    //           asset_type, logged_at.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS spread_log (
+        id            SERIAL      PRIMARY KEY,
+        symbol        TEXT        NOT NULL,
+        mt5_symbol    TEXT,
+        session       TEXT        NOT NULL,
+        hour_brussels INTEGER     NOT NULL,
+        minute_brussels INTEGER   NOT NULL,
+        day_of_week   INTEGER     NOT NULL,
+        bid           NUMERIC,
+        ask           NUMERIC,
+        spread_abs    NUMERIC,
+        spread_pct    NUMERIC,
+        asset_type    TEXT,
+        position_id   TEXT,
+        logged_at     TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_spread_log_sym     ON spread_log (symbol, logged_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_spread_log_session ON spread_log (session, hour_brussels);
+      CREATE INDEX IF NOT EXISTS idx_spread_log_ts      ON spread_log (logged_at DESC);
+    `);
+
     await client.query("COMMIT");
-    console.log("[DB] v10.6 schema OK");
+    console.log("[DB] v10.7 schema OK");
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("[DB] initDB ROLLBACK:", err.message);
@@ -464,8 +495,9 @@ async function saveGhostTrade(g) {
         (position_id, symbol, session, direction, vwap_position, optimizer_key,
          entry, sl, sl_pct, phantom_sl, tp_rr_used,
          max_price, max_rr_before_sl, phantom_sl_hit, stop_reason,
-         time_to_sl_min, opened_at, closed_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+         time_to_sl_min, opened_at, closed_at,
+         sl_changes, tp_changes)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
       ON CONFLICT DO NOTHING
     `, [
       g.positionId      ?? null,
@@ -483,6 +515,8 @@ async function saveGhostTrade(g) {
       g.timeToSLMin     ?? null,
       g.openedAt        ?? null,
       g.closedAt        ?? null,
+      g.slChanges       ?? 0,
+      g.tpChanges       ?? 0,
     ]);
   } catch (e) { console.warn("[!] saveGhostTrade:", e.message); }
 }
@@ -508,7 +542,9 @@ async function loadGhostTrades(optimizerKey = null, limitRows = 200) {
         stop_reason          AS "stopReason",
         time_to_sl_min       AS "timeToSLMin",
         opened_at            AS "openedAt",
-        closed_at            AS "closedAt"
+        closed_at            AS "closedAt",
+        sl_changes           AS "slChanges",
+        tp_changes           AS "tpChanges"
       FROM ghost_trades
       ${where}
       ORDER BY closed_at DESC
@@ -962,7 +998,82 @@ async function loadKeyRiskMults() {
   } catch (e) { console.warn('[!] loadKeyRiskMults:', e.message); return {}; }
 }
 
-// ── fetchRealizedPnl (FIX 4) ───────────────────────────────────
+// ── spread_log (v10.7) ─────────────────────────────────────────
+// Slaat spread op bij elke order — later filteren op tijdzone/sessie.
+async function saveSpreadLog({ symbol, mt5Symbol, session, hourBrussels, minuteBrussels,
+  dayOfWeek, bid, ask, spreadAbs, spreadPct, assetType, positionId }) {
+  try {
+    await pool.query(`
+      INSERT INTO spread_log
+        (symbol, mt5_symbol, session, hour_brussels, minute_brussels, day_of_week,
+         bid, ask, spread_abs, spread_pct, asset_type, position_id)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+    `, [
+      symbol, mt5Symbol ?? null, session, hourBrussels, minuteBrussels,
+      dayOfWeek, bid ?? null, ask ?? null,
+      spreadAbs ?? null, spreadPct ?? null,
+      assetType ?? null, positionId ?? null,
+    ]);
+  } catch (e) { console.warn('[!] saveSpreadLog:', e.message); }
+}
+
+// Laad spread statistieken: gemiddeld, p50, p90, p99 per symbool + sessie + uur.
+// Optioneel filteren op symbol, session, hour_brussels range, day_of_week.
+async function loadSpreadStats({ symbol, session, hourMin, hourMax, dayOfWeek } = {}) {
+  try {
+    const conds = [];
+    const vals  = [];
+    if (symbol)    { vals.push(symbol);    conds.push(`symbol = $${vals.length}`); }
+    if (session)   { vals.push(session);   conds.push(`session = $${vals.length}`); }
+    if (dayOfWeek != null) { vals.push(dayOfWeek); conds.push(`day_of_week = $${vals.length}`); }
+    if (hourMin != null)   { vals.push(hourMin);   conds.push(`hour_brussels >= $${vals.length}`); }
+    if (hourMax != null)   { vals.push(hourMax);   conds.push(`hour_brussels <= $${vals.length}`); }
+    const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
+    const r = await pool.query(`
+      SELECT
+        symbol,
+        session,
+        hour_brussels,
+        day_of_week,
+        COUNT(*)                                                           AS samples,
+        CAST(AVG(spread_abs)    AS FLOAT)                                  AS avg_spread_abs,
+        CAST(AVG(spread_pct)    AS FLOAT)                                  AS avg_spread_pct,
+        CAST(PERCENTILE_CONT(0.50) WITHIN GROUP(ORDER BY spread_abs) AS FLOAT) AS p50_spread,
+        CAST(PERCENTILE_CONT(0.90) WITHIN GROUP(ORDER BY spread_abs) AS FLOAT) AS p90_spread,
+        CAST(PERCENTILE_CONT(0.99) WITHIN GROUP(ORDER BY spread_abs) AS FLOAT) AS p99_spread,
+        CAST(MAX(spread_abs)    AS FLOAT)                                  AS max_spread,
+        CAST(MIN(bid)           AS FLOAT)                                  AS min_bid,
+        CAST(MAX(ask)           AS FLOAT)                                  AS max_ask
+      FROM spread_log
+      ${where}
+      GROUP BY symbol, session, hour_brussels, day_of_week
+      ORDER BY symbol, session, hour_brussels
+    `, vals);
+    return r.rows;
+  } catch (e) { console.warn('[!] loadSpreadStats:', e.message); return []; }
+}
+
+// Laad ruwe spread log rijen — voor detail analyse.
+async function loadSpreadLog({ symbol, session, limit = 500 } = {}) {
+  try {
+    const conds = [], vals = [];
+    if (symbol)  { vals.push(symbol);  conds.push(`symbol = $${vals.length}`); }
+    if (session) { vals.push(session); conds.push(`session = $${vals.length}`); }
+    vals.push(limit);
+    const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
+    const r = await pool.query(`
+      SELECT id, symbol, mt5_symbol, session, hour_brussels, minute_brussels,
+             day_of_week, bid, ask,
+             CAST(spread_abs AS FLOAT) AS spread_abs,
+             CAST(spread_pct AS FLOAT) AS spread_pct,
+             asset_type, position_id,
+             logged_at
+      FROM spread_log ${where}
+      ORDER BY logged_at DESC LIMIT $${vals.length}
+    `, vals);
+    return r.rows;
+  } catch (e) { console.warn('[!] loadSpreadLog:', e.message); return []; }
+}
 // Tries to get the actual realized P&L for a closed position from
 // the MetaApi deals history. Falls back to null if not available.
 // Note: this queries the deals table if it exists in the DB schema.
@@ -1039,6 +1150,10 @@ module.exports = {
   loadKeyRiskMults,
   // Realized P&L (FIX 4)
   fetchRealizedPnl,
+  // Spread log (v10.7)
+  saveSpreadLog,
+  loadSpreadStats,
+  loadSpreadLog,
   // Webhook history
   logWebhook,
   loadWebhookHistory,
