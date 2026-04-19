@@ -1,5 +1,8 @@
 // ===============================================================
-// session.js  v10.5  |  PRONTO-AI
+// session.js  v10.6  |  PRONTO-AI
+//
+// Changes v10.6:
+//  - No functional changes. Version bump for v10.6 release.
 //
 // Changes v10.5:
 //  - COMPLIANCE_DATE + COMPLIANCE_DATE_MS exported (FIX 8):
