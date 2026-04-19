@@ -1,7 +1,7 @@
 {
   "name": "nv-tradingview-webhook",
-  "version": "10.5.0",
-  "description": "TradingView → MetaApi REST → FTMO MT5 | PRONTO-AI v10.5 — 20 fixes: EV mult on riskEUR, day mult on lots, lotOverrides persistent, anti-consolidation SL-widen, closeReason price-based, shadow restore, dupGuard TTL, ghost sl=0 guard, evaluateDailyRisk all keys",
+  "version": "10.6.0",
+  "description": "TradingView → MetaApi REST → FTMO MT5 | PRONTO-AI v10.6 — Multipliers correctie (riskEUR puur balance×pct), Fix A (server berekent sl_pct van TV absolute prijzen), Fix C (currency exposure budget + EV anti-consolidation), Fix D (TP floor guard), Fix E (RR verificatie met echte MT5 data)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
