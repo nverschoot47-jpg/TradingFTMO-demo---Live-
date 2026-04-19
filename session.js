@@ -1,11 +1,11 @@
 // ===============================================================
-// session.js  v10.4  |  PRONTO-AI
+// session.js  v10.5  |  PRONTO-AI
+//
+// Changes v10.5:
+//  - COMPLIANCE_DATE + COMPLIANCE_DATE_MS exported (FIX 8):
+//    single source of truth, imported by server.js and db.js.
 //
 // Changes v10.4:
-//  - Version bump — no logic changes in this file
-//  - SL_BUFFER_MULT constant (1.5) lives in server.js
-//
-// Changes v10.2:
 //  - canOpenNewTrade(symbol): replaces isMarketOpen() for new trades
 //    * Stocks: only 16:00–21:00 Brussels (NY market hours)
 //    * Forex/Index/Commodity: 02:00–21:00 Brussels mon-fri
@@ -265,7 +265,13 @@ const SESSION_LABELS = {
   outside: "Outside window",
 };
 
+// ── Data quality compliance date (FIX 8: single source of truth) ────
+const COMPLIANCE_DATE    = '2026-04-18 00:00:00';
+const COMPLIANCE_DATE_MS = new Date('2026-04-18T00:00:00.000Z').getTime();
+
 module.exports = {
+  COMPLIANCE_DATE,
+  COMPLIANCE_DATE_MS,
   SYMBOL_CATALOG,
   SYMBOL_ALIASES,
   DEFAULT_RISK_BY_TYPE,
