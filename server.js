@@ -80,6 +80,7 @@ const {
   saveLotOverride, loadLotOverrides,
   saveKeyRiskMult, loadKeyRiskMults,
   fetchRealizedPnl,
+  saveSpreadLog, loadSpreadStats, loadSpreadLog,
 } = require("./db");
 
 const {
@@ -519,6 +520,10 @@ async function widenExistingTradeSL(pos, tpRR) {
 }
 
 // ── Ghost Optimizer ───────────────────────────────────────────────
+// v10.7: Ghost tracker volgt de LIVE SL/TP uit openPositions, niet de
+// gefixeerde waarden bij start. Als SL wijzigt (anti-consolidation,
+// handmatig, of synced van MT5), worden phantomSL en tpRRUsed bijgewerkt.
+// maxRR wordt altijd herberekend op de ACTUELE SL afstand op dat moment.
 function startGhostTracker(pos) {
   // FIX 18: guard sl=0
   if (!pos.sl || pos.sl <= 0) {
@@ -532,45 +537,88 @@ function startGhostTracker(pos) {
   // FIX 10: mt5Symbol fallback
   const mt5Symbol = pos.mt5Symbol || getSymbolInfo(symbol)?.mt5 || symbol;
 
-  const phantomSL = sl;
   let maxPrice    = entry;
   let timer       = null;
   const startTs   = Date.now();
 
-  ghostTrackers[positionId] = { positionId, symbol, mt5Symbol, session, direction,
-    vwapPosition, optimizerKey, entry, sl: phantomSL, slPct, tpRRUsed, openedAt,
-    maxPrice, startTs, timer };
+  // v10.7: sla GEEN vaste phantomSL op — lees live uit openPositions elke tick
+  // zodat SL wijzigingen automatisch worden meegenomen.
+  // Bewaar wel de originele SL voor logging/fallback (als positie al gesloten is).
+  const originalSL     = sl;
+  const originalSlPct  = slPct;
+  const originalTpRR   = tpRRUsed;
+
+  ghostTrackers[positionId] = {
+    positionId, symbol, mt5Symbol, session, direction,
+    vwapPosition, optimizerKey, entry,
+    sl: originalSL,           // wordt live bijgehouden in tick()
+    slPct: originalSlPct,
+    tpRRUsed: originalTpRR,   // wordt live bijgehouden in tick()
+    openedAt, maxPrice, startTs, timer,
+    slChanges: 0,             // teller: hoe vaak SL gewijzigd is
+    tpChanges: 0,
+  };
 
   async function tick() {
     try {
       if (!ghostTrackers[positionId]) return;
+      const g       = ghostTrackers[positionId];
       const elapsed = Date.now() - startTs;
       if (elapsed >= GHOST_MAX_MS) { await finalizeGhost(positionId, "timeout_72h", elapsed, maxPrice); return; }
       const { day } = getBrusselsComponents();
       if (day === 0 || day === 6) {
         timer = setTimeout(tick, 10 * 60 * 1000);
-        ghostTrackers[positionId].timer = timer;
+        g.timer = timer;
         return;
       }
+
+      // v10.7: lees LIVE SL/TP uit openPositions als positie nog open is
+      const livePos = openPositions[positionId];
+      if (livePos) {
+        const liveSL = livePos.sl;
+        const liveTP = livePos.tp;
+        const liveTpRR = livePos.tpRRUsed;
+
+        // Detecteer SL wijziging en update ghost
+        if (liveSL && liveSL > 0 && liveSL !== g.sl) {
+          console.log(`[Ghost] ${positionId}: SL bijgewerkt ${g.sl}→${liveSL} (wijziging #${g.slChanges + 1})`);
+          g.sl = liveSL;
+          g.slChanges++;
+        }
+        // Detecteer TP wijziging en update ghost tpRRUsed
+        if (liveTpRR && liveTpRR !== g.tpRRUsed) {
+          g.tpRRUsed = liveTpRR;
+          g.tpChanges++;
+        }
+      }
+
+      const phantomSL = g.sl;  // altijd de meest actuele SL
+
       const priceData = await fetchCurrentPrice(mt5Symbol);
       const price     = priceData?.mid ?? null;
       if (price !== null) {
+        // maxRR altijd berekend op ACTUELE SL afstand
         const better = direction === "buy" ? price > maxPrice : price < maxPrice;
-        if (better) { maxPrice = price; ghostTrackers[positionId].maxPrice = price; }
+        if (better) {
+          maxPrice = price;
+          g.maxPrice = price;
+          g.maxRR = calcMaxRR(direction, entry, phantomSL, price);
+        }
         const slHit = direction === "buy" ? price <= phantomSL : price >= phantomSL;
         if (slHit) { await finalizeGhost(positionId, "phantom_sl", elapsed, maxPrice); return; }
       }
       timer = setTimeout(tick, GHOST_POLL_MS);
-      ghostTrackers[positionId].timer = timer;
+      g.timer = timer;
     } catch (e) {
       console.warn(`[Ghost] ${positionId} tick error:`, e.message);
+      const g = ghostTrackers[positionId];
       timer = setTimeout(tick, GHOST_POLL_MS * 2);
-      if (ghostTrackers[positionId]) ghostTrackers[positionId].timer = timer;
+      if (g) g.timer = timer;
     }
   }
   timer = setTimeout(tick, GHOST_POLL_MS);
   ghostTrackers[positionId].timer = timer;
-  console.log(`[Ghost] Started: ${positionId} | ${optimizerKey} | phantomSL=${phantomSL}`);
+  console.log(`[Ghost] Started: ${positionId} | ${optimizerKey} | sl=${sl} (live tracking actief)`);
 }
 
 async function finalizeGhost(positionId, stopReason, elapsedMs, finalMaxPrice) {
@@ -579,17 +627,21 @@ async function finalizeGhost(positionId, stopReason, elapsedMs, finalMaxPrice) {
   clearTimeout(g.timer);
   delete ghostTrackers[positionId];
 
-  const maxRRBeforeSL = calcMaxRR(g.direction, g.entry, g.sl, finalMaxPrice);
+  // v10.7: maxRR berekend op de FINALE actuele SL (inclusief alle wijzigingen)
+  const finalSL       = g.sl;   // is de meest recente SL na live tracking
+  const maxRRBeforeSL = calcMaxRR(g.direction, g.entry, finalSL, finalMaxPrice);
   const timeToSLMin   = Math.round(elapsedMs / 60000);
   const phantomSLHit  = stopReason === "phantom_sl";
 
   const ghostRow = {
     positionId: g.positionId, symbol: g.symbol, session: g.session,
     direction: g.direction, vwapPosition: g.vwapPosition, optimizerKey: g.optimizerKey,
-    entry: g.entry, sl: g.sl, slPct: g.slPct, phantomSL: g.sl, tpRRUsed: g.tpRRUsed,
+    entry: g.entry, sl: finalSL, slPct: g.slPct, phantomSL: finalSL, tpRRUsed: g.tpRRUsed,
     maxPrice: finalMaxPrice, maxRRBeforeSL, phantomSLHit, stopReason,
     timeToSLMin: phantomSLHit ? timeToSLMin : null,
     openedAt: g.openedAt, closedAt: new Date().toISOString(),
+    slChanges: g.slChanges ?? 0,    // v10.7: aantal SL wijzigingen tijdens trade
+    tpChanges: g.tpChanges ?? 0,    // v10.7: aantal TP wijzigingen tijdens trade
   };
 
   await saveGhostTrade(ghostRow);
@@ -605,7 +657,7 @@ async function finalizeGhost(positionId, stopReason, elapsedMs, finalMaxPrice) {
     console.log(`[Ghost] ${positionId}: trueMaxRR=${maxRRBeforeSL}R written back (manual close)`);
   }
 
-  console.log(`[Ghost] Finalized: ${positionId} | key=${g.optimizerKey} | maxRR=${maxRRBeforeSL}R | slHit=${phantomSLHit}`);
+  console.log(`[Ghost] Finalized: ${positionId} | key=${g.optimizerKey} | finalSL=${finalSL} | maxRR=${maxRRBeforeSL}R | slChanges=${ghostRow.slChanges} | slHit=${phantomSLHit}`);
 }
 
 function cancelGhost(positionId) {
@@ -652,6 +704,8 @@ async function runAllShadowOptimizers() {
 }
 
 // ── Position sync (FIX 9: rate-limited, FIX 13: clear restore flag) ──
+// v10.7: live SL/TP wijzigingen van MT5 worden opgepikt en dashboard
+// waarden (slDistPct, tpRRActual) worden automatisch herberekend.
 async function syncOpenPositions() {
   const now = Date.now();
   if (now - lastSyncAt < SYNC_MIN_INTERVAL_MS) return;
@@ -672,6 +726,27 @@ async function syncOpenPositions() {
       local.currentPrice = cur;
       local.currentPnL   = livePos.unrealizedProfit ?? 0;
       local.lastSync     = new Date().toISOString();
+
+      // v10.7 FIX 2: Oppikken van SL/TP wijzigingen die in MT5 zijn gedaan
+      // (handmatig of via anti-consolidation). RR en slDistPct worden live herberekend.
+      const liveSL = livePos.stopLoss  ?? local.sl;
+      const liveTP = livePos.takeProfit ?? local.tp;
+      if (liveSL !== local.sl || liveTP !== local.tp) {
+        const oldSL = local.sl, oldTP = local.tp;
+        local.sl = liveSL;
+        local.tp = liveTP;
+        // Herbereken slDist en tpRR op basis van nieuwe SL/TP
+        const slDist = local.sl > 0 ? Math.abs(local.entry - local.sl) : 0;
+        if (slDist > 0) {
+          local.tpRRUsed = local.tp
+            ? parseFloat((Math.abs(local.tp - local.entry) / slDist).toFixed(3))
+            : local.tpRRUsed;
+        }
+        console.log(`[Sync] ${id}: SL/TP gewijzigd in MT5 — SL ${oldSL}→${liveSL} TP ${oldTP}→${liveTP} tpRR→${local.tpRRUsed}`);
+        logEvent({ type: "SL_TP_SYNCED_FROM_MT5", positionId: id, symbol: local.symbol,
+          oldSL, newSL: liveSL, oldTP, newTP: liveTP, tpRRNew: local.tpRRUsed });
+      }
+
       // FIX 13: clear restore flag after first live sync
       if (local.restoredAfterRestart) {
         local.restoredAfterRestart = false;
@@ -777,18 +852,25 @@ async function restorePositionsFromMT5() {
 }
 
 // ── Shadow snapshot cron ──────────────────────────────────────────
+// v10.7: snapshots gebruiken altijd de LIVE sl uit openPositions
+// (gesynchet via syncOpenPositions elke 55s). pctSlUsed is dus altijd
+// berekend op de actuele SL, ook na anti-consolidation widenings.
+// De snapshot slaat ook de actuele sl waarde op voor later terugkijken.
 async function takeShadowSnapshots() {
-  // FIX 13: restoredAfterRestart is cleared after first sync; snapshots then flow normally
   const positions = Object.values(openPositions).filter(p => p.sl > 0 && !p.restoredAfterRestart);
   for (const pos of positions) {
     try {
-      const pd = await fetchCurrentPrice(pos.mt5Symbol || getSymbolInfo(pos.symbol)?.mt5 || pos.symbol);
+      const mt5Sym = pos.mt5Symbol || getSymbolInfo(pos.symbol)?.mt5 || pos.symbol;
+      const pd = await fetchCurrentPrice(mt5Sym);
       if (!pd) continue;
-      const pct = calcPctSlUsed(pos.direction, pos.entry, pos.sl, pd.mid);
+      // Gebruik altijd de LIVE sl (kan gewijzigd zijn door sync of anti-consolidation)
+      const liveSL  = pos.sl;
+      const pct     = calcPctSlUsed(pos.direction, pos.entry, liveSL, pd.mid);
       await saveShadowSnapshot({
         positionId: pos.positionId, optimizerKey: pos.optimizerKey,
         symbol: pos.symbol, session: pos.session, direction: pos.direction,
-        vwapPosition: pos.vwapPosition, entry: pos.entry, sl: pos.sl,
+        vwapPosition: pos.vwapPosition, entry: pos.entry,
+        sl: liveSL,   // actuele SL, niet originele
         currentPrice: pd.mid, pctSlUsed: pct,
       });
     } catch (e) { /* non-critical */ }
@@ -1117,6 +1199,18 @@ app.post("/webhook", async (req, res) => {
 
   const slippage = parseFloat((executionPrice - closePrice).toFixed(5));
 
+  // v10.7 FIX 3: Spread opslaan in spread_log voor tijdzone analyse
+  if (bid != null && ask != null) {
+    const spreadAbs = parseFloat((ask - bid).toFixed(8));
+    const spreadPct = bid > 0 ? parseFloat((spreadAbs / bid * 100).toFixed(6)) : null;
+    const { hour, minute, day } = getBrusselsComponents();
+    saveSpreadLog({
+      symbol: symKey, mt5Symbol, session,
+      hourBrussels: hour, minuteBrussels: minute, dayOfWeek: day,
+      bid, ask, spreadAbs, spreadPct, assetType, positionId,
+    }).catch(() => {});
+  }
+
   // FIX 5: spread guard uses buffered SL distance
   if (assetType === "stock" && spread > 0) {
     const guardSLDist = Math.abs(executionPrice - calcSLFromDerivedPct(direction, executionPrice, derivedSlPct));
@@ -1279,19 +1373,49 @@ app.post("/webhook", async (req, res) => {
 // ── REST API ──────────────────────────────────────────────────────
 app.get("/live/positions", async (req, res) => {
   const balance = await getLiveBalance();
-  const positions = Object.values(openPositions).map(p => ({
-    positionId: p.positionId, symbol: p.symbol, direction: p.direction,
-    session: p.session, vwapPosition: p.vwapPosition, optimizerKey: p.optimizerKey,
-    entry: p.entry, sl: p.sl, tp: p.tp, lots: p.lots,
-    riskPct: p.riskPct, riskEUR: p.riskEUR, evMult: p.evMult ?? 1.0, dayMult: p.dayMult ?? 1.0,
-    spread: p.spread ?? 0, bid: p.bid, ask: p.ask,
-    currentPrice: p.currentPrice, currentPnL: p.currentPnL,
-    maxRR: p.maxRR, tpRR: p.tpRRUsed, openedAt: p.openedAt, balance: p.balance,
-    slDistPct: p.sl && p.entry ? parseFloat((Math.abs(p.entry - p.sl) / p.entry * 100).toFixed(3)) : null,
-    slPctUsed: p.currentPrice ? calcPctSlUsed(p.direction, p.entry, p.sl, p.currentPrice) : null,
-    isGhosted: !!ghostTrackers[p.positionId],
-    lotDivisor: p.lotDivisor ?? 1,
-  }));
+  const positions = Object.values(openPositions).map(p => {
+    // ── Werkelijke EUR exposure (eerlijk) ─────────────────────────
+    // riskEUR in het object is de PUUR berekende basis (balance × pct).
+    // Door evMult en dayMult wordt de werkelijke positiegrootte groter,
+    // waardoor ook de werkelijke exposure groter is.
+    const info    = getSymbolInfo(p.symbol);
+    const type    = info?.type || "stock";
+    const lotVal  = LOT_VALUE[type] ?? 1;
+    const slDist  = p.sl > 0 ? Math.abs(p.entry - p.sl) : 0;
+    // actualRiskEUR = werkelijke verlies bij SL hit (lots × slDist × lotVal)
+    const actualRiskEUR = slDist > 0 ? parseFloat((p.lots * slDist * lotVal).toFixed(2)) : null;
+    // actualRiskPct = actualRiskEUR als % van balance
+    const actualRiskPct = actualRiskEUR && balance > 0
+      ? parseFloat((actualRiskEUR / balance * 100).toFixed(4)) : null;
+    // SL distance % op basis van huidige MT5 SL (live, niet origineel)
+    const slDistPct = p.sl && p.entry
+      ? parseFloat((Math.abs(p.entry - p.sl) / p.entry * 100).toFixed(3)) : null;
+    // TP RR op basis van huidige MT5 SL/TP (live)
+    const tpRRActual = p.tp && p.sl && p.entry && slDist > 0
+      ? parseFloat((Math.abs(p.tp - p.entry) / slDist).toFixed(3)) : null;
+
+    return {
+      positionId: p.positionId, symbol: p.symbol, direction: p.direction,
+      session: p.session, vwapPosition: p.vwapPosition, optimizerKey: p.optimizerKey,
+      entry: p.entry, sl: p.sl, tp: p.tp, lots: p.lots,
+      riskPct: p.riskPct,
+      riskEUR: p.riskEUR,          // basis puur (balance × pct)
+      actualRiskEUR,               // werkelijk bij SL: lots × dist × lotVal
+      actualRiskPct,               // werkelijk % van balance
+      evMult: p.evMult ?? 1.0, dayMult: p.dayMult ?? 1.0,
+      spread: p.spread ?? 0, bid: p.bid, ask: p.ask,
+      currentPrice: p.currentPrice, currentPnL: p.currentPnL,
+      maxRR: p.maxRR, tpRR: p.tpRRUsed,
+      tpRRActual,                  // live TP RR op basis van huidige MT5 SL
+      openedAt: p.openedAt, balance: p.balance,
+      slDistPct,
+      slPctUsed: p.currentPrice ? calcPctSlUsed(p.direction, p.entry, p.sl, p.currentPrice) : null,
+      isGhosted: !!ghostTrackers[p.positionId],
+      lotDivisor: p.lotDivisor ?? 1,
+      isEvPlus: p.isEvPlus ?? false,
+      scaleFactor: p.scaleFactor ?? 1.0,
+    };
+  });
   res.json({ count: positions.length, balance, positions });
 });
 
@@ -1300,8 +1424,12 @@ app.get("/live/ghosts", (req, res) => {
     positionId: g.positionId, symbol: g.symbol, optimizerKey: g.optimizerKey,
     direction: g.direction, session: g.session, vwapPosition: g.vwapPosition,
     entry: g.entry, sl: g.sl, maxPrice: g.maxPrice,
+    phantomSL: g.sl,   // alias zodat dashboard code consistent is met history
     maxRR: calcMaxRR(g.direction, g.entry, g.sl, g.maxPrice),
+    tpRRUsed: g.tpRRUsed,
     elapsedMin: Math.round((Date.now() - g.startTs) / 60000),
+    slChanges: g.slChanges ?? 0,
+    tpChanges: g.tpChanges ?? 0,
   }));
   res.json({ count: ghosts.length, ghosts });
 });
@@ -1398,12 +1526,33 @@ app.get("/signal-stats", async (req, res) => {
   res.json(stats);
 });
 
+// ── Spread statistieken (v10.7 Fix 3) ────────────────────────────
+// GET /spread-stats?symbol=EURUSD&session=london&hourMin=8&hourMax=16&dayOfWeek=1
+app.get("/spread-stats", async (req, res) => {
+  const { symbol, session, hourMin, hourMax, dayOfWeek } = req.query;
+  const stats = await loadSpreadStats({
+    symbol:    symbol    || undefined,
+    session:   session   || undefined,
+    hourMin:   hourMin   != null ? parseInt(hourMin)   : undefined,
+    hourMax:   hourMax   != null ? parseInt(hourMax)   : undefined,
+    dayOfWeek: dayOfWeek != null ? parseInt(dayOfWeek) : undefined,
+  });
+  res.json({ count: stats.length, stats });
+});
+
+// GET /spread-log?symbol=EURUSD&session=london&limit=200
+app.get("/spread-log", async (req, res) => {
+  const { symbol, session, limit = 200 } = req.query;
+  const rows = await loadSpreadLog({ symbol, session, limit: parseInt(limit) });
+  res.json({ count: rows.length, rows });
+});
+
 app.get("/health", async (req, res) => {
   const balance = await getLiveBalance();
   const tradeWindowForex = canOpenNewTrade("EURUSD");
   const tradeWindowStock = canOpenNewTrade("AAPL");
   res.json({
-    status: "ok", version: "10.5.0", time: getBrusselsDateStr(),
+    status: "ok", version: "10.7.0", time: getBrusselsDateStr(),
     openPos: Object.keys(openPositions).length, ghosts: Object.keys(ghostTrackers).length,
     tpLocks: Object.keys(tpLocks).length, closedT: closedTrades.length, balance,
     fixedRiskPct: FIXED_RISK_PCT, marketOpen: isMarketOpen(), session: getSession(),
@@ -1428,7 +1577,7 @@ app.get(["/", "/dashboard"], async (req, res) => {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PRONTO-AI v10.6</title>
+<title>PRONTO-AI v10.7</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600;700&family=IBM+Plex+Sans+Condensed:wght@500;600;700&display=swap" rel="stylesheet">
 <style>
@@ -1541,7 +1690,7 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
 <div class="hdr">
   <div>
     <div class="logo">PRONTO-AI</div>
-    <div class="ver">v10.6 · TradingView → MetaApi → FTMO MT5 · Fixed Risk ${(FIXED_RISK_PCT*100).toFixed(3)}% · SL Buffer ×${SL_BUFFER_MULT} · Fix A/C/D/E actief</div>
+    <div class="ver">v10.7 · TradingView → MetaApi → FTMO MT5 · Fixed Risk ${(FIXED_RISK_PCT*100).toFixed(3)}% · SL Buffer ×${SL_BUFFER_MULT} · Fix A/C/D/E actief</div>
   </div>
   <div class="hdr-r">
     <span class="sb s-outside" id="hdr-sess">—</span>
@@ -1572,11 +1721,14 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
       <thead><tr>
         <th class="s" data-col="0">Pair</th><th class="s" data-col="1">Dir</th><th class="s" data-col="2">VWAP</th><th class="s" data-col="3">Session</th>
         <th class="s" data-col="4">Entry</th><th class="s" data-col="5">SL</th><th class="s" data-col="6">SL Dist%</th><th>SL Used%</th>
-        <th class="s" data-col="8">Max RR</th><th class="s" data-col="9">TP</th><th class="s" data-col="10">TP RR</th>
-        <th class="s" data-col="11">PnL €</th><th class="s" data-col="12">PnL %</th><th class="s" data-col="13">Lots</th><th class="s" data-col="14">Risk €</th>
-        <th>Ghost</th><th class="s" data-col="16">Opened</th>
+        <th class="s" data-col="8">Max RR</th><th class="s" data-col="9">TP</th><th class="s" data-col="10">TP RR live</th>
+        <th class="s" data-col="11">PnL €</th><th class="s" data-col="12">PnL %</th><th class="s" data-col="13">Lots</th>
+        <th class="s" data-col="14" title="Basis riskEUR = balance x pct (puur)">Risk € basis</th>
+        <th class="s" data-col="15" title="Werkelijk verlies bij SL: lots x dist x lotVal">Risk € echt</th>
+        <th class="s" data-col="16" title="Werkelijk risico als % van balance">Risk % echt</th>
+        <th>EV+</th><th>Ghost</th><th class="s" data-col="19">Opened</th>
       </tr></thead>
-      <tbody id="pos-body"><tr><td colspan="17" class="nodata">Loading…</td></tr></tbody>
+      <tbody id="pos-body"><tr><td colspan="20" class="nodata">Loading…</td></tr></tbody>
     </table>
   </div>
 </div>
@@ -1737,7 +1889,7 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
   <div class="sh"><span class="st o">▸ LOT SIZE CALCULATOR</span><span class="sm">formule · wat te wijzigen · live config</span></div>
   <div class="lotbox">
     <div class="lc">
-      <div class="lct b">Formule — v10.6</div>
+      <div class="lct b">Formule — v10.7</div>
       <div class="lcf">
         Elke trade riskeert exact hetzelfde <b style="color:var(--b)">€ bedrag</b> ongeacht SL afstand. <b style="color:var(--o)">evMult en dayMult werken alleen op lotsize, NIET op riskEUR.</b>
         <div class="formula">riskEUR  = balance × riskPct  <span style="color:#888">← puur, geen multipliers</span><br>dist     = |entry_price − sl_price| / entry_price × 1.5 buffer<br>baseLots = riskEUR ÷ (dist × lotValue)<br>finalLots= baseLots × evMult × dayMult  <span style="color:#888">← EV+ trades</span><br>finalLots= baseLots × scaleFactor        <span style="color:#888">← EV neutraal</span></div>
@@ -1785,10 +1937,14 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
       <thead><tr>
         <th>Key</th><th class="s" data-col="1">Symbol</th><th class="s" data-col="2">Dir</th>
         <th class="s" data-col="3">Session</th><th class="s" data-col="4">Entry</th>
-        <th class="s" data-col="5">Max RR</th><th>SL Used%</th>
-        <th class="s" data-col="7">Elapsed (min)</th><th>Status</th>
+        <th class="s" data-col="5">Finale SL</th>
+        <th class="s" data-col="6">Max RR</th><th>SL Used%</th>
+        <th class="s" data-col="8">Elapsed (min)</th>
+        <th class="s" data-col="9" title="SL wijzigingen tijdens trade">SL Chg</th>
+        <th class="s" data-col="10" title="TP wijzigingen tijdens trade">TP Chg</th>
+        <th>Status</th>
       </tr></thead>
-      <tbody id="gh-body"><tr><td colspan="9" class="nodata">Loading…</td></tr></tbody>
+      <tbody id="gh-body"><tr><td colspan="12" class="nodata">Loading…</td></tr></tbody>
     </table>
   </div>
 </div>
@@ -1856,6 +2012,11 @@ async function loadPositions(){
   tb.innerHTML=d.positions.map(p=>{
     const slU=p.slPctUsed||0;
     const pnlP=p.currentPnL!=null?((p.currentPnL/bal)*100).toFixed(2):null;
+    // Werkelijk risico kleur: rood als >2x basis riskEUR (multipliers hebben fors effect)
+    const riskRatio=p.actualRiskEUR&&p.riskEUR?p.actualRiskEUR/p.riskEUR:1;
+    const riskCls=riskRatio>2.5?'r':riskRatio>1.5?'o':'g';
+    // Live TP RR (na eventuele SL wijiging in MT5)
+    const tpRRShow=p.tpRRActual??p.tpRR;
     return\`<tr class="\${tClass(p.symbol)}">
       <td data-val="\${p.symbol}" class="b fw">\${p.symbol}</td>
       <td>\${dBadge(p.direction)}</td><td>\${vBadge(p.vwapPosition)}</td><td>\${sBadge(p.session)}</td>
@@ -1865,11 +2026,14 @@ async function loadPositions(){
       <td>\${slBar(slU)}</td>
       <td data-val="\${p.maxRR}" class="\${p.maxRR>0?'g':'d'} fw">\${f(p.maxRR,2)}R</td>
       <td data-val="\${p.tp}" class="g">\${f(p.tp,5)}</td>
-      <td data-val="\${p.tpRR}" class="y">\${f(p.tpRR,1)}R</td>
+      <td data-val="\${tpRRShow}" class="y" title="Live TP RR op basis van huidige MT5 SL/TP">\${f(tpRRShow,2)}R\${p.tpRRActual&&p.tpRRActual!==p.tpRR?' ✎':''}</td>
       <td data-val="\${p.currentPnL}" class="\${pC(p.currentPnL)} fw">\${eu(p.currentPnL)}</td>
       <td data-val="\${pnlP}" class="\${pC(p.currentPnL)}">\${pnlP!=null?(pnlP>=0?'+':'')+pnlP+'%':'—'}</td>
       <td data-val="\${p.lots}" class="c">\${f(p.lots,2)}</td>
-      <td data-val="\${p.riskEUR}" class="o">€\${f(p.riskEUR,0)}</td>
+      <td data-val="\${p.riskEUR}" class="d" title="Basis: balance x pct (puur, zonder multipliers)">€\${f(p.riskEUR,0)}</td>
+      <td data-val="\${p.actualRiskEUR}" class="\${riskCls} fw" title="Werkelijk verlies bij SL: \${p.lots} lots x dist x lotVal. evMult=\${f(p.evMult,2)}x dayMult=\${f(p.dayMult,2)}x">€\${p.actualRiskEUR!=null?f(p.actualRiskEUR,0):'—'}</td>
+      <td data-val="\${p.actualRiskPct}" class="\${riskCls}" title="Werkelijk % van balance bij SL">\${p.actualRiskPct!=null?f(p.actualRiskPct,3)+'%':'—'}</td>
+      <td>\${p.isEvPlus?'<span class="bd bd-evp" title="EV+ trade: evMult>1, geen currency budget check">EV+</span>':'<span class="bd d">EV0</span>'}</td>
       <td>\${p.isGhosted?'<span class="bd" style="color:var(--p);border-color:rgba(168,120,255,.3)">👻</span>':'<span class="d">—</span>'}</td>
       <td data-val="\${p.openedAt}" class="d" style="font-size:9px">\${dt(p.openedAt)} \${ts(p.openedAt)}</td>
     </tr>\`;
@@ -2153,17 +2317,24 @@ async function loadGhosts(){
   if(lv?.ghosts)lv.ghosts.forEach(g=>rows.push({...g,status:'ACTIVE'}));
   if(hi?.rows)hi.rows.forEach(r=>rows.push({...r,status:r.phantomSLHit?'SL HIT':r.stopReason||'closed'}));
   const tb=document.getElementById('gh-body');
-  if(!rows.length){tb.innerHTML='<tr><td colspan="9" class="nodata">No ghost data</td></tr>';return;}
+  if(!rows.length){tb.innerHTML='<tr><td colspan="12" class="nodata">No ghost data</td></tr>';return;}
   tb.innerHTML=rows.map(g=>{
     const isA=g.status==='ACTIVE';
     const rr=g.maxRR??g.maxRRBeforeSL;
+    const slChg=g.slChanges??0;
+    const tpChg=g.tpChanges??0;
+    // Actieve ghosts tonen live SL; history toont finale SL (phantom_sl)
+    const finalSL=g.phantomSL??g.sl;
     return\`<tr class="\${tClass(g.symbol||'')}">
       <td class="d" style="font-size:9px">\${(g.optimizerKey||'—').slice(0,28)}</td>
       <td class="b fw">\${g.symbol||'—'}</td><td>\${dBadge(g.direction)}</td><td>\${sBadge(g.session)}</td>
       <td data-val="\${g.entry}" class="d">\${f(g.entry,5)}</td>
+      <td data-val="\${finalSL}" class="\${slChg>0?'o':'r'}" title="\${slChg>0?slChg+' wijziging(en)':'geen wijziging'}">\${f(finalSL,5)}\${slChg>0?' ✎':''}</td>
       <td data-val="\${rr??-99}" class="\${rr>0?'g':'d'}">\${f(rr,2)}R</td>
       <td>\${slBar(g.slPctUsed??0)}</td>
       <td data-val="\${g.elapsedMin??g.timeToSLMin??0}" class="d">\${g.elapsedMin??g.timeToSLMin??'—'}</td>
+      <td data-val="\${slChg}" class="\${slChg>0?'o':'d'}" title="SL gewijzigd \${slChg}x tijdens trade">\${slChg>0?slChg+'x':'—'}</td>
+      <td data-val="\${tpChg}" class="\${tpChg>0?'y':'d'}" title="TP gewijzigd \${tpChg}x tijdens trade">\${tpChg>0?tpChg+'x':'—'}</td>
       <td>\${isA?'<span class="bd bd-evp">ACTIVE</span>':g.status==='SL HIT'?'<span class="bd bd-sl">SL HIT</span>':\`<span class="bd d">\${g.status}</span>\`}</td>
     </tr>\`;
   }).join('');
@@ -2210,7 +2381,7 @@ async function start() {
   const missing = ["META_API_TOKEN", "META_ACCOUNT_ID", "WEBHOOK_SECRET"].filter(k => !process.env[k]);
   if (missing.length) { console.error(`[ERR] Missing env: ${missing.join(", ")}`); process.exit(1); }
 
-  console.log("🚀 PRONTO-AI v10.6 starting...");
+  console.log("🚀 PRONTO-AI v10.7 starting...");
   await initDB();
 
   // Load closed trades
@@ -2269,7 +2440,7 @@ async function start() {
   console.log(`💱 Currency exposure rebuilt: ${JSON.stringify(Object.fromEntries(Object.entries(currencyExposure).map(([k,v])=>[k,v.toFixed(2)])))}`);
 
   app.listen(PORT, () => {
-    console.log(`[✓] PRONTO-AI v10.6 on port ${PORT}`);
+    console.log(`[✓] PRONTO-AI v10.7 on port ${PORT}`);
     console.log(`   🔹 Dashboard:      /`);
     console.log(`   🔹 Health:         /health`);
     console.log(`   🔹 EV Table:       /ev`);
@@ -2279,6 +2450,8 @@ async function start() {
     console.log(`   🔹 Lot Overrides:  /lot-overrides`);
     console.log(`   🔹 Risk Mults:     /risk-multipliers`);
     console.log(`   🔹 Signal Stats:   /signal-stats`);
+    console.log(`   🔹 Spread Stats:   /spread-stats?symbol=EURUSD&session=london`);
+    console.log(`   🔹 Spread Log:     /spread-log?symbol=EURUSD&limit=200`);
     console.log(`   🔹 Webhook:        POST /webhook?secret=<secret>`);
     console.log(`   💵 Fixed risk:     ${(FIXED_RISK_PCT*100).toFixed(3)}% | Balance: €${liveBalance.toFixed(2)}`);
     console.log(`   💰 Curr budget:    ${(CURRENCY_BUDGET_PCT*100).toFixed(1)}% per valuta | TP floor: ${MIN_TP_RR_FLOOR}R`);
