@@ -1,5 +1,12 @@
 // ===============================================================
-// db.js  v10.5  |  PRONTO-AI
+// db.js  v10.6  |  PRONTO-AI
+//
+// Changes v10.6:
+//  - key_risk_mult schema uitgebreid: ev_mult + day_mult kolommen.
+//    saveKeyRiskMult() accepteert { streak, evMult, dayMult }.
+//    loadKeyRiskMults() retourneert { streak, evMult, dayMult }.
+//  - closed_trades: ADD COLUMN exclude_from_ev BOOLEAN (Fix E).
+//  - currency_exposure tabel: NEW voor Fix C budget tracking.
 //
 // Changes v10.5:
 //  - COMPLIANCE_DATE imported from session.js (FIX 8).
@@ -302,18 +309,36 @@ async function initDB() {
       );
     `);
 
-    // ── key_risk_mult (FIX 19: persistent EV streak multipliers) ────
+    // ── key_risk_mult (FIX 19 + v10.6: ev_mult + day_mult separate) ─
     await client.query(`
       CREATE TABLE IF NOT EXISTS key_risk_mult (
         optimizer_key TEXT        PRIMARY KEY,
         streak        INTEGER     NOT NULL DEFAULT 0,
         mult          NUMERIC     NOT NULL DEFAULT 1.0,
+        ev_mult       NUMERIC     NOT NULL DEFAULT 1.0,
+        day_mult      NUMERIC     NOT NULL DEFAULT 1.0,
         updated_at    TIMESTAMPTZ DEFAULT NOW()
+      );
+      ALTER TABLE key_risk_mult ADD COLUMN IF NOT EXISTS ev_mult  NUMERIC NOT NULL DEFAULT 1.0;
+      ALTER TABLE key_risk_mult ADD COLUMN IF NOT EXISTS day_mult NUMERIC NOT NULL DEFAULT 1.0;
+    `);
+
+    // ── closed_trades: exclude_from_ev (Fix E: RR_VERIFY_FAILED) ────
+    await client.query(`
+      ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS exclude_from_ev BOOLEAN DEFAULT FALSE;
+    `);
+
+    // ── currency_exposure (Fix C: per-currency budget tracking) ─────
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS currency_exposure (
+        currency    TEXT        PRIMARY KEY,
+        exposure_eur NUMERIC    NOT NULL DEFAULT 0,
+        updated_at  TIMESTAMPTZ DEFAULT NOW()
       );
     `);
 
     await client.query("COMMIT");
-    console.log("[DB] v10.5 schema OK");
+    console.log("[DB] v10.6 schema OK");
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("[DB] initDB ROLLBACK:", err.message);
@@ -335,8 +360,9 @@ async function saveTrade(t) {
          lots, risk_pct, risk_eur, max_price, max_rr, true_max_rr, true_max_price,
          ghost_stop_reason, ghost_finalized_at, session, vwap_at_entry,
          opened_at, closed_at, sl_multiplier, realized_pnl_eur, hit_tp, close_reason,
-         spread_at_entry, vwap_band_pct, execution_price, tv_entry, slippage)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30)
+         spread_at_entry, vwap_band_pct, execution_price, tv_entry, slippage,
+         exclude_from_ev)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31)
       ON CONFLICT (position_id) DO UPDATE SET
         true_max_rr        = EXCLUDED.true_max_rr,
         true_max_price     = EXCLUDED.true_max_price,
@@ -352,7 +378,8 @@ async function saveTrade(t) {
         vwap_band_pct      = EXCLUDED.vwap_band_pct,
         execution_price    = EXCLUDED.execution_price,
         tv_entry           = EXCLUDED.tv_entry,
-        slippage           = EXCLUDED.slippage
+        slippage           = EXCLUDED.slippage,
+        exclude_from_ev    = EXCLUDED.exclude_from_ev
     `, [
       t.positionId   ?? null,
       t.symbol       ?? "",
@@ -379,11 +406,12 @@ async function saveTrade(t) {
       t.realizedPnlEUR ?? null,
       t.hitTP        ?? false,
       t.closeReason  ?? "manual",
-      t.spreadAtEntry  ?? null,   // FIX 1: spread_at_entry
-      t.vwapBandPct    ?? null,   // FIX 2: vwap_band_pct
-      t.executionPrice ?? null,   // execution_price
-      t.tvEntry        ?? null,   // tv_entry
-      t.slippage       ?? null,   // slippage
+      t.spreadAtEntry  ?? null,
+      t.vwapBandPct    ?? null,
+      t.executionPrice ?? null,
+      t.tvEntry        ?? null,
+      t.slippage       ?? null,
+      t.excludeFromEV  ?? false,  // Fix E: RR_VERIFY_FAILED trades
     ]);
   } catch (e) { console.warn("[!] saveTrade:", e.message); }
 }
@@ -849,18 +877,20 @@ async function loadShadowWinners() {
 // ── EV stats computed from ghost_trades ────────────────────────
 // DATA QUALITY: Only ghost trades from 18/04/2026 onward with valid
 // VWAP context (not 'unknown') are included in EV calculations.
-// Pre-compliance rows had missing execution_price / vwap_band_pct.
-// 'unknown' vwap keys produce meaningless optimizer classifications.
+// v10.6: Fix E — trades met exclude_from_ev=TRUE worden uitgesloten
+// via LEFT JOIN op closed_trades.
 async function computeEVStats(optimizerKey) {
   try {
     const r = await pool.query(`
-      SELECT CAST(max_rr_before_sl AS FLOAT) AS "maxRR"
-      FROM ghost_trades
-      WHERE optimizer_key=$1
-        AND phantom_sl_hit=TRUE
-        AND max_rr_before_sl IS NOT NULL
-        AND opened_at >= $2
-        AND vwap_position IN ('above','below')
+      SELECT CAST(g.max_rr_before_sl AS FLOAT) AS "maxRR"
+      FROM ghost_trades g
+      LEFT JOIN closed_trades ct ON ct.position_id = g.position_id
+      WHERE g.optimizer_key=$1
+        AND g.phantom_sl_hit=TRUE
+        AND g.max_rr_before_sl IS NOT NULL
+        AND g.opened_at >= $2
+        AND g.vwap_position IN ('above','below')
+        AND (ct.exclude_from_ev IS NULL OR ct.exclude_from_ev = FALSE)
     `, [optimizerKey, COMPLIANCE_DATE]);
     const arr = r.rows.map(x => x.maxRR);
     if (arr.length < 1) return { key: optimizerKey, count: 0, rrLevels: [], bestRR: 1.0, bestEV: null };
@@ -897,22 +927,37 @@ async function loadLotOverrides() {
   } catch (e) { console.warn('[!] loadLotOverrides:', e.message); return {}; }
 }
 
-// ── key_risk_mult (FIX 19) ─────────────────────────────────────
-async function saveKeyRiskMult(optimizerKey, { streak, mult }) {
+// ── key_risk_mult (FIX 19 + v10.6: ev_mult + day_mult) ────────
+// v10.6: streak, evMult en dayMult worden apart opgeslagen.
+// mult kolom is deprecated maar blijft voor backwards compat.
+async function saveKeyRiskMult(optimizerKey, { streak, evMult, dayMult }) {
   try {
+    const em = evMult  ?? 1.0;
+    const dm = dayMult ?? 1.0;
     await pool.query(`
-      INSERT INTO key_risk_mult (optimizer_key, streak, mult, updated_at)
-      VALUES ($1, $2, $3, NOW())
-      ON CONFLICT (optimizer_key) DO UPDATE SET streak=$2, mult=$3, updated_at=NOW()
-    `, [optimizerKey, streak, mult]);
+      INSERT INTO key_risk_mult (optimizer_key, streak, mult, ev_mult, day_mult, updated_at)
+      VALUES ($1, $2, $3, $4, $5, NOW())
+      ON CONFLICT (optimizer_key) DO UPDATE
+        SET streak=$2, mult=$3, ev_mult=$4, day_mult=$5, updated_at=NOW()
+    `, [optimizerKey, streak, em, em, dm]);
   } catch (e) { console.warn('[!] saveKeyRiskMult:', e.message); }
 }
 
 async function loadKeyRiskMults() {
   try {
-    const r = await pool.query(`SELECT optimizer_key, streak, CAST(mult AS FLOAT) AS mult FROM key_risk_mult`);
+    const r = await pool.query(`
+      SELECT optimizer_key,
+             streak,
+             CAST(ev_mult  AS FLOAT) AS ev_mult,
+             CAST(day_mult AS FLOAT) AS day_mult
+      FROM key_risk_mult
+    `);
     const map = {};
-    for (const row of r.rows) map[row.optimizer_key] = { streak: row.streak, mult: row.mult };
+    for (const row of r.rows) map[row.optimizer_key] = {
+      streak:  row.streak,
+      evMult:  row.ev_mult  ?? 1.0,
+      dayMult: row.day_mult ?? 1.0,
+    };
     return map;
   } catch (e) { console.warn('[!] loadKeyRiskMults:', e.message); return {}; }
 }
@@ -989,7 +1034,7 @@ module.exports = {
   // Lot overrides (FIX 2)
   saveLotOverride,
   loadLotOverrides,
-  // Key risk multipliers (FIX 19)
+  // Key risk multipliers (FIX 19 + v10.6 evMult/dayMult)
   saveKeyRiskMult,
   loadKeyRiskMults,
   // Realized P&L (FIX 4)
