@@ -1,33 +1,44 @@
 // ===============================================================
-// server.js  v10.5  |  PRONTO-AI
+// server.js  v10.6  |  PRONTO-AI
 // TradingView → MetaApi REST → FTMO MT5
 //
-// v10.5 — ALL-FIXES (19 April 2026):
-//  FIX 1  — EV mult ×4 on riskEUR (no cap). Day mult ×1.2 on lotsize separately.
-//            Combined: riskEUR = base × evMult, lots = baseLots × dayMult.
-//  FIX 2  — lotOverrides persistent in DB (lot_overrides table). Loaded at startup.
-//  FIX 3  — Anti-consolidation rewritten: same symbol+session+direction blocks new
-//            trade and instead widens SL×1.5 + adjusts TP on existing trade.
-//            Same currency different pair → lotsize ÷ relatedCount.
-//  FIX 4  — realizedPnlEUR: fetch actual deal P&L from MT5/DB after close.
-//  FIX 5  — Spread guard compares against buffered SL distance (×SL_BUFFER_MULT).
-//  FIX 6  — closeReason: compare currentPrice to sl/tp. Manual close → ghost
-//            continues, trueMaxRR written when ghost finalizes. unrealizedPnl only
-//            for manual; realizedPnl from MT5 for sl/tp closes.
-//  FIX 7  — evaluateDailyRisk uses realizedPnlEUR not currentPnL snapshot.
-//  FIX 8  — COMPLIANCE_DATE centralised in session.js.
-//  FIX 9  — syncOpenPositions: min 55s between MetaApi calls.
-//  FIX 10 — Ghost mt5Symbol fallback to SYMBOL_CATALOG.
-//  FIX 11 — evaluateDailyRisk resets ALL known keys, not just today's traders.
-//  FIX 12 — shadowResults restored from DB at startup.
-//  FIX 13 — restoredAfterRestart flag cleared after first successful sync.
-//  FIX 14 — getOptimalTP: single computeEVStats call.
-//  FIX 15 — /history endpoint returns all 200 entries (MAX_HISTORY).
-//  FIX 16 — closedTrades capped at MAX_CLOSED_TRADES (5000) in memory.
-//  FIX 17 — Dashboard loads /trades?limit=5000 for full TP Optimiser.
-//  FIX 18 — startGhostTracker guards sl=0.
-//  FIX 19 — keyRiskMult persisted in DB (key_risk_mult table).
-//  FIX 20 — dupGuard cleanup every 5min, TTL 120s.
+// v10.6 — FUNDAMENTELE CORRECTIES (19 April 2026):
+//
+//  MULT CORRECTIE —
+//    riskEUR = balance × FIXED_RISK_PCT  (puur, geen evMult).
+//    evMult + dayMult worden VERWIJDERD uit calcRiskEUR().
+//    Lotsize sequentieel: baseLots = riskEUR / (dist × lotVal)
+//      → finalLots = baseLots × evMult × dayMult  (voor EV+ trades)
+//      → finalLots = baseLots × scaleFactor        (voor EV neutraal)
+//    Budget check: finalLots × dist × lotVal = werkelijke EUR-exposure.
+//
+//  FIX A — Server berekent derivedSlPct van TV absolute prijzen:
+//    payload bevat entry_price + sl_price (absolute MT5 prijzen).
+//    server berekent: derivedSlPct = |entry_price - sl_price| / entry_price.
+//    Validatie: derivedSlPct > 0 EN ≤ 0.05, anders hard reject.
+//    MT5 SL: executionPrice × (1 ± derivedSlPct × SL_BUFFER_MULT).
+//
+//  FIX C — Currency Exposure Budget + Anti-consolidation:
+//    EV+ trades (evMult > 1.0): geen budget check, volle lots.
+//    EV neutraal (evMult = 1.0): beide valuta's tellen mee in budget.
+//    CURRENCY_BUDGET_PCT env var (default 0.02 = 2% van balance).
+//    scaleFactor beperkt lots bij budget exhaustion.
+//    Anti-consolidation: zelfde symbol+sessie+richting → modifyPosition()
+//      SL ×1.5 cumulatief op huidige MT5 SL + TP herberekend, geen nieuwe trade.
+//
+//  FIX D — TP Floor Guard:
+//    Na calcTPPrice(), vóór order naar MT5.
+//    minTPDist = |executionPrice - mt5SL| × MIN_TP_RR_FLOOR.
+//    TP gecorrigeerd zodat afstand ≥ minTPDist.
+//
+//  FIX E — RR Verificatie met echte MT5 data:
+//    Na TP Floor Guard: actualSLPct + actualTPRR gecontroleerd.
+//    SL op verkeerde kant → emergency close + ghost tracker start.
+//    closeReason: "RR_VERIFY_FAILED", excludeFromEV: true.
+//    Overige checks: SL_TOO_WIDE (>5%) + TP_RR_TOO_LOW (<0.3R) → log only.
+//    ORDER_PLACED log uitgebreid met derivedSlPct, actualSLPct, actualTPRR.
+//
+// (alle v10.5 fixes blijven actief — zie v10.5 header)
 // ===============================================================
 
 "use strict";
@@ -90,8 +101,13 @@ const PORT            = process.env.PORT || 3000;
 // FIXED_RISK_PCT: base risk per trade (0.15% of balance)
 const FIXED_RISK_PCT = parseFloat(process.env.FIXED_RISK_PCT || "0.0015");
 
-// FIX 1: EV multiplier applied to riskEUR (no cap — trust the EV logic).
-//        Day multiplier ×1.2 applied separately to lotsize.
+// FIX C: Currency exposure budget per valuta (default 2% van balance).
+// Op €100k balance = €2.000 max exposure per valuta voor EV-neutraal trades.
+const CURRENCY_BUDGET_PCT = parseFloat(process.env.CURRENCY_BUDGET_PCT || "0.02");
+
+// FIX D: Minimum TP RR floor — TP moet minimaal deze factor × SL-afstand zijn.
+const MIN_TP_RR_FLOOR = parseFloat(process.env.MIN_TP_RR_FLOOR || "0.5");
+
 // Ghost settings
 const GHOST_MIN_TRADES_FOR_TP = 5;
 const GHOST_POLL_MS           = 30000;
@@ -175,6 +191,10 @@ const symbolRiskMap  = {};
 const keyRiskMult    = {};   // { [optimizerKey]: { streak, evMult, dayMult } }
 const lotOverrides   = {};   // { [symbol]: baseLots }
 
+// FIX C: currency exposure tracking { [currency]: currentEURExposure }
+// Bijgewerkt bij elke nieuwe EV-neutraal trade open/close.
+const currencyExposure = {};
+
 // FIX 9: rate-limit protection
 let lastSyncAt = 0;
 const SYNC_MIN_INTERVAL_MS = 55000;
@@ -205,28 +225,90 @@ function getSymbolRiskPct(symbol) {
   return DEFAULT_RISK_BY_TYPE[info?.type || "stock"] ?? FIXED_RISK_PCT;
 }
 
-// FIX 1: EV multiplier on riskEUR (no cap). Day multiplier on lots separately.
+// v10.6 MULT CORRECTIE: evMult en dayMult alleen voor lotsize scaling.
+// riskEUR is puur: balance × pct — geen multipliers.
 function getKeyEvMult(optimizerKey)  { return keyRiskMult[optimizerKey]?.evMult  ?? 1.0; }
 function getKeyDayMult(optimizerKey) { return keyRiskMult[optimizerKey]?.dayMult ?? 1.0; }
 
-async function calcRiskEUR(symbol, optimizerKey) {
+// v10.6: calcRiskEUR = puur balance × pct. Geen evMult.
+async function calcRiskEUR(symbol) {
   const balance = await getLiveBalance();
   const pct     = getSymbolRiskPct(symbol);
-  const evMult  = getKeyEvMult(optimizerKey);
-  return balance * pct * evMult;  // FIX 1: EV mult on riskEUR
+  return balance * pct;
+}
+
+// ── FIX C: Currency exposure helpers ─────────────────────────────
+// Haal de twee valuta's op uit een forex pair (bijv. EURUSD → ['EUR','USD']).
+function getPairCurrencies(symbol) {
+  if (!symbol || symbol.length < 6) return [];
+  return [symbol.slice(0, 3).toUpperCase(), symbol.slice(3, 6).toUpperCase()];
+}
+
+// Bereken de werkelijke EUR-exposure van een positie.
+function calcPositionExposureEUR(lots, dist, lotVal) {
+  return lots * dist * lotVal;
+}
+
+// Haal het currency budget ceiling op (in EUR).
+async function getCurrencyBudget() {
+  const balance = await getLiveBalance();
+  return balance * CURRENCY_BUDGET_PCT;
+}
+
+// Rebuild currencyExposure vanuit alle open EV-neutrale posities.
+// Wordt aangeroepen na elke open/close van een EV-neutrale positie.
+function rebuildCurrencyExposure() {
+  for (const k of Object.keys(currencyExposure)) delete currencyExposure[k];
+  for (const pos of Object.values(openPositions)) {
+    // EV+ trades tellen NIET mee in currency budget (Fix C spec)
+    if ((pos.evMult ?? 1.0) > 1.0) continue;
+    const info   = getSymbolInfo(pos.symbol);
+    if (info?.type !== "forex") continue;
+    const dist   = Math.abs(pos.entry - pos.sl);
+    const lotVal = LOT_VALUE["forex"] ?? 10;
+    const expEUR = calcPositionExposureEUR(pos.lots ?? 0, dist, lotVal);
+    for (const ccy of getPairCurrencies(pos.symbol)) {
+      currencyExposure[ccy] = (currencyExposure[ccy] ?? 0) + expEUR;
+    }
+  }
+}
+
+// Bereken scaleFactor voor EV-neutrale trade op basis van budget.
+// Retourneert een getal 0..1 waarmee de lots worden vermenigvuldigd.
+// Bij 0 → budget volledig uitgeput → trade geblokkeerd.
+async function calcCurrencyScaleFactor(symbol, proposedLots, dist, lotVal) {
+  const budget      = await getCurrencyBudget();
+  const currencies  = getPairCurrencies(symbol);
+  if (!currencies.length) return 1.0; // non-forex: geen budget check
+
+  const proposedExp = calcPositionExposureEUR(proposedLots, dist, lotVal);
+  let   minScale    = 1.0;
+
+  for (const ccy of currencies) {
+    const current = currencyExposure[ccy] ?? 0;
+    const room    = budget - current;
+    if (room <= 0) return 0; // volledig uitgeput
+    const scale = room / proposedExp;
+    if (scale < minScale) minScale = scale;
+  }
+  return Math.min(1.0, Math.max(0, minScale));
 }
 
 // ── Lot calculation ───────────────────────────────────────────────
-// FIX 1: day mult applied here to lots. riskEUR already has evMult baked in.
-function calcLots(symbol, entry, sl, riskEUR, dayMult) {
+// v10.6 sequentieel:
+//   baseLots = riskEUR / (dist × lotVal)
+//   finalLots = baseLots × evMult × dayMult
+// riskEUR is puur (balance × pct). Multipliers alleen op lotsize.
+function calcLots(symbol, entry, sl, riskEUR, evMult, dayMult) {
   const info    = getSymbolInfo(symbol);
   const type    = info?.type || "stock";
   const lotVal  = LOT_VALUE[type] ?? 1;
   const dist    = Math.abs(entry - sl);
   if (!dist || !riskEUR) return 0.01;
-  const baseLots = riskEUR / (dist * lotVal);
-  const dm       = (dayMult && dayMult > 0) ? dayMult : 1.0;
-  return Math.max(0.01, parseFloat((baseLots * dm).toFixed(2)));
+  const baseLots  = riskEUR / (dist * lotVal);
+  const em        = (evMult  && evMult  > 0) ? evMult  : 1.0;
+  const dm        = (dayMult && dayMult > 0) ? dayMult : 1.0;
+  return Math.max(0.01, parseFloat((baseLots * em * dm).toFixed(2)));
 }
 
 // ── Recalculate base lots after SL hit ────────────────────────────
@@ -240,6 +322,7 @@ async function recalcLotsAfterSL(symbol, entry, sl) {
     const lotVal  = LOT_VALUE[type] ?? 1;
     const dist    = Math.abs(entry - sl);
     if (!dist) return;
+    // v10.6: puur balance × pct (geen multipliers in baseLots)
     const baseLots = parseFloat((balance * pct / (dist * lotVal)).toFixed(2));
     lotOverrides[symbol] = baseLots;
     await saveLotOverride(symbol, baseLots).catch(() => {});
@@ -249,11 +332,27 @@ async function recalcLotsAfterSL(symbol, entry, sl) {
 }
 
 // ── SL helpers ───────────────────────────────────────────────────
-function calcSLFromPct(direction, mt5Entry, slPct) {
-  const buffered = slPct * SL_BUFFER_MULT;
+// FIX A: server berekent derivedSlPct van absolute TV prijzen.
+// entry_price en sl_price komen uit de TV payload.
+// derivedSlPct = |entry_price - sl_price| / entry_price
+// Validatie: > 0 en <= 0.05 (5%), anders hard reject.
+function deriveSLPct(tvEntryPrice, tvSLPrice) {
+  if (!tvEntryPrice || !tvSLPrice || tvEntryPrice <= 0) return null;
+  return Math.abs(tvEntryPrice - tvSLPrice) / tvEntryPrice;
+}
+
+// MT5 SL berekening op basis van executionPrice + derivedSlPct.
+// ×1.5 buffer absorbeert slippage/delay én geeft shadow SL optimizer ruimte.
+function calcSLFromDerivedPct(direction, executionPrice, derivedSlPct) {
+  const buffered = derivedSlPct * SL_BUFFER_MULT;
   return direction === "buy"
-    ? parseFloat((mt5Entry * (1 - buffered)).toFixed(5))
-    : parseFloat((mt5Entry * (1 + buffered)).toFixed(5));
+    ? parseFloat((executionPrice * (1 - buffered)).toFixed(5))
+    : parseFloat((executionPrice * (1 + buffered)).toFixed(5));
+}
+
+// Backwards compat alias (gebruikt door widenExistingTradeSL intern)
+function calcSLFromPct(direction, mt5Entry, slPct) {
+  return calcSLFromDerivedPct(direction, mt5Entry, slPct);
 }
 
 function enforceMinStop(mt5Symbol, direction, entry, sl) {
@@ -282,6 +381,64 @@ function calcTPPrice(direction, entry, sl, rrTarget) {
   return direction === "buy"
     ? parseFloat((entry + dist * rrTarget).toFixed(5))
     : parseFloat((entry - dist * rrTarget).toFixed(5));
+}
+
+// FIX D: TP Floor Guard — TP moet minimaal MIN_TP_RR_FLOOR × SL-afstand zijn.
+// Basis = werkelijke MT5 SL afstand na enforceMinStop().
+// Retourneert gecorrigeerde TP prijs (onveranderd als floor OK is).
+function applyTPFloorGuard(direction, executionPrice, mt5SL, tp) {
+  const slDist    = Math.abs(executionPrice - mt5SL);
+  const minTPDist = slDist * MIN_TP_RR_FLOOR;
+  if (direction === "buy") {
+    const minTP = parseFloat((executionPrice + minTPDist).toFixed(5));
+    if (tp < minTP) {
+      console.log(`[TPFloor] BUY TP ${tp} < floor ${minTP} → gecorrigeerd`);
+      return minTP;
+    }
+  } else {
+    const minTP = parseFloat((executionPrice - minTPDist).toFixed(5));
+    if (tp > minTP) {
+      console.log(`[TPFloor] SELL TP ${tp} > floor ${minTP} → gecorrigeerd`);
+      return minTP;
+    }
+  }
+  return tp;
+}
+
+// ── FIX E: RR Verificatie met echte MT5 data ─────────────────────
+// Controleert na TP Floor Guard of SL/TP op de juiste kant liggen.
+// Retourneert { ok, slWrongSide, slTooWide, tpRRTooLow, actualSLPct, actualTPRR }
+function verifyRR(direction, executionPrice, mt5SL, mt5TP) {
+  const result = {
+    ok: true, slWrongSide: false, slTooWide: false, tpRRTooLow: false,
+    actualSLPct: null, actualTPRR: null,
+  };
+
+  // Bereken actuele SL afstand %
+  if (executionPrice > 0 && mt5SL > 0) {
+    result.actualSLPct = Math.abs(executionPrice - mt5SL) / executionPrice;
+  }
+
+  // SL op verkeerde kant?
+  if (direction === "buy"  && mt5SL >= executionPrice) { result.slWrongSide = true; result.ok = false; }
+  if (direction === "sell" && mt5SL <= executionPrice) { result.slWrongSide = true; result.ok = false; }
+
+  // SL te breed? (> 5%) — log only
+  if (result.actualSLPct != null && result.actualSLPct > 0.05) result.slTooWide = true;
+
+  // Bereken TP RR t.o.v. werkelijke SL afstand
+  if (mt5SL > 0 && mt5TP != null) {
+    const slDist = Math.abs(executionPrice - mt5SL);
+    const tpDist = direction === "buy"
+      ? mt5TP - executionPrice
+      : executionPrice - mt5TP;
+    result.actualTPRR = slDist > 0 ? parseFloat((tpDist / slDist).toFixed(3)) : null;
+  }
+
+  // TP RR te laag? (< 0.3R) — log only
+  if (result.actualTPRR != null && result.actualTPRR < 0.3) result.tpRRTooLow = true;
+
+  return result;
 }
 
 // ── TP Lock Engine ────────────────────────────────────────────────
@@ -577,6 +734,12 @@ async function handlePositionClosed(pos) {
   if (closeReason === "sl") {
     await recalcLotsAfterSL(pos.symbol, pos.entry, pos.sl).catch(() => {});
   }
+
+  // FIX C: rebuild currency exposure na close van EV-neutrale forex positie
+  const posInfo = getSymbolInfo(pos.symbol);
+  if (posInfo?.type === "forex" && !(pos.evMult > 1.0)) {
+    rebuildCurrencyExposure();
+  }
 }
 
 // ── Restore positions from MT5 ────────────────────────────────────
@@ -632,7 +795,7 @@ async function takeShadowSnapshots() {
   }
 }
 
-// ── Daily risk evaluation (FIX 7+11) ─────────────────────────────
+// ── Daily risk evaluation (FIX 7+11 + v10.6 mult correctie) ─────
 async function evaluateDailyRisk() {
   try {
     const todayStr = getBrusselsDateOnly();
@@ -667,16 +830,20 @@ async function evaluateDailyRisk() {
       const prev = keyRiskMult[key] ?? { streak: 0, evMult: 1.0, dayMult: 1.0 };
 
       if (hadTrades && isEvPositive && hasSample && isDayPositive) {
-        // FIX 1: EV mult on riskEUR (max ×4), day mult on lots (×1.2 per day)
-        const newEvMult  = Math.min(4.0, parseFloat((prev.evMult  * 1.0).toFixed(4)));  // EV mult set by EV, not streak
-        const newDayMult = parseFloat((prev.dayMult * 1.2).toFixed(4));                 // day mult grows daily
+        // v10.6 MULT CORRECTIE:
+        //   evMult  → uitsluitend bepaald door EV kwaliteit (max ×4), groeit via EV score.
+        //   dayMult → groeit ×1.2 per positieve dag (cumulatief streak).
+        // Beide multipliers werken uitsluitend op LOTS, NIET op riskEUR.
+        const evScore    = ev.bestEV ?? 0;
+        const newEvMult  = Math.min(4.0, parseFloat((1.0 + evScore * 10).toFixed(4))); // EV-gedreven
+        const newDayMult = parseFloat((prev.dayMult * 1.2).toFixed(4));
         keyRiskMult[key] = { streak: prev.streak + 1, evMult: newEvMult, dayMult: newDayMult };
         await saveKeyRiskMult(key, keyRiskMult[key]).catch(() => {});
         console.log(`[DailyRisk] ${key}: day+ → evMult=${newEvMult.toFixed(2)}× dayMult=${newDayMult.toFixed(2)}×`);
       } else {
         keyRiskMult[key] = { streak: 0, evMult: 1.0, dayMult: 1.0 };
         await saveKeyRiskMult(key, keyRiskMult[key]).catch(() => {});
-        if (prev.dayMult > 1.0 || prev.evMult > 1.0) {
+        if ((prev.dayMult ?? 1.0) > 1.0 || (prev.evMult ?? 1.0) > 1.0) {
           console.log(`[DailyRisk] ${key}: reset → ×1.0 (hadTrades=${hadTrades}, evPos=${isEvPositive}, dayPos=${isDayPositive})`);
         }
       }
@@ -757,7 +924,12 @@ app.post("/webhook", async (req, res) => {
   if (secret !== WEBHOOK_SECRET) return res.status(401).json({ error: "Unauthorized" });
 
   const body = req.body || {};
-  const { action, symbol: rawSymbol, entry: tvEntry, sl_pct, vwap, vwap_upper, vwap_lower } = body;
+  // FIX A: payload bevat entry_price + sl_price (absolute MT5 prijzen).
+  // sl_pct wordt NIET meer uit payload gelezen — server berekent derivedSlPct.
+  const { action, symbol: rawSymbol, entry_price, sl_price, vwap, vwap_upper, vwap_lower } = body;
+  // Backwards compat: als entry_price ontbreekt, val terug op 'entry' veld.
+  const tvEntryPrice = parseFloat(entry_price ?? body.entry) || 0;
+  const tvSLPrice    = parseFloat(sl_price) || 0;
 
   const direction = action === "buy" ? "buy" : action === "sell" ? "sell" : null;
   if (!direction) return res.status(400).json({ error: "action must be buy or sell" });
@@ -771,17 +943,20 @@ app.post("/webhook", async (req, res) => {
   }
   const { type: assetType, mt5: mt5Symbol } = symInfo;
 
-  const slPctRaw   = parseFloat(sl_pct);
-  const slPctHuman = slPctRaw ? (slPctRaw * 100).toFixed(3) + "%" : "invalid";
-  if (!slPctRaw || slPctRaw <= 0 || slPctRaw > 0.05) {
-    const reason = `Invalid sl_pct: ${sl_pct} (${slPctHuman}). Must be > 0 and <= 0.05`;
+  // FIX A: Server berekent derivedSlPct van TV absolute prijzen.
+  // Validatie: > 0 en <= 0.05 — anders hard reject.
+  const derivedSlPct = deriveSLPct(tvEntryPrice, tvSLPrice);
+  if (!derivedSlPct || derivedSlPct <= 0 || derivedSlPct > 0.05) {
+    const slPctHuman = derivedSlPct ? (derivedSlPct * 100).toFixed(3) + "%" : "invalid";
+    const reason = `FIX_A: derivedSlPct=${slPctHuman} ongeldig (entry_price=${tvEntryPrice}, sl_price=${tvSLPrice}). Moet > 0 en <= 0.05.`;
     logEvent({ type: "REJECTED", reason, symbol: symKey, direction });
-    await logSignal({ symbol: symKey, direction, tvEntry: parseFloat(tvEntry) || null, slPct: slPctRaw || null, slPctHuman, outcome: "REJECTED", rejectReason: reason }).catch(() => {});
+    await logSignal({ symbol: symKey, direction, tvEntry: tvEntryPrice, slPct: derivedSlPct ?? null, outcome: "REJECTED", rejectReason: reason }).catch(() => {});
     return res.status(400).json({ error: reason });
   }
+  const slPctHuman = (derivedSlPct * 100).toFixed(3) + "%";
 
   const session      = getSession();
-  const closePrice   = parseFloat(tvEntry) || 0;
+  const closePrice   = tvEntryPrice;
   const vwapMid      = parseFloat(vwap)       || 0;
   const vwapUpper    = parseFloat(vwap_upper) || 0;
   const vwapLower    = parseFloat(vwap_lower) || 0;
@@ -797,7 +972,7 @@ app.post("/webhook", async (req, res) => {
     if (vwapBandPct > 0.9) {
       const reason = `VWAP_BAND_EXHAUSTED: ${(vwapBandPct * 100).toFixed(0)}% into band`;
       logEvent({ type: "REJECTED", reason, symbol: symKey, direction, optimizerKey, vwapBandPct });
-      await logSignal({ symbol: symKey, direction, session, vwapPosition, optimizerKey, tvEntry: closePrice, slPct: slPctRaw, slPctHuman, vwap: vwapMid, vwapUpper, vwapLower, vwapBandPct, outcome: "REJECTED", rejectReason: reason }).catch(() => {});
+      await logSignal({ symbol: symKey, direction, session, vwapPosition, optimizerKey, tvEntry: closePrice, slPct: derivedSlPct, slPctHuman, vwap: vwapMid, vwapUpper, vwapLower, vwapBandPct, outcome: "REJECTED", rejectReason: reason }).catch(() => {});
       return res.status(200).json({ status: "VWAP_BAND_EXHAUSTED", vwapBandPct });
     }
   }
@@ -806,7 +981,7 @@ app.post("/webhook", async (req, res) => {
   const tradeWindow = canOpenNewTrade(symKey);
   if (!tradeWindow.allowed) {
     logEvent({ type: "REJECTED", reason: tradeWindow.reason, symbol: symKey, direction, assetType });
-    await logSignal({ symbol: symKey, direction, session, vwapPosition, optimizerKey, tvEntry: closePrice, slPct: slPctRaw, slPctHuman, vwap: vwapMid, vwapUpper, vwapLower, vwapBandPct, outcome: "OUTSIDE_WINDOW", rejectReason: tradeWindow.reason }).catch(() => {});
+    await logSignal({ symbol: symKey, direction, session, vwapPosition, optimizerKey, tvEntry: closePrice, slPct: derivedSlPct, slPctHuman, vwap: vwapMid, vwapUpper, vwapLower, vwapBandPct, outcome: "OUTSIDE_WINDOW", rejectReason: tradeWindow.reason }).catch(() => {});
     return res.status(200).json({ status: "OUTSIDE_TRADE_WINDOW", reason: tradeWindow.reason, assetType });
   }
 
@@ -815,39 +990,44 @@ app.post("/webhook", async (req, res) => {
   const dupLast = global._dupGuard?.[dupKey];
   if (dupLast && (Date.now() - dupLast) < DUP_GUARD_TTL_MS) {
     logEvent({ type: "DUPLICATE_BLOCKED", symbol: symKey, direction, optimizerKey });
-    await logSignal({ symbol: symKey, direction, session, vwapPosition, optimizerKey, tvEntry: closePrice, slPct: slPctRaw, slPctHuman, vwap: vwapMid, vwapBandPct, outcome: "DUPLICATE_BLOCKED" }).catch(() => {});
+    await logSignal({ symbol: symKey, direction, session, vwapPosition, optimizerKey, tvEntry: closePrice, slPct: derivedSlPct, slPctHuman, vwap: vwapMid, vwapBandPct, outcome: "DUPLICATE_BLOCKED" }).catch(() => {});
     return res.status(200).json({ status: "DUPLICATE_BLOCKED" });
   }
   global._dupGuard[dupKey] = Date.now();
 
-  // ── FIX 3: Anti-consolidation (forex) ────────────────────────────
-  // Rule A: exact same symbol + session + direction already open →
-  //   widen its SL ×1.5, adjust TP, block new trade.
-  // Rule B: same currency pair different symbol in same direction →
-  //   divide lotsize by number of related positions.
-  if (assetType === "forex") {
+  // ── FIX C: Anti-consolidation ─────────────────────────────────────
+  // Zelfde symbol + sessie + richting al open → modifyPosition() SL ×1.5
+  // cumulatief op huidige MT5 SL + TP herberekend. Geen nieuwe trade.
+  // Geldt voor ALLE asset types (niet alleen forex).
+  {
     const exactDup = findExactDuplicate(symKey, session, direction);
     if (exactDup) {
       const tpRRForDup = await getOptimalTP(exactDup.optimizerKey);
       await widenExistingTradeSL(exactDup, tpRRForDup);
-      const reason = `SAME_SYMBOL_SESSION_DIR: ${symKey} ${session} ${direction} already open — SL widened on existing trade`;
+      const reason = `ANTI_CONSOLIDATION: ${symKey} ${session} ${direction} al open — SL ×1.5 cumulatief op bestaande trade`;
       logEvent({ type: "CONSOLIDATION_SL_WIDENED", symbol: symKey, direction, session, positionId: exactDup.positionId, reason });
-      await logSignal({ symbol: symKey, direction, session, vwapPosition, optimizerKey, tvEntry: closePrice, slPct: slPctRaw, slPctHuman, vwap: vwapMid, vwapBandPct, outcome: "CONSOLIDATION_SL_WIDENED", rejectReason: reason }).catch(() => {});
+      await logSignal({ symbol: symKey, direction, session, vwapPosition, optimizerKey, tvEntry: closePrice, slPct: derivedSlPct, slPctHuman, vwap: vwapMid, vwapBandPct, outcome: "CONSOLIDATION_SL_WIDENED", rejectReason: reason }).catch(() => {});
       return res.status(200).json({ status: "CONSOLIDATION_SL_WIDENED", reason, existingPositionId: exactDup.positionId });
     }
   }
 
   // ── Risk & lots ───────────────────────────────────────────────────
-  // FIX 1: riskEUR = balance × riskPct × evMult (no cap, EV mult on riskEUR).
-  //        dayMult applied to lots separately.
-  // FIX 3 Rule B: related pairs in same direction → divide lots proportionally.
+  // v10.6 MULT CORRECTIE:
+  //   riskEUR = balance × pct (puur, geen evMult).
+  //   EV+ (evMult > 1.0): finalLots = baseLots × evMult × dayMult.
+  //     → tellen NIET mee in currency budget.
+  //   EV neutraal (evMult = 1.0): finalLots = baseLots × scaleFactor.
+  //     → tellen WEL mee in currency budget.
   const riskPct  = getSymbolRiskPct(symKey);
   const evMult   = getKeyEvMult(optimizerKey);
   const dayMult  = getKeyDayMult(optimizerKey);
-  let   riskEUR  = await calcRiskEUR(symKey, optimizerKey);  // already includes evMult
+  const isEvPlus = evMult > 1.0;
+
+  // Puur riskEUR — geen multipliers
+  const riskEUR  = await calcRiskEUR(symKey);
   const balance  = await getLiveBalance();
 
-  // Rule B: same-currency other pairs already open
+  // FIX 3 Rule B: same-currency other pairs (forex only)
   const relatedCount = (assetType === "forex") ? countRelatedForex(symKey, direction) : 0;
   const lotDivisor   = relatedCount > 0 ? (relatedCount + 1) : 1;
   if (relatedCount > 0) {
@@ -855,16 +1035,44 @@ app.post("/webhook", async (req, res) => {
     logEvent({ type: "LOTS_DIVIDED_FOREX", symbol: symKey, direction, relatedCount, lotDivisor });
   }
 
-  const tpRR     = await getOptimalTP(optimizerKey);
-  const rrLabel  = tpRR % 1 === 0 ? `${tpRR}R` : `${tpRR.toFixed(1)}R`;
-  const tempSL   = calcSLFromPct(direction, closePrice || 1, slPctRaw);
-  let   lots;
+  const tpRR    = await getOptimalTP(optimizerKey);
+  const rrLabel = tpRR % 1 === 0 ? `${tpRR}R` : `${tpRR.toFixed(1)}R`;
+
+  // Voorlopige SL voor lot berekening (op closePrice)
+  const tempSL  = calcSLFromDerivedPct(direction, closePrice || 1, derivedSlPct);
+  const info    = getSymbolInfo(symKey);
+  const lotVal  = LOT_VALUE[info?.type || "stock"] ?? 1;
+  const tempDist = Math.abs((closePrice || 1) - tempSL);
+
+  let lots;
   if (lotOverrides[symKey]) {
-    lots = parseFloat((lotOverrides[symKey] * dayMult / lotDivisor).toFixed(2));
-    console.log(`[Lots] ${symKey}: override=${lotOverrides[symKey]} × dayMult=${dayMult.toFixed(2)} ÷${lotDivisor} = ${lots}`);
+    // Lot override: baseLots × evMult × dayMult (of ×1 voor neutraal)
+    const base = lotOverrides[symKey];
+    lots = isEvPlus
+      ? parseFloat((base * evMult * dayMult / lotDivisor).toFixed(2))
+      : parseFloat((base / lotDivisor).toFixed(2));
+    console.log(`[Lots] ${symKey}: override=${base} evMult=${evMult.toFixed(2)} dayMult=${dayMult.toFixed(2)} ÷${lotDivisor} = ${lots}`);
   } else {
-    lots = calcLots(symKey, closePrice || 1, tempSL, riskEUR, dayMult);
+    // baseLots = riskEUR / (dist × lotVal) — dan evMult + dayMult erop
+    lots = calcLots(symKey, closePrice || 1, tempSL, riskEUR, evMult, dayMult);
     if (lotDivisor > 1) lots = Math.max(0.01, parseFloat((lots / lotDivisor).toFixed(2)));
+  }
+
+  // FIX C: currency exposure budget check (alleen voor EV neutraal + forex)
+  let scaleFactor = 1.0;
+  if (!isEvPlus && assetType === "forex") {
+    scaleFactor = await calcCurrencyScaleFactor(symKey, lots, tempDist, lotVal);
+    if (scaleFactor <= 0) {
+      const reason = `CURRENCY_BUDGET_EXHAUSTED: ${symKey} — beide valuta's op budget ceiling`;
+      logEvent({ type: "REJECTED", reason, symbol: symKey, direction, optimizerKey, evMult, scaleFactor: 0 });
+      await logSignal({ symbol: symKey, direction, session, vwapPosition, optimizerKey, tvEntry: closePrice, slPct: derivedSlPct, slPctHuman, vwap: vwapMid, vwapBandPct, outcome: "CURRENCY_BUDGET_EXHAUSTED", rejectReason: reason }).catch(() => {});
+      return res.status(200).json({ status: "CURRENCY_BUDGET_EXHAUSTED", reason });
+    }
+    if (scaleFactor < 1.0) {
+      lots = Math.max(0.01, parseFloat((lots * scaleFactor).toFixed(2)));
+      console.log(`[CurrBudget] ${symKey}: scaleFactor=${scaleFactor.toFixed(3)} → lots=${lots}`);
+      logEvent({ type: "LOTS_SCALED_CURRENCY_BUDGET", symbol: symKey, direction, scaleFactor, lots });
+    }
   }
 
   if (!lots || lots <= 0) {
@@ -891,7 +1099,7 @@ app.post("/webhook", async (req, res) => {
     const latencyMs = Date.now() - webhookReceivedAt;
     logEvent({ type: "ERROR", symbol: symKey, direction, reason: errMsg, optimizerKey });
     await logWebhook({ symbol: symKey, direction, session, vwapPos: vwapPosition, action, status: "ERROR", reason: errMsg, optimizerKey, entry: closePrice, sl: null, tp: null, lots, riskPct, latencyMs, tvEntry: closePrice, vwapBandPct });
-    await logSignal({ symbol: symKey, direction, session, vwapPosition, optimizerKey, tvEntry: closePrice, slPct: slPctRaw, slPctHuman, vwap: vwapMid, vwapBandPct, outcome: "ORDER_FAILED", rejectReason: errMsg, latencyMs }).catch(() => {});
+    await logSignal({ symbol: symKey, direction, session, vwapPosition, optimizerKey, tvEntry: closePrice, slPct: derivedSlPct, slPctHuman, vwap: vwapMid, vwapBandPct, outcome: "ORDER_FAILED", rejectReason: errMsg, latencyMs }).catch(() => {});
     return res.status(200).json({ status: "ORDER_FAILED", error: errMsg });
   }
 
@@ -911,25 +1119,98 @@ app.post("/webhook", async (req, res) => {
 
   // FIX 5: spread guard uses buffered SL distance
   if (assetType === "stock" && spread > 0) {
-    const guardSLDist = Math.abs(executionPrice - calcSLFromPct(direction, executionPrice, slPctRaw));
+    const guardSLDist = Math.abs(executionPrice - calcSLFromDerivedPct(direction, executionPrice, derivedSlPct));
     if (guardSLDist > 0 && spread > 0.25 * guardSLDist) {
       const reason = `SPREAD_GUARD: spread ${spread.toFixed(5)} > 25% of buffered SL dist ${guardSLDist.toFixed(5)}`;
       logEvent({ type: "SPREAD_GUARD_CLOSE", symbol: symKey, direction, positionId, spread, slDist: guardSLDist, reason });
-      await logSignal({ symbol: symKey, direction, session, vwapPosition, optimizerKey, tvEntry: closePrice, slPct: slPctRaw, slPctHuman, vwap: vwapMid, vwapBandPct, outcome: "SPREAD_GUARD_CLOSE", rejectReason: reason }).catch(() => {});
+      await logSignal({ symbol: symKey, direction, session, vwapPosition, optimizerKey, tvEntry: closePrice, slPct: derivedSlPct, slPctHuman, vwap: vwapMid, vwapBandPct, outcome: "SPREAD_GUARD_CLOSE", rejectReason: reason }).catch(() => {});
       try { await closePosition(positionId); } catch {}
       return res.status(200).json({ status: "SPREAD_GUARD_CLOSE", reason, positionId });
     }
   }
 
-  // Step C: Calculate SL + TP on real execution price
-  let mt5SL = calcSLFromPct(direction, executionPrice, slPctRaw);
+  // Step C: FIX A — SL berekening op executionPrice met derivedSlPct × 1.5 buffer.
+  // derivedSlPct komt van server (TV absolute prijzen), NIET van TV payload.
+  let mt5SL = calcSLFromDerivedPct(direction, executionPrice, derivedSlPct);
   mt5SL     = enforceMinStop(mt5Symbol, direction, executionPrice, mt5SL);
-  const mt5TP = calcTPPrice(direction, executionPrice, mt5SL, tpRR);
 
-  // Recalculate lots on real price
+  // Step C2: Recalculate lots op executionPrice (als geen override)
   if (!lotOverrides[symKey]) {
-    lots = calcLots(symKey, executionPrice, mt5SL, riskEUR, dayMult);
+    lots = calcLots(symKey, executionPrice, mt5SL, riskEUR, evMult, dayMult);
     if (lotDivisor > 1) lots = Math.max(0.01, parseFloat((lots / lotDivisor).toFixed(2)));
+    // FIX C: herbereken scaleFactor op echte dist
+    if (!isEvPlus && assetType === "forex") {
+      const realDist = Math.abs(executionPrice - mt5SL);
+      scaleFactor = await calcCurrencyScaleFactor(symKey, lots, realDist, lotVal);
+      if (scaleFactor <= 0) {
+        // Budget uitgeput na executie — position sluiten
+        try { await closePosition(positionId); } catch {}
+        const reason = `CURRENCY_BUDGET_EXHAUSTED post-execution: ${symKey}`;
+        logEvent({ type: "CURRENCY_BUDGET_EXHAUSTED_POSTEXEC", symbol: symKey, direction, positionId, reason });
+        return res.status(200).json({ status: "CURRENCY_BUDGET_EXHAUSTED", reason, positionId });
+      }
+      if (scaleFactor < 1.0) {
+        lots = Math.max(0.01, parseFloat((lots * scaleFactor).toFixed(2)));
+      }
+    }
+  }
+
+  // Step D: TP berekening
+  let mt5TP = calcTPPrice(direction, executionPrice, mt5SL, tpRR);
+
+  // FIX D: TP Floor Guard — vóór order naar MT5
+  const mt5TPBeforeFloor = mt5TP;
+  mt5TP = applyTPFloorGuard(direction, executionPrice, mt5SL, mt5TP);
+  if (mt5TP !== mt5TPBeforeFloor) {
+    logEvent({ type: "TP_FLOOR_APPLIED", symbol: symKey, direction, positionId,
+      tpBefore: mt5TPBeforeFloor, tpAfter: mt5TP, executionPrice, mt5SL });
+  }
+
+  // FIX E: RR Verificatie met werkelijke MT5 waarden
+  const rrCheck = verifyRR(direction, executionPrice, mt5SL, mt5TP);
+  if (rrCheck.slWrongSide) {
+    // Emergency close + ghost tracker start (Optie A)
+    console.error(`[RR_VERIFY_FAILED] ${positionId}: SL op VERKEERDE KANT! exec=${executionPrice} sl=${mt5SL} dir=${direction}`);
+    logEvent({
+      type: "RR_VERIFY_FAILED", positionId, symbol: symKey, direction,
+      executionPrice, mt5SL, mt5TP,
+      actualSLPct: rrCheck.actualSLPct, actualTPRR: rrCheck.actualTPRR,
+    });
+    // Sluit positie
+    try { await closePosition(positionId); } catch (ce) {
+      console.error(`[RR_VERIFY_FAILED] closePosition ${positionId} mislukt: ${ce.message}`);
+    }
+    // Register gesloten trade met excludeFromEV flag
+    const failedTrade = {
+      positionId, symbol: symKey, mt5Symbol, direction, vwapPosition,
+      optimizerKey, entry: executionPrice, sl: mt5SL, tp: mt5TP,
+      lots, riskEUR, riskPct, evMult, dayMult, balance,
+      session, openedAt: new Date().toISOString(), closedAt: new Date().toISOString(),
+      closeReason: "RR_VERIFY_FAILED", excludeFromEV: true,
+      maxRR: 0, hitTP: false, realizedPnlEUR: 0,
+      tvEntry: closePrice, executionPrice, slippage, vwapBandPct,
+      spread, derivedSlPct,
+    };
+    closedTrades.push(failedTrade);
+    if (closedTrades.length > MAX_CLOSED_TRADES) closedTrades.splice(0, closedTrades.length - MAX_CLOSED_TRADES);
+    await saveTrade(failedTrade).catch(() => {});
+    // Start ghost tracker zodat MAE + trueMaxRR bijgehouden worden
+    openPositions[positionId] = { ...failedTrade, maxPrice: executionPrice, currentPnL: 0 };
+    startGhostTracker(openPositions[positionId]);
+    // Positie direct verwijderen uit openPositions (al gesloten)
+    delete openPositions[positionId];
+    await logSignal({ symbol: symKey, direction, session, vwapPosition, optimizerKey, tvEntry: closePrice, slPct: derivedSlPct, slPctHuman, outcome: "RR_VERIFY_FAILED", latencyMs: Date.now() - webhookReceivedAt, positionId }).catch(() => {});
+    return res.status(200).json({ status: "RR_VERIFY_FAILED", positionId, executionPrice, mt5SL, mt5TP });
+  }
+
+  // FIX E: log-only checks (niet blokkeren)
+  if (rrCheck.slTooWide) {
+    logEvent({ type: "SL_TOO_WIDE", positionId, symbol: symKey, actualSLPct: rrCheck.actualSLPct });
+    console.warn(`[SL_TOO_WIDE] ${positionId}: actualSLPct=${(rrCheck.actualSLPct * 100).toFixed(3)}%`);
+  }
+  if (rrCheck.tpRRTooLow) {
+    logEvent({ type: "TP_RR_TOO_LOW", positionId, symbol: symKey, actualTPRR: rrCheck.actualTPRR });
+    console.warn(`[TP_RR_TOO_LOW] ${positionId}: actualTPRR=${rrCheck.actualTPRR}R`);
   }
 
   // Step D: Set SL + TP — retry up to 3×
@@ -953,34 +1234,45 @@ app.post("/webhook", async (req, res) => {
   const now = new Date().toISOString();
   openPositions[positionId] = {
     positionId, symbol: symKey, mt5Symbol, direction, vwapPosition,
-    optimizerKey, entry: executionPrice, sl: mt5SL, tp: mt5TP, slPct: slPctRaw,
+    optimizerKey, entry: executionPrice, sl: mt5SL, tp: mt5TP, slPct: derivedSlPct,
     lots, riskEUR, riskPct, evMult, dayMult, balance,
     spread, bid, ask, session, openedAt: now,
     maxPrice: executionPrice, maxRR: 0, currentPnL: 0,
     vwapAtEntry: vwapMid, tpRRUsed: tpRR,
     tvEntry: closePrice, executionPrice, slippage, vwapBandPct, slPctHuman,
-    lotDivisor,
+    lotDivisor, isEvPlus, scaleFactor, derivedSlPct,
   };
+
+  // FIX C: currency exposure bijwerken voor EV-neutrale forex trades
+  if (!isEvPlus && assetType === "forex") {
+    rebuildCurrencyExposure();
+  }
+
   startGhostTracker(openPositions[positionId]);
 
+  // FIX E: ORDER_PLACED log uitgebreid met derivedSlPct, actualSLPct, actualTPRR
   logEvent({
     type: "ORDER_PLACED", symbol: symKey, direction, session, vwapPosition, optimizerKey,
     executionPrice, slippage, sl: mt5SL, tp: mt5TP, tpRR, rrLabel,
     lots, riskPct, riskEUR: riskEUR.toFixed(2), evMult, dayMult, lotDivisor,
     spread: spread.toFixed(5), bid, ask, balance: balance.toFixed(2),
-    positionId, comment, slPct: slPctRaw, slPctHuman, vwap: vwapMid, vwapBandPct, latencyMs,
+    positionId, comment, derivedSlPct, slPctHuman, vwap: vwapMid, vwapBandPct, latencyMs,
+    actualSLPct: rrCheck.actualSLPct, actualTPRR: rrCheck.actualTPRR,
+    isEvPlus, scaleFactor,
+    tpFloorApplied: mt5TP !== mt5TPBeforeFloor,
   });
 
   await logWebhook({ symbol: symKey, direction, session, vwapPos: vwapPosition, action, status: "PLACED", positionId, optimizerKey, entry: executionPrice, sl: mt5SL, tp: mt5TP, lots, riskPct, latencyMs, tvEntry: closePrice, executionPrice, slippage, vwapBandPct });
-  await logSignal({ symbol: symKey, direction, session, vwapPosition, optimizerKey, tvEntry: closePrice, slPct: slPctRaw, slPctHuman, vwap: vwapMid, vwapUpper, vwapLower, vwapBandPct, outcome: "PLACED", latencyMs, positionId }).catch(() => {});
+  await logSignal({ symbol: symKey, direction, session, vwapPosition, optimizerKey, tvEntry: closePrice, slPct: derivedSlPct, slPctHuman, vwap: vwapMid, vwapUpper, vwapLower, vwapBandPct, outcome: "PLACED", latencyMs, positionId }).catch(() => {});
 
-  console.log(`[✓] ${direction.toUpperCase()} ${symKey} | key=${optimizerKey} | exec=${executionPrice} | sl=${mt5SL} tp=${mt5TP} (${rrLabel}) | lots=${lots} | riskEUR=€${riskEUR.toFixed(2)} evMult=×${evMult.toFixed(2)} dayMult=×${dayMult.toFixed(2)} | latency=${latencyMs}ms`);
+  console.log(`[✓] ${direction.toUpperCase()} ${symKey} | key=${optimizerKey} | exec=${executionPrice} | sl=${mt5SL} tp=${mt5TP} (${rrLabel}) | lots=${lots} | riskEUR=€${riskEUR.toFixed(2)} evMult=×${evMult.toFixed(2)} dayMult=×${dayMult.toFixed(2)} derivedSlPct=${slPctHuman} | latency=${latencyMs}ms`);
 
   return res.status(200).json({
     status: "PLACED", positionId, symbol: symKey, direction,
     executionPrice, slippage, sl: mt5SL, tp: mt5TP, tpRR, rrLabel,
     lots, riskPct, riskEUR, evMult, dayMult, lotDivisor, optimizerKey,
-    spread, bid, ask, balance, latencyMs, slPctHuman, vwapBandPct,
+    spread, bid, ask, balance, latencyMs, derivedSlPct, slPctHuman, vwapBandPct,
+    actualSLPct: rrCheck.actualSLPct, actualTPRR: rrCheck.actualTPRR, isEvPlus, scaleFactor,
   });
 });
 
@@ -1910,16 +2202,11 @@ document.addEventListener('DOMContentLoaded',()=>{initAll();loadAll();setInterva
 app.use((req, res) => res.status(404).json({ error: "Route not found", route: `${req.method} ${req.originalUrl}` }));
 
 // ── Startup ───────────────────────────────────────────────────────
-
-// 404
-app.use((req, res) => res.status(404).json({ error: "Route not found", route: `${req.method} ${req.originalUrl}` }));
-
-// ── Startup ───────────────────────────────────────────────────────
 async function start() {
   const missing = ["META_API_TOKEN", "META_ACCOUNT_ID", "WEBHOOK_SECRET"].filter(k => !process.env[k]);
   if (missing.length) { console.error(`[ERR] Missing env: ${missing.join(", ")}`); process.exit(1); }
 
-  console.log("🚀 PRONTO-AI v10.5 starting...");
+  console.log("🚀 PRONTO-AI v10.6 starting...");
   await initDB();
 
   // Load closed trades
@@ -1973,8 +2260,12 @@ async function start() {
 
   await restorePositionsFromMT5();
 
+  // FIX C: rebuild currency exposure na restore van open posities
+  rebuildCurrencyExposure();
+  console.log(`💱 Currency exposure rebuilt: ${JSON.stringify(Object.fromEntries(Object.entries(currencyExposure).map(([k,v])=>[k,v.toFixed(2)])))}`);
+
   app.listen(PORT, () => {
-    console.log(`[✓] PRONTO-AI v10.5 on port ${PORT}`);
+    console.log(`[✓] PRONTO-AI v10.6 on port ${PORT}`);
     console.log(`   🔹 Dashboard:      /`);
     console.log(`   🔹 Health:         /health`);
     console.log(`   🔹 EV Table:       /ev`);
@@ -1986,6 +2277,7 @@ async function start() {
     console.log(`   🔹 Signal Stats:   /signal-stats`);
     console.log(`   🔹 Webhook:        POST /webhook?secret=<secret>`);
     console.log(`   💵 Fixed risk:     ${(FIXED_RISK_PCT*100).toFixed(3)}% | Balance: €${liveBalance.toFixed(2)}`);
+    console.log(`   💰 Curr budget:    ${(CURRENCY_BUDGET_PCT*100).toFixed(1)}% per valuta | TP floor: ${MIN_TP_RR_FLOOR}R`);
     console.log(`   🕐 Ghost max:      72h | SL buffer: ×${SL_BUFFER_MULT}`);
     console.log(`   📊 Mult threshold: ${MULT_MIN_SAMPLE} ghost samples`);
   });
