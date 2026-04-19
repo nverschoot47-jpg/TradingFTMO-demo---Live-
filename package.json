@@ -1,7 +1,7 @@
 {
   "name": "nv-tradingview-webhook",
   "version": "10.6.0",
-  "description": "TradingView → MetaApi REST → FTMO MT5 | PRONTO-AI v10.6 — Multipliers correctie (riskEUR puur balance×pct), Fix A (server berekent sl_pct van TV absolute prijzen), Fix C (currency exposure budget + EV anti-consolidation), Fix D (TP floor guard), Fix E (RR verificatie met echte MT5 data)",
+  "description": "TradingView -> MetaApi REST -> FTMO MT5 | PRONTO-AI v10.6 - Multipliers fix, Fix A server-side sl_pct, Fix C currency budget, Fix D TP floor, Fix E RR verify",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -9,7 +9,7 @@
   },
   "dependencies": {
     "express": "^4.19.2",
-    "helmet": "^8.0.0",
+    "helmet": "^7.2.0",
     "node-cron": "^3.0.3",
     "pg": "^8.13.0"
   },
@@ -17,7 +17,7 @@
     "nodemon": "^3.1.0"
   },
   "engines": { "node": ">=18.0.0" },
-  "author": "Nick Verschoot — PRONTO-AI",
+  "author": "Nick Verschoot - PRONTO-AI",
   "license": "UNLICENSED",
   "private": true
 }
