@@ -1,7 +1,7 @@
 {
   "name": "nv-tradingview-webhook",
-  "version": "10.4.0",
-  "description": "TradingView → MetaApi REST → FTMO MT5 | PRONTO-AI v10.4 — ghost continuity on manual close, SL×1.5 buffer, lotsize-based risk scaling, stock cap removed, nightly optimizer safe for open ghosts, SL/TP retry ×3, Max SL% in dashboard",
+  "version": "10.5.0",
+  "description": "TradingView → MetaApi REST → FTMO MT5 | PRONTO-AI v10.5 — 20 fixes: EV mult on riskEUR, day mult on lots, lotOverrides persistent, anti-consolidation SL-widen, closeReason price-based, shadow restore, dupGuard TTL, ghost sl=0 guard, evaluateDailyRisk all keys",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -16,9 +16,7 @@
   "devDependencies": {
     "nodemon": "^3.1.0"
   },
-  "engines": {
-    "node": ">=18.0.0"
-  },
+  "engines": { "node": ">=18.0.0" },
   "author": "Nick Verschoot — PRONTO-AI",
   "license": "UNLICENSED",
   "private": true
