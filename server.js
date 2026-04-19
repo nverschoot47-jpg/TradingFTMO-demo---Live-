@@ -1428,7 +1428,7 @@ app.get(["/", "/dashboard"], async (req, res) => {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PRONTO-AI v10.5</title>
+<title>PRONTO-AI v10.6</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600;700&family=IBM+Plex+Sans+Condensed:wght@500;600;700&display=swap" rel="stylesheet">
 <style>
@@ -1541,7 +1541,7 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
 <div class="hdr">
   <div>
     <div class="logo">PRONTO-AI</div>
-    <div class="ver">v10.5 · TradingView → MetaApi → FTMO MT5 · Fixed Risk ${(FIXED_RISK_PCT*100).toFixed(3)}% · SL Buffer ×${SL_BUFFER_MULT}</div>
+    <div class="ver">v10.6 · TradingView → MetaApi → FTMO MT5 · Fixed Risk ${(FIXED_RISK_PCT*100).toFixed(3)}% · SL Buffer ×${SL_BUFFER_MULT} · Fix A/C/D/E actief</div>
   </div>
   <div class="hdr-r">
     <span class="sb s-outside" id="hdr-sess">—</span>
@@ -1734,33 +1734,37 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
 
 <!-- 8. LOT SIZE CALCULATOR -->
 <div class="sec">
-  <div class="sh"><span class="st o">▸ LOT SIZE CALCULATOR</span><span class="sm">formula · what to change · live config</span></div>
+  <div class="sh"><span class="st o">▸ LOT SIZE CALCULATOR</span><span class="sm">formule · wat te wijzigen · live config</span></div>
   <div class="lotbox">
     <div class="lc">
-      <div class="lct b">Formula</div>
+      <div class="lct b">Formule — v10.6</div>
       <div class="lcf">
-        Every trade risks the same <b style="color:var(--b)">€ amount</b> regardless of SL distance.
-        <div class="formula">riskEUR = balance × riskPct × mult<br>dist    = |entry − SL|<br>lots    = riskEUR ÷ (dist × lotValue)</div>
+        Elke trade riskeert exact hetzelfde <b style="color:var(--b)">€ bedrag</b> ongeacht SL afstand. <b style="color:var(--o)">evMult en dayMult werken alleen op lotsize, NIET op riskEUR.</b>
+        <div class="formula">riskEUR  = balance × riskPct  <span style="color:#888">← puur, geen multipliers</span><br>dist     = |entry_price − sl_price| / entry_price × 1.5 buffer<br>baseLots = riskEUR ÷ (dist × lotValue)<br>finalLots= baseLots × evMult × dayMult  <span style="color:#888">← EV+ trades</span><br>finalLots= baseLots × scaleFactor        <span style="color:#888">← EV neutraal</span></div>
         <b style="color:var(--b)">lotValue:</b> Forex=<code>10</code> Index=<code>20</code> Commodity=<code>100</code> Stock=<code>1</code><br><br>
-        Stocks capped at <b style="color:var(--o)">20% of balance</b> as max notional.
+        <b style="color:var(--g)">Fix A:</b> SL% wordt server-side berekend van <code>entry_price</code> + <code>sl_price</code> (absolute MT5 prijzen uit TV payload). TV <code>sl_pct</code> veld wordt niet meer vertrouwd.<br><br>
+        <b style="color:var(--b)">Fix C:</b> EV+ trades (evMult &gt; 1.0) tellen <b>niet</b> mee in currency budget. EV neutraal: max <code>CURRENCY_BUDGET_PCT</code> (2%) per valuta.
       </div>
     </div>
     <div class="lc">
-      <div class="lct g">Variables to Change</div>
+      <div class="lct g">Wat te Wijzigen</div>
       <ul class="chlist">
-        <li><b>FIXED_RISK_PCT</b> — master risk%. Set in Railway: <code>FIXED_RISK_PCT=0.002</code></li>
-        <li><b>RISK_&lt;SYM&gt;</b> — per-symbol override: <code>RISK_EURUSD=0.002</code></li>
-        <li><b>LOTS_&lt;SYM&gt;</b> — hard lot override after SL recalc: <code>LOTS_NVDA=0.05</code></li>
-        <li><b>LOT_VALUE</b> in server.js — lot value per type if broker differs</li>
-        <li><b>MIN_STOP</b> in server.js — min SL distance per symbol</li>
-        <li><b>Risk mult</b> — auto ×1.2/day up to ×4 after EV+ streak (needs 30 ghost samples)</li>
+        <li><b>FIXED_RISK_PCT</b> — basis risk%. Stel in Railway: <code>FIXED_RISK_PCT=0.002</code>. <span style="color:var(--r)">Wijzig alleen buiten trading uren of weekend.</span></li>
+        <li><b>RISK_&lt;SYM&gt;</b> — per-symbool override: <code>RISK_EURUSD=0.002</code></li>
+        <li><b>LOTS_&lt;SYM&gt;</b> — hard lot override na SL herberekening: <code>LOTS_NVDA=0.05</code></li>
+        <li><b>CURRENCY_BUDGET_PCT</b> — max EUR exposure per valuta voor EV neutrale forex. Default: <code>0.02</code> (2%)</li>
+        <li><b>MIN_TP_RR_FLOOR</b> — minimum TP afstand als factor van SL. Default: <code>0.5</code> (0.5R)</li>
+        <li><b>LOT_VALUE</b> in server.js — lot waarde per type als broker afwijkt</li>
+        <li><b>MIN_STOP</b> in server.js — min SL afstand per MT5 symbool</li>
+        <li><b>evMult</b> — automatisch via EV score (max ×4). Werkt op <b>lots</b>, niet riskEUR</li>
+        <li><b>dayMult</b> — automatisch ×1.2/dag bij positieve EV streak (min 30 ghost samples). Werkt op <b>lots</b></li>
       </ul>
     </div>
     <div class="lc">
       <div class="lct y">Live Config &amp; Lot Overrides</div>
       <div class="tw" style="border:none">
         <table id="risk-tbl" style="font-size:10px">
-          <thead><tr><th>Symbol</th><th>Type</th><th>Risk%</th><th>Risk €</th><th>Mult</th><th>Lot OV</th></tr></thead>
+          <thead><tr><th>Symbol</th><th>Type</th><th>Risk%</th><th>Risk € (puur)</th><th>evMult (lots)</th><th>Lot OV</th></tr></thead>
           <tbody id="risk-body"><tr><td colspan="6" class="nodata">Loading…</td></tr></tbody>
         </table>
       </div>
