@@ -129,8 +129,13 @@ const MIN_STOP = {
   "XAUUSD": 0.5,
 };
 
+// LOT_VALUE = contract size per lot per asset type.
+// Forex:     100.000 units (standaard lot). dist × 100000 = correcte pip waarde.
+// Index:     20 EUR per punt per lot (bijv. DAX, NAS100 — broker afhankelijk).
+// Commodity: 100 (bijv. XAUUSD: 100 troy oz per lot).
+// Stock:     1 (CFD: 1 aandeel per lot).
 const LOT_VALUE = {
-  index: 20, commodity: 100, stock: 1, forex: 10,
+  index: 20, commodity: 100, stock: 1, forex: 100000,
 };
 
 // ── Live balance cache ────────────────────────────────────────────
@@ -301,21 +306,50 @@ async function calcCurrencyScaleFactor(symbol, proposedLots, dist, lotVal) {
   return Math.min(1.0, Math.max(0, minScale));
 }
 
+// ── MT5 Symbol Spec Cache ─────────────────────────────────────────
+// Haalt contractSize en tickValue op van MT5 via MetaApi.
+// Gecached per mt5Symbol — één keer ophalen, daarna uit cache.
+// lotValue = tickValue / tickSize  (EUR per 1 prijspunt per lot)
+// Fallback: LOT_VALUE[type] als MetaApi niet beschikbaar is.
+const symbolSpecCache = {};
+
+async function fetchSymbolLotValue(mt5Symbol, assetType) {
+  if (symbolSpecCache[mt5Symbol]) return symbolSpecCache[mt5Symbol];
+  try {
+    const spec = await metaFetch(`/symbols/${encodeURIComponent(mt5Symbol)}/specification`, {}, 6000);
+    // MetaApi geeft: contractSize, tickSize, tickValue (in account currency)
+    const contractSize = parseFloat(spec?.contractSize) || null;
+    const tickSize     = parseFloat(spec?.tickSize)     || null;
+    const tickValue    = parseFloat(spec?.tickValue)    || null;
+    if (contractSize && tickSize && tickValue && tickSize > 0) {
+      // lotValue = hoeveel account-currency verandert per 1 prijspunt per lot
+      const lotVal = parseFloat((tickValue / tickSize).toFixed(6));
+      symbolSpecCache[mt5Symbol] = { lotVal, contractSize, tickSize, tickValue, source: "mt5" };
+      console.log(`[SymSpec] ${mt5Symbol}: contractSize=${contractSize} tickSize=${tickSize} tickValue=${tickValue} -> lotVal=${lotVal}`);
+      return symbolSpecCache[mt5Symbol];
+    }
+  } catch (e) {
+    console.warn(`[SymSpec] ${mt5Symbol}: kon spec niet ophalen (${e.message}) — gebruik fallback`);
+  }
+  // Fallback op statische LOT_VALUE
+  const lotVal = LOT_VALUE[assetType] ?? 1;
+  symbolSpecCache[mt5Symbol] = { lotVal, source: "fallback" };
+  return symbolSpecCache[mt5Symbol];
+}
 // ── Lot calculation ───────────────────────────────────────────────
-// v10.6 sequentieel:
-//   baseLots = riskEUR / (dist × lotVal)
-//   finalLots = baseLots × evMult × dayMult
-// riskEUR is puur (balance × pct). Multipliers alleen op lotsize.
-function calcLots(symbol, entry, sl, riskEUR, evMult, dayMult) {
-  const info    = getSymbolInfo(symbol);
-  const type    = info?.type || "stock";
-  const lotVal  = LOT_VALUE[type] ?? 1;
-  const dist    = Math.abs(entry - sl);
-  if (!dist || !riskEUR) return 0.01;
-  const baseLots  = riskEUR / (dist * lotVal);
-  const em        = (evMult  && evMult  > 0) ? evMult  : 1.0;
-  const dm        = (dayMult && dayMult > 0) ? dayMult : 1.0;
-  return Math.max(0.01, parseFloat((baseLots * em * dm).toFixed(2)));
+// v10.7: lotVal live opgehaald van MT5 via fetchSymbolLotValue().
+// Fallback op statische LOT_VALUE als MetaApi spec niet beschikbaar.
+// Retourneert object: { lots, lotVal, source }
+async function calcLots(symbol, mt5Sym, assetType, entry, sl, riskEUR, evMult, dayMult) {
+  const spec   = await fetchSymbolLotValue(mt5Sym, assetType);
+  const lotVal = spec.lotVal;
+  const dist   = Math.abs(entry - sl);
+  if (!dist || !riskEUR) return { lots: 0.01, lotVal, source: spec.source };
+  const baseLots = riskEUR / (dist * lotVal);
+  const em       = (evMult  && evMult  > 0) ? evMult  : 1.0;
+  const dm       = (dayMult && dayMult > 0) ? dayMult : 1.0;
+  const lots     = Math.max(0.01, parseFloat((baseLots * em * dm).toFixed(2)));
+  return { lots, lotVal, source: spec.source };
 }
 
 // ── Recalculate base lots after SL hit ────────────────────────────
@@ -1126,10 +1160,10 @@ app.post("/webhook", async (req, res) => {
   const tpRR    = await getOptimalTP(optimizerKey);
   const rrLabel = tpRR % 1 === 0 ? `${tpRR}R` : `${tpRR.toFixed(1)}R`;
 
-  // Voorlopige SL voor lot berekening (op closePrice)
-  const tempSL  = calcSLFromDerivedPct(direction, closePrice || 1, derivedSlPct);
-  const info    = getSymbolInfo(symKey);
-  const lotVal  = LOT_VALUE[info?.type || "stock"] ?? 1;
+  // Voorlopige SL voor lot berekening (op closePrice) — lotVal wordt live bijgewerkt
+  const tempSL   = calcSLFromDerivedPct(direction, closePrice || 1, derivedSlPct);
+  const symInfoL = getSymbolInfo(symKey);
+  let   lotVal   = LOT_VALUE[symInfoL?.type || "stock"] ?? 1; // fallback, overschreven door live MT5 spec
   const tempDist = Math.abs((closePrice || 1) - tempSL);
 
   let lots;
@@ -1141,9 +1175,12 @@ app.post("/webhook", async (req, res) => {
       : parseFloat((base / lotDivisor).toFixed(2));
     console.log(`[Lots] ${symKey}: override=${base} evMult=${evMult.toFixed(2)} dayMult=${dayMult.toFixed(2)} ÷${lotDivisor} = ${lots}`);
   } else {
-    // baseLots = riskEUR / (dist × lotVal) — dan evMult + dayMult erop
-    lots = calcLots(symKey, closePrice || 1, tempSL, riskEUR, evMult, dayMult);
+    // Live lotVal van MT5 spec — gecached na eerste keer
+    const calcResult = await calcLots(symKey, mt5Symbol, assetType, closePrice || 1, tempSL, riskEUR, evMult, dayMult);
+    lots = calcResult.lots;
+    lotVal = calcResult.lotVal; // update lotVal met live waarde voor currency budget check
     if (lotDivisor > 1) lots = Math.max(0.01, parseFloat((lots / lotDivisor).toFixed(2)));
+    console.log(`[Lots] ${symKey}: ${calcResult.source} lotVal=${lotVal} baseLots→${lots}`);
   }
 
   // FIX C: currency exposure budget check (alleen voor EV neutraal + forex)
@@ -1234,16 +1271,17 @@ app.post("/webhook", async (req, res) => {
   let mt5SL = calcSLFromDerivedPct(direction, executionPrice, derivedSlPct);
   mt5SL     = enforceMinStop(mt5Symbol, direction, executionPrice, mt5SL);
 
-  // Step C2: Recalculate lots op executionPrice (als geen override)
+  // Step C2: Recalculate lots op executionPrice (als geen override) — nu met live lotVal
   if (!lotOverrides[symKey]) {
-    lots = calcLots(symKey, executionPrice, mt5SL, riskEUR, evMult, dayMult);
+    const calcResult2 = await calcLots(symKey, mt5Symbol, assetType, executionPrice, mt5SL, riskEUR, evMult, dayMult);
+    lots   = calcResult2.lots;
+    lotVal = calcResult2.lotVal; // live lotVal na executie (spec al gecached)
     if (lotDivisor > 1) lots = Math.max(0.01, parseFloat((lots / lotDivisor).toFixed(2)));
-    // FIX C: herbereken scaleFactor op echte dist
+    // FIX C: herbereken scaleFactor op echte dist met live lotVal
     if (!isEvPlus && assetType === "forex") {
       const realDist = Math.abs(executionPrice - mt5SL);
       scaleFactor = await calcCurrencyScaleFactor(symKey, lots, realDist, lotVal);
       if (scaleFactor <= 0) {
-        // Budget uitgeput na executie — position sluiten
         try { await closePosition(positionId); } catch {}
         const reason = `CURRENCY_BUDGET_EXHAUSTED post-execution: ${symKey}`;
         logEvent({ type: "CURRENCY_BUDGET_EXHAUSTED_POSTEXEC", symbol: symKey, direction, positionId, reason });
