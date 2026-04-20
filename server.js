@@ -1232,7 +1232,7 @@ app.post("/webhook", async (req, res) => {
   let executionPrice = closePrice;
   let spread = 0, bid = null, ask = null;
   try {
-    await new Promise(r => setTimeout(r, 600));
+    await new Promise(r => setTimeout(r, 2500)); // verhoogd van 600ms → 2500ms (MetaApi positie beschikbaarheid)
     const positions = await fetchOpenPositions();
     const thisPos   = Array.isArray(positions) ? positions.find(p => String(p.id) === positionId) : null;
     if (thisPos?.openPrice) executionPrice = parseFloat(thisPos.openPrice);
@@ -1353,18 +1353,18 @@ app.post("/webhook", async (req, res) => {
 
   // Step D: Set SL + TP — retry up to 3×
   let slTpSet = false;
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  for (let attempt = 1; attempt <= 5; attempt++) {
     try {
       await metaFetch(`/positions/${positionId}`, { method: "PUT", body: JSON.stringify({ stopLoss: mt5SL, takeProfit: mt5TP }) }, 8000);
       console.log(`[SL/TP] ${positionId} → SL=${mt5SL} TP=${mt5TP} (${tpRR}R) exec=${executionPrice} attempt=${attempt}`);
       slTpSet = true; break;
     } catch (e) {
       console.warn(`[!] SL/TP attempt ${attempt}/3 failed: ${e.message}`);
-      if (attempt < 3) await new Promise(r => setTimeout(r, 1000 * attempt));
+      if (attempt < 5) await new Promise(r => setTimeout(r, 2000 * attempt));
     }
   }
   if (!slTpSet) {
-    logEvent({ type: "SL_TP_SET_FAILED", positionId, symbol: symKey, executionPrice, mt5SL, mt5TP, note: "3 retries exhausted" });
+    logEvent({ type: "SL_TP_SET_FAILED", positionId, symbol: symKey, executionPrice, mt5SL, mt5TP, note: "5 retries exhausted" });
   }
 
   // Register position
@@ -2478,6 +2478,25 @@ async function start() {
   if (dr) console.log(`📊 Last daily risk record: ${dr.tradeDate}`);
 
   await restorePositionsFromMT5();
+
+  // STARTUP: prefetch MT5 symbol specs voor alle catalog symbolen
+  // Zo is de lotVal cache gevuld voor de eerste trade - geen fallback meer.
+  console.log("Prefetching MT5 symbol specs...");
+  const prefetchResults = { ok: 0, fallback: 0 };
+  await Promise.allSettled(
+    Object.entries(SYMBOL_CATALOG).map(async ([sym, info]) => {
+      try {
+        const spec = await fetchSymbolLotValue(info.mt5, info.type);
+        if (spec.source === "mt5") prefetchResults.ok++;
+        else prefetchResults.fallback++;
+        console.log(`[SymSpec] ${sym} (${info.mt5}): lotVal=${spec.lotVal} source=${spec.source}`);
+      } catch (e) {
+        prefetchResults.fallback++;
+        console.warn(`[SymSpec] ${sym}: prefetch failed - ${e.message}`);
+      }
+    })
+  );
+  console.log(`[SymSpec] Done: ${prefetchResults.ok} live van MT5, ${prefetchResults.fallback} fallback`);
 
   // FIX C: rebuild currency exposure na restore van open posities
   rebuildCurrencyExposure();
