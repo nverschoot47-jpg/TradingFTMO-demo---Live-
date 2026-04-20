@@ -61,7 +61,25 @@ app.use(helmet({
     },
   },
 }));
+// express.json() parset alleen Content-Type: application/json.
+// TradingView stuurt webhooks soms als Content-Type: text/plain.
+// express.text() vangt dit op en we parsen het handmatig als JSON.
 app.use(express.json());
+app.use(express.text({ type: "text/plain" }));
+
+// Middleware: parse text/plain body als JSON wanneer nodig.
+// TradingView webhook body is altijd JSON-string, maar Content-Type kan text/plain zijn.
+app.use((req, res, next) => {
+  if (typeof req.body === "string" && req.body.trim().startsWith("{")) {
+    try {
+      req.body = JSON.parse(req.body);
+      console.log("[BodyParse] text/plain body geparsed als JSON OK");
+    } catch (e) {
+      console.warn("[BodyParse] text/plain body kon niet geparsed worden:", e.message, "raw:", req.body.slice(0, 200));
+    }
+  }
+  next();
+});
 
 // ── DB & Session imports ─────────────────────────────────────────
 const {
@@ -1083,8 +1101,20 @@ function logReject(label, { symbol, direction, session, optimizerKey, reason, pa
 app.post("/webhook", async (req, res) => {
   const webhookReceivedAt = Date.now();
 
+  // ── Debug log: elke inkomende webhook request zichtbaar in Railway logs ──
+  console.log(`[WebhookIN][${new Date().toISOString()}] ─────────────────────────`);
+  console.log(`  Method       : ${req.method}`);
+  console.log(`  Content-Type : ${req.headers["content-type"] ?? "(geen)"}`);
+  console.log(`  Body type    : ${typeof req.body}`);
+  console.log(`  Body preview : ${JSON.stringify(req.body)?.slice(0, 300) ?? "(leeg)"}`);
+  console.log(`  Query secret : ${req.query.secret ? "aanwezig" : "(geen query secret)"}`);
+  console.log(`[WebhookIN] ─────────────────────────────────────────────────────`);
+
   const secret = req.query.secret || req.body?.secret;
-  if (secret !== WEBHOOK_SECRET) return res.status(401).json({ error: "Unauthorized" });
+  if (secret !== WEBHOOK_SECRET) {
+    console.warn(`[WebhookIN] 401 UNAUTHORIZED — secret mismatch. Query: "${req.query.secret ?? "(geen)"}" Body.secret: "${req.body?.secret ?? "(geen)"}"`);
+    return res.status(401).json({ error: "Unauthorized" });
+  }
 
   const body = req.body || {};
   const { action, symbol: rawSymbol, vwap, vwap_upper, vwap_lower } = body;
