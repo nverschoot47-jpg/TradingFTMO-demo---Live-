@@ -1,6 +1,26 @@
 // ===============================================================
-// server.js  v11.2  |  PRONTO-AI
+// server.js  v11.3  |  PRONTO-AI
 // TradingView → MetaApi REST → FTMO MT5
+//
+// v11.3 — PHANTOM TRADE FIX + STOCK VOLUME STEP (21 April 2026):
+//
+//  FIX C1 — local_ positionId guard:
+//    Als MetaApi geen positionId teruggeeft na placeOrder(), genereert de
+//    server een fake local_${Date.now()} ID. Alle vervolgcalls faalden dan
+//    met HTTP 404 en de trade werd toch opgeslagen als 0.00R phantom entry
+//    in de TP Optimiser. Nieuw: na 2.5s wacht, zoek echte positie op MT5
+//    o.b.v. symbol + richting + geopend < 30s geleden.
+//    Gevonden → gebruik echt ID en ga door.
+//    Niet gevonden → ORDER_NOT_CONFIRMED return (geen DB opslaan, geen ghost).
+//
+//  FIX C2 — Stock volume step (ZM, AAPL, TSLA, etc.):
+//    calcLots() rondde altijd af op 0.01 stap. Stocks hebben minLot=1 en
+//    volumeStep=1 (hele aandelen). MT5/FTMO weigerde volumes als 432.82.
+//    fetchSymbolLotValue() slaat nu ook minVolume en volumeStep op uit spec.
+//    calcLots() rondt af via floor naar volumeStep:
+//      stocks: 432.82 → 432 lots (hele aandelen)
+//      forex:  0.726  → 0.72 lots (0.01 stap, ongewijzigd gedrag)
+//    minVolume gebruikt als ondergrens (ipv hardcoded 0.01).
 //
 // v11.2 — UK100 RISK FIX + VWAP BAND THRESHOLD (20 April 2026):
 //
@@ -437,19 +457,25 @@ async function fetchSymbolLotValue(mt5Symbol, assetType) {
     const contractSize = parseFloat(spec?.contractSize) || null;
     const tickSize     = parseFloat(spec?.tickSize)     || null;
     const tickValue    = parseFloat(spec?.tickValue)    || null;
+    // FIX C2 (v11.3): sla ook minVolume en volumeStep op — kritisch voor stocks (volumeStep=1)
+    const minVolume    = parseFloat(spec?.minVolume)    || null;
+    const volumeStep   = parseFloat(spec?.volumeStep)   || null;
     if (contractSize && tickSize && tickValue && tickSize > 0) {
       // lotValue = hoeveel account-currency verandert per 1 prijspunt per lot
       const lotVal = parseFloat((tickValue / tickSize).toFixed(6));
-      symbolSpecCache[mt5Symbol] = { lotVal, contractSize, tickSize, tickValue, source: "mt5" };
-      console.log(`[SymSpec] ${mt5Symbol}: contractSize=${contractSize} tickSize=${tickSize} tickValue=${tickValue} -> lotVal=${lotVal}`);
+      symbolSpecCache[mt5Symbol] = { lotVal, contractSize, tickSize, tickValue, minVolume, volumeStep, source: "mt5" };
+      console.log(`[SymSpec] ${mt5Symbol}: contractSize=${contractSize} tickSize=${tickSize} tickValue=${tickValue} -> lotVal=${lotVal} minVol=${minVolume} step=${volumeStep}`);
       return symbolSpecCache[mt5Symbol];
     }
   } catch (e) {
     console.warn(`[SymSpec] ${mt5Symbol}: kon spec niet ophalen (${e.message}) — gebruik fallback`);
   }
   // Fallback: eerst per-symbol override, dan generiek per asset type
-  const lotVal = LOT_VALUE_BY_MT5[mt5Symbol] ?? LOT_VALUE[assetType] ?? 1;
-  symbolSpecCache[mt5Symbol] = { lotVal, source: "fallback" };
+  // FIX C2 (v11.3): stocks fallback — minVolume=1, volumeStep=1 (hele aandelen)
+  const lotVal     = LOT_VALUE_BY_MT5[mt5Symbol] ?? LOT_VALUE[assetType] ?? 1;
+  const minVolume  = assetType === "stock" ? 1 : 0.01;
+  const volumeStep = assetType === "stock" ? 1 : 0.01;
+  symbolSpecCache[mt5Symbol] = { lotVal, minVolume, volumeStep, source: "fallback" };
   return symbolSpecCache[mt5Symbol];
 }
 // ── Lot calculation ───────────────────────────────────────────────
@@ -457,22 +483,37 @@ async function fetchSymbolLotValue(mt5Symbol, assetType) {
 // Fallback op statische LOT_VALUE als MetaApi spec niet beschikbaar.
 // Retourneert object: { lots, lotVal, source }
 async function calcLots(symbol, mt5Sym, assetType, entry, sl, riskEUR, evMult, dayMult) {
-  const spec   = await fetchSymbolLotValue(mt5Sym, assetType);
-  const lotVal = spec.lotVal;
-  const dist   = Math.abs(entry - sl);
-  if (!dist || !riskEUR) return { lots: 0.01, lotVal, source: spec.source };
+  const spec       = await fetchSymbolLotValue(mt5Sym, assetType);
+  const lotVal     = spec.lotVal;
+  // FIX C2 (v11.3): gebruik volumeStep en minVolume uit MT5 spec.
+  // Stocks: volumeStep=1, minVolume=1 (hele aandelen, geen decimalen).
+  // Forex:  volumeStep=0.01, minVolume=0.01 (ongewijzigd gedrag).
+  const volumeStep = spec.volumeStep ?? (assetType === "stock" ? 1 : 0.01);
+  const minVolume  = spec.minVolume  ?? (assetType === "stock" ? 1 : 0.01);
+
+  const dist = Math.abs(entry - sl);
+  if (!dist || !riskEUR) return { lots: minVolume, lotVal, source: spec.source };
   const baseLots = riskEUR / (dist * lotVal);
   const em       = (evMult  && evMult  > 0) ? evMult  : 1.0;
   const dm       = (dayMult && dayMult > 0) ? dayMult : 1.0;
   const rawLots  = baseLots * em * dm;
+
+  // FIX C2 (v11.3): rond af naar volumeStep via floor (niet 0.01 hardcoded).
+  // floor(432.82 / 1) * 1 = 432  → stocks: hele aandelen
+  // floor(0.726  / 0.01) * 0.01 = 0.72 → forex: 0.01 stap
+  const steppedLots = Math.floor(rawLots / volumeStep) * volumeStep;
+  const clampedLots = Math.max(minVolume, steppedLots);
+
   // FIX R2 (v11.0): waarschuw als min lot floor de werkelijke risk inflateert.
-  // Dit gebeurt typisch bij indexes met kleine SL in punten maar grote lotVal.
-  if (rawLots < 0.01) {
-    const inflatedRisk = 0.01 * dist * lotVal;
+  if (rawLots < minVolume) {
+    const inflatedRisk = minVolume * dist * lotVal;
     const inflationPct = ((inflatedRisk / riskEUR - 1) * 100).toFixed(0);
-    console.warn(`[MinLot] ${mt5Sym} (${assetType}): rawLots=${rawLots.toFixed(5)} → clamped 0.01. actualRisk=€${inflatedRisk.toFixed(2)} vs intended=€${riskEUR.toFixed(2)} (+${inflationPct}%)`);
+    console.warn(`[MinLot] ${mt5Sym} (${assetType}): rawLots=${rawLots.toFixed(5)} → clamped ${minVolume}. actualRisk=€${inflatedRisk.toFixed(2)} vs intended=€${riskEUR.toFixed(2)} (+${inflationPct}%)`);
   }
-  const lots = Math.max(0.01, parseFloat(rawLots.toFixed(2)));
+
+  // Afronden op correcte decimalen op basis van volumeStep
+  const decimals = volumeStep < 1 ? (String(volumeStep).split(".")[1]?.length ?? 2) : 0;
+  const lots = parseFloat(clampedLots.toFixed(decimals));
   return { lots, lotVal, source: spec.source };
 }
 
@@ -1534,8 +1575,43 @@ app.post("/webhook", async (req, res) => {
   try {
     await new Promise(r => setTimeout(r, 2500));
     const positions = await fetchOpenPositions();
-    const thisPos   = Array.isArray(positions) ? positions.find(p => String(p.id) === positionId) : null;
-    if (thisPos?.openPrice) executionPrice = parseFloat(thisPos.openPrice);
+
+    // FIX C1 (v11.3): local_ positionId guard.
+    // Als MetaApi geen positionId gaf na placeOrder() → fake ID gegenereerd.
+    // Zoek de echte positie op basis van symbol + richting + recent geopend (<30s).
+    if (positionId.startsWith("local_")) {
+      const nowMs   = Date.now();
+      const matched = Array.isArray(positions)
+        ? positions.find(p =>
+            p.symbol === mt5Symbol &&
+            (direction === "buy"
+              ? p.type === "POSITION_TYPE_BUY"
+              : p.type === "POSITION_TYPE_SELL") &&
+            (p.time ? nowMs - new Date(p.time).getTime() < 30000 : true)
+          )
+        : null;
+      if (matched) {
+        console.log(`[Order] local_ ID opgelost → echte positionId=${matched.id} (${mt5Symbol} ${direction})`);
+        positionId = String(matched.id);
+      } else {
+        // Positie bestaat niet op MT5 — niet opslaan in DB
+        const errMsg = `ORDER_NOT_CONFIRMED: geen positionId van MetaApi en positie niet gevonden op MT5 (${mt5Symbol} ${direction})`;
+        console.warn(`[Order] ${errMsg}`);
+        logEvent({ type: "ERROR", symbol: symKey, direction, reason: errMsg, optimizerKey });
+        await logWebhook({ symbol: symKey, direction, session, vwapPos: vwapPosition, action,
+          status: "ORDER_NOT_CONFIRMED", reason: errMsg, optimizerKey,
+          entry: closePrice, sl: null, tp: null, lots, riskPct,
+          latencyMs: Date.now() - webhookReceivedAt, tvEntry: closePrice, vwapBandPct });
+        await logSignal({ symbol: symKey, direction, session, vwapPosition, optimizerKey,
+          tvEntry: closePrice, slPct: derivedSlPct, slPctHuman, vwap: vwapMid, vwapBandPct,
+          outcome: "ORDER_NOT_CONFIRMED", rejectReason: errMsg,
+          latencyMs: Date.now() - webhookReceivedAt }).catch(() => {});
+        return res.status(200).json({ status: "ORDER_NOT_CONFIRMED", error: errMsg });
+      }
+    }
+
+    const realPos = Array.isArray(positions) ? positions.find(p => String(p.id) === positionId) : null;
+    if (realPos?.openPrice) executionPrice = parseFloat(realPos.openPrice);
     // Refresh spread na fill
     const pd = await fetchCurrentPrice(mt5Symbol);
     if (pd) { bid = pd.bid; ask = pd.ask; spread = pd.spread ?? 0; }
@@ -2472,10 +2548,10 @@ async function loadOverview(){
       for(const dir of['buy','sell']){
         for(const vwap of['above','below']){
           const key=sym+'_'+sess+'_'+dir+'_'+vwap;
-// COMPLIANCE: only CLOSED trades opened on or after 2026-04-20T12:00:00Z with valid VWAP.
-// FIX 3: openedAt >= 2026-04-20T12:00:00Z (niet closedAt) — trades die vóór 12u20 zijn
-// geopend zijn uitgesloten. Trades die nog open staan (closedAt null) worden ook uitgesloten.
-const TP_OPT_DATE = new Date('2026-04-20T12:00:00.000Z');
+// COMPLIANCE: only CLOSED trades opened on or after 2026-04-21T01:00:00 Brussels
+// = 2026-04-20T23:00:00.000Z UTC. Schone lei datum na sluiting alle trades 20/04 avond.
+// FIX 3 (v11.3 update): datum verschoven naar 21/04 01:00 Brussels.
+const TP_OPT_DATE = new Date('2026-04-20T23:00:00.000Z');
           const trades=_allTrades.filter(t=>
             t.symbol===sym &&
             t.session===sess &&
