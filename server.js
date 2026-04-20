@@ -1891,6 +1891,28 @@ app.get("/live/ghosts", (req, res) => {
   res.json({ count: ghosts.length, ghosts });
 });
 
+// ── POST /admin/ghosts/cancel-all ─────────────────────────────────
+// Annuleert alle actieve ghost trackers zonder ze op te slaan in de DB.
+// Gebruik dit na manueel sluiten van alle trades voor een schone herstart.
+// Vereist: ?secret=WEBHOOK_SECRET (zelfde als webhook secret).
+app.post("/admin/ghosts/cancel-all", (req, res) => {
+  const { secret } = req.query;
+  if (secret !== WEBHOOK_SECRET) {
+    return res.status(401).json({ error: "Unauthorized — geef ?secret= mee" });
+  }
+  const ids      = Object.keys(ghostTrackers);
+  const count    = ids.length;
+  if (count === 0) {
+    return res.json({ status: "OK", cancelled: 0, message: "Geen actieve ghosts." });
+  }
+  for (const id of ids) {
+    cancelGhost(id);
+  }
+  console.log(`[Admin] /admin/ghosts/cancel-all: ${count} ghost(s) geannuleerd`);
+  logEvent({ type: "ADMIN_GHOSTS_CANCELLED", count, ids });
+  res.json({ status: "OK", cancelled: count, ids, message: `${count} ghost(s) geannuleerd (niet opgeslagen in DB).` });
+});
+
 app.get("/ghosts/history", async (req, res) => {
   const { key, limit = 100 } = req.query;
   const rows = await loadGhostTrades(key || null, parseInt(limit));
