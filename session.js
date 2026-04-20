@@ -62,7 +62,7 @@ const SYMBOL_CATALOG = {
   GE:        { type: "stock",     mt5: "GE"        },
   GM:        { type: "stock",     mt5: "GM"        },
   GME:       { type: "stock",     mt5: "GME"       },
-  GOOGL:     { type: "stock",     mt5: "GOOGL"     },
+  GOOGL:     { type: "stock",     mt5: "GOOG"      }, // broker symbol is GOOG (Alphabet Class C)
   IBM:       { type: "stock",     mt5: "IBM"       },
   INTC:      { type: "stock",     mt5: "INTC"      },
   JNJ:       { type: "stock",     mt5: "JNJ"       },
