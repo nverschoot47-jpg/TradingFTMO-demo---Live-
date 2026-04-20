@@ -551,12 +551,27 @@ function sharesCurrency(a, b) {
   return aBase === bBase || aBase === bQuote || aQuote === bBase || aQuote === bQuote;
 }
 
-// FIX 3: Find exact duplicate (same symbol + session + direction).
-// Returns the existing position object or null.
+// FIX 3: Find duplicate — zelfde symbol + richting, ongeacht sessie.
+// Een open trade leeft over sessies heen, sessie mag niet als escape gelden.
+// Returns de OUDSTE open positie (voor SL widen), of null als geen bestaat.
 function findExactDuplicate(symKey, session, direction) {
-  return Object.values(openPositions).find(p =>
-    p.symbol === symKey && p.session === session && p.direction === direction
-  ) ?? null;
+  const matches = Object.values(openPositions).filter(p =>
+    p.symbol === symKey && p.direction === direction
+  );
+  if (!matches.length) return null;
+  // Oudste eerst — SL widen op de langst lopende positie
+  matches.sort((a, b) => new Date(a.openedAt) - new Date(b.openedAt));
+  return matches[0];
+}
+
+// Hard cap: max 1 open positie per symbol+richting.
+// MetaApi REST ondersteunt geen positie modify — SL widen is niet mogelijk.
+// Bij >= 1 open in zelfde richting → trade geblokkeerd.
+const MAX_SAME_DIRECTION = 1;
+function countSameDirection(symKey, direction) {
+  return Object.values(openPositions).filter(p =>
+    p.symbol === symKey && p.direction === direction
+  ).length;
 }
 
 // FIX 3: Count same-currency pairs open in same direction (excluding exact duplicate).
@@ -1216,25 +1231,27 @@ app.post("/webhook", async (req, res) => {
   }
   global._dupGuard[dupKey] = Date.now();
 
-  // ── FIX C: Anti-consolidation ─────────────────────────────────────
-  // Zelfde symbol + sessie + richting al open → modifyPosition() SL ×1.5
-  // cumulatief op huidige MT5 SL + TP herberekend. Geen nieuwe trade.
-  // Geldt voor ALLE asset types (niet alleen forex).
+  // ── Anti-consolidation ────────────────────────────────────────────
+  // MetaApi REST ondersteunt geen positie modify (SL/TP aanpassen na open).
+  // Enige optie: blokkeren als zelfde symbol+richting al open staat.
+  // Ongeacht sessie — een open trade leeft over sessies heen.
   {
-    const exactDup = findExactDuplicate(symKey, session, direction);
-    if (exactDup) {
-      const tpRRForDup = await getOptimalTP(exactDup.optimizerKey);
-      await widenExistingTradeSL(exactDup, tpRRForDup);
-      const reason = `ANTI_CONSOLIDATION: ${symKey} ${session} ${direction} al open — SL ×1.5 cumulatief op bestaande trade`;
-      logReject("CONSOLIDATION_SL_WIDENED", { symbol: symKey, direction, session, optimizerKey, reason, payload: {
-        existingPositionId: exactDup.positionId,
-        existingEntry: exactDup.entry, existingSlBefore: exactDup.sl,
+    const sameCount = countSameDirection(symKey, direction);
+    if (sameCount >= MAX_SAME_DIRECTION) {
+      const existing = Object.values(openPositions).find(p => p.symbol === symKey && p.direction === direction);
+      const reason = `DUPLICATE_BLOCKED: ${symKey} ${direction} al open (pos=${existing?.positionId} sess=${existing?.session}) — MetaApi ondersteunt geen SL modify`;
+      logReject("DUPLICATE_BLOCKED", { symbol: symKey, direction, session, optimizerKey, reason, payload: {
+        existingPositionId: existing?.positionId, existingSession: existing?.session,
+        existingEntry: existing?.entry, existingOpenedAt: existing?.openedAt,
         closePrice, derivedSlPct: slPctHuman,
-        sessionHigh: sessionHigh ?? "NaN→null", sessionLow: sessionLow ?? "NaN→null",
       }});
-      logEvent({ type: "CONSOLIDATION_SL_WIDENED", symbol: symKey, direction, session, positionId: exactDup.positionId, reason });
-      await logSignal({ symbol: symKey, direction, session, vwapPosition, optimizerKey, tvEntry: closePrice, slPct: derivedSlPct, slPctHuman, vwap: vwapMid, vwapBandPct, outcome: "CONSOLIDATION_SL_WIDENED", rejectReason: reason }).catch(() => {});
-      return res.status(200).json({ status: "CONSOLIDATION_SL_WIDENED", reason, existingPositionId: exactDup.positionId });
+      logEvent({ type: "DUPLICATE_BLOCKED", symbol: symKey, direction, session, optimizerKey,
+        existingPositionId: existing?.positionId });
+      await logSignal({ symbol: symKey, direction, session, vwapPosition, optimizerKey,
+        tvEntry: closePrice, slPct: derivedSlPct, slPctHuman, vwap: vwapMid, vwapBandPct,
+        outcome: "DUPLICATE_BLOCKED", rejectReason: reason }).catch(() => {});
+      return res.status(200).json({ status: "DUPLICATE_BLOCKED", reason,
+        existingPositionId: existing?.positionId });
     }
   }
 
