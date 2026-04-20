@@ -843,7 +843,7 @@ async function loadWebhookHistory(limit = 100) {
 // Returns: total, placed, conversionPct, byOutcome, topRejectReasons
 async function loadSignalStats() {
   try {
-    const [totalR, byOutcomeR, rejectR] = await Promise.all([
+    const [totalR, byOutcomeR, rejectR, rejectSymR] = await Promise.all([
       pool.query(`SELECT COUNT(*) AS cnt FROM signal_log`),
       pool.query(`
         SELECT outcome, COUNT(*) AS cnt
@@ -859,16 +859,42 @@ async function loadSignalStats() {
         ORDER BY cnt DESC
         LIMIT 20
       `),
+      // Per reject_reason: welke symbols en hoe vaak
+      pool.query(`
+        SELECT reject_reason,
+               symbol,
+               direction,
+               COUNT(*) AS cnt
+        FROM signal_log
+        WHERE reject_reason IS NOT NULL AND reject_reason != ''
+          AND symbol IS NOT NULL
+        GROUP BY reject_reason, symbol, direction
+        ORDER BY reject_reason, cnt DESC
+      `),
     ]);
     const totalN  = parseInt(totalR.rows[0]?.cnt ?? 0, 10);
     const placed  = byOutcomeR.rows.find(r => r.outcome === "PLACED");
     const placedN = parseInt(placed?.cnt ?? 0, 10);
+
+    // Bouw per reject_reason een gesorteerde lijst van pairs op
+    const symsByReason = {};
+    for (const row of rejectSymR.rows) {
+      const r = row.reject_reason;
+      if (!symsByReason[r]) symsByReason[r] = [];
+      symsByReason[r].push({ symbol: row.symbol, direction: row.direction, count: parseInt(row.cnt, 10) });
+    }
+
     return {
       total:            totalN,
       placed:           placedN,
       conversionPct:    totalN > 0 ? parseFloat((placedN / totalN * 100).toFixed(2)) : 0,
       byOutcome:        byOutcomeR.rows.map(r => ({ outcome: r.outcome, count: parseInt(r.cnt, 10) })),
-      topRejectReasons: rejectR.rows.map(r => ({ reason: r.reject_reason, count: parseInt(r.cnt, 10) })),
+      topRejectReasons: rejectR.rows.map(r => ({
+        reason: r.reject_reason,
+        count:  parseInt(r.cnt, 10),
+        // Top 5 pairs voor deze reason, gesorteerd op count
+        pairs:  (symsByReason[r.reject_reason] ?? []).slice(0, 5),
+      })),
     };
   } catch (e) { console.warn("[!] loadSignalStats:", e.message); return null; }
 }
