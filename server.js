@@ -1,23 +1,22 @@
 // ===============================================================
-// server.js  v11.1  |  PRONTO-AI
+// server.js  v11.2  |  PRONTO-AI
 // TradingView → MetaApi REST → FTMO MT5
 //
-// v11.1 — BUG FIXES (20 April 2026):
+// v11.2 — BUG FIXES (20 April 2026):
 //
-//  FIX 1 — VWAP label in Open Positions bij server restart:
-//    restorePositionsFromMT5() parseert vwapPosition uit MT5 comment
-//    (format: "NV-B-AUDCHF-A-2R-LON", segment index 3 = A/B/U).
-//    Posities hersteld na restart tonen nu correct ABOVE/BELOW badge.
+//  FIX A — SL/TP modify 404: resolvePositionId()
+//    MetaApi geeft soms een orderId terug i.p.v. positionId na placeOrder.
+//    Nieuwe helper resolvePositionId() probeert eerst exact ID match,
+//    daarna fallback op symbol+richting+recentOpenedAt (< 45s).
+//    Werkelijke positionId wordt doorgepropageerd naar alle volgende stappen.
 //
-//  FIX 2 — Ghost tracking / SL/TP modify 404 fouten:
-//    Nieuwe helper waitForPositionReady() pollt MetaApi (max 6×, 1.2s)
-//    totdat de positie zichtbaar is. SL/TP modify start ALLEEN nadat
-//    de positie beschikbaar is — geen 404 meer bij normale latency.
+//  FIX B — SIGTERM bij startup: batched prefetch
+//    60+ symbolen tegelijk prefetchen veroorzaakte Railway SIGTERM (rate-limit).
+//    Prefetch nu in batches van 5 met 300ms pauze ertussen.
 //
-//  FIX 3 — TP Optimiser datum filter:
-//    Dashboard filtert trades op openedAt >= 2026-04-20T12:00:00Z
-//    EN closeReason IN ('tp','sl') — geen manual/open trades meer.
-//    "Volledig gesloten" = tp of sl hit (geen manual closes).
+// v11.1 fixes blijven actief:
+//  - VWAP label parsen uit MT5 comment bij restore
+//  - TP Optimiser filter op openedAt >= 2026-04-20T12:00 + volledig gesloten
 //
 // (alle v11.0 fixes blijven actief — zie v11.0 header)
 // ===============================================================
@@ -672,23 +671,43 @@ async function widenExistingTradeSL(pos, tpRR) {
   }
 }
 
-// ── Wait until a position is visible in MetaApi ────────────────────
-// After placeOrder(), MetaApi registreert de positie asynchroon.
-// SL/TP modify faalt met HTTP 404 als de positie nog niet zichtbaar is.
-// Poll max `maxAttempts` keer met `intervalMs` tussenpoze.
-async function waitForPositionReady(positionId, maxAttempts = 6, intervalMs = 1200) {
+// ── Resolve real positionId after placeOrder ──────────────────────
+// MetaApi geeft soms een orderId terug (nog niet gefilled) i.p.v. een
+// echte positionId. Gevolg: alle /positions/:id calls falen met 404.
+// Strategie:
+//   1. Exact ID match (werkt als MetaApi direct positionId geeft)
+//   2. Fallback: zoek op symbol + richting + recentOpenedAt (< 45s)
+// Retourneert { resolvedId, changed }.
+async function resolvePositionId(candidateId, mt5Symbol, direction, maxAttempts = 7, intervalMs = 1200) {
+  const typeStr = direction === 'buy' ? 'POSITION_TYPE_BUY' : 'POSITION_TYPE_SELL';
   for (let i = 0; i < maxAttempts; i++) {
     try {
       const live = await fetchOpenPositions();
-      if (Array.isArray(live) && live.find(p => String(p.id) === String(positionId))) {
-        console.log(`[PosReady] ${positionId}: zichtbaar na ${(i * intervalMs / 1000).toFixed(1)}s (poging ${i + 1})`);
-        return true;
+      if (!Array.isArray(live)) { await new Promise(r => setTimeout(r, intervalMs)); continue; }
+      // 1. Exact ID match
+      const exact = live.find(p => String(p.id) === String(candidateId));
+      if (exact) {
+        if (i > 0) console.log(`[PosResolve] ${candidateId}: exact match na ${(i * intervalMs / 1000).toFixed(1)}s`);
+        return { resolvedId: String(exact.id), changed: false };
       }
-    } catch {}
+      // 2. Symbol + direction + recent open (< 45s)
+      const cutoff = Date.now() - 45000;
+      const bySymbol = live.find(p =>
+        p.symbol === mt5Symbol &&
+        p.type === typeStr &&
+        p.time && new Date(p.time).getTime() >= cutoff
+      );
+      if (bySymbol) {
+        console.log(`[PosResolve] orderId=${candidateId} -> ECHT positionId=${bySymbol.id} (symbol match)`);
+        return { resolvedId: String(bySymbol.id), changed: String(bySymbol.id) !== String(candidateId) };
+      }
+    } catch (e) {
+      console.warn(`[PosResolve] attempt ${i + 1} error: ${e.message}`);
+    }
     if (i < maxAttempts - 1) await new Promise(r => setTimeout(r, intervalMs));
   }
-  console.warn(`[PosReady] ${positionId}: NIET zichtbaar na ${maxAttempts} pogingen — SL/TP modify zal falen`);
-  return false;
+  console.warn(`[PosResolve] ${candidateId}: niet gevonden na ${maxAttempts} pogingen`);
+  return { resolvedId: String(candidateId), changed: false };
 }
 
 ────
@@ -1494,12 +1513,17 @@ app.post("/webhook", async (req, res) => {
     return res.status(200).json({ status: "ORDER_FAILED", error: errMsg });
   }
 
-  // Step B: Read back real execution price
-  // Pre-order SL/TP al actief in MT5. Nu verfijnen op werkelijke fill prijs.
-  let executionPrice = preExecPrice; // start van live MT5 prijs, niet TV entry
+  // Step B: Resolve echte positionId + read back real execution price.
+  // MetaApi geeft soms orderId ipv positionId — resolvePositionId lost dit op
+  // via exact ID match of symbol+richting+recency fallback.
+  let executionPrice = preExecPrice;
   let spread = preSpread, bid = preBid, ask = preAsk;
   try {
-    await new Promise(r => setTimeout(r, 2500));
+    const { resolvedId, changed } = await resolvePositionId(positionId, mt5Symbol, direction);
+    if (changed) {
+      console.log(`[PosResolve] positionId gecorrigeerd: ${positionId} -> ${resolvedId}`);
+      positionId = resolvedId;
+    }
     const positions = await fetchOpenPositions();
     const thisPos   = Array.isArray(positions) ? positions.find(p => String(p.id) === positionId) : null;
     if (thisPos?.openPrice) executionPrice = parseFloat(thisPos.openPrice);
@@ -1633,8 +1657,7 @@ app.post("/webhook", async (req, res) => {
 
   // Step D: Verfijn SL + TP op werkelijke executionPrice — retry 3×
   // Pre-order SL/TP (preMt5SL/preMt5TP) zijn al actief als fallback in MT5.
-  // FIX 2: wacht tot positie zichtbaar is in MetaApi VOOR modify (voorkomt 404).
-  await waitForPositionReady(positionId);
+  // positionId is al geresolved in Step B via resolvePositionId().
   let slTpSet = false;
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
@@ -1905,7 +1928,7 @@ app.get("/spread-log", async (req, res) => {
 app.get("/test", (req, res) => {
   res.json({
     status: "Railway is bereikbaar",
-    version: "11.1.0",
+    version: "11.2.0",
     headers: {
       "content-type": req.headers["content-type"] ?? "(geen)",
       "user-agent":   (req.headers["user-agent"] ?? "(geen)").slice(0, 80),
@@ -1933,7 +1956,7 @@ app.get("/health", async (req, res) => {
   const tradeWindowForex = canOpenNewTrade("EURUSD");
   const tradeWindowStock = canOpenNewTrade("AAPL");
   res.json({
-    status: "ok", version: "11.1.0", time: getBrusselsDateStr(),
+    status: "ok", version: "11.2.0", time: getBrusselsDateStr(),
     openPos: Object.keys(openPositions).length, ghosts: Object.keys(ghostTrackers).length,
     tpLocks: Object.keys(tpLocks).length, closedT: closedTrades.length, balance,
     fixedRiskPct: FIXED_RISK_PCT, marketOpen: isMarketOpen(), session: getSession(),
@@ -1958,7 +1981,7 @@ app.get(["/", "/dashboard"], async (req, res) => {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PRONTO-AI v11.1</title>
+<title>PRONTO-AI v11.2</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600;700&family=IBM+Plex+Sans+Condensed:wght@500;600;700&display=swap" rel="stylesheet">
 <style>
@@ -2071,7 +2094,7 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
 <div class="hdr">
   <div>
     <div class="logo">PRONTO-AI</div>
-    <div class="ver">v11.1 · TradingView → MetaApi → FTMO MT5 · Fixed Risk ${(FIXED_RISK_PCT*100).toFixed(3)}% · SL Buffer ×${SL_BUFFER_MULT} · Fix A/C/D/E actief</div>
+    <div class="ver">v11.2 · TradingView → MetaApi → FTMO MT5 · Fixed Risk ${(FIXED_RISK_PCT*100).toFixed(3)}% · SL Buffer ×${SL_BUFFER_MULT} · Fix A/C/D/E actief</div>
   </div>
   <div class="hdr-r">
     <span class="sb s-outside" id="hdr-sess">—</span>
@@ -2779,7 +2802,7 @@ async function start() {
   const missing = ["META_API_TOKEN", "META_ACCOUNT_ID", "WEBHOOK_SECRET"].filter(k => !process.env[k]);
   if (missing.length) { console.error(`[ERR] Missing env: ${missing.join(", ")}`); process.exit(1); }
 
-  console.log("🚀 PRONTO-AI v11.1 starting...");
+  console.log("🚀 PRONTO-AI v11.2 starting...");
   await initDB();
 
   // Load closed trades
@@ -2833,12 +2856,15 @@ async function start() {
 
   await restorePositionsFromMT5();
 
-  // STARTUP: prefetch MT5 symbol specs voor alle catalog symbolen
-  // Zo is de lotVal cache gevuld voor de eerste trade - geen fallback meer.
-  console.log("Prefetching MT5 symbol specs...");
+  // STARTUP: prefetch MT5 symbol specs in batches van 5 (voorkomt rate-limit / SIGTERM).
+  // Concurrent fetch van 60+ symbolen tegelijk veroorzaakte Railway SIGTERM.
+  console.log("Prefetching MT5 symbol specs (batched)...");
   const prefetchResults = { ok: 0, fallback: 0 };
-  await Promise.allSettled(
-    Object.entries(SYMBOL_CATALOG).map(async ([sym, info]) => {
+  const symEntries = Object.entries(SYMBOL_CATALOG);
+  const BATCH_SIZE = 5;
+  for (let i = 0; i < symEntries.length; i += BATCH_SIZE) {
+    const batch = symEntries.slice(i, i + BATCH_SIZE);
+    await Promise.allSettled(batch.map(async ([sym, info]) => {
       try {
         const spec = await fetchSymbolLotValue(info.mt5, info.type);
         if (spec.source === "mt5") prefetchResults.ok++;
@@ -2848,8 +2874,10 @@ async function start() {
         prefetchResults.fallback++;
         console.warn(`[SymSpec] ${sym}: prefetch failed - ${e.message}`);
       }
-    })
-  );
+    }));
+    // Kleine pauze tussen batches om rate-limit te respecteren
+    if (i + BATCH_SIZE < symEntries.length) await new Promise(r => setTimeout(r, 300));
+  }
   console.log(`[SymSpec] Done: ${prefetchResults.ok} live van MT5, ${prefetchResults.fallback} fallback`);
 
   // FIX C: rebuild currency exposure na restore van open posities
@@ -2857,7 +2885,7 @@ async function start() {
   console.log(`💱 Currency exposure rebuilt: ${JSON.stringify(Object.fromEntries(Object.entries(currencyExposure).map(([k,v])=>[k,v.toFixed(2)])))}`);
 
   app.listen(PORT, () => {
-    console.log(`[✓] PRONTO-AI v11.1 on port ${PORT}`);
+    console.log(`[✓] PRONTO-AI v11.2 on port ${PORT}`);
     console.log(`   🔹 Dashboard:      /`);
     console.log(`   🔹 Health:         /health`);
     console.log(`   🔹 EV Table:       /ev`);
