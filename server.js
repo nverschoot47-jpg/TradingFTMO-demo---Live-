@@ -49,17 +49,11 @@ const helmet  = require("helmet");
 const cron    = require("node-cron");
 
 const app = express();
+// Trust Railway proxy (X-Forwarded-* headers)
+app.set("trust proxy", 1);
+
 app.use(helmet({
-  contentSecurityPolicy: {
-    directives: {
-      defaultSrc: ["'self'"],
-      scriptSrc:  ["'self'", "'unsafe-inline'"],
-      styleSrc:   ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
-      fontSrc:    ["'self'", "https://fonts.gstatic.com"],
-      connectSrc: ["'self'"],
-      imgSrc:     ["'self'", "data:"],
-    },
-  },
+  contentSecurityPolicy: false, // Dashboard-only, niet nodig voor webhook
 }));
 // express.json() parset alleen Content-Type: application/json.
 // TradingView stuurt webhooks soms als Content-Type: text/plain.
@@ -1724,6 +1718,38 @@ app.get("/spread-log", async (req, res) => {
   const { symbol, session, limit = 200 } = req.query;
   const rows = await loadSpreadLog({ symbol, session, limit: parseInt(limit) });
   res.json({ count: rows.length, rows });
+});
+
+// ── TEST endpoint — gebruik dit om Railway connectie te verifiëren ──
+// GET  /test           → bevestigt dat Railway draait
+// POST /test           → echo's de body terug zodat je TV webhook kunt testen
+// Gebruik: curl -X POST https://JOUW-URL/test -H "Content-Type: application/json" -d '{"hello":"world"}'
+// Of in TV webhook URL: https://JOUW-URL/test (geen secret nodig)
+app.get("/test", (req, res) => {
+  res.json({
+    status: "Railway is bereikbaar",
+    version: "10.8.0",
+    time: new Date().toISOString(),
+    headers: {
+      "content-type": req.headers["content-type"] ?? "(geen)",
+      "user-agent":   (req.headers["user-agent"] ?? "(geen)").slice(0, 80),
+    },
+  });
+});
+
+app.post("/test", (req, res) => {
+  const ts = new Date().toISOString();
+  console.log(`[TEST POST][${ts}] Content-Type: ${req.headers["content-type"] ?? "(geen)"}`);
+  console.log(`[TEST POST] Body type: ${typeof req.body}`);
+  console.log(`[TEST POST] Body: ${JSON.stringify(req.body)?.slice(0, 500)}`);
+  res.json({
+    status: "POST ontvangen",
+    time: ts,
+    contentType: req.headers["content-type"] ?? "(geen)",
+    bodyType: typeof req.body,
+    bodyReceived: req.body,
+    note: "Als bodyReceived leeg/null is → Content-Type probleem. Als bodyReceived gevuld is → webhook URL of secret probleem.",
+  });
 });
 
 app.get("/health", async (req, res) => {
