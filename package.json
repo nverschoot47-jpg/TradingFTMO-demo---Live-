@@ -1,7 +1,7 @@
 {
   "name": "nv-tradingview-webhook",
-  "version": "10.7.0",
-  "description": "TradingView -> MetaApi REST -> FTMO MT5 | PRONTO-AI v10.7 - Fix1 actualRiskEUR dashboard, Fix2 live SL/TP sync van MT5, Fix3 spread_log per tijdzone",
+  "version": "11.0.0",
+  "description": "TradingView -> MetaApi REST -> FTMO MT5 | PRONTO-AI v11.0 - Fix R1 TP=2R default, Fix R2 minLot warning, Fix R3 live lotVal dashboard, Fix R4 lotDivisor removed, Fix R5 C2 uniform risk",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
