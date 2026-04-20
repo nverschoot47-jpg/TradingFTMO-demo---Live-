@@ -1,6 +1,23 @@
 // ===============================================================
-// server.js  v11.1  |  PRONTO-AI
+// server.js  v11.2  |  PRONTO-AI
 // TradingView → MetaApi REST → FTMO MT5
+//
+// v11.2 — UK100 RISK FIX + VWAP BAND THRESHOLD (20 April 2026):
+//
+//  FIX A — vwapBandPct threshold: 0.9 → 1.5 (150%):
+//    Channel break strategie genereert signals buiten de VWAP band.
+//    Threshold van 90% blokkeerde bijna alle UK100 trades.
+//    Verhoogd naar 150% — alleen extreme uitschieters (>1.5× halve band)
+//    worden nog geblokkeerd met VWAP_BAND_EXHAUSTED.
+//
+//  FIX B — UK100 lotVal fallback gecorrigeerd:
+//    LOT_VALUE[index] = 20 was fout voor UK100.cash (FTSE 100 CFD).
+//    Echte lotVal = 1 GBP/punt/lot op FTMO MT5.
+//    Nieuw: LOT_VALUE_BY_MT5 map met per-symbol fallbacks:
+//      UK100.cash = 1, GER40.cash = 1, US100.cash = 1, US30.cash = 1.
+//    fetchSymbolLotValue() gebruikt deze map vóór de generieke LOT_VALUE.
+//    Bij actieve MT5 connectie prevaleert altijd de live spec (ongewijzigd).
+//    recalcLotsAfterSL() en rebuildCurrencyExposure() ook bijgewerkt.
 //
 // v11.1 — BUG FIXES (20 April 2026):
 //
@@ -220,6 +237,20 @@ const LOT_VALUE = {
   index: 20, commodity: 100, stock: 1, forex: 100000,
 };
 
+// FIX UK100: per-MT5-symbol lotVal fallback voor indexes.
+// UK100.cash: lotVal = 1 GBP/punt/lot (niet 20 — dat is fout voor FTSE).
+// GER40.cash: lotVal = 1 EUR/punt/lot.
+// US100.cash: lotVal = 1 USD/punt/lot.
+// US30.cash:  lotVal = 1 USD/punt/lot.
+// Deze waarden worden gebruikt als fetchSymbolLotValue() geen MT5 spec terugkrijgt.
+// Bij een werkende MT5 connectie wordt dit altijd overschreven door de live spec.
+const LOT_VALUE_BY_MT5 = {
+  "UK100.cash": 1,
+  "GER40.cash": 1,
+  "US100.cash": 1,
+  "US30.cash":  1,
+};
+
 // ── Live balance cache ────────────────────────────────────────────
 let liveBalance   = 50000;
 let liveBalanceAt = 0;
@@ -362,7 +393,7 @@ function rebuildCurrencyExposure() {
     // Gebruik gecachede lotVal van MT5 spec (live waarde), fallback op statische 100000 voor forex
     const mt5Sym4  = pos.mt5Symbol || getSymbolInfo(pos.symbol)?.mt5 || pos.symbol;
     const cachedSpec = symbolSpecCache[mt5Sym4];
-    const lotVal = cachedSpec?.lotVal ?? LOT_VALUE["forex"] ?? 100000;
+    const lotVal = cachedSpec?.lotVal ?? LOT_VALUE_BY_MT5[mt5Sym4] ?? LOT_VALUE["forex"] ?? 100000;
     const expEUR = calcPositionExposureEUR(pos.lots ?? 0, dist, lotVal);
     for (const ccy of getPairCurrencies(pos.symbol)) {
       currencyExposure[ccy] = (currencyExposure[ccy] ?? 0) + expEUR;
@@ -416,8 +447,8 @@ async function fetchSymbolLotValue(mt5Symbol, assetType) {
   } catch (e) {
     console.warn(`[SymSpec] ${mt5Symbol}: kon spec niet ophalen (${e.message}) — gebruik fallback`);
   }
-  // Fallback op statische LOT_VALUE
-  const lotVal = LOT_VALUE[assetType] ?? 1;
+  // Fallback: eerst per-symbol override, dan generiek per asset type
+  const lotVal = LOT_VALUE_BY_MT5[mt5Symbol] ?? LOT_VALUE[assetType] ?? 1;
   symbolSpecCache[mt5Symbol] = { lotVal, source: "fallback" };
   return symbolSpecCache[mt5Symbol];
 }
@@ -456,7 +487,7 @@ async function recalcLotsAfterSL(symbol, entry, sl) {
     const mt5Sym  = info?.mt5 || symbol;
     // Gebruik live lotVal van MT5 spec als gecached, anders fallback
     const cachedSpec = symbolSpecCache[mt5Sym];
-    const lotVal  = cachedSpec?.lotVal ?? LOT_VALUE[type] ?? 1;
+    const lotVal  = cachedSpec?.lotVal ?? LOT_VALUE_BY_MT5[mt5Sym] ?? LOT_VALUE[type] ?? 1;
     const dist    = Math.abs(entry - sl);
     if (!dist) return;
     // v10.6: puur balance × pct (geen multipliers in baseLots)
@@ -1288,7 +1319,7 @@ app.post("/webhook", async (req, res) => {
   if (bandWidth > 0 && vwapMid > 0) {
     const distFromMid = Math.abs(closePrice - vwapMid);
     vwapBandPct = parseFloat((distFromMid / (bandWidth / 2)).toFixed(3));
-    if (vwapBandPct > 0.9) {
+    if (vwapBandPct > 1.5) {
       const reason = `VWAP_BAND_EXHAUSTED: ${(vwapBandPct * 100).toFixed(0)}% into band`;
       logReject("VWAP_BAND_EXHAUSTED", { symbol: symKey, direction, session, optimizerKey, reason, payload: {
         closePrice, vwapMid, vwapUpper, vwapLower,
