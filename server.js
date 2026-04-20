@@ -1,6 +1,26 @@
 // ===============================================================
-// server.js  v11.0  |  PRONTO-AI
+// server.js  v11.1  |  PRONTO-AI
 // TradingView → MetaApi REST → FTMO MT5
+//
+// v11.1 — BUG FIXES (20 April 2026):
+//
+//  FIX 1 — VWAP label in Open Positions bij server restart:
+//    restorePositionsFromMT5() parseert vwapPosition uit MT5 comment
+//    (format: "NV-B-AUDCHF-A-2R-LON", segment index 3 = A/B/U).
+//    Posities hersteld na restart tonen nu correct ABOVE/BELOW badge.
+//
+//  FIX 2 — Ghost tracking / SL/TP modify 404 fouten:
+//    Nieuwe helper waitForPositionReady() pollt MetaApi (max 6×, 1.2s)
+//    totdat de positie zichtbaar is. SL/TP modify start ALLEEN nadat
+//    de positie beschikbaar is — geen 404 meer bij normale latency.
+//
+//  FIX 3 — TP Optimiser datum filter:
+//    Dashboard filtert trades op openedAt >= 2026-04-20T12:00:00Z
+//    EN closeReason IN ('tp','sl') — geen manual/open trades meer.
+//    "Volledig gesloten" = tp of sl hit (geen manual closes).
+//
+// (alle v11.0 fixes blijven actief — zie v11.0 header)
+// ===============================================================
 //
 // v11.0 — RISK SIZING FIXES (20 April 2026):
 //
@@ -652,7 +672,26 @@ async function widenExistingTradeSL(pos, tpRR) {
   }
 }
 
-// ── Ghost Optimizer ───────────────────────────────────────────────
+// ── Wait until a position is visible in MetaApi ────────────────────
+// After placeOrder(), MetaApi registreert de positie asynchroon.
+// SL/TP modify faalt met HTTP 404 als de positie nog niet zichtbaar is.
+// Poll max `maxAttempts` keer met `intervalMs` tussenpoze.
+async function waitForPositionReady(positionId, maxAttempts = 6, intervalMs = 1200) {
+  for (let i = 0; i < maxAttempts; i++) {
+    try {
+      const live = await fetchOpenPositions();
+      if (Array.isArray(live) && live.find(p => String(p.id) === String(positionId))) {
+        console.log(`[PosReady] ${positionId}: zichtbaar na ${(i * intervalMs / 1000).toFixed(1)}s (poging ${i + 1})`);
+        return true;
+      }
+    } catch {}
+    if (i < maxAttempts - 1) await new Promise(r => setTimeout(r, intervalMs));
+  }
+  console.warn(`[PosReady] ${positionId}: NIET zichtbaar na ${maxAttempts} pogingen — SL/TP modify zal falen`);
+  return false;
+}
+
+────
 // v10.7: Ghost tracker volgt de LIVE SL/TP uit openPositions, niet de
 // gefixeerde waarden bij start. Als SL wijzigt (anti-consolidation,
 // handmatig, of synced van MT5), worden phantomSL en tpRRUsed bijgewerkt.
@@ -968,11 +1007,19 @@ async function restorePositionsFromMT5() {
       const dir    = lp.type === "POSITION_TYPE_BUY" ? "buy" : "sell";
       const entry  = lp.openPrice ?? lp.currentPrice ?? 0;
       const sess   = getSession(lp.time ? new Date(lp.time) : null);
-      const vpPos  = "unknown";
+      // FIX 1: Parse vwapPosition from MT5 comment (format: "NV-B-AUDCHF-A-2R-LON")
+      // Segment index 3 (0-based) = vwap shortcode: A=above, B=below, U=unknown
+      const commentParts = (lp.comment || '').split('-');
+      let vpPos = 'unknown';
+      if (commentParts.length >= 4) {
+        if (commentParts[3] === 'A') vpPos = 'above';
+        else if (commentParts[3] === 'B') vpPos = 'below';
+      }
       const optKey = buildOptimizerKey(sym, sess, dir, vpPos);
       openPositions[id] = {
         positionId: id, symbol: sym, mt5Symbol: lp.symbol,
         direction: dir, vwapPosition: vpPos, optimizerKey: optKey,
+        // vwapPosition parsed from comment (A/B/U) — allows correct dashboard display
         entry, sl: lp.stopLoss ?? 0, tp: lp.takeProfit ?? null,
         lots: lp.volume ?? 0.01, riskEUR: 0, riskPct: FIXED_RISK_PCT,
         session: sess, openedAt: lp.time ?? new Date().toISOString(),
@@ -1586,6 +1633,8 @@ app.post("/webhook", async (req, res) => {
 
   // Step D: Verfijn SL + TP op werkelijke executionPrice — retry 3×
   // Pre-order SL/TP (preMt5SL/preMt5TP) zijn al actief als fallback in MT5.
+  // FIX 2: wacht tot positie zichtbaar is in MetaApi VOOR modify (voorkomt 404).
+  await waitForPositionReady(positionId);
   let slTpSet = false;
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
@@ -1856,8 +1905,7 @@ app.get("/spread-log", async (req, res) => {
 app.get("/test", (req, res) => {
   res.json({
     status: "Railway is bereikbaar",
-    version: "11.0.0",
-    time: new Date().toISOString(),
+    version: "11.1.0",
     headers: {
       "content-type": req.headers["content-type"] ?? "(geen)",
       "user-agent":   (req.headers["user-agent"] ?? "(geen)").slice(0, 80),
@@ -1885,7 +1933,7 @@ app.get("/health", async (req, res) => {
   const tradeWindowForex = canOpenNewTrade("EURUSD");
   const tradeWindowStock = canOpenNewTrade("AAPL");
   res.json({
-    status: "ok", version: "11.0.0", time: getBrusselsDateStr(),
+    status: "ok", version: "11.1.0", time: getBrusselsDateStr(),
     openPos: Object.keys(openPositions).length, ghosts: Object.keys(ghostTrackers).length,
     tpLocks: Object.keys(tpLocks).length, closedT: closedTrades.length, balance,
     fixedRiskPct: FIXED_RISK_PCT, marketOpen: isMarketOpen(), session: getSession(),
@@ -1910,7 +1958,7 @@ app.get(["/", "/dashboard"], async (req, res) => {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PRONTO-AI v11.0</title>
+<title>PRONTO-AI v11.1</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600;700&family=IBM+Plex+Sans+Condensed:wght@500;600;700&display=swap" rel="stylesheet">
 <style>
@@ -2023,7 +2071,7 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
 <div class="hdr">
   <div>
     <div class="logo">PRONTO-AI</div>
-    <div class="ver">v11.0 · TradingView → MetaApi → FTMO MT5 · Fixed Risk ${(FIXED_RISK_PCT*100).toFixed(3)}% · SL Buffer ×${SL_BUFFER_MULT} · Fix A/C/D/E actief</div>
+    <div class="ver">v11.1 · TradingView → MetaApi → FTMO MT5 · Fixed Risk ${(FIXED_RISK_PCT*100).toFixed(3)}% · SL Buffer ×${SL_BUFFER_MULT} · Fix A/C/D/E actief</div>
   </div>
   <div class="hdr-r">
     <span class="sb s-outside" id="hdr-sess">—</span>
@@ -2392,11 +2440,11 @@ async function loadOverview(){
       for(const dir of['buy','sell']){
         for(const vwap of['above','below']){
           const key=sym+'_'+sess+'_'+dir+'_'+vwap;
-// COMPLIANCE: only trades from 18-Apr-2026 onward with valid VWAP.
-// vwap is always 'above'|'below' here, so the vwapPosition===vwap
-// check automatically excludes 'unknown' positions.
-const COMPLIANCE_DATE=new Date('2026-04-18T00:00:00.000Z');
-          const trades=_allTrades.filter(t=>t.symbol===sym&&t.session===sess&&t.direction===dir&&t.vwapPosition===vwap&&t.closedAt&&new Date(t.closedAt)>=COMPLIANCE_DATE);
+// COMPLIANCE FIX 3: only fully-closed trades opened >= 20-Apr-2026 12:00 UTC.
+// "Volledig" = closeReason 'tp' or 'sl' only (no manual/incomplete closes).
+// vwapPosition===vwap automatically excludes 'unknown' positions.
+const TP_FILTER_DATE=new Date('2026-04-20T12:00:00.000Z');
+          const trades=_allTrades.filter(t=>t.symbol===sym&&t.session===sess&&t.direction===dir&&t.vwapPosition===vwap&&t.openedAt&&new Date(t.openedAt)>=TP_FILTER_DATE&&t.closedAt&&(t.closeReason==='tp'||t.closeReason==='sl'));
           const wins=trades.filter(t=>t.closeReason==='tp');
           const sls=trades.filter(t=>t.closeReason==='sl');
           const pnls=trades.map(t=>t.realizedPnlEUR??t.currentPnL??0);
@@ -2731,7 +2779,7 @@ async function start() {
   const missing = ["META_API_TOKEN", "META_ACCOUNT_ID", "WEBHOOK_SECRET"].filter(k => !process.env[k]);
   if (missing.length) { console.error(`[ERR] Missing env: ${missing.join(", ")}`); process.exit(1); }
 
-  console.log("🚀 PRONTO-AI v11.0 starting...");
+  console.log("🚀 PRONTO-AI v11.1 starting...");
   await initDB();
 
   // Load closed trades
@@ -2809,7 +2857,7 @@ async function start() {
   console.log(`💱 Currency exposure rebuilt: ${JSON.stringify(Object.fromEntries(Object.entries(currencyExposure).map(([k,v])=>[k,v.toFixed(2)])))}`);
 
   app.listen(PORT, () => {
-    console.log(`[✓] PRONTO-AI v11.0 on port ${PORT}`);
+    console.log(`[✓] PRONTO-AI v11.1 on port ${PORT}`);
     console.log(`   🔹 Dashboard:      /`);
     console.log(`   🔹 Health:         /health`);
     console.log(`   🔹 EV Table:       /ev`);
