@@ -138,7 +138,13 @@ let liveBalance   = 50000;
 let liveBalanceAt = 0;
 
 // ── MetaApi ───────────────────────────────────────────────────────
-const META_BASE = `https://mt-client-api-v1.london.agiliumtrade.ai/users/current/accounts/${META_ACCOUNT_ID}`;
+// ── MetaApi ───────────────────────────────────────────────────────
+// META_API_REGION: stel in via Railway env als je account niet op london staat.
+// Geldige waarden: london, new-york, frankfurt, singapore, sydney
+// Standaard: london. Als je HTTP 504 ziet "account region mismatch" -> wijzig dit.
+// Zie: https://app.metaapi.cloud/api-access/api-urls voor jouw account regio.
+const META_REGION = process.env.META_API_REGION || "london";
+const META_BASE = `https://mt-client-api-v1.${META_REGION}.agiliumtrade.ai/users/current/accounts/${META_ACCOUNT_ID}`;
 
 async function metaFetch(path, options = {}, timeoutMs = 8000) {
   const ctrl = new AbortController();
@@ -1006,12 +1012,13 @@ app.post("/webhook", async (req, res) => {
   if (secret !== WEBHOOK_SECRET) return res.status(401).json({ error: "Unauthorized" });
 
   const body = req.body || {};
-  // FIX A: payload bevat entry_price + sl_price (absolute MT5 prijzen).
-  // sl_pct wordt NIET meer uit payload gelezen — server berekent derivedSlPct.
-  const { action, symbol: rawSymbol, entry_price, sl_price, vwap, vwap_upper, vwap_lower } = body;
-  // Backwards compat: als entry_price ontbreekt, val terug op 'entry' veld.
-  const tvEntryPrice = parseFloat(entry_price ?? body.entry) || 0;
-  const tvSLPrice    = parseFloat(sl_price) || 0;
+  const { action, symbol: rawSymbol, vwap, vwap_upper, vwap_lower } = body;
+
+  // TV stuurt entry + sl (absolute prijzen) + sl_pct (genegeerd).
+  // Server berekent derivedSlPct zelf: |entry - sl| / entry
+  // Pine Script hoeft NIETS te wijzigen.
+  const tvEntry = parseFloat(body.entry ?? body.entry_price) || 0;
+  const tvSL    = parseFloat(body.sl    ?? body.sl_price)    || 0;
 
   const direction = action === "buy" ? "buy" : action === "sell" ? "sell" : null;
   if (!direction) return res.status(400).json({ error: "action must be buy or sell" });
@@ -1025,20 +1032,19 @@ app.post("/webhook", async (req, res) => {
   }
   const { type: assetType, mt5: mt5Symbol } = symInfo;
 
-  // FIX A: Server berekent derivedSlPct van TV absolute prijzen.
-  // Validatie: > 0 en <= 0.05 — anders hard reject.
-  const derivedSlPct = deriveSLPct(tvEntryPrice, tvSLPrice);
+  // Server berekent derivedSlPct — sl_pct van TV volledig genegeerd.
+  const derivedSlPct = deriveSLPct(tvEntry, tvSL);
   if (!derivedSlPct || derivedSlPct <= 0 || derivedSlPct > 0.05) {
     const slPctHuman = derivedSlPct ? (derivedSlPct * 100).toFixed(3) + "%" : "invalid";
-    const reason = `FIX_A: derivedSlPct=${slPctHuman} ongeldig (entry_price=${tvEntryPrice}, sl_price=${tvSLPrice}). Moet > 0 en <= 0.05.`;
+    const reason = `SL_INVALID: derivedSlPct=${slPctHuman} (entry=${tvEntry}, sl=${tvSL}). Moet > 0 en <= 5%.`;
     logEvent({ type: "REJECTED", reason, symbol: symKey, direction });
-    await logSignal({ symbol: symKey, direction, tvEntry: tvEntryPrice, slPct: derivedSlPct ?? null, outcome: "REJECTED", rejectReason: reason }).catch(() => {});
+    await logSignal({ symbol: symKey, direction, tvEntry, slPct: derivedSlPct ?? null, outcome: "REJECTED", rejectReason: reason }).catch(() => {});
     return res.status(400).json({ error: reason });
   }
   const slPctHuman = (derivedSlPct * 100).toFixed(3) + "%";
 
-  const session      = getSession();
-  const closePrice   = tvEntryPrice;
+  const session     = getSession();
+  const closePrice  = tvEntry;
   const vwapMid      = parseFloat(vwap)       || 0;
   const vwapUpper    = parseFloat(vwap_upper) || 0;
   const vwapLower    = parseFloat(vwap_lower) || 0;
@@ -2454,6 +2460,7 @@ async function start() {
     console.log(`   🔹 Spread Log:     /spread-log?symbol=EURUSD&limit=200`);
     console.log(`   🔹 Webhook:        POST /webhook?secret=<secret>`);
     console.log(`   💵 Fixed risk:     ${(FIXED_RISK_PCT*100).toFixed(3)}% | Balance: €${liveBalance.toFixed(2)}`);
+    console.log(`   🌍 MetaApi regio:  ${META_REGION} (wijzig via META_API_REGION env als 504 errors)`);
     console.log(`   💰 Curr budget:    ${(CURRENCY_BUDGET_PCT*100).toFixed(1)}% per valuta | TP floor: ${MIN_TP_RR_FLOOR}R`);
     console.log(`   🕐 Ghost max:      72h | SL buffer: ×${SL_BUFFER_MULT}`);
     console.log(`   📊 Mult threshold: ${MULT_MIN_SAMPLE} ghost samples`);
