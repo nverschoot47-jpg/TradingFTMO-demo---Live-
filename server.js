@@ -612,9 +612,14 @@ async function widenExistingTradeSL(pos, tpRR) {
 // handmatig, of synced van MT5), worden phantomSL en tpRRUsed bijgewerkt.
 // maxRR wordt altijd herberekend op de ACTUELE SL afstand op dat moment.
 function startGhostTracker(pos) {
-  // FIX 18: guard sl=0
+  // Guard: ghost is nutteloos zonder SL (geen price tracking mogelijk)
+  // en zonder vwapPosition (kan nooit in EV tabel terechtkomen)
   if (!pos.sl || pos.sl <= 0) {
-    console.warn(`[Ghost] ${pos.positionId}: sl=0, ghost NOT started`);
+    console.warn(`[Ghost] ${pos.positionId}: sl=0, ghost NOT started — wacht op SL sync`);
+    return;
+  }
+  if (!pos.vwapPosition || pos.vwapPosition === "unknown") {
+    console.warn(`[Ghost] ${pos.positionId}: vwapPosition=unknown, ghost NOT started — data incompleet voor EV`);
     return;
   }
   if (ghostTrackers[pos.positionId]) return;
@@ -1660,17 +1665,25 @@ app.get("/live/positions", async (req, res) => {
 });
 
 app.get("/live/ghosts", (req, res) => {
-  const ghosts = Object.values(ghostTrackers).map(g => ({
-    positionId: g.positionId, symbol: g.symbol, optimizerKey: g.optimizerKey,
-    direction: g.direction, session: g.session, vwapPosition: g.vwapPosition,
-    entry: g.entry, sl: g.sl, maxPrice: g.maxPrice,
-    phantomSL: g.sl,   // alias zodat dashboard code consistent is met history
-    maxRR: calcMaxRR(g.direction, g.entry, g.sl, g.maxPrice),
-    tpRRUsed: g.tpRRUsed,
-    elapsedMin: Math.round((Date.now() - g.startTs) / 60000),
-    slChanges: g.slChanges ?? 0,
-    tpChanges: g.tpChanges ?? 0,
-  }));
+  const ghosts = Object.values(ghostTrackers).map(g => {
+    const livePos  = openPositions[g.positionId];
+    const liveSL   = livePos?.sl ?? g.sl;
+    const livePrice = livePos?.currentPrice ?? g.maxPrice;
+    return {
+      positionId: g.positionId, symbol: g.symbol, optimizerKey: g.optimizerKey,
+      direction: g.direction, session: g.session, vwapPosition: g.vwapPosition,
+      entry: g.entry, sl: liveSL, maxPrice: g.maxPrice,
+      phantomSL: liveSL,
+      maxRR: calcMaxRR(g.direction, g.entry, liveSL, g.maxPrice),
+      tpRRUsed: g.tpRRUsed,
+      elapsedMin: Math.round((Date.now() - g.startTs) / 60000),
+      openedAt: g.openedAt,
+      slPctUsed: liveSL && g.entry && livePrice
+        ? calcPctSlUsed(g.direction, g.entry, liveSL, livePrice) : 0,
+      slChanges: g.slChanges ?? 0,
+      tpChanges: g.tpChanges ?? 0,
+    };
+  });
   res.json({ count: ghosts.length, ghosts });
 });
 
@@ -2314,7 +2327,10 @@ async function loadPositions(){
 
 // ── 2. TP OPTIMISER ──────────────────────────────────────
 async function loadOverview(){
-  const [trD,evD,tpD]=await Promise.all([api('/trades?limit=2000'),api('/ev'),api('/tp-locks')]);
+  // Haal het werkelijke aantal trades op — niet hardcoded 2000
+  const countD=await api('/trades?limit=1');
+  const realLimit=countD?.count??5000;
+  const [trD,evD,tpD]=await Promise.all([api('/trades?limit='+Math.max(realLimit,5000)),api('/ev'),api('/tp-locks')]);
   if(!trD)return;
   _allTrades=trD.trades||[];
   const tpMap={};if(tpD)tpD.forEach(t=>{tpMap[t.key]=t;});
@@ -2536,25 +2552,39 @@ function loadErrors(){
 async function loadOpts(){
   const [sd,sigD]=await Promise.all([api('/shadow'),api('/signal-stats')]);
   const tips=[];
-  if(sd?.results){
-    const wide=sd.results.filter(r=>r.currentSlTooWide&&(r.potentialSavingPct??0)>5);
-    if(wide.length)tips.push({cls:'tip-g',title:'🎯 SL Tightening Opportunity',body:wide.slice(0,5).map(w=>\`<b>\${w.symbol}</b> \${w.session}/\${w.direction}: rec \${w.recommendedSlPct?.toFixed(2)||'?'}% → save <b>\${w.potentialSavingPct}%</b>\`).join('<br>')});
-  }
-  if(_ovData.length){
-    const ev0=_ovData.filter(c=>(c.ev?.bestEV||0)>0&&!c.tp&&c.trades.length>=3);
-    if(ev0.length)tips.push({cls:'tip-y',title:'⚡ EV+ Combos — TP Not Locked Yet',body:ev0.slice(0,6).map(c=>\`<b>\${c.sym}</b> \${c.sess} \${c.dir} \${c.vwap} — EV=\${(c.ev.bestEV||0).toFixed(3)} n=\${c.trades.length}\`).join('<br>')});
-    const bad=_ovData.filter(c=>(c.ev?.bestEV||0)<-0.1&&c.trades.length>=5).sort((a,b)=>(a.ev?.bestEV||0)-(b.ev?.bestEV||0));
-    if(bad.length)tips.push({cls:'tip-r',title:'⛔ Underperforming Combos',body:bad.slice(0,6).map(c=>\`<b>\${c.sym}</b> \${c.sess} \${c.dir} \${c.vwap} — EV=\${(c.ev.bestEV||0).toFixed(3)} n=\${c.trades.length}\`).join('<br>')});
-    const best=_ovData.filter(c=>c.trades.length>=3&&c.winPct!=null).sort((a,b)=>b.winPct-a.winPct).slice(0,5);
-    if(best.length)tips.push({cls:'tip-b',title:'🏆 Best Win Rate Combos',body:best.map(c=>\`<b>\${c.sym}</b> \${c.sess} \${c.dir} \${c.vwap} — \${c.winPct.toFixed(0)}% (\${c.wins.length}/\${c.trades.length})\`).join('<br>')});
-  }
+
+  // Conversie ratio + reject reasons met pair namen
   if(sigD){
     const rate=sigD.conversionPct??null;
-    if(rate!=null){const cls=rate>=80?'tip-g':rate>=50?'tip-y':'tip-r';tips.push({cls,title:'📡 Signal Conversion: '+rate+'%',body:\`\${sigD.placed||0} placed / \${sigD.total||0} total<br>\${(sigD.topRejectReasons||[]).slice(0,4).map(r=>\`\${r.reason}: \${r.count}\`).join(' · ')}\`});}
+    if(rate!=null){
+      const cls=rate>=80?'tip-g':rate>=50?'tip-y':'tip-r';
+      const rejectLines=(sigD.topRejectReasons||[]).slice(0,6).map(r=>{
+        const label=r.reason.length>60?r.reason.slice(0,60)+'...':r.reason;
+        const pairStr=(r.pairs||[]).map(p=>'<b>'+p.symbol+'</b> '+p.direction+'\xD7'+p.count).join(', ');
+        return '<div style="margin:2px 0"><span class="bd d">'+r.count+'\xD7</span> '+label+(pairStr?'<br><span style="color:var(--dim);padding-left:8px">\u21B3 '+pairStr+'</span>':'')+'</div>';
+      }).join('');
+      tips.push({cls,title:'📡 Signal Conversion: '+rate+'% \u2014 '+(sigD.placed||0)+' placed / '+(sigD.total||0)+' total',body:rejectLines||'Geen rejects'});
+    }
   }
+
+  // SL tightening
+  if(sd?.results){
+    const wide=sd.results.filter(r=>r.currentSlTooWide&&(r.potentialSavingPct??0)>5);
+    if(wide.length)tips.push({cls:'tip-g',title:'🎯 SL Tightening Opportunity',body:wide.slice(0,5).map(w=>'<b>'+w.symbol+'</b> '+w.session+'/'+w.direction+'/'+(w.vwapPosition||'?')+': rec <b>'+(w.recommendedSlPct?.toFixed(2)||'?')+'%</b> \u2192 save <b>'+w.potentialSavingPct+'%</b>').join('<br>')});
+  }
+
+  if(_ovData.length){
+    const ev0=_ovData.filter(c=>(c.ev?.bestEV||0)>0&&!c.tp&&c.trades.length>=3);
+    if(ev0.length)tips.push({cls:'tip-y',title:'⚡ EV+ Combos \u2014 TP Not Locked Yet',body:ev0.slice(0,6).map(c=>'<b>'+c.sym+'</b> '+c.sess+' '+c.dir+' '+c.vwap+' \u2014 EV='+(c.ev.bestEV||0).toFixed(3)+' n='+c.trades.length).join('<br>')});
+    const bad=_ovData.filter(c=>(c.ev?.bestEV||0)<-0.1&&c.trades.length>=5).sort((a,b)=>(a.ev?.bestEV||0)-(b.ev?.bestEV||0));
+    if(bad.length)tips.push({cls:'tip-r',title:'⛔ Underperforming Combos',body:bad.slice(0,6).map(c=>'<b>'+c.sym+'</b> '+c.sess+' '+c.dir+' '+c.vwap+' \u2014 EV='+(c.ev.bestEV||0).toFixed(3)+' n='+c.trades.length).join('<br>')});
+    const best=_ovData.filter(c=>c.trades.length>=3&&c.winPct!=null).sort((a,b)=>b.winPct-a.winPct).slice(0,5);
+    if(best.length)tips.push({cls:'tip-b',title:'🏆 Best Win Rate Combos',body:best.map(c=>'<b>'+c.sym+'</b> '+c.sess+' '+c.dir+' '+c.vwap+' \u2014 '+c.winPct.toFixed(0)+'% ('+c.wins.length+'/'+c.trades.length+')').join('<br>')});
+  }
+
   if(!tips.length)tips.push({cls:'tip-b',title:'ℹ️ No Suggestions Yet',body:'Need more trades to generate tips.'});
   document.getElementById('opt-meta').textContent=tips.length+' suggestions';
-  document.getElementById('opt-tips').innerHTML=tips.map(t=>\`<div class="tip \${t.cls}"><div class="tipt">\${t.title}</div><div class="tipb">\${t.body}</div></div>\`).join('');
+  document.getElementById('opt-tips').innerHTML=tips.map(t=>'<div class="tip '+t.cls+'"><div class="tipt">'+t.title+'</div><div class="tipb">'+t.body+'</div></div>').join('');
 }
 
 // ── 8. RISK CONFIG ────────────────────────────────────────
