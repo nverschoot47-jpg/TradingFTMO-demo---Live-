@@ -1325,11 +1325,48 @@ app.post("/webhook", async (req, res) => {
   // Step A: Place market order
   const sessShort = session === "london" ? "LON" : session === "ny" ? "NY" : "AS";
   const dirShort  = direction === "buy" ? "B" : "S";
-  const comment   = `NV-${dirShort}-${symKey.slice(0, 6)}-${rrLabel}-${sessShort}`.slice(0, 26);
+  // Fix 2: vwapPosition vanuit TV payload (above/below) — onafhankelijk van MT5 prijs
+  const vpShort   = vwapPosition === "above" ? "A" : vwapPosition === "below" ? "B" : "U";
+  const comment   = `NV-${dirShort}-${symKey.slice(0, 6)}-${vpShort}-${rrLabel}-${sessShort}`.slice(0, 26);
+  // Resultaat: NV-B-USDCHF-A-2R-LON (buy, above VWAP, london)
+  //            NV-S-XAUUSD-B-2R-LON (sell, below VWAP, london)
+  // Fix 1: Haal live MT5 prijs op VOOR de order.
+  // TV entry + TV SL → derivedSlPct al bekend. Nu: live MT5 bid/ask ophalen,
+  // zelfde % eraf/erbij zetten voor SL (×1.5 buffer), TP berekenen op die prijs.
+  // Alles meegestuurd in de orderPayload — geen aparte modify nodig als fallback.
+  let preBid = null, preAsk = null, preSpread = 0;
+  let preExecPrice = closePrice; // fallback op TV entry als MT5 niet bereikbaar
+  try {
+    const prePd = await fetchCurrentPrice(mt5Symbol);
+    if (prePd) {
+      preBid    = prePd.bid;
+      preAsk    = prePd.ask;
+      preSpread = prePd.spread ?? 0;
+      // Gebruik bid voor sell, ask voor buy — dit is de realistische executieprijs
+      preExecPrice = direction === "buy"
+        ? (prePd.ask ?? prePd.mid ?? closePrice)
+        : (prePd.bid ?? prePd.mid ?? closePrice);
+      console.log(`[PreOrder] ${mt5Symbol}: bid=${preBid} ask=${preAsk} spread=${preSpread} → preExec=${preExecPrice}`);
+    }
+  } catch (e) {
+    console.warn(`[PreOrder] fetchCurrentPrice failed (${e.message}) — fallback op TV entry ${closePrice}`);
+  }
+
+  // Bereken SL/TP op live MT5 prijs vóór de order
+  // derivedSlPct = |tvEntry - tvSL| / tvEntry (al berekend bovenaan)
+  // Zelfde % op MT5 live prijs toepassen, met ×1.5 buffer
+  const preMt5SL = enforceMinStop(mt5Symbol, direction,
+    preExecPrice, calcSLFromDerivedPct(direction, preExecPrice, derivedSlPct));
+  const preMt5TP = applyTPFloorGuard(direction, preExecPrice, preMt5SL,
+    calcTPPrice(direction, preExecPrice, preMt5SL, tpRR));
+  console.log(`[PreOrder] SL=${preMt5SL} TP=${preMt5TP} (${tpRR}R) op preExec=${preExecPrice} | derivedSlPct=${slPctHuman}`);
+
   const orderPayload = {
     symbol: mt5Symbol,
     actionType: direction === "buy" ? "ORDER_TYPE_BUY" : "ORDER_TYPE_SELL",
     volume: lots, comment,
+    stopLoss:   preMt5SL,  // Fix 1: direct in order — werkt ook als modify later faalt
+    takeProfit: preMt5TP,  // Fix 1: direct in order
   };
 
   let result, positionId;
@@ -1346,16 +1383,18 @@ app.post("/webhook", async (req, res) => {
   }
 
   // Step B: Read back real execution price
-  let executionPrice = closePrice;
-  let spread = 0, bid = null, ask = null;
+  // Pre-order SL/TP al actief in MT5. Nu verfijnen op werkelijke fill prijs.
+  let executionPrice = preExecPrice; // start van live MT5 prijs, niet TV entry
+  let spread = preSpread, bid = preBid, ask = preAsk;
   try {
-    await new Promise(r => setTimeout(r, 2500)); // verhoogd van 600ms → 2500ms (MetaApi positie beschikbaarheid)
+    await new Promise(r => setTimeout(r, 2500));
     const positions = await fetchOpenPositions();
     const thisPos   = Array.isArray(positions) ? positions.find(p => String(p.id) === positionId) : null;
     if (thisPos?.openPrice) executionPrice = parseFloat(thisPos.openPrice);
+    // Refresh spread na fill
     const pd = await fetchCurrentPrice(mt5Symbol);
     if (pd) { bid = pd.bid; ask = pd.ask; spread = pd.spread ?? 0; }
-  } catch { /* fallback */ }
+  } catch { /* pre-order waarden blijven actief als fallback */ }
 
   const slippage = parseFloat((executionPrice - closePrice).toFixed(5));
 
@@ -1480,20 +1519,31 @@ app.post("/webhook", async (req, res) => {
     console.warn(`[TP_RR_TOO_LOW] ${positionId}: actualTPRR=${rrCheck.actualTPRR}R`);
   }
 
-  // Step D: Set SL + TP — retry up to 3×
+  // Step D: Verfijn SL + TP op werkelijke executionPrice — retry 3×
+  // Pre-order SL/TP (preMt5SL/preMt5TP) zijn al actief als fallback in MT5.
   let slTpSet = false;
-  for (let attempt = 1; attempt <= 5; attempt++) {
+  for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       await metaFetch(`/positions/${positionId}`, { method: "PUT", body: JSON.stringify({ stopLoss: mt5SL, takeProfit: mt5TP }) }, 8000);
-      console.log(`[SL/TP] ${positionId} → SL=${mt5SL} TP=${mt5TP} (${tpRR}R) exec=${executionPrice} attempt=${attempt}`);
+      console.log(`[SL/TP] ✓ ${positionId} → SL=${mt5SL} TP=${mt5TP} (${tpRR}R) exec=${executionPrice} attempt=${attempt}`);
+      if (preMt5SL !== mt5SL || preMt5TP !== mt5TP) {
+        console.log(`[SL/TP] Verfijnd t.o.v. pre-order: SL ${preMt5SL}→${mt5SL} TP ${preMt5TP}→${mt5TP} (slippage=${slippage})`);
+      }
       slTpSet = true; break;
     } catch (e) {
-      console.warn(`[!] SL/TP attempt ${attempt}/3 failed: ${e.message}`);
-      if (attempt < 5) await new Promise(r => setTimeout(r, 2000 * attempt));
+      console.warn(`[SL/TP] attempt ${attempt}/3 failed: ${e.message}`);
+      if (attempt < 3) await new Promise(r => setTimeout(r, 2000 * attempt));
     }
   }
   if (!slTpSet) {
-    logEvent({ type: "SL_TP_SET_FAILED", positionId, symbol: symKey, executionPrice, mt5SL, mt5TP, note: "5 retries exhausted" });
+    // Pre-order SL/TP (preMt5SL/preMt5TP) zijn nog steeds actief in MT5 — trade heeft SL/TP
+    console.warn(`[SL/TP] Modify mislukt na 3 pogingen — pre-order SL=${preMt5SL} TP=${preMt5TP} blijft actief`);
+    logEvent({ type: "SL_TP_MODIFY_FAILED_USING_PRE", positionId, symbol: symKey,
+      preSL: preMt5SL, preTP: preMt5TP, refinedSL: mt5SL, refinedTP: mt5TP,
+      executionPrice, slippage, note: "pre-order SL/TP actief als fallback" });
+    // Gebruik pre-order waarden zodat openPositions correct is
+    mt5SL = preMt5SL;
+    mt5TP = preMt5TP;
   }
 
   // Register position
