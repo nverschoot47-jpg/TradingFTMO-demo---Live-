@@ -1,25 +1,28 @@
 // ===============================================================
-// server.js  v11.2  |  PRONTO-AI
+// server.js  v11.1  |  PRONTO-AI
 // TradingView → MetaApi REST → FTMO MT5
 //
-// v11.2 — BUG FIXES (20 April 2026):
+// v11.1 — BUG FIXES (20 April 2026):
 //
-//  FIX A — SL/TP modify 404: resolvePositionId()
-//    MetaApi geeft soms een orderId terug i.p.v. positionId na placeOrder.
-//    Nieuwe helper resolvePositionId() probeert eerst exact ID match,
-//    daarna fallback op symbol+richting+recentOpenedAt (< 45s).
-//    Werkelijke positionId wordt doorgepropageerd naar alle volgende stappen.
+//  FIX 1 — vwapPosition hersteld bij server restart:
+//    restorePositionsFromMT5() parsete vpPos hardcoded als "unknown".
+//    Nu wordt vwapPosition geparsed uit de MT5 comment string via
+//    parseVwapFromComment(). Comment formaat: NV-{dir}-{sym}-{A|B|U}-{rr}-{sess}.
+//    A=above, B=below, U=unknown. OptKey en ghost tracker gebruiken
+//    de juiste vwapPosition na restart → VWAP-tag correct in dashboard.
 //
-//  FIX B — SIGTERM bij startup: batched prefetch
-//    60+ symbolen tegelijk prefetchen veroorzaakte Railway SIGTERM (rate-limit).
-//    Prefetch nu in batches van 5 met 300ms pauze ertussen.
+//  FIX 2 — Ghost tracker eerste tick delay 3s:
+//    Ghost startte onmiddellijk na placeOrder(). MetaApi had de positie
+//    nog niet geregistreerd → eerste SL/TP modify mislukte met HTTP 404.
+//    GHOST_INITIAL_DELAY_MS = 3000ms vóór de eerste tick.
+//    Vervolgende ticks gebruiken GHOST_POLL_MS (30s) zoals voorheen.
 //
-// v11.1 fixes blijven actief:
-//  - VWAP label parsen uit MT5 comment bij restore
-//  - TP Optimiser filter op openedAt >= 2026-04-20T12:00 + volledig gesloten
-//
-// (alle v11.0 fixes blijven actief — zie v11.0 header)
-// ===============================================================
+//  FIX 3 — TP Optimiser: filter op openedAt ≥ 2026-04-20T12:00 + status closed:
+//    Dashboard loadOverview() filterde op closedAt ≥ 2026-04-18.
+//    Gecorrigeerd naar: openedAt ≥ 2026-04-20T12:00:00Z AND closedAt IS NOT NULL.
+//    Trades die nog open staan (closedAt null) worden uitgesloten.
+//    Trades geopend vóór 12u op 20/04/2026 worden uitgesloten.
+//    Alleen in de dashboard-side filter — geen DB wijziging nodig.
 //
 // v11.0 — RISK SIZING FIXES (20 April 2026):
 //
@@ -671,46 +674,7 @@ async function widenExistingTradeSL(pos, tpRR) {
   }
 }
 
-// ── Resolve real positionId after placeOrder ──────────────────────
-// MetaApi geeft soms een orderId terug (nog niet gefilled) i.p.v. een
-// echte positionId. Gevolg: alle /positions/:id calls falen met 404.
-// Strategie:
-//   1. Exact ID match (werkt als MetaApi direct positionId geeft)
-//   2. Fallback: zoek op symbol + richting + recentOpenedAt (< 45s)
-// Retourneert { resolvedId, changed }.
-async function resolvePositionId(candidateId, mt5Symbol, direction, maxAttempts = 7, intervalMs = 1200) {
-  const typeStr = direction === 'buy' ? 'POSITION_TYPE_BUY' : 'POSITION_TYPE_SELL';
-  for (let i = 0; i < maxAttempts; i++) {
-    try {
-      const live = await fetchOpenPositions();
-      if (!Array.isArray(live)) { await new Promise(r => setTimeout(r, intervalMs)); continue; }
-      // 1. Exact ID match
-      const exact = live.find(p => String(p.id) === String(candidateId));
-      if (exact) {
-        if (i > 0) console.log(`[PosResolve] ${candidateId}: exact match na ${(i * intervalMs / 1000).toFixed(1)}s`);
-        return { resolvedId: String(exact.id), changed: false };
-      }
-      // 2. Symbol + direction + recent open (< 45s)
-      const cutoff = Date.now() - 45000;
-      const bySymbol = live.find(p =>
-        p.symbol === mt5Symbol &&
-        p.type === typeStr &&
-        p.time && new Date(p.time).getTime() >= cutoff
-      );
-      if (bySymbol) {
-        console.log(`[PosResolve] orderId=${candidateId} -> ECHT positionId=${bySymbol.id} (symbol match)`);
-        return { resolvedId: String(bySymbol.id), changed: String(bySymbol.id) !== String(candidateId) };
-      }
-    } catch (e) {
-      console.warn(`[PosResolve] attempt ${i + 1} error: ${e.message}`);
-    }
-    if (i < maxAttempts - 1) await new Promise(r => setTimeout(r, intervalMs));
-  }
-  console.warn(`[PosResolve] ${candidateId}: niet gevonden na ${maxAttempts} pogingen`);
-  return { resolvedId: String(candidateId), changed: false };
-}
-
-────
+// ── Ghost Optimizer ───────────────────────────────────────────────
 // v10.7: Ghost tracker volgt de LIVE SL/TP uit openPositions, niet de
 // gefixeerde waarden bij start. Als SL wijzigt (anti-consolidation,
 // handmatig, of synced van MT5), worden phantomSL en tpRRUsed bijgewerkt.
@@ -812,9 +776,14 @@ function startGhostTracker(pos) {
       if (g) g.timer = timer;
     }
   }
-  timer = setTimeout(tick, GHOST_POLL_MS);
+  // FIX 2: initiële delay van 3s vóór eerste tick.
+  // MetaApi registreert de positie na placeOrder() met een lichte vertraging.
+  // Zonder deze delay faalt de eerste SL/TP modify met HTTP 404 (positie niet gevonden).
+  // 3s is ruim voldoende voor MetaApi om de positie in zijn systeem te hebben.
+  const GHOST_INITIAL_DELAY_MS = 3000;
+  timer = setTimeout(tick, GHOST_INITIAL_DELAY_MS);
   ghostTrackers[positionId].timer = timer;
-  console.log(`[Ghost] Started: ${positionId} | ${optimizerKey} | sl=${sl} (live tracking actief)`);
+  console.log(`[Ghost] Started: ${positionId} | ${optimizerKey} | sl=${sl} | eerste tick over ${GHOST_INITIAL_DELAY_MS}ms`);
 }
 
 async function finalizeGhost(positionId, stopReason, elapsedMs, finalMaxPrice) {
@@ -1014,6 +983,26 @@ async function handlePositionClosed(pos) {
 }
 
 // ── Restore positions from MT5 ────────────────────────────────────
+// FIX 1: vwapPosition wordt geparsed uit de MT5 comment string.
+// Comment formaat: "NV-B-XAUUSD-A-2R-LON" → vpShort 'A'=above, 'B'=below, 'U'=unknown.
+// Fallback: "unknown" als comment ontbreekt of geen vpShort heeft.
+function parseVwapFromComment(comment) {
+  if (!comment) return "unknown";
+  // Comment: NV-{dir}-{sym}-{vp}-{rr}-{sess}
+  const parts = comment.split("-");
+  // Index 3 = vpShort (A/B/U), maar comment kan variëren in lengte door symKey lengte
+  // Zoek expliciet: het karakter direct na het 3e '-' dat A, B of U is
+  // Formaat: NV-[B|S]-[SYMBOL]-[A|B|U]-[RR]-[SESS]
+  // parts[0]=NV, parts[1]=dir, parts[2..n-3]=sym (sym kan '-' bevatten), parts[n-2]=rr, parts[n-1]=sess
+  // vpShort staat op index parts.length-3
+  if (parts.length >= 5) {
+    const vp = parts[parts.length - 3];
+    if (vp === "A") return "above";
+    if (vp === "B") return "below";
+  }
+  return "unknown";
+}
+
 async function restorePositionsFromMT5() {
   try {
     const live = await fetchOpenPositions();
@@ -1026,25 +1015,19 @@ async function restorePositionsFromMT5() {
       const dir    = lp.type === "POSITION_TYPE_BUY" ? "buy" : "sell";
       const entry  = lp.openPrice ?? lp.currentPrice ?? 0;
       const sess   = getSession(lp.time ? new Date(lp.time) : null);
-      // FIX 1: Parse vwapPosition from MT5 comment (format: "NV-B-AUDCHF-A-2R-LON")
-      // Segment index 3 (0-based) = vwap shortcode: A=above, B=below, U=unknown
-      const commentParts = (lp.comment || '').split('-');
-      let vpPos = 'unknown';
-      if (commentParts.length >= 4) {
-        if (commentParts[3] === 'A') vpPos = 'above';
-        else if (commentParts[3] === 'B') vpPos = 'below';
-      }
+      // FIX 1: herstel vwapPosition uit MT5 comment (NV-B-SYM-A-2R-LON formaat)
+      const vpPos  = parseVwapFromComment(lp.comment ?? lp.reason ?? "");
       const optKey = buildOptimizerKey(sym, sess, dir, vpPos);
       openPositions[id] = {
         positionId: id, symbol: sym, mt5Symbol: lp.symbol,
         direction: dir, vwapPosition: vpPos, optimizerKey: optKey,
-        // vwapPosition parsed from comment (A/B/U) — allows correct dashboard display
         entry, sl: lp.stopLoss ?? 0, tp: lp.takeProfit ?? null,
         lots: lp.volume ?? 0.01, riskEUR: 0, riskPct: FIXED_RISK_PCT,
         session: sess, openedAt: lp.time ?? new Date().toISOString(),
         maxPrice: entry, maxRR: 0, currentPnL: lp.unrealizedProfit ?? 0,
         slPct: null, restoredAfterRestart: true,
       };
+      console.log(`[Restart] ${sym} (${id}): vwapPosition='${vpPos}' (comment='${lp.comment ?? ""}')`);
       if (openPositions[id].sl > 0) {
         console.log(`[Restart] Ghost for ${sym} (${id}): entry=${entry}`);
         startGhostTracker(openPositions[id]);
@@ -1513,17 +1496,12 @@ app.post("/webhook", async (req, res) => {
     return res.status(200).json({ status: "ORDER_FAILED", error: errMsg });
   }
 
-  // Step B: Resolve echte positionId + read back real execution price.
-  // MetaApi geeft soms orderId ipv positionId — resolvePositionId lost dit op
-  // via exact ID match of symbol+richting+recency fallback.
-  let executionPrice = preExecPrice;
+  // Step B: Read back real execution price
+  // Pre-order SL/TP al actief in MT5. Nu verfijnen op werkelijke fill prijs.
+  let executionPrice = preExecPrice; // start van live MT5 prijs, niet TV entry
   let spread = preSpread, bid = preBid, ask = preAsk;
   try {
-    const { resolvedId, changed } = await resolvePositionId(positionId, mt5Symbol, direction);
-    if (changed) {
-      console.log(`[PosResolve] positionId gecorrigeerd: ${positionId} -> ${resolvedId}`);
-      positionId = resolvedId;
-    }
+    await new Promise(r => setTimeout(r, 2500));
     const positions = await fetchOpenPositions();
     const thisPos   = Array.isArray(positions) ? positions.find(p => String(p.id) === positionId) : null;
     if (thisPos?.openPrice) executionPrice = parseFloat(thisPos.openPrice);
@@ -1657,7 +1635,6 @@ app.post("/webhook", async (req, res) => {
 
   // Step D: Verfijn SL + TP op werkelijke executionPrice — retry 3×
   // Pre-order SL/TP (preMt5SL/preMt5TP) zijn al actief als fallback in MT5.
-  // positionId is al geresolved in Step B via resolvePositionId().
   let slTpSet = false;
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
@@ -1928,7 +1905,8 @@ app.get("/spread-log", async (req, res) => {
 app.get("/test", (req, res) => {
   res.json({
     status: "Railway is bereikbaar",
-    version: "11.2.0",
+    version: "11.0.0",
+    time: new Date().toISOString(),
     headers: {
       "content-type": req.headers["content-type"] ?? "(geen)",
       "user-agent":   (req.headers["user-agent"] ?? "(geen)").slice(0, 80),
@@ -1956,7 +1934,7 @@ app.get("/health", async (req, res) => {
   const tradeWindowForex = canOpenNewTrade("EURUSD");
   const tradeWindowStock = canOpenNewTrade("AAPL");
   res.json({
-    status: "ok", version: "11.2.0", time: getBrusselsDateStr(),
+    status: "ok", version: "11.0.0", time: getBrusselsDateStr(),
     openPos: Object.keys(openPositions).length, ghosts: Object.keys(ghostTrackers).length,
     tpLocks: Object.keys(tpLocks).length, closedT: closedTrades.length, balance,
     fixedRiskPct: FIXED_RISK_PCT, marketOpen: isMarketOpen(), session: getSession(),
@@ -1981,7 +1959,7 @@ app.get(["/", "/dashboard"], async (req, res) => {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PRONTO-AI v11.2</title>
+<title>PRONTO-AI v11.0</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600;700&family=IBM+Plex+Sans+Condensed:wght@500;600;700&display=swap" rel="stylesheet">
 <style>
@@ -2094,7 +2072,7 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
 <div class="hdr">
   <div>
     <div class="logo">PRONTO-AI</div>
-    <div class="ver">v11.2 · TradingView → MetaApi → FTMO MT5 · Fixed Risk ${(FIXED_RISK_PCT*100).toFixed(3)}% · SL Buffer ×${SL_BUFFER_MULT} · Fix A/C/D/E actief</div>
+    <div class="ver">v11.0 · TradingView → MetaApi → FTMO MT5 · Fixed Risk ${(FIXED_RISK_PCT*100).toFixed(3)}% · SL Buffer ×${SL_BUFFER_MULT} · Fix A/C/D/E actief</div>
   </div>
   <div class="hdr-r">
     <span class="sb s-outside" id="hdr-sess">—</span>
@@ -2463,11 +2441,18 @@ async function loadOverview(){
       for(const dir of['buy','sell']){
         for(const vwap of['above','below']){
           const key=sym+'_'+sess+'_'+dir+'_'+vwap;
-// COMPLIANCE FIX 3: only fully-closed trades opened >= 20-Apr-2026 12:00 UTC.
-// "Volledig" = closeReason 'tp' or 'sl' only (no manual/incomplete closes).
-// vwapPosition===vwap automatically excludes 'unknown' positions.
-const TP_FILTER_DATE=new Date('2026-04-20T12:00:00.000Z');
-          const trades=_allTrades.filter(t=>t.symbol===sym&&t.session===sess&&t.direction===dir&&t.vwapPosition===vwap&&t.openedAt&&new Date(t.openedAt)>=TP_FILTER_DATE&&t.closedAt&&(t.closeReason==='tp'||t.closeReason==='sl'));
+// COMPLIANCE: only CLOSED trades opened on or after 2026-04-20T12:00:00Z with valid VWAP.
+// FIX 3: openedAt >= 2026-04-20T12:00:00Z (niet closedAt) — trades die vóór 12u20 zijn
+// geopend zijn uitgesloten. Trades die nog open staan (closedAt null) worden ook uitgesloten.
+const TP_OPT_DATE = new Date('2026-04-20T12:00:00.000Z');
+          const trades=_allTrades.filter(t=>
+            t.symbol===sym &&
+            t.session===sess &&
+            t.direction===dir &&
+            t.vwapPosition===vwap &&
+            t.closedAt != null &&                            // status === 'closed' (nog open = null)
+            t.openedAt && new Date(t.openedAt) >= TP_OPT_DATE  // geopend ná cut-off
+          );
           const wins=trades.filter(t=>t.closeReason==='tp');
           const sls=trades.filter(t=>t.closeReason==='sl');
           const pnls=trades.map(t=>t.realizedPnlEUR??t.currentPnL??0);
@@ -2802,7 +2787,7 @@ async function start() {
   const missing = ["META_API_TOKEN", "META_ACCOUNT_ID", "WEBHOOK_SECRET"].filter(k => !process.env[k]);
   if (missing.length) { console.error(`[ERR] Missing env: ${missing.join(", ")}`); process.exit(1); }
 
-  console.log("🚀 PRONTO-AI v11.2 starting...");
+  console.log("🚀 PRONTO-AI v11.1 starting...");
   await initDB();
 
   // Load closed trades
@@ -2856,15 +2841,12 @@ async function start() {
 
   await restorePositionsFromMT5();
 
-  // STARTUP: prefetch MT5 symbol specs in batches van 5 (voorkomt rate-limit / SIGTERM).
-  // Concurrent fetch van 60+ symbolen tegelijk veroorzaakte Railway SIGTERM.
-  console.log("Prefetching MT5 symbol specs (batched)...");
+  // STARTUP: prefetch MT5 symbol specs voor alle catalog symbolen
+  // Zo is de lotVal cache gevuld voor de eerste trade - geen fallback meer.
+  console.log("Prefetching MT5 symbol specs...");
   const prefetchResults = { ok: 0, fallback: 0 };
-  const symEntries = Object.entries(SYMBOL_CATALOG);
-  const BATCH_SIZE = 5;
-  for (let i = 0; i < symEntries.length; i += BATCH_SIZE) {
-    const batch = symEntries.slice(i, i + BATCH_SIZE);
-    await Promise.allSettled(batch.map(async ([sym, info]) => {
+  await Promise.allSettled(
+    Object.entries(SYMBOL_CATALOG).map(async ([sym, info]) => {
       try {
         const spec = await fetchSymbolLotValue(info.mt5, info.type);
         if (spec.source === "mt5") prefetchResults.ok++;
@@ -2874,10 +2856,8 @@ async function start() {
         prefetchResults.fallback++;
         console.warn(`[SymSpec] ${sym}: prefetch failed - ${e.message}`);
       }
-    }));
-    // Kleine pauze tussen batches om rate-limit te respecteren
-    if (i + BATCH_SIZE < symEntries.length) await new Promise(r => setTimeout(r, 300));
-  }
+    })
+  );
   console.log(`[SymSpec] Done: ${prefetchResults.ok} live van MT5, ${prefetchResults.fallback} fallback`);
 
   // FIX C: rebuild currency exposure na restore van open posities
@@ -2885,7 +2865,7 @@ async function start() {
   console.log(`💱 Currency exposure rebuilt: ${JSON.stringify(Object.fromEntries(Object.entries(currencyExposure).map(([k,v])=>[k,v.toFixed(2)])))}`);
 
   app.listen(PORT, () => {
-    console.log(`[✓] PRONTO-AI v11.2 on port ${PORT}`);
+    console.log(`[✓] PRONTO-AI v11.0 on port ${PORT}`);
     console.log(`   🔹 Dashboard:      /`);
     console.log(`   🔹 Health:         /health`);
     console.log(`   🔹 EV Table:       /ev`);
