@@ -1,7 +1,41 @@
 // ===============================================================
-// server.js  v10.8  |  PRONTO-AI
+// server.js  v11.0  |  PRONTO-AI
 // TradingView → MetaApi REST → FTMO MT5
 //
+// v11.0 — RISK SIZING FIXES (20 April 2026):
+//
+//  FIX R1 — getOptimalTP() altijd DEFAULT_TP_RR = 2.0R bij geen data:
+//    Geen asset type cap. Zolang er geen EV-data is (< 5 ghosts),
+//    wordt altijd 2.0R gebruikt als TP target voor alle asset types.
+//    Zodra er voldoende ghosts zijn, pakt de EV optimizer het beste
+//    RR niveau en wordt dat gelockt via updateTPLock().
+//    De TP lock is de enige bron van truth voor EV+ combos.
+//
+//  FIX R2 — calcLots() min lot warning:
+//    Als rawLots < 0.01 → clamped naar 0.01 maar console.warn
+//    toont inflatedRisk vs riskEUR (+% inflatie) zodat het
+//    dashboard niet stilletjes verkeerde risk toont.
+//
+//  FIX R3 — actualRiskEUR in /live/positions gebruikt live symbolSpecCache:
+//    Primair: symbolSpecCache[mt5Sym].lotVal (live van MT5).
+//    Fallback: LOT_VALUE[type] (statisch). Indexes tonen nu
+//    correcte werkelijke exposure (niet 23× te laag).
+//
+//  FIX R4 — lotDivisor anti-consolidation VERWIJDERD:
+//    lotDivisor was bedoeld voor currency correlatie maar
+//    zorgt voor inconsistente lotgroottes. Verwijderd uit
+//    alle lot berekeningen → uniform 0.15% risk per trade.
+//
+//  FIX R5 — Step C2 post-execution lot herberekening:
+//    lotDivisor verwijderd. scaleFactor reductie ook verwijderd
+//    voor EV+ trades. Alleen forex EV-neutraal krijgt nog
+//    currency budget check (scaleFactor ≤ 1.0).
+//
+//  GENOTEERD (later fixen):
+//    Alle pairs draaien momenteel op inconsistente riskPct.
+//    getSymbolRiskPct resolvet via env var → DB → DEFAULT_RISK_BY_TYPE
+//    → FIXED_RISK_PCT. Fix = uniforme configuratie per type zonder
+//    losse env overrides, of een aparte reconcile-run.
 //
 // v10.6 — FUNDAMENTELE CORRECTIES (19 April 2026):
 //
@@ -377,7 +411,15 @@ async function calcLots(symbol, mt5Sym, assetType, entry, sl, riskEUR, evMult, d
   const baseLots = riskEUR / (dist * lotVal);
   const em       = (evMult  && evMult  > 0) ? evMult  : 1.0;
   const dm       = (dayMult && dayMult > 0) ? dayMult : 1.0;
-  const lots     = Math.max(0.01, parseFloat((baseLots * em * dm).toFixed(2)));
+  const rawLots  = baseLots * em * dm;
+  // FIX R2 (v11.0): waarschuw als min lot floor de werkelijke risk inflateert.
+  // Dit gebeurt typisch bij indexes met kleine SL in punten maar grote lotVal.
+  if (rawLots < 0.01) {
+    const inflatedRisk = 0.01 * dist * lotVal;
+    const inflationPct = ((inflatedRisk / riskEUR - 1) * 100).toFixed(0);
+    console.warn(`[MinLot] ${mt5Sym} (${assetType}): rawLots=${rawLots.toFixed(5)} → clamped 0.01. actualRisk=€${inflatedRisk.toFixed(2)} vs intended=€${riskEUR.toFixed(2)} (+${inflationPct}%)`);
+  }
+  const lots = Math.max(0.01, parseFloat(rawLots.toFixed(2)));
   return { lots, lotVal, source: spec.source };
 }
 
@@ -440,8 +482,12 @@ function enforceMinStop(mt5Symbol, direction, entry, sl) {
 // ── TP calculation ────────────────────────────────────────────────
 const DEFAULT_TP_RR = 2.0;
 
-// FIX 14: single computeEVStats call
-async function getOptimalTP(optimizerKey) {
+// v11.0: Geen cap per asset type — DEFAULT_TP_RR = 2.0R voor alle assets
+// zolang er nog geen EV-data is (< GHOST_MIN_TRADES_FOR_TP ghosts).
+// Zodra er voldoende data is, pakt de EV optimizer het beste RR niveau
+// en wordt dat gelockt via updateTPLock(). De TP lock is de enige
+// bron van truth voor EV+ combos — geen externe cap nodig.
+async function getOptimalTP(optimizerKey, assetType = null) {
   const locked = tpLocks[optimizerKey];
   if (locked) return locked.lockedRR;
   const ev = await computeEVStats(optimizerKey);
@@ -1276,14 +1322,12 @@ app.post("/webhook", async (req, res) => {
   const riskEUR  = await calcRiskEUR(symKey);
   const balance  = await getLiveBalance();
 
-  // FIX 3 Rule B: same-currency other pairs (forex only)
-  const relatedCount = (assetType === "forex") ? countRelatedForex(symKey, direction) : 0;
-  const lotDivisor   = relatedCount > 0 ? (relatedCount + 1) : 1;
-  if (relatedCount > 0) {
-    console.log(`[AntiConsolid] ${symKey}: ${relatedCount} related ${direction} pairs → lots ÷${lotDivisor}`);
-    logEvent({ type: "LOTS_DIVIDED_FOREX", symbol: symKey, direction, relatedCount, lotDivisor });
-  }
+  // FIX R4 (v11.0): lotDivisor anti-consolidation VERWIJDERD.
+  // Was bedoeld voor currency correlatie maar zorgde voor inconsistente
+  // lotgroottes per pair. Uniform 0.15% risk per trade ongeacht correlatie.
+  const lotDivisor = 1; // altijd 1 — geen divisie meer
 
+  // FIX R1 (v11.0): DEFAULT_TP_RR=2.0R bij geen data, EV lock zodra ≥5 ghosts
   const tpRR    = await getOptimalTP(optimizerKey);
   const rrLabel = tpRR % 1 === 0 ? `${tpRR}R` : `${tpRR.toFixed(1)}R`;
 
@@ -1298,15 +1342,14 @@ app.post("/webhook", async (req, res) => {
     // Lot override: baseLots × evMult × dayMult (of ×1 voor neutraal)
     const base = lotOverrides[symKey];
     lots = isEvPlus
-      ? parseFloat((base * evMult * dayMult / lotDivisor).toFixed(2))
-      : parseFloat((base / lotDivisor).toFixed(2));
-    console.log(`[Lots] ${symKey}: override=${base} evMult=${evMult.toFixed(2)} dayMult=${dayMult.toFixed(2)} ÷${lotDivisor} = ${lots}`);
+      ? parseFloat((base * evMult * dayMult).toFixed(2))
+      : parseFloat((base).toFixed(2));
+    console.log(`[Lots] ${symKey}: override=${base} evMult=${evMult.toFixed(2)} dayMult=${dayMult.toFixed(2)} = ${lots}`);
   } else {
     // Live lotVal van MT5 spec — gecached na eerste keer
     const calcResult = await calcLots(symKey, mt5Symbol, assetType, closePrice || 1, tempSL, riskEUR, evMult, dayMult);
     lots = calcResult.lots;
     lotVal = calcResult.lotVal; // update lotVal met live waarde voor currency budget check
-    if (lotDivisor > 1) lots = Math.max(0.01, parseFloat((lots / lotDivisor).toFixed(2)));
     console.log(`[Lots] ${symKey}: ${calcResult.source} lotVal=${lotVal} baseLots→${lots}`);
   }
 
@@ -1456,12 +1499,12 @@ app.post("/webhook", async (req, res) => {
   mt5SL     = enforceMinStop(mt5Symbol, direction, executionPrice, mt5SL);
 
   // Step C2: Recalculate lots op executionPrice (als geen override) — nu met live lotVal
+  // FIX R5 (v11.0): lotDivisor verwijderd — uniform risk per trade.
   if (!lotOverrides[symKey]) {
     const calcResult2 = await calcLots(symKey, mt5Symbol, assetType, executionPrice, mt5SL, riskEUR, evMult, dayMult);
     lots   = calcResult2.lots;
     lotVal = calcResult2.lotVal; // live lotVal na executie (spec al gecached)
-    if (lotDivisor > 1) lots = Math.max(0.01, parseFloat((lots / lotDivisor).toFixed(2)));
-    // FIX C: herbereken scaleFactor op echte dist met live lotVal
+    // FIX C: herbereken scaleFactor op echte dist met live lotVal (alleen forex EV-neutraal)
     if (!isEvPlus && assetType === "forex") {
       const realDist = Math.abs(executionPrice - mt5SL);
       scaleFactor = await calcCurrencyScaleFactor(symKey, lots, realDist, lotVal);
@@ -1623,10 +1666,15 @@ app.get("/live/positions", async (req, res) => {
     // riskEUR in het object is de PUUR berekende basis (balance × pct).
     // Door evMult en dayMult wordt de werkelijke positiegrootte groter,
     // waardoor ook de werkelijke exposure groter is.
-    const info    = getSymbolInfo(p.symbol);
-    const type    = info?.type || "stock";
-    const lotVal  = LOT_VALUE[type] ?? 1;
-    const slDist  = p.sl > 0 ? Math.abs(p.entry - p.sl) : 0;
+    const info      = getSymbolInfo(p.symbol);
+    const type      = info?.type || "stock";
+    const mt5SymL   = info?.mt5 || p.mt5Symbol || p.symbol;
+    // FIX R3 (v11.0): gebruik live symbolSpecCache voor correcte lotVal.
+    // Statische LOT_VALUE[index]=20 is FOUT voor indexes (echte waarde ≈0.85).
+    // symbolSpecCache bevat de live MT5 spec opgehaald bij startup + eerste trade.
+    const cachedSpecL = symbolSpecCache[mt5SymL];
+    const lotVal    = cachedSpecL?.lotVal ?? LOT_VALUE[type] ?? 1;
+    const slDist    = p.sl > 0 ? Math.abs(p.entry - p.sl) : 0;
     // actualRiskEUR = werkelijke verlies bij SL hit (lots × slDist × lotVal)
     const actualRiskEUR = slDist > 0 ? parseFloat((p.lots * slDist * lotVal).toFixed(2)) : null;
     // actualRiskPct = actualRiskEUR als % van balance
@@ -1808,7 +1856,7 @@ app.get("/spread-log", async (req, res) => {
 app.get("/test", (req, res) => {
   res.json({
     status: "Railway is bereikbaar",
-    version: "10.8.0",
+    version: "11.0.0",
     time: new Date().toISOString(),
     headers: {
       "content-type": req.headers["content-type"] ?? "(geen)",
@@ -1837,7 +1885,7 @@ app.get("/health", async (req, res) => {
   const tradeWindowForex = canOpenNewTrade("EURUSD");
   const tradeWindowStock = canOpenNewTrade("AAPL");
   res.json({
-    status: "ok", version: "10.8.0", time: getBrusselsDateStr(),
+    status: "ok", version: "11.0.0", time: getBrusselsDateStr(),
     openPos: Object.keys(openPositions).length, ghosts: Object.keys(ghostTrackers).length,
     tpLocks: Object.keys(tpLocks).length, closedT: closedTrades.length, balance,
     fixedRiskPct: FIXED_RISK_PCT, marketOpen: isMarketOpen(), session: getSession(),
@@ -1862,7 +1910,7 @@ app.get(["/", "/dashboard"], async (req, res) => {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PRONTO-AI v10.8</title>
+<title>PRONTO-AI v11.0</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600;700&family=IBM+Plex+Sans+Condensed:wght@500;600;700&display=swap" rel="stylesheet">
 <style>
@@ -1975,7 +2023,7 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
 <div class="hdr">
   <div>
     <div class="logo">PRONTO-AI</div>
-    <div class="ver">v10.8 · TradingView → MetaApi → FTMO MT5 · Fixed Risk ${(FIXED_RISK_PCT*100).toFixed(3)}% · SL Buffer ×${SL_BUFFER_MULT} · Fix A/C/D/E actief</div>
+    <div class="ver">v11.0 · TradingView → MetaApi → FTMO MT5 · Fixed Risk ${(FIXED_RISK_PCT*100).toFixed(3)}% · SL Buffer ×${SL_BUFFER_MULT} · Fix A/C/D/E actief</div>
   </div>
   <div class="hdr-r">
     <span class="sb s-outside" id="hdr-sess">—</span>
@@ -2683,7 +2731,7 @@ async function start() {
   const missing = ["META_API_TOKEN", "META_ACCOUNT_ID", "WEBHOOK_SECRET"].filter(k => !process.env[k]);
   if (missing.length) { console.error(`[ERR] Missing env: ${missing.join(", ")}`); process.exit(1); }
 
-  console.log("🚀 PRONTO-AI v10.8 starting...");
+  console.log("🚀 PRONTO-AI v11.0 starting...");
   await initDB();
 
   // Load closed trades
@@ -2761,7 +2809,7 @@ async function start() {
   console.log(`💱 Currency exposure rebuilt: ${JSON.stringify(Object.fromEntries(Object.entries(currencyExposure).map(([k,v])=>[k,v.toFixed(2)])))}`);
 
   app.listen(PORT, () => {
-    console.log(`[✓] PRONTO-AI v10.8 on port ${PORT}`);
+    console.log(`[✓] PRONTO-AI v11.0 on port ${PORT}`);
     console.log(`   🔹 Dashboard:      /`);
     console.log(`   🔹 Health:         /health`);
     console.log(`   🔹 EV Table:       /ev`);
