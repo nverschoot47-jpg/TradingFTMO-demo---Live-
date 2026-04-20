@@ -1,6 +1,7 @@
 // ===============================================================
-// server.js  v10.6  |  PRONTO-AI
+// server.js  v10.8  |  PRONTO-AI
 // TradingView → MetaApi REST → FTMO MT5
+//
 //
 // v10.6 — FUNDAMENTELE CORRECTIES (19 April 2026):
 //
@@ -129,11 +130,24 @@ const MIN_STOP = {
   "XAUUSD": 0.5,
 };
 
-// LOT_VALUE = contract size per lot per asset type.
-// Forex:     100.000 units (standaard lot). dist × 100000 = correcte pip waarde.
-// Index:     20 EUR per punt per lot (bijv. DAX, NAS100 — broker afhankelijk).
-// Commodity: 100 (bijv. XAUUSD: 100 troy oz per lot).
-// Stock:     1 (CFD: 1 aandeel per lot).
+// LOT_VALUE = fallback contract size per lot per asset type.
+// PRIMAIR: live lotVal wordt opgehaald via fetchSymbolLotValue() van MT5 spec.
+// Onderstaande waarden zijn ALLEEN de fallback als MT5 spec niet beschikbaar is.
+//
+// Broker-specifieke specs (uit MT5 symbool info, 20 Apr 2026):
+// ┌────────────┬──────────────┬──────────┬───────────┬──────────────────────────┐
+// │ Symbool    │ Type         │ Min lot  │ Max lot   │ Commission               │
+// ├────────────┼──────────────┼──────────┼───────────┼──────────────────────────┤
+// │ XAUUSD     │ commodity    │ 0.01     │ 100       │ 0.0007% EUR/lot          │
+// │ EURUSD     │ forex        │ 0.01     │ 50        │ 2.5 USD/lot              │
+// │ NZDUSD     │ forex        │ 0.01     │ 50        │ 2.5 USD/lot              │
+// │ GBPNZD     │ forex        │ 0.01     │ 50        │ 2.5 USD/lot              │
+// │ USDCHF     │ forex        │ 0.01     │ 50        │ 2.5 USD/lot              │
+// │ GOOG       │ stock (CFD)  │ 1        │ 10000     │ 0.002% EUR/lot           │
+// └────────────┴──────────────┴──────────┴───────────┴──────────────────────────┘
+// Swap type voor forex/commodity: "In punten" (points-based, niet percentage).
+// Swap koersen: Ma/Di/Do/Vr=1x, Woensdag=3x (triple swap).
+// Forex: dist × 100000 = pip-waarde. Live lotVal van MT5 prevaleert altijd.
 const LOT_VALUE = {
   index: 20, commodity: 100, stock: 1, forex: 100000,
 };
@@ -277,7 +291,10 @@ function rebuildCurrencyExposure() {
     const info   = getSymbolInfo(pos.symbol);
     if (info?.type !== "forex") continue;
     const dist   = Math.abs(pos.entry - pos.sl);
-    const lotVal = LOT_VALUE["forex"] ?? 10;
+    // Gebruik gecachede lotVal van MT5 spec (live waarde), fallback op statische 100000 voor forex
+    const mt5Sym4  = pos.mt5Symbol || getSymbolInfo(pos.symbol)?.mt5 || pos.symbol;
+    const cachedSpec = symbolSpecCache[mt5Sym4];
+    const lotVal = cachedSpec?.lotVal ?? LOT_VALUE["forex"] ?? 100000;
     const expEUR = calcPositionExposureEUR(pos.lots ?? 0, dist, lotVal);
     for (const ccy of getPairCurrencies(pos.symbol)) {
       currencyExposure[ccy] = (currencyExposure[ccy] ?? 0) + expEUR;
@@ -360,7 +377,10 @@ async function recalcLotsAfterSL(symbol, entry, sl) {
     const pct     = getSymbolRiskPct(symbol);
     const info    = getSymbolInfo(symbol);
     const type    = info?.type || "stock";
-    const lotVal  = LOT_VALUE[type] ?? 1;
+    const mt5Sym  = info?.mt5 || symbol;
+    // Gebruik live lotVal van MT5 spec als gecached, anders fallback
+    const cachedSpec = symbolSpecCache[mt5Sym];
+    const lotVal  = cachedSpec?.lotVal ?? LOT_VALUE[type] ?? 1;
     const dist    = Math.abs(entry - sl);
     if (!dist) return;
     // v10.6: puur balance × pct (geen multipliers in baseLots)
@@ -1038,6 +1058,27 @@ cron.schedule("0 4 * * 1-5", async () => {
 }, { timezone: "Europe/Brussels" });
 
 
+// ── Detailed reject logger ────────────────────────────────────────
+// Prints timestamp, symbol, reject reason, and ALL relevant payload values
+// at every reject path so Railway logs have full context for debugging.
+function logReject(label, { symbol, direction, session, optimizerKey, reason, payload = {} } = {}) {
+  const ts = new Date().toISOString();
+  console.log(`[REJECT][${ts}] ──────────────────────────────────────────`);
+  console.log(`  Label    : ${label}`);
+  console.log(`  Symbol   : ${symbol ?? '?'}`);
+  console.log(`  Direction: ${direction ?? '?'}`);
+  console.log(`  Session  : ${session ?? '?'}`);
+  console.log(`  OptKey   : ${optimizerKey ?? '?'}`);
+  console.log(`  Reason   : ${reason}`);
+  if (Object.keys(payload).length) {
+    console.log(`  Payload  :`);
+    for (const [k, v] of Object.entries(payload)) {
+      console.log(`    ${String(k).padEnd(22)}: ${v}`);
+    }
+  }
+  console.log(`[REJECT] ────────────────────────────────────────────────`);
+}
+
 // ── Webhook handler ───────────────────────────────────────────────
 app.post("/webhook", async (req, res) => {
   const webhookReceivedAt = Date.now();
@@ -1047,6 +1088,13 @@ app.post("/webhook", async (req, res) => {
 
   const body = req.body || {};
   const { action, symbol: rawSymbol, vwap, vwap_upper, vwap_lower } = body;
+
+  // session_high / session_low kunnen NaN zijn vanuit TradingView Pine Script.
+  // Sanitize: NaN → null zodat ze nooit DB of log vervuilen.
+  const rawSessionHigh = parseFloat(body.session_high);
+  const rawSessionLow  = parseFloat(body.session_low);
+  const sessionHigh = isNaN(rawSessionHigh) ? null : rawSessionHigh;
+  const sessionLow  = isNaN(rawSessionLow)  ? null : rawSessionLow;
 
   // TV stuurt entry + sl (absolute prijzen) + sl_pct (genegeerd).
   // Server berekent derivedSlPct zelf: |entry - sl| / entry
@@ -1060,8 +1108,13 @@ app.post("/webhook", async (req, res) => {
   const symKey  = normalizeSymbol(rawSymbol);
   const symInfo = symKey ? getSymbolInfo(symKey) : null;
   if (!symKey || !symInfo) {
-    logEvent({ type: "REJECTED", reason: `Symbol not in catalog: ${rawSymbol}` });
-    await logSignal({ symbol: rawSymbol, direction, outcome: "REJECTED", rejectReason: `Symbol not in catalog: ${rawSymbol}` }).catch(() => {});
+    const _r1 = `Symbol not in catalog: ${rawSymbol}`;
+    logReject("SYMBOL_NOT_IN_CATALOG", { symbol: rawSymbol, direction, reason: _r1, payload: {
+      rawSymbol, action, tvEntry, tvSL,
+      sessionHigh, sessionLow,
+    }});
+    logEvent({ type: "REJECTED", reason: _r1 });
+    await logSignal({ symbol: rawSymbol, direction, outcome: "REJECTED", rejectReason: _r1 }).catch(() => {});
     return res.status(400).json({ error: `Symbol not allowed: ${rawSymbol}` });
   }
   const { type: assetType, mt5: mt5Symbol } = symInfo;
@@ -1071,6 +1124,11 @@ app.post("/webhook", async (req, res) => {
   if (!derivedSlPct || derivedSlPct <= 0 || derivedSlPct > 0.05) {
     const slPctHuman = derivedSlPct ? (derivedSlPct * 100).toFixed(3) + "%" : "invalid";
     const reason = `SL_INVALID: derivedSlPct=${slPctHuman} (entry=${tvEntry}, sl=${tvSL}). Moet > 0 en <= 5%.`;
+    logReject("SL_INVALID", { symbol: symKey, direction, reason, payload: {
+      tvEntry, tvSL, derivedSlPct: derivedSlPct ?? "null",
+      slPctHuman, assetType, mt5Symbol,
+      sessionHigh: sessionHigh ?? "NaN→null", sessionLow: sessionLow ?? "NaN→null",
+    }});
     logEvent({ type: "REJECTED", reason, symbol: symKey, direction });
     await logSignal({ symbol: symKey, direction, tvEntry, slPct: derivedSlPct ?? null, outcome: "REJECTED", rejectReason: reason }).catch(() => {});
     return res.status(400).json({ error: reason });
@@ -1093,6 +1151,12 @@ app.post("/webhook", async (req, res) => {
     vwapBandPct = parseFloat((distFromMid / (bandWidth / 2)).toFixed(3));
     if (vwapBandPct > 0.9) {
       const reason = `VWAP_BAND_EXHAUSTED: ${(vwapBandPct * 100).toFixed(0)}% into band`;
+      logReject("VWAP_BAND_EXHAUSTED", { symbol: symKey, direction, session, optimizerKey, reason, payload: {
+        closePrice, vwapMid, vwapUpper, vwapLower,
+        vwapBandPct: (vwapBandPct * 100).toFixed(1) + "%",
+        vwapPosition, derivedSlPct: slPctHuman,
+        sessionHigh: sessionHigh ?? "NaN→null", sessionLow: sessionLow ?? "NaN→null",
+      }});
       logEvent({ type: "REJECTED", reason, symbol: symKey, direction, optimizerKey, vwapBandPct });
       await logSignal({ symbol: symKey, direction, session, vwapPosition, optimizerKey, tvEntry: closePrice, slPct: derivedSlPct, slPctHuman, vwap: vwapMid, vwapUpper, vwapLower, vwapBandPct, outcome: "REJECTED", rejectReason: reason }).catch(() => {});
       return res.status(200).json({ status: "VWAP_BAND_EXHAUSTED", vwapBandPct });
@@ -1102,6 +1166,11 @@ app.post("/webhook", async (req, res) => {
   // Trade window check
   const tradeWindow = canOpenNewTrade(symKey);
   if (!tradeWindow.allowed) {
+    logReject("OUTSIDE_TRADE_WINDOW", { symbol: symKey, direction, session, optimizerKey, reason: tradeWindow.reason, payload: {
+      assetType, closePrice, derivedSlPct: slPctHuman,
+      vwapPosition, vwapBandPct: vwapBandPct ?? "n/a",
+      sessionHigh: sessionHigh ?? "NaN→null", sessionLow: sessionLow ?? "NaN→null",
+    }});
     logEvent({ type: "REJECTED", reason: tradeWindow.reason, symbol: symKey, direction, assetType });
     await logSignal({ symbol: symKey, direction, session, vwapPosition, optimizerKey, tvEntry: closePrice, slPct: derivedSlPct, slPctHuman, vwap: vwapMid, vwapUpper, vwapLower, vwapBandPct, outcome: "OUTSIDE_WINDOW", rejectReason: tradeWindow.reason }).catch(() => {});
     return res.status(200).json({ status: "OUTSIDE_TRADE_WINDOW", reason: tradeWindow.reason, assetType });
@@ -1111,6 +1180,12 @@ app.post("/webhook", async (req, res) => {
   const dupKey  = `${symKey}_${direction}`;
   const dupLast = global._dupGuard?.[dupKey];
   if (dupLast && (Date.now() - dupLast) < DUP_GUARD_TTL_MS) {
+    const _dupAge = Math.round((Date.now() - dupLast) / 1000);
+    logReject("DUPLICATE_BLOCKED", { symbol: symKey, direction, session, optimizerKey, reason: `Duplicate within TTL (${_dupAge}s ago, TTL=${DUP_GUARD_TTL_MS/1000}s)`, payload: {
+      dupKey, dupAgeSeconds: _dupAge, ttlSeconds: DUP_GUARD_TTL_MS / 1000,
+      closePrice, derivedSlPct: slPctHuman,
+      sessionHigh: sessionHigh ?? "NaN→null", sessionLow: sessionLow ?? "NaN→null",
+    }});
     logEvent({ type: "DUPLICATE_BLOCKED", symbol: symKey, direction, optimizerKey });
     await logSignal({ symbol: symKey, direction, session, vwapPosition, optimizerKey, tvEntry: closePrice, slPct: derivedSlPct, slPctHuman, vwap: vwapMid, vwapBandPct, outcome: "DUPLICATE_BLOCKED" }).catch(() => {});
     return res.status(200).json({ status: "DUPLICATE_BLOCKED" });
@@ -1127,6 +1202,12 @@ app.post("/webhook", async (req, res) => {
       const tpRRForDup = await getOptimalTP(exactDup.optimizerKey);
       await widenExistingTradeSL(exactDup, tpRRForDup);
       const reason = `ANTI_CONSOLIDATION: ${symKey} ${session} ${direction} al open — SL ×1.5 cumulatief op bestaande trade`;
+      logReject("CONSOLIDATION_SL_WIDENED", { symbol: symKey, direction, session, optimizerKey, reason, payload: {
+        existingPositionId: exactDup.positionId,
+        existingEntry: exactDup.entry, existingSlBefore: exactDup.sl,
+        closePrice, derivedSlPct: slPctHuman,
+        sessionHigh: sessionHigh ?? "NaN→null", sessionLow: sessionLow ?? "NaN→null",
+      }});
       logEvent({ type: "CONSOLIDATION_SL_WIDENED", symbol: symKey, direction, session, positionId: exactDup.positionId, reason });
       await logSignal({ symbol: symKey, direction, session, vwapPosition, optimizerKey, tvEntry: closePrice, slPct: derivedSlPct, slPctHuman, vwap: vwapMid, vwapBandPct, outcome: "CONSOLIDATION_SL_WIDENED", rejectReason: reason }).catch(() => {});
       return res.status(200).json({ status: "CONSOLIDATION_SL_WIDENED", reason, existingPositionId: exactDup.positionId });
@@ -1189,6 +1270,13 @@ app.post("/webhook", async (req, res) => {
     scaleFactor = await calcCurrencyScaleFactor(symKey, lots, tempDist, lotVal);
     if (scaleFactor <= 0) {
       const reason = `CURRENCY_BUDGET_EXHAUSTED: ${symKey} — beide valuta's op budget ceiling`;
+      logReject("CURRENCY_BUDGET_EXHAUSTED", { symbol: symKey, direction, session, optimizerKey, reason, payload: {
+        lots, tempDist, lotVal, scaleFactor: 0,
+        evMult, isEvPlus, assetType,
+        currencies: getPairCurrencies(symKey).join("/"),
+        currentExposure: JSON.stringify(Object.fromEntries(getPairCurrencies(symKey).map(c => [c, (currencyExposure[c] ?? 0).toFixed(2)]))),
+        sessionHigh: sessionHigh ?? "NaN→null", sessionLow: sessionLow ?? "NaN→null",
+      }});
       logEvent({ type: "REJECTED", reason, symbol: symKey, direction, optimizerKey, evMult, scaleFactor: 0 });
       await logSignal({ symbol: symKey, direction, session, vwapPosition, optimizerKey, tvEntry: closePrice, slPct: derivedSlPct, slPctHuman, vwap: vwapMid, vwapBandPct, outcome: "CURRENCY_BUDGET_EXHAUSTED", rejectReason: reason }).catch(() => {});
       return res.status(200).json({ status: "CURRENCY_BUDGET_EXHAUSTED", reason });
@@ -1201,6 +1289,11 @@ app.post("/webhook", async (req, res) => {
   }
 
   if (!lots || lots <= 0) {
+    logReject("LOT_CALC_FAILED", { symbol: symKey, direction, session, optimizerKey, reason: "calcLots returned 0 or undefined", payload: {
+      lots, lotVal, riskEUR: riskEUR?.toFixed(2), tempDist, closePrice,
+      derivedSlPct: slPctHuman, assetType, mt5Symbol,
+      sessionHigh: sessionHigh ?? "NaN→null", sessionLow: sessionLow ?? "NaN→null",
+    }});
     logEvent({ type: "REJECTED", reason: "calcLots returned 0", symbol: symKey, direction });
     return res.status(200).json({ status: "LOT_CALC_FAILED" });
   }
@@ -1259,6 +1352,12 @@ app.post("/webhook", async (req, res) => {
     const guardSLDist = Math.abs(executionPrice - calcSLFromDerivedPct(direction, executionPrice, derivedSlPct));
     if (guardSLDist > 0 && spread > 0.25 * guardSLDist) {
       const reason = `SPREAD_GUARD: spread ${spread.toFixed(5)} > 25% of buffered SL dist ${guardSLDist.toFixed(5)}`;
+      logReject("SPREAD_GUARD_CLOSE", { symbol: symKey, direction, session, optimizerKey, reason, payload: {
+        positionId, spread: spread.toFixed(5), guardSLDist: guardSLDist.toFixed(5),
+        spreadPct: (spread / guardSLDist * 100).toFixed(1) + "% of SL dist",
+        executionPrice, lots, assetType,
+        sessionHigh: sessionHigh ?? "NaN→null", sessionLow: sessionLow ?? "NaN→null",
+      }});
       logEvent({ type: "SPREAD_GUARD_CLOSE", symbol: symKey, direction, positionId, spread, slDist: guardSLDist, reason });
       await logSignal({ symbol: symKey, direction, session, vwapPosition, optimizerKey, tvEntry: closePrice, slPct: derivedSlPct, slPctHuman, vwap: vwapMid, vwapBandPct, outcome: "SPREAD_GUARD_CLOSE", rejectReason: reason }).catch(() => {});
       try { await closePosition(positionId); } catch {}
@@ -1309,6 +1408,12 @@ app.post("/webhook", async (req, res) => {
   if (rrCheck.slWrongSide) {
     // Emergency close + ghost tracker start (Optie A)
     console.error(`[RR_VERIFY_FAILED] ${positionId}: SL op VERKEERDE KANT! exec=${executionPrice} sl=${mt5SL} dir=${direction}`);
+    logReject("RR_VERIFY_FAILED", { symbol: symKey, direction, session, optimizerKey, reason: `SL on wrong side: exec=${executionPrice} sl=${mt5SL}`, payload: {
+      positionId, executionPrice, mt5SL, mt5TP, direction,
+      actualSLPct: rrCheck.actualSLPct, actualTPRR: rrCheck.actualTPRR,
+      derivedSlPct: slPctHuman, lots, riskEUR: riskEUR?.toFixed(2),
+      sessionHigh: sessionHigh ?? "NaN→null", sessionLow: sessionLow ?? "NaN→null",
+    }});
     logEvent({
       type: "RR_VERIFY_FAILED", positionId, symbol: symKey, direction,
       executionPrice, mt5SL, mt5TP,
@@ -1596,7 +1701,7 @@ app.get("/health", async (req, res) => {
   const tradeWindowForex = canOpenNewTrade("EURUSD");
   const tradeWindowStock = canOpenNewTrade("AAPL");
   res.json({
-    status: "ok", version: "10.7.0", time: getBrusselsDateStr(),
+    status: "ok", version: "10.8.0", time: getBrusselsDateStr(),
     openPos: Object.keys(openPositions).length, ghosts: Object.keys(ghostTrackers).length,
     tpLocks: Object.keys(tpLocks).length, closedT: closedTrades.length, balance,
     fixedRiskPct: FIXED_RISK_PCT, marketOpen: isMarketOpen(), session: getSession(),
@@ -1621,7 +1726,7 @@ app.get(["/", "/dashboard"], async (req, res) => {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PRONTO-AI v10.7</title>
+<title>PRONTO-AI v10.8</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600;700&family=IBM+Plex+Sans+Condensed:wght@500;600;700&display=swap" rel="stylesheet">
 <style>
@@ -1734,7 +1839,7 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
 <div class="hdr">
   <div>
     <div class="logo">PRONTO-AI</div>
-    <div class="ver">v10.7 · TradingView → MetaApi → FTMO MT5 · Fixed Risk ${(FIXED_RISK_PCT*100).toFixed(3)}% · SL Buffer ×${SL_BUFFER_MULT} · Fix A/C/D/E actief</div>
+    <div class="ver">v10.8 · TradingView → MetaApi → FTMO MT5 · Fixed Risk ${(FIXED_RISK_PCT*100).toFixed(3)}% · SL Buffer ×${SL_BUFFER_MULT} · Fix A/C/D/E actief</div>
   </div>
   <div class="hdr-r">
     <span class="sb s-outside" id="hdr-sess">—</span>
@@ -2425,7 +2530,7 @@ async function start() {
   const missing = ["META_API_TOKEN", "META_ACCOUNT_ID", "WEBHOOK_SECRET"].filter(k => !process.env[k]);
   if (missing.length) { console.error(`[ERR] Missing env: ${missing.join(", ")}`); process.exit(1); }
 
-  console.log("🚀 PRONTO-AI v10.7 starting...");
+  console.log("🚀 PRONTO-AI v10.8 starting...");
   await initDB();
 
   // Load closed trades
@@ -2503,7 +2608,7 @@ async function start() {
   console.log(`💱 Currency exposure rebuilt: ${JSON.stringify(Object.fromEntries(Object.entries(currencyExposure).map(([k,v])=>[k,v.toFixed(2)])))}`);
 
   app.listen(PORT, () => {
-    console.log(`[✓] PRONTO-AI v10.7 on port ${PORT}`);
+    console.log(`[✓] PRONTO-AI v10.8 on port ${PORT}`);
     console.log(`   🔹 Dashboard:      /`);
     console.log(`   🔹 Health:         /health`);
     console.log(`   🔹 EV Table:       /ev`);
