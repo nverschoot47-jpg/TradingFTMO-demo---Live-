@@ -13,6 +13,12 @@
 //    Gevonden → gebruik echt ID en ga door.
 //    Niet gevonden → ORDER_NOT_CONFIRMED return (geen DB opslaan, geen ghost).
 //
+//  FIX C3 — NaN sanitizer in TV payload:
+//    TradingView stuurt soms NaN voor session_high/low (forex + stocks).
+//    JSON.parse() faalt op NaN → signaal verloren. Middleware vervangt
+//    nu :NaN door :0 vóór parse. session_high/low worden toch niet
+//    gebruikt in EV-berekening — veilig om 0 te zetten.
+//
 //  FIX C2 — Stock volume step (ZM, AAPL, TSLA, etc.):
 //    calcLots() rondde altijd af op 0.01 stap. Stocks hebben minLot=1 en
 //    volumeStep=1 (hele aandelen). MT5/FTMO weigerde volumes als 432.82.
@@ -156,10 +162,16 @@ app.use(express.text({ type: "text/plain" }));
 
 // Middleware: parse text/plain body als JSON wanneer nodig.
 // TradingView webhook body is altijd JSON-string, maar Content-Type kan text/plain zijn.
+// FIX C3 (v11.3): TV stuurt soms NaN als waarde (bv. session_high:NaN, session_low:NaN).
+// NaN is geen geldig JSON — vervang :NaN door :0 vóór de parse zodat signalen niet verloren gaan.
 app.use((req, res, next) => {
   if (typeof req.body === "string" && req.body.trim().startsWith("{")) {
     try {
-      req.body = JSON.parse(req.body);
+      const sanitized = req.body.replace(/:NaN\b/g, ":0");
+      if (sanitized !== req.body) {
+        console.warn("[BodyParse] NaN waarden vervangen door 0 in TV payload (session_high/low reset)");
+      }
+      req.body = JSON.parse(sanitized);
       console.log("[BodyParse] text/plain body geparsed als JSON OK");
     } catch (e) {
       console.warn("[BodyParse] text/plain body kon niet geparsed worden:", e.message, "raw:", req.body.slice(0, 200));
