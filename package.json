@@ -1,7 +1,7 @@
 {
   "name": "nv-tradingview-webhook",
-  "version": "11.0.0",
-  "description": "TradingView -> MetaApi REST -> FTMO MT5 | PRONTO-AI v11.0 - Fix R1 TP=2R default, Fix R2 minLot warning, Fix R3 live lotVal dashboard, Fix R4 lotDivisor removed, Fix R5 C2 uniform risk",
+  "version": "12.0.0",
+  "description": "TradingView -> MetaApi REST -> FTMO MT5 | PRONTO-AI v12.0 - DAX consistent risk fix, dashboard redesign: EV-only combos, ghost history, VWAP band analysis tabs, combo selection table, removed lot calc/flagged/all-events clutter",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
