@@ -151,12 +151,8 @@ async function initDB() {
         time_to_sl_min      INTEGER,
         opened_at           TIMESTAMPTZ,
         closed_at           TIMESTAMPTZ,
-        created_at          TIMESTAMPTZ DEFAULT NOW(),
-        sl_changes          INTEGER     DEFAULT 0,
-        tp_changes          INTEGER     DEFAULT 0
+        created_at          TIMESTAMPTZ DEFAULT NOW()
       );
-      ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS sl_changes INTEGER DEFAULT 0;
-      ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS tp_changes INTEGER DEFAULT 0;
       CREATE INDEX IF NOT EXISTS idx_ghost_trades_key     ON ghost_trades (optimizer_key);
       CREATE INDEX IF NOT EXISTS idx_ghost_trades_symbol  ON ghost_trades (symbol);
       CREATE INDEX IF NOT EXISTS idx_ghost_trades_closed  ON ghost_trades (closed_at);
@@ -495,9 +491,8 @@ async function saveGhostTrade(g) {
         (position_id, symbol, session, direction, vwap_position, optimizer_key,
          entry, sl, sl_pct, phantom_sl, tp_rr_used,
          max_price, max_rr_before_sl, phantom_sl_hit, stop_reason,
-         time_to_sl_min, opened_at, closed_at,
-         sl_changes, tp_changes)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+         time_to_sl_min, opened_at, closed_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
       ON CONFLICT DO NOTHING
     `, [
       g.positionId      ?? null,
@@ -515,8 +510,6 @@ async function saveGhostTrade(g) {
       g.timeToSLMin     ?? null,
       g.openedAt        ?? null,
       g.closedAt        ?? null,
-      g.slChanges       ?? 0,
-      g.tpChanges       ?? 0,
     ]);
   } catch (e) { console.warn("[!] saveGhostTrade:", e.message); }
 }
@@ -542,9 +535,7 @@ async function loadGhostTrades(optimizerKey = null, limitRows = 200) {
         stop_reason          AS "stopReason",
         time_to_sl_min       AS "timeToSLMin",
         opened_at            AS "openedAt",
-        closed_at            AS "closedAt",
-        sl_changes           AS "slChanges",
-        tp_changes           AS "tpChanges"
+        closed_at            AS "closedAt"
       FROM ghost_trades
       ${where}
       ORDER BY closed_at DESC
