@@ -184,6 +184,8 @@ app.use((req, res, next) => {
 const {
   initDB, saveTrade, loadAllTrades,
   saveGhostTrade, loadGhostTrades, countGhostsByKey,
+  saveGhostState, loadAllGhostStates, deleteGhostState,
+  saveBandGhost, loadBandGhosts, loadBandGhostStats,
   saveShadowSnapshot, loadShadowSnapshots, saveShadowAnalysis, loadShadowAnalysis,
   loadAllShadowAnalysis,
   saveTPConfig, loadTPConfig,
@@ -230,7 +232,8 @@ const MIN_TP_RR_FLOOR = parseFloat(process.env.MIN_TP_RR_FLOOR || "0.5");
 // Ghost settings
 const GHOST_MIN_TRADES_FOR_TP = 5;
 const GHOST_POLL_MS           = 30000;
-const GHOST_MAX_MS            = 72 * 3600 * 1000;
+const GHOST_MAX_MS            = 14 * 24 * 3600 * 1000;  // 2 weeks max tracking
+const GHOST_MAX_RR            = 15;                       // stop at 15R peak
 const MULT_MIN_SAMPLE         = 30;
 
 // FIX 16
@@ -739,7 +742,7 @@ function countRelatedForex(symKey, direction) {
 // ── Ghost Optimizer ───────────────────────────────────────────────
 // Ghost tracker volgt de live prijs en berekent maxRR op de VASTE
 // SL die bij trade-open is gezet. SL en TP wijzigen niet meer mid-trade.
-function startGhostTracker(pos) {
+function startGhostTracker(pos, restoreData = null) {
   // Guard: ghost is nutteloos zonder SL (geen price tracking mogelijk)
   // en zonder vwapPosition (kan nooit in EV tabel terechtkomen)
   if (!pos.sl || pos.sl <= 0) {
@@ -757,32 +760,38 @@ function startGhostTracker(pos) {
   // FIX 10: mt5Symbol fallback
   const mt5Symbol = pos.mt5Symbol || getSymbolInfo(symbol)?.mt5 || symbol;
 
-  let maxPrice    = entry;
-  let timer       = null;
-  const startTs   = Date.now();
-
-  // v10.7: sla GEEN vaste phantomSL op — lees live uit openPositions elke tick
-  // zodat maxRR altijd correct is.
-  // Bewaar wel de originele SL voor logging/fallback (als positie al gesloten is).
-  const originalSL     = sl;
+  // Restore maxPrice from persisted ghost_state if available (survives restarts)
+  let maxPrice       = restoreData?.maxPrice  ?? entry;
+  let maxSlPctUsed   = restoreData?.maxSlPctUsed ?? 0;
+  let timer          = null;
+  const startTs      = Date.now() - (restoreData ? (Date.now() - new Date(openedAt ?? 0).getTime()) : 0);
+  const originalSL   = sl;
   const originalSlPct  = slPct;
   const originalTpRR   = tpRRUsed;
+  let   lastStateSaveTs = Date.now();
 
   ghostTrackers[positionId] = {
     positionId, symbol, mt5Symbol, session, direction,
     vwapPosition, optimizerKey, entry,
-    sl: originalSL,           // wordt live bijgehouden in tick()
+    sl: originalSL,
     slPct: originalSlPct,
     tpRRUsed: originalTpRR,
-    openedAt, maxPrice, startTs, timer,
+    openedAt, maxPrice, maxSlPctUsed,
+    maxRR: restoreData?.maxRR ?? 0,
+    startTs, timer,
   };
+
+  // Write initial state to DB (or update if restored)
+  saveGhostState({ positionId, optimizerKey, symbol, mt5Symbol, session, direction,
+    vwapPosition, entry, sl: originalSL, slPct: originalSlPct, tpRRUsed: originalTpRR,
+    maxPrice, maxRR: restoreData?.maxRR ?? 0, maxSlPctUsed, openedAt }).catch(() => {});
 
   async function tick() {
     try {
       if (!ghostTrackers[positionId]) return;
       const g       = ghostTrackers[positionId];
-      const elapsed = Date.now() - startTs;
-      if (elapsed >= GHOST_MAX_MS) { await finalizeGhost(positionId, "timeout_72h", elapsed, maxPrice); return; }
+      const elapsed = Date.now() - new Date(openedAt ?? startTs).getTime();
+      if (elapsed >= GHOST_MAX_MS) { await finalizeGhost(positionId, "timeout_2w", elapsed, maxPrice); return; }
       const { day } = getBrusselsComponents();
       if (day === 0 || day === 6) {
         timer = setTimeout(tick, 10 * 60 * 1000);
@@ -795,16 +804,44 @@ function startGhostTracker(pos) {
       const priceData = await fetchCurrentPrice(mt5Symbol);
       const price     = priceData?.mid ?? null;
       if (price !== null) {
-        // maxRR altijd berekend op ACTUELE SL afstand
+        // Track max favorable movement
         const better = direction === "buy" ? price > maxPrice : price < maxPrice;
         if (better) {
           maxPrice = price;
           g.maxPrice = price;
           g.maxRR = calcMaxRR(direction, entry, phantomSL, price);
         }
+        // Track max adverse excursion as % of SL (MAE)
+        const slDist = Math.abs(entry - phantomSL);
+        if (slDist > 0) {
+          const adverse = direction === "buy" ? entry - price : price - entry;
+          const slPctNow = parseFloat((Math.max(0, Math.min(100, (adverse / slDist) * 100)).toFixed(2)));
+          if (slPctNow > maxSlPctUsed) {
+            maxSlPctUsed = slPctNow;
+            g.maxSlPctUsed = maxSlPctUsed;
+          }
+        }
+        // Cap at 15RR — ghost has done its job at this point
+        if (g.maxRR >= GHOST_MAX_RR) {
+          await finalizeGhost(positionId, "max_rr_15", elapsed, maxPrice); return;
+        }
+        // Ghost is FULLY INDEPENDENT of the actual trade outcome.
+        // It only stops when the PHANTOM SL (original entry SL) is hit.
+        // Even if the real trade was closed at TP or manually, the ghost
+        // keeps running until the phantom SL is touched — this gives the
+        // true maxRR the market was willing to give for this setup.
         const slHit = direction === "buy" ? price <= phantomSL : price >= phantomSL;
         if (slHit) { await finalizeGhost(positionId, "phantom_sl", elapsed, maxPrice); return; }
       }
+
+      // Persist ghost state every 5 minutes (not every tick — don't hammer DB)
+      if (Date.now() - lastStateSaveTs > 5 * 60 * 1000) {
+        saveGhostState({ positionId, optimizerKey, symbol, mt5Symbol, session, direction,
+          vwapPosition, entry, sl: g.sl, slPct: originalSlPct, tpRRUsed: originalTpRR,
+          maxPrice, maxRR: g.maxRR, maxSlPctUsed, openedAt }).catch(() => {});
+        lastStateSaveTs = Date.now();
+      }
+
       timer = setTimeout(tick, GHOST_POLL_MS);
       g.timer = timer;
     } catch (e) {
@@ -841,10 +878,12 @@ async function finalizeGhost(positionId, stopReason, elapsedMs, finalMaxPrice) {
     entry: g.entry, sl: finalSL, slPct: g.slPct, phantomSL: finalSL, tpRRUsed: g.tpRRUsed,
     maxPrice: finalMaxPrice, maxRRBeforeSL, phantomSLHit, stopReason,
     timeToSLMin: phantomSLHit ? timeToSLMin : null,
+    maxSlPctUsed: g.maxSlPctUsed ?? 0,
     openedAt: g.openedAt, closedAt: new Date().toISOString(),
   };
 
   await saveGhostTrade(ghostRow);
+  await deleteGhostState(g.positionId).catch(() => {});
   await updateTPLock(g.optimizerKey, g.symbol, g.session, g.direction, g.vwapPosition);
   await runShadowOptimizer(g.optimizerKey).catch(() => {});
 
@@ -867,34 +906,150 @@ function cancelGhost(positionId) {
   delete ghostTrackers[positionId];
 }
 
-// ── Shadow Optimizer ──────────────────────────────────────────────
+// ── Band Ghost Tracker (Ghost 2.0) ───────────────────────────────
+// Tracks VWAP-exhausted rejected signals to see what would have happened.
+// Completely separate from ghostTrackers and main EV data.
+// Stops at: phantom SL hit / 15RR / 2-week timeout.
+const bandGhostTrackers = {};
+
+function startBandGhostTracker(pos) {
+  const id = `band_${pos.symbol}_${pos.session}_${pos.direction}_${Date.now()}`;
+  if (!pos.sl || pos.sl <= 0 || !pos.entry) return;
+
+  const { optimizerKey, symbol, mt5Symbol, session, direction, vwapPosition,
+          bandTier, bandPct, entry, sl, slPct, openedAt, signalId } = pos;
+  let maxPrice     = entry;
+  let maxSlPctUsed = 0;
+  let maxRR        = 0;
+  let timer        = null;
+  const startTs    = Date.now();
+
+  bandGhostTrackers[id] = { id, optimizerKey, symbol, mt5Symbol, session, direction,
+    vwapPosition, bandTier, bandPct, entry, sl, slPct, openedAt, signalId,
+    maxPrice, maxRR, maxSlPctUsed, timer, startTs };
+
+  async function tick() {
+    try {
+      const g = bandGhostTrackers[id];
+      if (!g) return;
+      const elapsed = Date.now() - startTs;
+      if (elapsed >= GHOST_MAX_MS) {
+        await finalizeBandGhost(id, "timeout_2w", elapsed, maxPrice); return;
+      }
+      const { day } = getBrusselsComponents();
+      if (day === 0 || day === 6) { timer = setTimeout(tick, 10*60*1000); g.timer = timer; return; }
+
+      const priceData = await fetchCurrentPrice(mt5Symbol ?? symbol);
+      const price     = priceData?.mid ?? null;
+      if (price !== null) {
+        const better = direction === "buy" ? price > maxPrice : price < maxPrice;
+        if (better) { maxPrice = price; g.maxPrice = price; g.maxRR = calcMaxRR(direction, entry, sl, price); maxRR = g.maxRR; }
+        const slDist = Math.abs(entry - sl);
+        if (slDist > 0) {
+          const adv = direction === "buy" ? entry - price : price - entry;
+          const pct = Math.max(0, Math.min(100, (adv / slDist) * 100));
+          if (pct > maxSlPctUsed) { maxSlPctUsed = pct; g.maxSlPctUsed = pct; }
+        }
+        if (maxRR >= GHOST_MAX_RR) { await finalizeBandGhost(id, "max_rr_15", elapsed, maxPrice); return; }
+        const slHit = direction === "buy" ? price <= sl : price >= sl;
+        if (slHit) { await finalizeBandGhost(id, "phantom_sl", elapsed, maxPrice); return; }
+      }
+      timer = setTimeout(tick, GHOST_POLL_MS);
+      g.timer = timer;
+    } catch (e) {
+      const g = bandGhostTrackers[id];
+      timer = setTimeout(tick, GHOST_POLL_MS * 2);
+      if (g) g.timer = timer;
+    }
+  }
+  timer = setTimeout(tick, 3000);
+  bandGhostTrackers[id].timer = timer;
+  console.log(`[BandGhost] Started ${id} | ${bandTier} ${(bandPct*100).toFixed(0)}% | entry=${entry}`);
+}
+
+async function finalizeBandGhost(id, stopReason, elapsedMs, finalMaxPrice) {
+  const g = bandGhostTrackers[id];
+  if (!g) return;
+  clearTimeout(g.timer);
+  delete bandGhostTrackers[id];
+  const finalMaxRR   = calcMaxRR(g.direction, g.entry, g.sl, finalMaxPrice);
+  const timeToSLMin  = Math.round(elapsedMs / 60000);
+  await saveBandGhost({
+    signalId: g.signalId, optimizerKey: g.optimizerKey,
+    symbol: g.symbol, session: g.session, direction: g.direction,
+    vwapPosition: g.vwapPosition, bandTier: g.bandTier, bandPct: g.bandPct,
+    entry: g.entry, sl: g.sl, slPct: g.slPct,
+    maxPrice: finalMaxPrice, maxRR: finalMaxRR, maxSlPctUsed: g.maxSlPctUsed ?? 0,
+    phantomSLHit: stopReason === "phantom_sl",
+    stopReason, timeToSLMin: stopReason === "phantom_sl" ? timeToSLMin : null,
+    openedAt: g.openedAt, closedAt: new Date().toISOString(),
+  }).catch(() => {});
+  console.log(`[BandGhost] Finalized ${id} | maxRR=${finalMaxRR}R | reason=${stopReason}`);
+}
+
+// ── SL Reduction Optimizer ────────────────────────────────────────
+// Uses finalized ghost trades to analyse if SL can be tightened.
+// Requires 30 ghosts. Sweeps SL from 10%→100% of original distance.
+// At each level: ghosts where maxSlPctUsed > level survive (SL not hit early).
+// Shows EV change + WR drop so you can make an informed cut decision.
 async function runShadowOptimizer(optimizerKey) {
   try {
-    const snaps = await loadShadowSnapshots(optimizerKey, 10000);
-    if (snaps.length < 10) return;
-    const vals   = snaps.map(s => s.pctSlUsed).sort((a, b) => a - b);
-    const n      = vals.length;
-    const pct    = (p) => vals[Math.min(n - 1, Math.floor(p / 100 * n))];
-    const p50    = pct(50), p90 = pct(90), p99 = pct(99);
-    const maxUsed = vals[n - 1];
-    const recommendedSlPct = parseFloat((p99 / 100).toFixed(4));
-    const tooWide          = p99 < 70;
-    const potentialSaving  = tooWide ? parseFloat((100 - p99).toFixed(1)) : 0;
-    const uniquePos        = new Set(snaps.map(s => s.positionId)).size;
+    const ghosts = await loadGhostTrades(optimizerKey, 2000);
+    const valid  = ghosts.filter(g => g.phantomSLHit && (g.maxRRBeforeSL ?? 0) > 0 && g.maxSlPctUsed != null);
+    const n      = valid.length;
+    const MIN_GHOSTS = 30;
+    if (n < MIN_GHOSTS) {
+      shadowResults[optimizerKey] = { optimizerKey, n, ready: false,
+        message: `Need ${MIN_GHOSTS - n} more ghosts (have ${n}/${MIN_GHOSTS})` };
+      return;
+    }
+    const evData = await computeEVStats(optimizerKey);
+    const baseEV = evData?.bestEV ?? null;
+    const baseRR = evData?.bestRR ?? 2.0;
+    const baseWR = baseRR ? valid.filter(g => g.maxRRBeforeSL >= baseRR).length / n : 0;
+
+    const slPcts = valid.map(g => g.maxSlPctUsed).sort((a, b) => a - b);
+    const pctile = (p) => slPcts[Math.min(n - 1, Math.floor(p / 100 * n))];
+    const p50 = pctile(50), p75 = pctile(75), p90 = pctile(90), p99 = pctile(99);
+    const maxUsed = slPcts[n - 1];
+
+    // Sweep: at SL tightness X%, ghosts where maxSlPctUsed > X would have been stopped early
+    // Those become losses at the tighter SL. Survivors: maxSlPctUsed <= X (never touched tighter SL)
+    const levels = [];
+    for (let sl = 10; sl <= 100; sl += 5) {
+      const hitTighter  = valid.filter(g => g.maxSlPctUsed > sl).length; // stopped early by tighter SL
+      const stillHitTP  = valid.filter(g => g.maxSlPctUsed <= sl && g.maxRRBeforeSL >= baseRR).length;
+      const newWR       = (valid.filter(g => g.maxRRBeforeSL >= baseRR && g.maxSlPctUsed <= sl).length +
+                           valid.filter(g => g.maxRRBeforeSL >= baseRR && g.maxSlPctUsed > sl).length * 0) / n;
+      // Simpler: at tighter SL, any ghost that reached baseRR AND didn't get knocked out is a win
+      const wins  = valid.filter(g => g.maxRRBeforeSL >= baseRR && g.maxSlPctUsed <= sl).length;
+      const newWRfinal = wins / n;
+      const newEV = parseFloat((newWRfinal * baseRR - (1 - newWRfinal)).toFixed(4));
+      const wrDrop = parseFloat(((newWRfinal - baseWR) * 100).toFixed(1));
+      levels.push({ sl, wins, hitTighter, newWR: parseFloat((newWRfinal * 100).toFixed(1)), newEV, wrDrop });
+    }
+
+    // Best reduction: tightest SL where EV > 0 and WR drops < 10 percentage points
+    const safeLevels = levels.filter(l => l.newEV > 0 && l.wrDrop > -10.0);
+    const recommendation = safeLevels.length
+      ? { reduceTo: safeLevels[0].sl, saving: 100 - safeLevels[0].sl,
+          newEV: safeLevels[0].newEV, newWR: safeLevels[0].newWR, wrDrop: safeLevels[0].wrDrop }
+      : null;
+
     const analysis = {
-      optimizerKey,
-      symbol:        optimizerKey.split("_")[0],
-      session:       optimizerKey.split("_")[1] ?? "",
-      direction:     optimizerKey.split("_")[2] ?? "",
-      vwapPosition:  optimizerKey.split("_")[3] ?? "unknown",
-      snapshotsCount: n, positionsCount: uniquePos,
-      p50, p90, p99, maxUsed, recommendedSlPct,
-      currentSlTooWide: tooWide, potentialSavingPct: potentialSaving,
+      optimizerKey, n, ready: true,
+      symbol: optimizerKey.split("_")[0], session: optimizerKey.split("_")[1] ?? "",
+      direction: optimizerKey.split("_")[2] ?? "", vwapPosition: optimizerKey.split("_")[3] ?? "unknown",
+      p50, p75, p90, p99, maxUsed, baseEV, baseRR, baseWR: parseFloat((baseWR * 100).toFixed(1)),
+      levels, recommendation,
+      message: recommendation
+        ? `Reduce SL to ${recommendation.reduceTo}% — saves ${recommendation.saving}% width, EV ${recommendation.newEV > 0 ? "+" : ""}${recommendation.newEV}, WR ${recommendation.wrDrop}%`
+        : "No safe SL reduction — keep current SL",
     };
     shadowResults[optimizerKey] = analysis;
     await saveShadowAnalysis(analysis);
-    console.log(`[Shadow] ${optimizerKey}: p99=${p99}% tooWide=${tooWide}`);
-  } catch (e) { console.warn(`[Shadow] ${optimizerKey}:`, e.message); }
+    console.log(`[SL-Opt] ${optimizerKey}: n=${n} maxUsed=${maxUsed}% rec=${recommendation?.reduceTo ?? "none"}%`);
+  } catch (e) { console.warn(`[SL-Opt] ${optimizerKey}:`, e.message); }
 }
 
 async function runAllShadowOptimizers() {
@@ -1022,6 +1177,12 @@ async function restorePositionsFromMT5() {
   try {
     const live = await fetchOpenPositions();
     if (!Array.isArray(live) || !live.length) return;
+
+    // Load persisted ghost states so maxPrice/maxSlPctUsed survive restarts
+    const ghostStates = await loadAllGhostStates();
+    const ghostStateMap = {};
+    for (const gs of ghostStates) ghostStateMap[gs.positionId] = gs;
+
     let restored = 0;
     for (const lp of live) {
       const id = String(lp.id);
@@ -1044,11 +1205,23 @@ async function restorePositionsFromMT5() {
       };
       console.log(`[Restart] ${sym} (${id}): vwapPosition='${vpPos}' (comment='${lp.comment ?? ""}')`);
       if (openPositions[id].sl > 0) {
-        console.log(`[Restart] Ghost for ${sym} (${id}): entry=${entry}`);
-        startGhostTracker(openPositions[id]);
+        // Pass persisted ghost state if available — preserves maxPrice across deploys
+        const gs = ghostStateMap[id] ?? null;
+        if (gs) console.log(`[Restart] Ghost ${sym} (${id}): restoring maxPrice=${gs.maxPrice} maxRR=${gs.maxRR}R maxSlPct=${gs.maxSlPctUsed}%`);
+        startGhostTracker(openPositions[id], gs);
       }
       restored++;
     }
+
+    // Clean up ghost_state rows for positions no longer open on MT5
+    const liveIds = new Set(live.map(p => String(p.id)));
+    for (const gs of ghostStates) {
+      if (!liveIds.has(gs.positionId)) {
+        await deleteGhostState(gs.positionId).catch(() => {});
+        console.log(`[Restart] Cleaned stale ghost_state for ${gs.positionId}`);
+      }
+    }
+
     console.log(`[Restart] ${restored} position(s) restored from MT5`);
   } catch (e) { console.warn("[Restart]", e.message); }
 }
@@ -1308,7 +1481,23 @@ app.post("/webhook", async (req, res) => {
         sessionHigh: sessionHigh ?? "NaN→null", sessionLow: sessionLow ?? "NaN→null",
       }});
       logEvent({ type: "REJECTED", reason, symbol: symKey, direction, optimizerKey, vwapBandPct });
-      await logSignal({ symbol: symKey, direction, session, vwapPosition, optimizerKey, tvEntry: closePrice, slPct: derivedSlPct, slPctHuman, vwap: vwapMid, vwapUpper, vwapLower, vwapBandPct, outcome: "REJECTED", rejectReason: reason }).catch(() => {});
+      const signalLogRow = await logSignal({ symbol: symKey, direction, session, vwapPosition, optimizerKey, tvEntry: closePrice, slPct: derivedSlPct, slPctHuman, vwap: vwapMid, vwapUpper, vwapLower, vwapBandPct, outcome: "REJECTED", rejectReason: reason }).catch(() => null);
+
+      // ── Ghost 2.0: start a band ghost for this rejected signal ──────
+      // Track what would have happened — completely separate from main EV data.
+      const pct = vwapBandPct;
+      const bandTier = pct >= 2.5 ? "250_350" : "150_250";
+      if (pct < 3.5) {  // only track up to 350%
+        const tempSLForBand   = calcSLFromDerivedPct(direction, closePrice, derivedSlPct);
+        const enforcedSLBand  = enforceMinStop(mt5Symbol, direction, closePrice, tempSLForBand);
+        startBandGhostTracker({
+          signalId:      signalLogRow?.id ?? null,
+          optimizerKey, symbol: symKey, mt5Symbol, session, direction, vwapPosition,
+          bandTier, bandPct: pct,
+          entry: closePrice, sl: enforcedSLBand, slPct: derivedSlPct,
+          openedAt: new Date().toISOString(),
+        });
+      }
       return res.status(200).json({ status: "VWAP_BAND_EXHAUSTED", vwapBandPct });
     }
   }
@@ -1867,9 +2056,30 @@ app.get("/ev/:key", async (req, res) => {
 });
 
 app.get("/ev", async (req, res) => {
-  const keys = new Set([...Object.keys(tpLocks), ...closedTrades.map(t => buildOptimizerKey(t.symbol, t.session, t.direction, t.vwapPosition ?? "unknown"))]);
+  // Build full set of keys: all symbol×session×dir×vwap combos that have any ghost data
+  // Plus any keys from tpLocks or closedTrades to ensure nothing is missed
+  const { SYMBOL_CATALOG } = require("./session");
+  const sessions = { stock: ["ny"], forex: ["asia","london","ny"], index: ["asia","london","ny"], commodity: ["asia","london","ny"] };
+  const allKeys = new Set([...Object.keys(tpLocks)]);
+  for (const [sym, info] of Object.entries(SYMBOL_CATALOG)) {
+    for (const sess of (sessions[info.type] ?? ["london"])) {
+      for (const dir of ["buy","sell"]) {
+        for (const vwap of ["above","below"]) {
+          allKeys.add(`${sym}_${sess}_${dir}_${vwap}`);
+        }
+      }
+    }
+  }
+  closedTrades.forEach(t => allKeys.add(buildOptimizerKey(t.symbol, t.session, t.direction, t.vwapPosition ?? "unknown")));
+
   const results = [];
-  for (const key of keys) { const ev = await computeEVStats(key); results.push({ key, ...ev }); }
+  for (const key of allKeys) {
+    const ev = await computeEVStats(key);
+    if (!ev || ev.count === 0) { results.push({ key, count: 0, bestRR: null, bestEV: null, avgRR: null, avgTimeToSLMin: null, avgMaxSlPct: null, bestWinnerSlPct: null }); continue; }
+    // avgRR: average of maxRR values across all ghosts (already filtered >0 in computeEVStats)
+    const avgRR = ev.rrLevels.length ? null : null; // compute separately below
+    results.push({ key, ...ev });
+  }
   results.sort((a, b) => (b.bestEV ?? -99) - (a.bestEV ?? -99));
   res.json(results);
 });
@@ -1877,6 +2087,65 @@ app.get("/ev", async (req, res) => {
 app.get("/shadow", (req, res) => {
   const results = Object.values(shadowResults).sort((a, b) => a.optimizerKey.localeCompare(b.optimizerKey));
   res.json({ count: results.length, results });
+});
+
+// GET /shadow/sl-warning
+// Returns open positions that have hit 50%, 75%, or 90%+ of their SL distance.
+// For each, compares to the SL distribution from ghost data for that combo:
+// if the current SL% used exceeds p75 of historical MAE for winners on that combo,
+// it means the trade is behaving like a loser — early close consideration flag.
+app.get("/shadow/sl-warning", async (req, res) => {
+  const warnings = [];
+  for (const pos of Object.values(openPositions)) {
+    if (!pos.sl || !pos.entry || !pos.currentPrice) continue;
+    const slDist  = Math.abs(pos.entry - pos.sl);
+    if (!slDist) continue;
+    const adverse = pos.direction === "buy"
+      ? pos.entry - pos.currentPrice
+      : pos.currentPrice - pos.entry;
+    const slPctNow = Math.max(0, Math.min(100, (adverse / slDist) * 100));
+
+    // Thresholds: 50% / 75% / 90% of SL used
+    const tier = slPctNow >= 90 ? 3 : slPctNow >= 75 ? 2 : slPctNow >= 50 ? 1 : 0;
+    if (tier === 0) continue;
+
+    // Compare to ghost data for this combo
+    const sr = shadowResults[pos.optimizerKey];
+    let historicalContext = null;
+    if (sr?.ready && sr.p75 != null) {
+      // If current SL% used > p75 of ALL ghosts → most ghosts didn't go this deep
+      const beyondP75 = slPctNow > sr.p75;
+      const beyondP90 = slPctNow > sr.p90;
+      historicalContext = {
+        p50: sr.p50, p75: sr.p75, p90: sr.p90, maxUsed: sr.maxUsed,
+        beyondP75, beyondP90,
+        signal: beyondP90
+          ? "STRONG: deeper than 90% of historical moves — consider closing"
+          : beyondP75
+            ? "MODERATE: deeper than 75% of historical moves — watch closely"
+            : "NORMAL: within typical range",
+      };
+    }
+
+    warnings.push({
+      positionId:  pos.positionId,
+      symbol:      pos.symbol,
+      direction:   pos.direction,
+      session:     pos.session,
+      vwapPosition: pos.vwapPosition,
+      optimizerKey: pos.optimizerKey,
+      entry:       pos.entry,
+      sl:          pos.sl,
+      currentPrice: pos.currentPrice,
+      slPctUsed:   parseFloat(slPctNow.toFixed(1)),
+      tier,         // 1=50%+ 2=75%+ 3=90%+
+      tierLabel:   tier === 3 ? "90%+ — DANGER" : tier === 2 ? "75%+" : "50%+",
+      currentPnL:  pos.currentPnL ?? 0,
+      historicalContext,
+    });
+  }
+  warnings.sort((a, b) => b.slPctUsed - a.slPctUsed);
+  res.json({ count: warnings.length, warnings });
 });
 
 app.get("/shadow/winners", async (req, res) => {
@@ -1947,6 +2216,15 @@ app.get("/signal-stats", async (req, res) => {
   res.json(stats);
 });
 
+// GET /stats — dashboard KPI totals
+app.get("/stats", (req, res) => {
+  res.json({
+    totalClosedTrades: closedTrades.length,
+    totalOpenPositions: Object.keys(openPositions).length,
+    totalActiveGhosts: Object.keys(ghostTrackers).length,
+  });
+});
+
 // ── Spread statistieken (v10.7 Fix 3) ────────────────────────────
 // GET /spread-stats?symbol=EURUSD&session=london&hourMin=8&hourMax=16&dayOfWeek=1
 app.get("/spread-stats", async (req, res) => {
@@ -1990,6 +2268,31 @@ app.get("/vwap-band-signals", async (req, res) => {
   } catch (e) {
     res.json({ count: 0, rows: [], error: e.message });
   }
+});
+
+// GET /vwap-band-signals — raw rejected signals for dashboard band tabs
+// GET /band-ghosts?tier=150_250&limit=200 — finalized band ghost trades
+app.get("/band-ghosts", async (req, res) => {
+  const { tier, symbol, limit = 200 } = req.query;
+  const rows = await loadBandGhosts({ bandTier: tier, symbol, limit: parseInt(limit) });
+  res.json({ count: rows.length, rows });
+});
+
+// GET /band-ghost-stats?tier=150_250 — aggregated stats per combo for EV preview
+app.get("/band-ghost-stats", async (req, res) => {
+  const { tier = "150_250" } = req.query;
+  const rows = await loadBandGhostStats(tier);
+  res.json({ count: rows.length, tier, rows });
+});
+
+// GET /band-ghosts/active — currently running band ghost count
+app.get("/band-ghosts/active", (req, res) => {
+  const active = Object.values(bandGhostTrackers).map(g => ({
+    id: g.id, symbol: g.symbol, bandTier: g.bandTier,
+    bandPct: g.bandPct ? parseFloat((g.bandPct * 100).toFixed(0)) : null,
+    maxRR: g.maxRR ?? 0, elapsedMin: Math.round((Date.now() - g.startTs) / 60000),
+  }));
+  res.json({ count: active.length, active });
 });
 
 // ── TEST endpoint — gebruik dit om Railway connectie te verifiëren ──
@@ -2171,7 +2474,7 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
   <div class="kpi k6"><div class="kl">Session</div><div class="kv o" id="k-sess" style="font-size:13px">—</div></div>
   <div class="kpi k7"><div class="kl">Risk %</div><div class="kv c">${(FIXED_RISK_PCT*100).toFixed(3)}%</div></div>
   <div class="kpi k8"><div class="kl">Trades / Sess</div><div class="kv b" id="k-tps">—</div></div>
-  <div class="kpi k9"><div class="kl">Errors</div><div class="kv r" id="k-err">—</div></div>
+  <div class="kpi k9"><div class="kl">Logged Trades</div><div class="kv b" id="k-err">—</div></div>
 </div>
 
 <div class="main">
@@ -2242,7 +2545,7 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
     <button class="fb on" onclick="setEVF('vwap','all',this)">All</button>
     <button class="fb" onclick="setEVF('vwap','above',this)">Above</button>
     <button class="fb" onclick="setEVF('vwap','below',this)">Below</button>
-    &nbsp;<span class="fl">Min trades:</span>
+    &nbsp;<span class="fl">Min ghosts:</span>
     <button class="fb on" onclick="setEVF('min','1',this)">1+</button>
     <button class="fb" onclick="setEVF('min','5',this)">5+ (EV ready)</button>
     <button class="fb" onclick="setEVF('min','10',this)">10+</button>
@@ -2250,7 +2553,7 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
   <div class="strip">
     <div class="stat"><span class="sl2">Combos w/ data</span><span class="sv2 b" id="ev-count">—</span></div>
     <div class="stat"><span class="sl2">Total trades</span><span class="sv2 c" id="ev-trades">—</span></div>
-    <div class="stat"><span class="sl2">Win %</span><span class="sv2 g" id="ev-winpct">—</span></div>
+    <div class="stat"><span class="sl2">With ghost data</span><span class="sv2 b" id="ev-winpct">—</span></div>
     <div class="stat"><span class="sl2">Total P&amp;L</span><span class="sv2" id="ev-pnl">—</span></div>
     <div class="stat"><span class="sl2">EV+ locked</span><span class="sv2 y" id="ev-locked">—</span></div>
   </div>
@@ -2259,15 +2562,15 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
       <thead><tr>
         <th class="s" data-col="0">Symbol</th><th>Type</th><th class="s" data-col="2">Session</th>
         <th class="s" data-col="3">Dir</th><th class="s" data-col="4">VWAP</th>
-        <th class="s" data-col="5">#</th>
-        <th class="s" data-col="6">Win%</th>
-        <th class="s" data-col="7">Best TP RR</th>
-        <th class="s" data-col="8">Avg RR</th>
-        <th class="s" data-col="9">EV</th>
+        <th class="s" data-col="5" title="Closed ghost trades with maxRR>0"># Ghosts</th>
+        <th class="s" data-col="6">Best TP RR</th>
+        <th class="s" data-col="7">Avg RR</th>
+        <th class="s" data-col="8">EV</th>
         <th>EV Status</th>
-        <th class="s" data-col="11">TP Lock</th>
-        <th class="s" data-col="12" title="Best SL% from winning trades (read only)">Best SL% (W)</th>
-        <th class="s" data-col="13" title="Max SL% seen across all trades (read only)">Max SL%</th>
+        <th class="s" data-col="10">TP Lock</th>
+        <th class="s" data-col="11" title="Avg minutes from open to phantom SL hit">Avg T→SL</th>
+        <th class="s" data-col="12" title="Avg max SL% used — basis for SL tightening (read only)">Avg SL%</th>
+        <th class="s" data-col="13" title="Best SL% from winning ghost trades (read only)">Best SL% (W)</th>
         <th class="s" data-col="14">Total P&amp;L</th>
       </tr></thead>
       <tbody id="ev-body"><tr><td colspan="15" class="nodata">Loading…</td></tr></tbody>
@@ -2283,10 +2586,10 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
       <thead><tr>
         <th class="s" data-col="0">Symbol</th><th>Type</th><th class="s" data-col="2">Session</th>
         <th class="s" data-col="3">Dir</th><th class="s" data-col="4">VWAP</th>
-        <th class="s" data-col="5" title="Highest RR reached before close">Max RR</th>
-        <th class="s" data-col="6" title="Max SL used as % of original SL">Max SL%</th>
+        <th class="s" data-col="5" title="Highest RR reached before phantom SL">Max RR</th>
+        <th class="s" data-col="6" title="Max SL% used (adverse excursion)">Max SL%</th>
+        <th class="s" data-col="7" title="Minutes from open to phantom SL hit">T→SL min</th>
         <th>Close Reason</th>
-        <th class="s" data-col="8">Elapsed</th>
         <th class="s" data-col="9">Opened</th>
       </tr></thead>
       <tbody id="ghh-body"><tr><td colspan="10" class="nodata">Loading…</td></tr></tbody>
@@ -2318,33 +2621,41 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
   <!-- Band 150-250% tab -->
   <div class="tpane" id="wh-tab-band150">
     <div style="padding:7px 12px;background:var(--bg2);font-size:9px;color:var(--dim);border-bottom:1px solid var(--bdr2)">
-      Signals rejected as <b class="o">VWAP_BAND_EXHAUSTED</b> with band position 150%–250%.
-      These are trades that <em>would have fired</em> if threshold was raised to 250%.
-      Use this data to decide if widening the band makes sense.
+      <b class="o">Ghost 2.0 — Band 150%–250%.</b> Each rejected signal spawns a ghost tracker that runs until phantom SL / 15RR / 2 weeks.
+      Aggregated stats show what these trades would have earned. Data is read-only — never merged into main EV optimizer.
+    </div>
+    <div class="strip" id="band150-strip" style="display:none">
+      <div class="stat"><span class="sl2">Ghosts</span><span class="sv2 b" id="b150-n">—</span></div>
+      <div class="stat"><span class="sl2">Avg Max RR</span><span class="sv2 g" id="b150-rr">—</span></div>
+      <div class="stat"><span class="sl2">Avg SL%</span><span class="sv2 o" id="b150-sl">—</span></div>
     </div>
     <div class="tw">
       <table id="band150-tbl">
         <thead><tr>
-          <th>Time</th><th>Symbol</th><th>Dir</th><th>Session</th><th>VWAP pos</th>
-          <th>Entry</th><th>SL%</th><th title="VWAP band position as % of half-band">Band%</th>
+          <th>Symbol</th><th>Session</th><th>Dir</th><th>VWAP</th>
+          <th>n Ghosts</th><th>Avg Max RR</th><th>Max RR</th><th>Avg SL%</th><th>Avg T→SL</th>
         </tr></thead>
-        <tbody id="band150-body"><tr><td colspan="8" class="nodata">Loading…</td></tr></tbody>
+        <tbody id="band150-body"><tr><td colspan="9" class="nodata">Loading tab to see data…</td></tr></tbody>
       </table>
     </div>
   </div>
   <!-- Band 250-350% tab -->
   <div class="tpane" id="wh-tab-band250">
     <div style="padding:7px 12px;background:var(--bg2);font-size:9px;color:var(--dim);border-bottom:1px solid var(--bdr2)">
-      Signals rejected as <b class="r">VWAP_BAND_EXHAUSTED</b> with band position 250%–350%.
-      Extreme outliers — likely not worth taking.
+      <b class="r">Ghost 2.0 — Band 250%–350%.</b> Extreme outliers tracked separately. Read-only — never added to main optimizer.
+    </div>
+    <div class="strip" id="band250-strip" style="display:none">
+      <div class="stat"><span class="sl2">Ghosts</span><span class="sv2 b" id="b250-n">—</span></div>
+      <div class="stat"><span class="sl2">Avg Max RR</span><span class="sv2 g" id="b250-rr">—</span></div>
+      <div class="stat"><span class="sl2">Avg SL%</span><span class="sv2 o" id="b250-sl">—</span></div>
     </div>
     <div class="tw">
       <table id="band250-tbl">
         <thead><tr>
-          <th>Time</th><th>Symbol</th><th>Dir</th><th>Session</th><th>VWAP pos</th>
-          <th>Entry</th><th>SL%</th><th title="VWAP band position as % of half-band">Band%</th>
+          <th>Symbol</th><th>Session</th><th>Dir</th><th>VWAP</th>
+          <th>n Ghosts</th><th>Avg Max RR</th><th>Max RR</th><th>Avg SL%</th><th>Avg T→SL</th>
         </tr></thead>
-        <tbody id="band250-body"><tr><td colspan="8" class="nodata">Loading…</td></tr></tbody>
+        <tbody id="band250-body"><tr><td colspan="9" class="nodata">Loading tab to see data…</td></tr></tbody>
       </table>
     </div>
   </div>
@@ -2390,7 +2701,7 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
     <table id="cf-tbl">
       <thead><tr>
         <th>#</th><th>Symbol</th><th>Type</th><th>Session</th><th>Dir</th><th>VWAP</th>
-        <th>#</th><th>Win%</th><th>Avg RR</th><th>EV</th><th>Total P&amp;L</th><th>Action</th>
+        <th># Ghosts</th><th>Avg RR</th><th>EV</th><th>Total P&amp;L</th><th>Action</th>
       </tr></thead>
       <tbody id="cf-body"><tr><td colspan="12" class="nodata">Loading…</td></tr></tbody>
     </table>
@@ -2559,7 +2870,7 @@ async function loadEV(){
   _tpMap={};if(tpD)tpD.forEach(t=>{_tpMap[t.key]=t;});
   _evMap={};if(evD)evD.forEach(e=>{_evMap[e.key]=e;});
   document.getElementById('k-tp').textContent=Object.values(_tpMap).filter(t=>(t.evAtLock??0)>0).length;
-  // Build combos — only where trades exist
+  // Build combos — ALL symbol/session/dir/vwap combos, even with 0 closed trades
   const combos=[];
   const allSyms=[...FOREX,...INDEX,...COMM,...STOCKS];
   for(const sym of allSyms){
@@ -2569,31 +2880,26 @@ async function loadEV(){
       for(const dir of['buy','sell']){
         for(const vwap of['above','below']){
           const key=sym+'_'+sess+'_'+dir+'_'+vwap;
+          // Closed MT5 trades — for P&L and combo activity indicator
           const trades=_allTrades.filter(t=>
             t.symbol===sym&&t.session===sess&&t.direction===dir&&
             t.vwapPosition===vwap&&t.closedAt!=null&&
             t.openedAt&&new Date(t.openedAt)>=TP_OPT_DATE
           );
-          if(!trades.length)continue; // skip empty
-          const wins=trades.filter(t=>t.closeReason==='tp');
-          const sls=trades.filter(t=>t.closeReason==='sl');
-          const winPct=trades.length?(wins.length/trades.length*100):null;
-          const rrs=trades.map(t=>t.maxRR).filter(v=>v!=null);
-          const avgRR=rrs.length?rrs.reduce((a,b)=>a+b,0)/rrs.length:null;
-          const bestRR=rrs.length?Math.max(...rrs):null;
           const totalPnl=trades.reduce((s,t)=>s+(t.realizedPnlEUR??t.currentPnL??0),0);
-          // SL analysis (read only)
-          const wSlP=wins.map(t=>t.slDistPct??(t.entry&&t.sl?Math.abs(t.entry-t.sl)/t.entry*100:null)).filter(v=>v!=null);
-          const avgWSlP=wSlP.length?wSlP.reduce((a,b)=>a+b,0)/wSlP.length:null;
-          const allSlP=trades.map(t=>t.slDistPct??(t.entry&&t.sl?Math.abs(t.entry-t.sl)/t.entry*100:null)).filter(v=>v!=null);
-          const maxSlP=allSlP.length?Math.max(...allSlP):null;
-          combos.push({sym,sess,dir,vwap,key,trades,wins,sls,winPct,avgRR,bestRR,totalPnl,type,avgWSlP,maxSlP,ev:_evMap[key],tp:_tpMap[key]});
+          // EV data comes from ghost_trades via server /ev endpoint
+          const ev=_evMap[key]??null;
+          const tp=_tpMap[key]??null;
+          // avgRR from ghosts (server-computed ev.rrLevels[0].winRate is for all RR levels)
+          // Just use ev.bestRR and ev.avgMaxSlPct from server
+          const avgRR=ev?.avgRR??null;
+          combos.push({sym,sess,dir,vwap,key,trades,totalPnl,type,ev,tp});
         }
       }
     }
   }
   _evData=combos;renderEV();
-  loadGhostHistory();  // Also load ghost history while we have data
+  loadGhostHistory();
   buildMatrix(combos);
   renderComboFilter(combos);
 }
@@ -2604,44 +2910,59 @@ function renderEV(){
   if(evF.sess!=='all')d=d.filter(c=>c.sess===evF.sess);
   if(evF.dir!=='all')d=d.filter(c=>c.dir===evF.dir);
   if(evF.vwap!=='all')d=d.filter(c=>c.vwap===evF.vwap);
-  if(evF.min!=='1')d=d.filter(c=>c.trades.length>=parseInt(evF.min));
-  d.sort((a,b)=>{const ea=a.ev?.bestEV??-99,eb=b.ev?.bestEV??-99;return eb!==ea?eb-ea:b.trades.length-a.trades.length;});
-  const tot=d.reduce((s,c)=>s+c.trades.length,0);
-  const wins=d.reduce((s,c)=>s+c.wins.length,0);
+  // min filter: based on ghost count from EV data
+  if(evF.min==='5')d=d.filter(c=>(c.ev?.count??0)>=5);
+  else if(evF.min==='10')d=d.filter(c=>(c.ev?.count??0)>=10);
+  else if(evF.min!=='1')d=d.filter(c=>(c.ev?.count??0)>=parseInt(evF.min));
+  // Sort: EV+ first, then by EV desc, then by ghost count
+  d.sort((a,b)=>{
+    const ea=a.ev?.bestEV??-999,eb=b.ev?.bestEV??-999;
+    if(eb!==ea)return eb-ea;
+    return (b.ev?.count??0)-(a.ev?.count??0);
+  });
+  const withData=d.filter(c=>c.ev&&c.ev.count>0);
   const pnl=d.reduce((s,c)=>s+c.totalPnl,0);
-  document.getElementById('ev-meta').textContent=d.length+' combos shown';
+  document.getElementById('ev-meta').textContent=d.length+' combos · '+withData.length+' with ghost data';
   document.getElementById('ev-count').textContent=d.length;
-  document.getElementById('ev-trades').textContent=tot;
-  document.getElementById('ev-winpct').textContent=tot?(wins/tot*100).toFixed(1)+'%':'—';
+  document.getElementById('ev-trades').textContent=withData.length+'/'+d.length;
+  document.getElementById('ev-winpct').textContent='—'; // win% is ghost-based (see EV column)
   const pEl=document.getElementById('ev-pnl');pEl.textContent=(pnl>=0?'+':'')+'€'+pnl.toFixed(0);pEl.className='sv2 '+pC(pnl);
   document.getElementById('ev-locked').textContent=d.filter(c=>c.tp&&(c.ev?.bestEV??0)>0).length;
   const tb=document.getElementById('ev-body');
-  if(!d.length){tb.innerHTML='<tr><td colspan="15" class="nodata">No data — use filters above or wait for trades to close</td></tr>';return;}
+  if(!d.length){tb.innerHTML='<tr><td colspan="15" class="nodata">No combos</td></tr>';return;}
   tb.innerHTML=d.map(c=>{
-    const ev=c.ev;const tp=c.tp;const evV=ev?.bestEV??null;
-    const ready=c.trades.length>=5;
-    const bestTP=tp?tp.lockedRR:(ev?.bestRR??c.bestRR??null);
-    return\`<tr class="\${tClass(c.sym)}">
+    const ev=c.ev;const tp=c.tp;
+    const evV=ev?.bestEV??null;
+    const ghostN=ev?.count??0;
+    const ready=ghostN>=5;
+    // bestTP: locked RR from TP lock > server EV bestRR > null (never show 1.0R default)
+    const bestTP=tp?tp.lockedRR:(ev?.bestRR??null);
+    const avgTimeMin=ev?.avgTimeToSLMin??null;
+    const avgSlPct=ev?.avgMaxSlPct??null;
+    // Best SL% from winners: from ev data (server computes this)
+    const bestSlW=ev?.bestWinnerSlPct??null;
+    return\`<tr class="\${tClass(c.sym)}\${ghostN===0?' opacity:0.45':''}">
       <td data-val="\${c.sym}" class="b fw">\${c.sym}</td>
       <td>\${tyBadge(c.type)}</td>
       <td>\${sBadge(c.sess)}</td>
       <td>\${dBadge(c.dir)}</td>
       <td>\${vBadge(c.vwap)}</td>
-      <td data-val="\${c.trades.length}" class="\${ready?'y fw':'c'}">\${c.trades.length}\${ready?'':' <span class="d" style="font-size:8px">('+(5-c.trades.length)+'more)</span>'}</td>
-      <td data-val="\${c.winPct??-1}" class="\${c.winPct==null?'d':c.winPct>=50?'g':'r'}">\${c.winPct!=null?c.winPct.toFixed(0)+'%':'—'}</td>
-      <td data-val="\${bestTP??-99}" class="g fw">\${bestTP!=null?f(bestTP,1)+'R':'—'}</td>
-      <td data-val="\${c.avgRR??-99}" class="\${(c.avgRR??0)>=1?'g':'r'}">\${c.avgRR!=null?f(c.avgRR,2)+'R':'—'}</td>
-      <td data-val="\${evV??-99}" class="\${evC(evV)} fw">\${evV!=null?evV.toFixed(3):'—'}</td>
-      <td>\${ready?(evV!=null?(evV>0?'<span class="bd bd-evp">EV+ ✓</span>':'<span class="bd bd-evn">EV-</span>'):'<span class="bd d">pending</span>'):'<span class="d" style="font-size:9px">need 5+</span>'}</td>
+      <td data-val="\${ghostN}" class="\${ready?'y fw':ghostN>0?'c':'d'}">\${ghostN===0?'<span class="d">—</span>':ghostN+(ready?'':' <span class="d" style="font-size:8px">('+(5-ghostN)+'→5)</span>')}</td>
+      <td data-val="\${bestTP??-99}" class="\${bestTP?'g fw':'d'}">\${bestTP!=null?f(bestTP,1)+'R':'—'}</td>
+      <td data-val="\${ev?.avgRR??-99}" class="\${(ev?.avgRR??0)>=1?'g':'d'}">\${ev?.avgRR!=null?f(ev.avgRR,2)+'R':'—'}</td>
+      <td data-val="\${evV??-999}" class="\${evC(evV)} fw">\${evV!=null?evV.toFixed(3):'—'}</td>
+      <td>\${ready?(evV!=null?(evV>0?'<span class="bd bd-evp">EV+ ✓</span>':'<span class="bd bd-evn">EV-</span>'):'<span class="bd d">pending</span>'):'<span class="d" style="font-size:9px">\${ghostN>0?'need '+(5-ghostN)+' more':'no data'}</span>'}</td>
       <td>\${tp?\`<span class="bd bd-lck">★ \${tp.lockedRR.toFixed(1)}R</span>\`:'<span class="d">—</span>'}</td>
-      <td data-val="\${c.avgWSlP??-1}" class="g" title="Best SL% from winners (read only)">\${c.avgWSlP!=null?f(c.avgWSlP,2)+'%':'—'}</td>
-      <td data-val="\${c.maxSlP??-1}" class="r" title="Max SL% used (read only)">\${c.maxSlP!=null?f(c.maxSlP,2)+'%':'—'}</td>
+      <td data-val="\${avgTimeMin??9999}" class="d">\${avgTimeMin!=null?avgTimeMin+'min':'—'}</td>
+      <td data-val="\${avgSlPct??-1}" class="\${avgSlPct!=null?(avgSlPct<50?'g':avgSlPct<80?'y':'o'):'d'}" title="Avg max SL% used — lower = can tighten">\${avgSlPct!=null?f(avgSlPct,1)+'%':'—'}</td>
+      <td data-val="\${bestSlW??-1}" class="g" title="Best SL% from winning ghosts (read only)">\${bestSlW!=null?f(bestSlW,1)+'%':'—'}</td>
       <td data-val="\${c.totalPnl}" class="\${pC(c.totalPnl)} fw">\${eu(c.totalPnl)}</td>
     </tr>\`;
   }).join('');
 }
 
 function setEVF(k,v,btn){evF[k]=v;btn.closest('.fbar').querySelectorAll('.fb').forEach(b=>{if(b.getAttribute('onclick')?.includes("'"+k+"'"))b.classList.remove('on');});btn.classList.add('on');renderEV();}
+
 
 // ── 4. GHOST HISTORY ─────────────────────────────────────
 async function loadGhostHistory(){
@@ -2652,20 +2973,24 @@ async function loadGhostHistory(){
   if(!rows.length){tb.innerHTML='<tr><td colspan="10" class="nodata">No closed ghost data yet</td></tr>';return;}
   tb.innerHTML=rows.map(g=>{
     const type=sTypeName(g.symbol||'');
-    // Close reason: map maxRR15 / timing2w / sl hit
-    let closeReason=g.closeReason||'sl';
-    if((g.maxRR||0)>=15)closeReason='maxRR';
-    else if((g.elapsedMin||0)>=20160)closeReason='timeout'; // 2 weeks
+    const maxRR=g.maxRRBeforeSL??g.maxRR??0;
+    const maxSlP=g.maxSlPctUsed??g.slPctUsed??null;
+    const tMin=g.timeToSLMin??null;
+    let cr=g.stopReason||g.closeReason||'sl';
+    if(maxRR>=15)cr='maxRR';
+    else if(tMin!=null&&tMin>=20160)cr='timeout';
+    else if(cr==='phantom_sl'||cr==='sl')cr='sl';
+    else if(cr==='timeout_72h')cr='timeout';
     return\`<tr class="\${tClass(g.symbol||'')}">
       <td data-val="\${g.symbol}" class="b fw">\${g.symbol||'—'}</td>
       <td>\${tyBadge(type)}</td>
       <td>\${sBadge(g.session)}</td>
       <td>\${dBadge(g.direction)}</td>
       <td>\${vBadge(g.vwapPosition)}</td>
-      <td data-val="\${g.maxRR??-99}" class="\${(g.maxRR??0)>0?'g':'d'} fw">\${f(g.maxRR,2)}R</td>
-      <td data-val="\${g.slPctUsed??-1}" class="o">\${g.slPctUsed!=null?f(g.slPctUsed,0)+'%':'—'}</td>
-      <td>\${cBadge(closeReason)}</td>
-      <td data-val="\${g.elapsedMin??0}" class="d">\${g.elapsedMin!=null?g.elapsedMin+'min':'—'}</td>
+      <td data-val="\${maxRR}" class="\${maxRR>0?'g':'d'} fw">\${f(maxRR,2)}R</td>
+      <td data-val="\${maxSlP??-1}" class="\${maxSlP!=null?(maxSlP<50?'g':maxSlP<80?'y':'o'):'d'}">\${maxSlP!=null?f(maxSlP,0)+'%':'—'}</td>
+      <td data-val="\${tMin??9999}" class="d">\${tMin!=null?tMin+'min':'—'}</td>
+      <td>\${cBadge(cr)}</td>
       <td data-val="\${g.openedAt||''}" class="d" style="font-size:9px">\${dtTs(g.openedAt)}</td>
     </tr>\`;
   }).join('');
@@ -2700,23 +3025,37 @@ async function loadErrors(){
 }
 
 async function loadBandSignals(minPct,maxPct,prefix){
-  const d=await api(\`/vwap-band-signals?minPct=\${minPct}&maxPct=\${maxPct}&limit=300\`);
+  const tier=prefix==='band150'?'150_250':'250_350';
+  const d=await api(\`/band-ghost-stats?tier=\${tier}\`);
   const rows=d?.rows||[];
   const tb=document.getElementById(prefix+'-body');
-  if(!rows.length){tb.innerHTML='<tr><td colspan="8" class="nodata">No signals in this range yet</td></tr>';return;}
-  tb.innerHTML=rows.map(r=>{
-    const bp=r.vwap_band_pct;
-    return\`<tr>
-      <td class="d" style="font-size:9px">\${dtTs(r.received_at)}</td>
-      <td class="b fw">\${r.symbol||'—'}</td>
-      <td>\${dBadge(r.direction)}</td>
-      <td>\${sBadge(r.session)}</td>
-      <td>\${vBadge(r.vwap_position)}</td>
-      <td class="d">\${r.tv_entry?f(r.tv_entry,5):'—'}</td>
-      <td class="o">\${r.sl_pct_human||'—'}</td>
-      <td class="\${bp>2.5?'r':'o'} fw">\${bp!=null?((+bp)*100).toFixed(0)+'%':'—'}</td>
-    </tr>\`;
-  }).join('');
+  const strip=document.getElementById(prefix+'-strip');
+  if(!rows.length){
+    tb.innerHTML=\`<tr><td colspan="9" class="nodata">No ghost data yet for \${tier.replace('_','%–')}% — ghosts start on next rejected signal</td></tr>\`;
+    if(strip)strip.style.display='none';return;
+  }
+  const totalN=rows.reduce((s,r)=>s+(+r.n||0),0);
+  const rrRows=rows.filter(r=>r.avgMaxRR!=null);
+  const avgRR=rrRows.length?rrRows.reduce((s,r)=>s+(+r.avgMaxRR),0)/rrRows.length:0;
+  const slRows=rows.filter(r=>r.avgSlPct!=null);
+  const avgSL=slRows.length?slRows.reduce((s,r)=>s+(+r.avgSlPct),0)/slRows.length:0;
+  if(strip)strip.style.display='flex';
+  const pfx=prefix==='band150'?'b150':'b250';
+  const nEl=document.getElementById(pfx+'-n');const rrEl=document.getElementById(pfx+'-rr');const slEl=document.getElementById(pfx+'-sl');
+  if(nEl)nEl.textContent=totalN;
+  if(rrEl)rrEl.textContent=avgRR?f(avgRR,2)+'R':'—';
+  if(slEl)slEl.textContent=avgSL?f(avgSL,1)+'%':'—';
+  tb.innerHTML=rows.map(r=>\`<tr class="\${tClass(r.symbol||'')}">
+    <td class="b fw">\${r.symbol||'—'}</td>
+    <td>\${sBadge(r.session)}</td>
+    <td>\${dBadge(r.direction)}</td>
+    <td>\${vBadge(r.vwapPosition)}</td>
+    <td class="\${(+r.n||0)>=5?'y fw':'c'}">\${r.n||0}</td>
+    <td class="\${(+r.avgMaxRR||0)>=2?'g fw':(+r.avgMaxRR||0)>=1?'y fw':'d'}">\${r.avgMaxRR!=null?f(r.avgMaxRR,2)+'R':'—'}</td>
+    <td class="g">\${r.maxMaxRR!=null?f(r.maxMaxRR,2)+'R':'—'}</td>
+    <td class="\${(+r.avgSlPct||0)<50?'g':(+r.avgSlPct||0)<80?'y':'o'}">\${r.avgSlPct!=null?f(r.avgSlPct,1)+'%':'—'}</td>
+    <td class="d">\${r.avgTimeMin!=null?r.avgTimeMin+'min':'—'}</td>
+  </tr>\`).join('');
 }
 
 // ── 6. EV MATRIX ─────────────────────────────────────────
@@ -2753,23 +3092,28 @@ function buildMatrix(combos){
 // ── 7. COMBO SELECTION ────────────────────────────────────
 function renderComboFilter(combos){
   let d=[...combos];
-  if(cfF.show==='ev+')d=d.filter(c=>(c.ev?.bestEV??0)>0);
+  // Only show combos with ghost data or closed trades for combo filter
+  if(cfF.show==='all')d=d.filter(c=>(c.ev?.count??0)>0||c.trades?.length>0||c.totalPnl!==0);
+  else if(cfF.show==='ev+')d=d.filter(c=>(c.ev?.bestEV??0)>0);
   else if(cfF.show==='ev-')d=d.filter(c=>c.ev?.bestEV!=null&&c.ev.bestEV<0);
-  else if(cfF.show==='min5')d=d.filter(c=>c.trades.length>=5);
-  if(cfF.sort==='ev')d.sort((a,b)=>(b.ev?.bestEV??-99)-(a.ev?.bestEV??-99));
+  else if(cfF.show==='min5')d=d.filter(c=>(c.ev?.count??0)>=5);
+  if(cfF.sort==='ev')d.sort((a,b)=>(b.ev?.bestEV??-999)-(a.ev?.bestEV??-999));
   else if(cfF.sort==='pnl')d.sort((a,b)=>b.totalPnl-a.totalPnl);
-  else if(cfF.sort==='winpct')d.sort((a,b)=>(b.winPct??-1)-(a.winPct??-1));
-  else if(cfF.sort==='trades')d.sort((a,b)=>b.trades.length-a.trades.length);
+  else if(cfF.sort==='winpct')d.sort((a,b)=>(b.ev?.bestEV??-999)-(a.ev?.bestEV??-999));
+  else if(cfF.sort==='trades')d.sort((a,b)=>(b.ev?.count??0)-(a.ev?.count??0));
   const tb=document.getElementById('cf-body');
-  if(!d.length){tb.innerHTML='<tr><td colspan="12" class="nodata">No data</td></tr>';return;}
+  if(!d.length){tb.innerHTML='<tr><td colspan="11" class="nodata">No traded combos yet</td></tr>';return;}
   tb.innerHTML=d.map((c,i)=>{
     const evV=c.ev?.bestEV??null;
+    const ghostN=c.ev?.count??0;
+    const ready=ghostN>=5;
     let action='—',aCls='d';
-    if(c.trades.length>=5){
+    if(ready){
       if(evV!=null&&evV>0.05){action='⬆ KEEP / SCALE';aCls='g';}
       else if(evV!=null&&evV<-0.05){action='⬇ CONSIDER CUT';aCls='r';}
       else{action='↔ NEUTRAL';aCls='y';}
-    } else {action=\`need \${5-c.trades.length} more\`;aCls='d';}
+    } else if(ghostN>0){action=\`need \${5-ghostN} more ghosts\`;aCls='d';}
+    else{action='no data yet';aCls='d';}
     return\`<tr class="\${tClass(c.sym)}">
       <td class="d">\${i+1}</td>
       <td class="b fw">\${c.sym}</td>
@@ -2777,9 +3121,8 @@ function renderComboFilter(combos){
       <td>\${sBadge(c.sess)}</td>
       <td>\${dBadge(c.dir)}</td>
       <td>\${vBadge(c.vwap)}</td>
-      <td class="c fw">\${c.trades.length}</td>
-      <td class="\${(c.winPct??0)>=50?'g':'r'}">\${c.winPct!=null?c.winPct.toFixed(0)+'%':'—'}</td>
-      <td class="\${(c.avgRR??0)>=1?'g':'r'}">\${c.avgRR!=null?f(c.avgRR,2)+'R':'—'}</td>
+      <td class="\${ready?'y fw':ghostN>0?'c':'d'}">\${ghostN||'—'}</td>
+      <td class="\${(c.ev?.avgRR??0)>=1?'g':c.ev?.avgRR!=null?'r':'d'}">\${c.ev?.avgRR!=null?f(c.ev.avgRR,2)+'R':'—'}</td>
       <td class="\${evC(evV)} fw">\${evV!=null?evV.toFixed(3):'—'}</td>
       <td class="\${pC(c.totalPnl)}">\${eu(c.totalPnl)}</td>
       <td class="\${aCls} fw" style="font-size:9.5px">\${action}</td>
@@ -2791,14 +3134,15 @@ function setCF(k,v,btn){cfF[k]=v;btn.closest('.fbar').querySelectorAll('.fb').fo
 
 // ── SIGNAL STATS for session trades KPI ──────────────────
 async function loadSignalStats(){
-  const d=await api('/signal-stats');
-  if(!d)return;
-  // count placed trades per session today
-  const t=d.topRejectReasons||[];
-  // Just show total logged / conversion
-  const total=d.total||0;const placed=d.placed||0;
-  const pct=total>0?((placed/total)*100).toFixed(0):'?';
-  document.getElementById('k-tps').textContent=placed+' ('+pct+'%)';
+  const [sigD,statsD]=await Promise.all([api('/signal-stats'),api('/stats')]);
+  if(sigD){
+    const total=sigD.total||0;const placed=sigD.placed||0;
+    const pct=total>0?((placed/total)*100).toFixed(0):'?';
+    document.getElementById('k-tps').textContent=placed+' ('+pct+'%)';
+  }
+  if(statsD){
+    document.getElementById('k-err').textContent=statsD.totalClosedTrades??'?';
+  }
 }
 
 // ── SHADOW SL key count for KPI ──────────────────────────
