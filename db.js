@@ -149,13 +149,37 @@ async function initDB() {
         phantom_sl_hit      BOOLEAN     DEFAULT FALSE,
         stop_reason         TEXT,
         time_to_sl_min      INTEGER,
+        max_sl_pct_used     NUMERIC     DEFAULT 0,
         opened_at           TIMESTAMPTZ,
         closed_at           TIMESTAMPTZ,
         created_at          TIMESTAMPTZ DEFAULT NOW()
       );
+      ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS max_sl_pct_used NUMERIC DEFAULT 0;
       CREATE INDEX IF NOT EXISTS idx_ghost_trades_key     ON ghost_trades (optimizer_key);
       CREATE INDEX IF NOT EXISTS idx_ghost_trades_symbol  ON ghost_trades (symbol);
       CREATE INDEX IF NOT EXISTS idx_ghost_trades_closed  ON ghost_trades (closed_at);
+    `);
+
+    // ── ghost_state (persists ghost tracking across restarts) ─────
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS ghost_state (
+        position_id       TEXT        PRIMARY KEY,
+        optimizer_key     TEXT        NOT NULL,
+        symbol            TEXT        NOT NULL,
+        mt5_symbol        TEXT,
+        session           TEXT        NOT NULL,
+        direction         TEXT        NOT NULL,
+        vwap_position     TEXT        DEFAULT 'unknown',
+        entry             NUMERIC     NOT NULL,
+        sl                NUMERIC     NOT NULL,
+        sl_pct            NUMERIC,
+        tp_rr_used        NUMERIC,
+        max_price         NUMERIC,
+        max_rr            NUMERIC     DEFAULT 0,
+        max_sl_pct_used   NUMERIC     DEFAULT 0,
+        opened_at         TIMESTAMPTZ,
+        updated_at        TIMESTAMPTZ DEFAULT NOW()
+      );
     `);
 
     // ── shadow_snapshots ─────────────────────────────────────────
@@ -298,6 +322,39 @@ async function initDB() {
       CREATE INDEX IF NOT EXISTS idx_signal_log_ts     ON signal_log (received_at DESC);
       CREATE INDEX IF NOT EXISTS idx_signal_log_sym    ON signal_log (symbol);
       CREATE INDEX IF NOT EXISTS idx_signal_log_key    ON signal_log (optimizer_key);
+    `);
+
+    // ── vwap_band_ghost — ghost data for signals rejected by VWAP band exhaustion ──
+    // Separate from main ghost_trades. Tracks what would have happened if we took
+    // the trade at 150–250% and 250–350% VWAP band exhaustion.
+    // NEVER merged into main EV / TP optimizer tables.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS vwap_band_ghost (
+        id              SERIAL      PRIMARY KEY,
+        signal_id       INTEGER,               -- fk to signal_log.id if available
+        optimizer_key   TEXT        NOT NULL,
+        symbol          TEXT        NOT NULL,
+        session         TEXT        NOT NULL,
+        direction       TEXT        NOT NULL,
+        vwap_position   TEXT        DEFAULT 'unknown',
+        band_tier       TEXT        NOT NULL,  -- '150_250' or '250_350'
+        band_pct        NUMERIC,               -- actual band% at signal time
+        entry           NUMERIC     NOT NULL,
+        sl              NUMERIC,
+        sl_pct          NUMERIC,
+        max_price       NUMERIC,
+        max_rr          NUMERIC     DEFAULT 0,
+        max_sl_pct_used NUMERIC     DEFAULT 0,
+        phantom_sl_hit  BOOLEAN     DEFAULT FALSE,
+        stop_reason     TEXT,
+        time_to_sl_min  INTEGER,
+        opened_at       TIMESTAMPTZ,
+        closed_at       TIMESTAMPTZ,
+        created_at      TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_vwap_band_ghost_key  ON vwap_band_ghost (optimizer_key);
+      CREATE INDEX IF NOT EXISTS idx_vwap_band_ghost_tier ON vwap_band_ghost (band_tier);
+      CREATE INDEX IF NOT EXISTS idx_vwap_band_ghost_sym  ON vwap_band_ghost (symbol);
     `);
 
     // ── lot_overrides (FIX 2: persistent lot overrides) ─────────────
@@ -491,8 +548,8 @@ async function saveGhostTrade(g) {
         (position_id, symbol, session, direction, vwap_position, optimizer_key,
          entry, sl, sl_pct, phantom_sl, tp_rr_used,
          max_price, max_rr_before_sl, phantom_sl_hit, stop_reason,
-         time_to_sl_min, opened_at, closed_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+         time_to_sl_min, max_sl_pct_used, opened_at, closed_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
       ON CONFLICT DO NOTHING
     `, [
       g.positionId      ?? null,
@@ -508,6 +565,7 @@ async function saveGhostTrade(g) {
       g.phantomSLHit    ?? false,
       g.stopReason      ?? null,
       g.timeToSLMin     ?? null,
+      g.maxSlPctUsed    ?? 0,
       g.openedAt        ?? null,
       g.closedAt        ?? null,
     ]);
@@ -534,6 +592,7 @@ async function loadGhostTrades(optimizerKey = null, limitRows = 200) {
         phantom_sl_hit       AS "phantomSLHit",
         stop_reason          AS "stopReason",
         time_to_sl_min       AS "timeToSLMin",
+        CAST(max_sl_pct_used AS FLOAT) AS "maxSlPctUsed",
         opened_at            AS "openedAt",
         closed_at            AS "closedAt"
       FROM ghost_trades
@@ -935,29 +994,49 @@ async function loadShadowWinners() {
 async function computeEVStats(optimizerKey) {
   try {
     const r = await pool.query(`
-      SELECT CAST(g.max_rr_before_sl AS FLOAT) AS "maxRR"
+      SELECT
+        CAST(g.max_rr_before_sl AS FLOAT)  AS "maxRR",
+        g.time_to_sl_min                   AS "timeToSL",
+        CAST(g.max_sl_pct_used  AS FLOAT)  AS "maxSlPct"
       FROM ghost_trades g
       LEFT JOIN closed_trades ct ON ct.position_id = g.position_id
       WHERE g.optimizer_key=$1
         AND g.phantom_sl_hit=TRUE
         AND g.max_rr_before_sl IS NOT NULL
+        AND g.max_rr_before_sl > 0
         AND g.opened_at >= $2
         AND g.vwap_position IN ('above','below')
         AND (ct.exclude_from_ev IS NULL OR ct.exclude_from_ev = FALSE)
     `, [optimizerKey, COMPLIANCE_DATE]);
-    const arr = r.rows.map(x => x.maxRR);
-    if (arr.length < 1) return { key: optimizerKey, count: 0, rrLevels: [], bestRR: 1.0, bestEV: null };
+
+    // Filter 0.00R ghosts — they went straight to SL with no movement, not useful for TP calc
+    const rows = r.rows.filter(x => (x.maxRR ?? 0) > 0);
+    if (rows.length < 1) return { key: optimizerKey, count: 0, rrLevels: [], bestRR: null, bestEV: null, avgTimeToSLMin: null, avgMaxSlPct: null };
+
+    const arr      = rows.map(x => x.maxRR);
+    const timings  = rows.map(x => x.timeToSL).filter(v => v != null);
+    const slPcts   = rows.map(x => x.maxSlPct).filter(v => v != null);
+    const avgTimeToSLMin = timings.length  ? Math.round(timings.reduce((s,v)=>s+v,0)/timings.length)   : null;
+    const avgMaxSlPct    = slPcts.length   ? parseFloat((slPcts.reduce((s,v)=>s+v,0)/slPcts.length).toFixed(1)) : null;
+    const avgRR          = arr.length      ? parseFloat((arr.reduce((s,v)=>s+v,0)/arr.length).toFixed(3)) : null;
 
     const levels = [];
     for (let rr = 0.5; rr <= 15.01; rr = parseFloat((rr + 0.1).toFixed(1))) {
-      const wins   = arr.filter(v => v >= rr).length;
-      const wr     = wins / arr.length;
-      const ev     = parseFloat((wr * rr - (1 - wr)).toFixed(4));
+      const wins = arr.filter(v => v >= rr).length;
+      const wr   = wins / arr.length;
+      const ev   = parseFloat((wr * rr - (1 - wr)).toFixed(4));
       levels.push({ rr, winRate: parseFloat((wr * 100).toFixed(1)), ev });
     }
     const best = levels.reduce((a, b) => b.ev > a.ev ? b : a);
-    return { key: optimizerKey, count: arr.length, rrLevels: levels, bestRR: best.rr, bestEV: best.ev };
-  } catch (e) { return { key: optimizerKey, count: 0, rrLevels: [], bestRR: 1.0, bestEV: null }; }
+
+    // bestWinnerSlPct: avg SL% used only from ghosts that would have hit TP at bestRR
+    // These are "winning" ghosts — their SL% tells you how much SL you actually needed
+    const winnerRows = rows.filter(x => x.maxRR >= best.rr);
+    const wSlPcts    = winnerRows.map(x => x.maxSlPct).filter(v => v != null);
+    const bestWinnerSlPct = wSlPcts.length ? parseFloat((wSlPcts.reduce((s,v)=>s+v,0)/wSlPcts.length).toFixed(1)) : null;
+
+    return { key: optimizerKey, count: arr.length, rrLevels: levels, bestRR: best.rr, bestEV: best.ev, avgRR, avgTimeToSLMin, avgMaxSlPct, bestWinnerSlPct };
+  } catch (e) { return { key: optimizerKey, count: 0, rrLevels: [], bestRR: null, bestEV: null, avgRR: null, avgTimeToSLMin: null, avgMaxSlPct: null, bestWinnerSlPct: null }; }
 }
 
 // ── lot_overrides (FIX 2) ──────────────────────────────────────
@@ -1133,6 +1212,145 @@ async function loadAllShadowAnalysis() {
   } catch (e) { console.warn('[!] loadAllShadowAnalysis:', e.message); return []; }
 }
 
+// ── ghost_state (restart persistence) ─────────────────────────
+async function saveGhostState(g) {
+  try {
+    await pool.query(`
+      INSERT INTO ghost_state
+        (position_id, optimizer_key, symbol, mt5_symbol, session, direction,
+         vwap_position, entry, sl, sl_pct, tp_rr_used,
+         max_price, max_rr, max_sl_pct_used, opened_at, updated_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,NOW())
+      ON CONFLICT (position_id) DO UPDATE SET
+        max_price       = EXCLUDED.max_price,
+        max_rr          = EXCLUDED.max_rr,
+        max_sl_pct_used = EXCLUDED.max_sl_pct_used,
+        updated_at      = NOW()
+    `, [
+      g.positionId, g.optimizerKey, g.symbol, g.mt5Symbol ?? g.symbol,
+      g.session, g.direction, g.vwapPosition ?? 'unknown',
+      g.entry, g.sl, g.slPct ?? null, g.tpRRUsed ?? null,
+      g.maxPrice ?? g.entry, g.maxRR ?? 0, g.maxSlPctUsed ?? 0,
+      g.openedAt ?? null,
+    ]);
+  } catch (e) { console.warn('[!] saveGhostState:', e.message); }
+}
+
+async function loadAllGhostStates() {
+  try {
+    const r = await pool.query(`
+      SELECT
+        position_id       AS "positionId",
+        optimizer_key     AS "optimizerKey",
+        symbol, mt5_symbol AS "mt5Symbol",
+        session, direction,
+        vwap_position     AS "vwapPosition",
+        CAST(entry            AS FLOAT) AS entry,
+        CAST(sl               AS FLOAT) AS sl,
+        CAST(sl_pct           AS FLOAT) AS "slPct",
+        CAST(tp_rr_used       AS FLOAT) AS "tpRRUsed",
+        CAST(max_price        AS FLOAT) AS "maxPrice",
+        CAST(max_rr           AS FLOAT) AS "maxRR",
+        CAST(max_sl_pct_used  AS FLOAT) AS "maxSlPctUsed",
+        opened_at             AS "openedAt"
+      FROM ghost_state
+    `);
+    return r.rows;
+  } catch (e) { console.warn('[!] loadAllGhostStates:', e.message); return []; }
+}
+
+async function deleteGhostState(positionId) {
+  try {
+    await pool.query('DELETE FROM ghost_state WHERE position_id=$1', [positionId]);
+  } catch (e) { console.warn('[!] deleteGhostState:', e.message); }
+}
+
+// ── vwap_band_ghost ─────────────────────────────────────────────
+// Ghost 2.0: tracks what would have happened for VWAP-exhausted signals
+async function saveBandGhost(g) {
+  try {
+    await pool.query(`
+      INSERT INTO vwap_band_ghost
+        (signal_id, optimizer_key, symbol, session, direction, vwap_position,
+         band_tier, band_pct, entry, sl, sl_pct,
+         max_price, max_rr, max_sl_pct_used, phantom_sl_hit, stop_reason,
+         time_to_sl_min, opened_at, closed_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+      ON CONFLICT DO NOTHING
+    `, [
+      g.signalId ?? null,
+      g.optimizerKey, g.symbol, g.session, g.direction,
+      g.vwapPosition ?? "unknown",
+      g.bandTier,       // '150_250' or '250_350'
+      g.bandPct ?? null,
+      g.entry, g.sl ?? null, g.slPct ?? null,
+      g.maxPrice ?? null, g.maxRR ?? 0, g.maxSlPctUsed ?? 0,
+      g.phantomSLHit ?? false, g.stopReason ?? null,
+      g.timeToSLMin ?? null,
+      g.openedAt ?? null, g.closedAt ?? null,
+    ]);
+  } catch (e) { console.warn("[!] saveBandGhost:", e.message); }
+}
+
+async function loadBandGhosts({ bandTier, symbol, optimizerKey, limit = 500 } = {}) {
+  try {
+    const conds = [], vals = [];
+    if (bandTier)      { conds.push(`band_tier=$${vals.length+1}`);      vals.push(bandTier); }
+    if (symbol)        { conds.push(`symbol=$${vals.length+1}`);         vals.push(symbol); }
+    if (optimizerKey)  { conds.push(`optimizer_key=$${vals.length+1}`);  vals.push(optimizerKey); }
+    const where = conds.length ? `WHERE ${conds.join(" AND ")}` : "";
+    const r = await pool.query(`
+      SELECT
+        id, signal_id AS "signalId", optimizer_key AS "optimizerKey",
+        symbol, session, direction, vwap_position AS "vwapPosition",
+        band_tier AS "bandTier", CAST(band_pct AS FLOAT) AS "bandPct",
+        CAST(entry AS FLOAT) AS entry, CAST(sl AS FLOAT) AS sl,
+        CAST(sl_pct AS FLOAT) AS "slPct",
+        CAST(max_price AS FLOAT) AS "maxPrice",
+        CAST(max_rr AS FLOAT) AS "maxRR",
+        CAST(max_sl_pct_used AS FLOAT) AS "maxSlPctUsed",
+        phantom_sl_hit AS "phantomSLHit", stop_reason AS "stopReason",
+        time_to_sl_min AS "timeToSLMin",
+        opened_at AS "openedAt", closed_at AS "closedAt"
+      FROM vwap_band_ghost
+      ${where}
+      ORDER BY opened_at DESC
+      LIMIT $${vals.length+1}
+    `, [...vals, limit]);
+    return r.rows;
+  } catch (e) { console.warn("[!] loadBandGhosts:", e.message); return []; }
+}
+
+async function loadBandGhostStats(bandTier) {
+  try {
+    const r = await pool.query(`
+      SELECT
+        optimizer_key AS "optimizerKey", symbol, session, direction,
+        vwap_position AS "vwapPosition",
+        band_tier AS "bandTier",
+        COUNT(*)                                                   AS n,
+        COUNT(*) FILTER (WHERE phantom_sl_hit)                     AS "nSLHit",
+        AVG(max_rr) FILTER (WHERE phantom_sl_hit AND max_rr > 0)   AS "avgMaxRR",
+        MAX(max_rr)                                                AS "maxMaxRR",
+        AVG(max_sl_pct_used)                                       AS "avgSlPct",
+        AVG(time_to_sl_min) FILTER (WHERE time_to_sl_min IS NOT NULL) AS "avgTimeMin"
+      FROM vwap_band_ghost
+      WHERE band_tier = $1
+      GROUP BY optimizer_key, symbol, session, direction, vwap_position, band_tier
+      ORDER BY "avgMaxRR" DESC NULLS LAST
+    `, [bandTier]);
+    return r.rows.map(row => ({
+      ...row,
+      n: parseInt(row.n),
+      nSLHit: parseInt(row.nSLHit),
+      avgMaxRR: row.avgMaxRR != null ? parseFloat(parseFloat(row.avgMaxRR).toFixed(3)) : null,
+      maxMaxRR: row.maxMaxRR != null ? parseFloat(parseFloat(row.maxMaxRR).toFixed(3)) : null,
+      avgSlPct: row.avgSlPct != null ? parseFloat(parseFloat(row.avgSlPct).toFixed(1)) : null,
+      avgTimeMin: row.avgTimeMin != null ? Math.round(row.avgTimeMin) : null,
+    }));
+  } catch (e) { console.warn("[!] loadBandGhostStats:", e.message); return []; }
+}
+
 module.exports = {
   initDB,
   // Trades
@@ -1141,6 +1359,12 @@ module.exports = {
   // Ghost optimizer
   saveGhostTrade,
   loadGhostTrades,
+  saveGhostState,
+  loadAllGhostStates,
+  deleteGhostState,
+  saveBandGhost,
+  loadBandGhosts,
+  loadBandGhostStats,
   countGhostsByKey,
   // Shadow optimizer
   saveShadowSnapshot,
