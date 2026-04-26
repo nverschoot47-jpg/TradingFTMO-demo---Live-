@@ -2227,17 +2227,28 @@ app.get("/ev/:key", async (req, res) => {
   res.json(ev);
 });
 
-app.get("/ev", async (req, res) => {
-  // Return cache immediately; trigger background rebuild if stale
+app.get("/ev", (req, res) => {
+  // ALTIJD onmiddellijk antwoorden — nooit wachten op cache rebuild.
+  // Als cache leeg is: stuur lege array + header zodat dashboard weet dat het bezig is.
   const age = Date.now() - evCache.lastBuilt;
-  if (age > EV_CACHE_TTL_MS && !evCache.building) {
-    rebuildEVCache().catch(() => {});  // fire-and-forget
+  if (!evCache.building && (age > EV_CACHE_TTL_MS || evCache.data.length === 0)) {
+    rebuildEVCache().catch(() => {});  // altijd fire-and-forget
   }
-  // If cache is empty (first load), build synchronously and wait
-  if (evCache.data.length === 0) {
-    await rebuildEVCache().catch(() => {});
-  }
-  res.json(evCache.data);
+  res.setHeader("X-Cache-Status", evCache.data.length === 0 ? "building" : "ready");
+  res.setHeader("X-Cache-Age-Ms", String(age));
+  res.json(evCache.data);  // [] als nog leeg — dashboard herlaadt na 5s
+});
+
+// GET /ev/status — dashboard pollt dit om te weten wanneer cache klaar is
+app.get("/ev/status", (req, res) => {
+  res.json({
+    ready:      evCache.data.length > 0,
+    building:   evCache.building,
+    count:      evCache.data.length,
+    withData:   evCache.data.filter(r => r.count > 0).length,
+    lastBuiltMs: evCache.lastBuilt,
+    ageMs:      Date.now() - evCache.lastBuilt,
+  });
 });
 
 app.get("/shadow", (req, res) => {
@@ -2963,8 +2974,14 @@ async function loadPositions(){
   const tb=document.getElementById('pos-body');
   const em=document.getElementById('pos-empty');
   const pw=document.getElementById('pos-wrap');
-  document.getElementById('pos-meta').textContent=d?d.count+' open':'error';
-  setDot('pos-dot',!!d,d?'OK':'Failed to load positions');
+  if(!d){
+    setDot('pos-dot',false,'Failed — server error or timeout');
+    document.getElementById('pos-meta').textContent='error — will retry';
+    if(tb)tb.innerHTML='<tr><td colspan="15" class="nodata r">⚠ Failed to load — auto-retry in 10s</td></tr>';
+    setTimeout(loadPositions,10000);return;
+  }
+  document.getElementById('pos-meta').textContent=d.count+' open';
+  setDot('pos-dot',true,'OK');
   document.getElementById('k-pos').textContent=d?.count??'?';
   const pnlTotal=d?.positions?.reduce((s,p)=>s+(p.currentPnL??0),0)??null;
   const pnlEl=document.getElementById('k-pnl');
@@ -3008,8 +3025,13 @@ async function loadPositions(){
 // ── 2. ACTIVE GHOSTS ─────────────────────────────────────
 async function loadGhosts(){
   const d=await api('/live/ghosts');
-  document.getElementById('gh-meta').textContent=d?d.count+' active':'error';
-  setDot('gh-dot',!!d,d?'OK':'Failed to load ghosts');
+  if(!d){
+    setDot('gh-dot',false,'Failed — retrying in 10s');
+    document.getElementById('gh-meta').textContent='error — retrying';
+    setTimeout(loadGhosts,10000);return;
+  }
+  document.getElementById('gh-meta').textContent=d.count+' active';
+  setDot('gh-dot',true,'OK');
   document.getElementById('k-gh').textContent=d?.count??'?';
   const tb=document.getElementById('gh-body');
   if(!d||!d.ghosts?.length){tb.innerHTML='<tr><td colspan="9" class="nodata">No active ghosts</td></tr>';return;}
@@ -3030,15 +3052,46 @@ async function loadGhosts(){
 }
 
 // ── 3. EV / TP + SL OPTIMISER ────────────────────────────
+// EV cache op server kan 10-30s nodig hebben bij eerste start.
+// loadEV laadt trades en TP locks onmiddellijk.
+// EV data wordt apart opgehaald — als cache nog leeg is, wordt na 5s opnieuw geprobeerd (max 12×).
 async function loadEV(){
   const countD=await api('/trades?limit=1');
   const realLimit=countD?.count??5000;
-  const [trD,evD,tpD]=await Promise.all([api('/trades?limit='+Math.max(realLimit,5000)),api('/ev'),api('/tp-locks')]);
+  const [trD,tpD]=await Promise.all([api('/trades?limit='+Math.max(realLimit,5000)),api('/tp-locks')]);
   if(!trD){setDot('ev-dot',false,'Failed to load trades');return;}
-  setDot('ev-dot',true,'OK');
   _allTrades=trD.trades||[];
   _tpMap={};if(tpD)tpD.forEach(t=>{_tpMap[t.key]=t;});
-  _evMap={};if(evD)evD.forEach(e=>{_evMap[e.key]=e;});
+  document.getElementById('k-tp').textContent=Object.values(_tpMap).filter(t=>(t.evAtLock??0)>0).length;
+  // Bouw alle combos onmiddellijk op — EV data wordt apart ingeladen
+  _buildCombos();
+  // Laad EV data met retry totdat cache klaar is
+  await _loadEVWithRetry();
+}
+
+async function _loadEVWithRetry(attempt=0){
+  const MAX=12, INTERVAL=5000;
+  const evD=await api('/ev');
+  const status=await api('/ev/status');
+  _evMap={};if(evD&&evD.length>0)evD.forEach(e=>{_evMap[e.key]=e;});
+  if(evD&&evD.length>0){
+    setDot('ev-dot',true,'EV cache ready — '+evD.filter(e=>e.count>0).length+' combos with data');
+    _buildCombos();// re-render with EV data
+    return;
+  }
+  // Cache nog leeg — toon status en retry
+  if(attempt<MAX){
+    const remaining=Math.round(((MAX-attempt)*INTERVAL)/1000);
+    setDot('ev-dot',false,status?.building?'EV cache building on server...':'EV cache empty — retrying');
+    document.getElementById('ev-meta').textContent=
+      status?.building?('EV cache wordt gebouwd op server... retry '+(attempt+1)+'/'+MAX+' (nog ~'+remaining+'s)'):'Retrying...';
+    setTimeout(()=>_loadEVWithRetry(attempt+1),INTERVAL);
+  } else {
+    setDot('ev-dot',false,'EV cache niet beschikbaar na '+MAX+' pogingen — refresh handmatig');
+  }
+}
+
+function _buildCombos(){
   document.getElementById('k-tp').textContent=Object.values(_tpMap).filter(t=>(t.evAtLock??0)>0).length;
   // Build combos — ALL symbol/session/dir/vwap combos, even with 0 closed trades
   const combos=[];
@@ -3092,14 +3145,18 @@ function renderEV(){
   });
   const withData=d.filter(c=>c.ev&&c.ev.count>0);
   const pnl=d.reduce((s,c)=>s+c.totalPnl,0);
-  document.getElementById('ev-meta').textContent=d.length+' combos · '+withData.length+' with ghost data';
+  document.getElementById('ev-meta').textContent=d.length+' combos · '+withData.length+' met ghost data'+(_evMap&&Object.keys(_evMap).length===0?' · ⏳ EV data laden...':'');
   document.getElementById('ev-count').textContent=d.length;
   document.getElementById('ev-trades').textContent=withData.length+'/'+d.length;
   document.getElementById('ev-winpct').textContent='—'; // win% is ghost-based (see EV column)
   const pEl=document.getElementById('ev-pnl');pEl.textContent=(pnl>=0?'+':'')+'€'+pnl.toFixed(0);pEl.className='sv2 '+pC(pnl);
   document.getElementById('ev-locked').textContent=d.filter(c=>c.tp&&(c.ev?.bestEV??0)>0).length;
   const tb=document.getElementById('ev-body');
-  if(!d.length){tb.innerHTML='<tr><td colspan="15" class="nodata">No combos</td></tr>';return;}
+  if(!d.length){
+    const evBuilding=Object.keys(_evMap).length===0;
+    tb.innerHTML='<tr><td colspan="15" class="nodata '+(evBuilding?'y':'d')+'">'+(evBuilding?'⏳ EV cache wordt gebouwd op server — secties verschijnen automatisch...':'Geen combos met huidige filters')+' </td></tr>';
+    return;
+  }
   tb.innerHTML=d.map(c=>{
     const ev=c.ev;const tp=c.tp;
     const evV=ev?.bestEV??null;
@@ -3170,6 +3227,11 @@ async function loadGhostHistory(){
 // ── 5. WEBHOOK ERRORS ────────────────────────────────────
 async function loadErrors(){
   const d=await api('/history');
+  if(d===null){
+    setDot('whe-dot',false,'Failed — retrying in 10s');
+    document.getElementById('whe-meta').textContent='error — retrying';
+    setTimeout(loadErrors,10000);return;
+  }
   const all=Array.isArray(d)?d:[];
   const errs=all.filter(e=>['REJECTED','SL_TP_SET_FAILED','LOT_CALC_FAILED','ORDER_NOT_CONFIRMED','VWAP_BAND_EXHAUSTED','SPREAD_GUARD_CLOSE','RR_VERIFY_FAILED','CURRENCY_BUDGET_EXHAUSTED','OUTSIDE_WINDOW'].includes(e.type));
   document.getElementById('whe-meta').textContent=errs.length+' errors';
@@ -3375,7 +3437,19 @@ async function loadAll(){
   if(gsTime)gsTime.textContent='Last refresh: '+_lastLoad.toLocaleTimeString('nl-BE',{hour:'2-digit',minute:'2-digit',second:'2-digit'})+' ('+elapsed+'ms)';
 }
 
-document.addEventListener('DOMContentLoaded',()=>{initAll();loadAll();setInterval(loadAll,30000);});
+document.addEventListener('DOMContentLoaded',async()=>{
+  initAll();
+  // Check EV cache status first — show user what's happening
+  const status=await api('/ev/status').catch(()=>null);
+  const gsText=document.getElementById('gs-text');
+  if(gsText){
+    if(status?.building)gsText.textContent='EV cache wordt gebouwd op server — secties laden zodra klaar...';
+    else if(status?.ready)gsText.textContent='EV cache klaar ('+status.count+' combos) — laden...';
+    else gsText.textContent='Server starten — laden...';
+  }
+  loadAll();
+  setInterval(loadAll,30000);
+});
 </script>
 </body>
 </html>`);
