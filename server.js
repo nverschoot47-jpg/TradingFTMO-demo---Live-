@@ -884,6 +884,8 @@ async function finalizeGhost(positionId, stopReason, elapsedMs, finalMaxPrice) {
 
   await saveGhostTrade(ghostRow);
   await deleteGhostState(g.positionId).catch(() => {});
+  // Rebuild EV cache in background — new ghost data is now available
+  rebuildEVCache().catch(() => {});
   await updateTPLock(g.optimizerKey, g.symbol, g.session, g.direction, g.vwapPosition);
   await runShadowOptimizer(g.optimizerKey).catch(() => {});
 
@@ -1787,6 +1789,13 @@ app.post("/webhook", async (req, res) => {
   let mt5SL = calcSLFromDerivedPct(direction, executionPrice, derivedSlPct);
   mt5SL     = enforceMinStop(mt5Symbol, direction, executionPrice, mt5SL);
 
+  // Fix 6: Log the full SL conversion chain for audit
+  {
+    const slDist = Math.abs(executionPrice - mt5SL);
+    const slPctActual = executionPrice > 0 ? (slDist / executionPrice * 100).toFixed(4) : "?";
+    console.log(`[SL-CHAIN] ${symKey} ${direction}: TV entry=${closePrice} TV SL=${tvSL ?? "n/a"} → slPct=${(derivedSlPct*100).toFixed(4)}% → MT5 exec=${executionPrice} → MT5 SL=${mt5SL} (dist=${slDist.toFixed(5)} = ${slPctActual}%)`);
+  }
+
   // Step C2: Recalculate lots op executionPrice (als geen override) — nu met live lotVal
   // FIX R5 (v11.0): lotDivisor verwijderd — uniform risk per trade.
   if (!lotOverrides[symKey]) {
@@ -1818,6 +1827,13 @@ app.post("/webhook", async (req, res) => {
   if (mt5TP !== mt5TPBeforeFloor) {
     logEvent({ type: "TP_FLOOR_APPLIED", symbol: symKey, direction, positionId,
       tpBefore: mt5TPBeforeFloor, tpAfter: mt5TP, executionPrice, mt5SL });
+  }
+  // Fix 6: Log final TP placement
+  {
+    const slDist = Math.abs(executionPrice - mt5SL);
+    const tpDist = Math.abs(mt5TP - executionPrice);
+    const rrActual = slDist > 0 ? (tpDist / slDist).toFixed(3) : "?";
+    console.log(`[TP-CHAIN] ${symKey} ${direction}: MT5 TP=${mt5TP} → actual RR=${rrActual}R (target=${tpRR}R) lots=${lots}`);
   }
 
   // FIX E: RR Verificatie met werkelijke MT5 waarden
@@ -2044,11 +2060,126 @@ app.post("/admin/ghosts/cancel-all", (req, res) => {
   res.json({ status: "OK", cancelled: count, ids, message: `${count} ghost(s) geannuleerd (niet opgeslagen in DB).` });
 });
 
+// ── PRE-DEPLOY: finalize all active ghosts with reason "manual_deploy" ──
+// This saves their maxRR data to DB before a restart wipes memory.
+// Use via the dashboard PREPARE DEPLOY button or directly with curl.
+app.post("/admin/finalize-all-ghosts", async (req, res) => {
+  const { secret } = req.query;
+  if (secret !== WEBHOOK_SECRET) return res.status(401).json({ error: "Unauthorized" });
+  const ids = Object.keys(ghostTrackers);
+  if (!ids.length) return res.json({ status: "OK", finalized: 0, message: "No active ghosts." });
+  const results = [];
+  for (const id of ids) {
+    const g = ghostTrackers[id];
+    if (!g) continue;
+    const elapsed = Date.now() - new Date(g.openedAt ?? g.startTs ?? 0).getTime();
+    try {
+      await finalizeGhost(id, "manual_deploy", elapsed, g.maxPrice ?? g.entry);
+      results.push({ id, symbol: g.symbol, maxRR: g.maxRR ?? 0, status: "finalized" });
+    } catch (e) {
+      results.push({ id, symbol: g.symbol, status: "error", error: e.message });
+    }
+  }
+  console.log(`[Admin] finalize-all-ghosts: ${results.length} ghost(s) finalized for deploy`);
+  logEvent({ type: "ADMIN_GHOSTS_FINALIZED_DEPLOY", count: results.length });
+  res.json({ status: "OK", finalized: results.length, results });
+});
+
+// ── PRE-DEPLOY: close all open MT5 positions ──────────────────────────
+app.post("/admin/close-all-positions", async (req, res) => {
+  const { secret } = req.query;
+  if (secret !== WEBHOOK_SECRET) return res.status(401).json({ error: "Unauthorized" });
+  const positions = Object.values(openPositions);
+  if (!positions.length) return res.json({ status: "OK", closed: 0, message: "No open positions." });
+  const results = [];
+  for (const pos of positions) {
+    try {
+      await metaFetch(`/positions/${pos.positionId}`, { method: "DELETE" }, 8000);
+      results.push({ positionId: pos.positionId, symbol: pos.symbol, status: "closed" });
+      console.log(`[Admin] Closed position ${pos.positionId} (${pos.symbol})`);
+    } catch (e) {
+      results.push({ positionId: pos.positionId, symbol: pos.symbol, status: "error", error: e.message });
+    }
+  }
+  logEvent({ type: "ADMIN_POSITIONS_CLOSED_DEPLOY", count: results.filter(r => r.status === "closed").length });
+  res.json({ status: "OK", closed: results.filter(r => r.status === "closed").length, results });
+});
+
+// ── GET /admin/deploy-status — check if safe to deploy ───────────────
+app.get("/admin/deploy-status", (req, res) => {
+  const openCount  = Object.keys(openPositions).length;
+  const ghostCount = Object.keys(ghostTrackers).length;
+  const { day, hhmm } = getBrusselsComponents();
+  const outsideWindow = day === 0 || day === 6 || hhmm < 200 || hhmm >= 2100;
+  res.json({
+    safeToDeployNow: openCount === 0 && ghostCount === 0,
+    outsideMarketWindow: outsideWindow,
+    openPositions: openCount,
+    activeGhosts: ghostCount,
+    recommendation: openCount === 0 && ghostCount === 0
+      ? "✓ Safe to deploy — no open positions or active ghosts"
+      : openCount > 0
+        ? `⚠ Close ${openCount} open position(s) first, then finalize ${ghostCount} ghost(s)`
+        : `⚠ Finalize ${ghostCount} active ghost(s) before deploy`,
+  });
+});
+
 app.get("/ghosts/history", async (req, res) => {
   const { key, limit = 100 } = req.query;
   const rows = await loadGhostTrades(key || null, parseInt(limit));
   res.json({ count: rows.length, rows });
 });
+
+// EV cache — rebuilt after each ghost finalizes and on demand
+// Prevents the dashboard from timing out on 500+ serial DB queries
+const evCache = { data: [], lastBuilt: 0, building: false };
+const EV_CACHE_TTL_MS = 5 * 60 * 1000; // 5 min stale-while-revalidate
+
+async function rebuildEVCache() {
+  if (evCache.building) return;
+  evCache.building = true;
+  try {
+    const { SYMBOL_CATALOG } = require("./session");
+    const sessions = { stock: ["ny"], forex: ["asia","london","ny"], index: ["asia","london","ny"], commodity: ["asia","london","ny"] };
+    const allKeys = new Set([...Object.keys(tpLocks)]);
+    for (const [sym, info] of Object.entries(SYMBOL_CATALOG)) {
+      for (const sess of (sessions[info.type] ?? ["london"])) {
+        for (const dir of ["buy","sell"]) {
+          for (const vwap of ["above","below"]) {
+            allKeys.add(`${sym}_${sess}_${dir}_${vwap}`);
+          }
+        }
+      }
+    }
+    closedTrades.forEach(t => {
+      const k = buildOptimizerKey(t.symbol, t.session, t.direction, t.vwapPosition ?? "unknown");
+      allKeys.add(k);
+    });
+
+    const keyArr = [...allKeys];
+    const results = [];
+    // Process in chunks of 20 concurrent DB queries — avoids pool exhaustion
+    const CHUNK = 20;
+    for (let i = 0; i < keyArr.length; i += CHUNK) {
+      const chunk = keyArr.slice(i, i + CHUNK);
+      const evs   = await Promise.all(chunk.map(k => computeEVStats(k).catch(() => null)));
+      for (let j = 0; j < chunk.length; j++) {
+        const ev = evs[j];
+        results.push(ev && ev.count > 0
+          ? { key: chunk[j], ...ev }
+          : { key: chunk[j], count: 0, bestRR: null, bestEV: null, avgRR: null, avgTimeToSLMin: null, avgMaxSlPct: null, bestWinnerSlPct: null });
+      }
+    }
+    results.sort((a, b) => (b.bestEV ?? -99) - (a.bestEV ?? -99));
+    evCache.data      = results;
+    evCache.lastBuilt = Date.now();
+    console.log(`[EV Cache] rebuilt: ${results.filter(r => r.count > 0).length} combos with data / ${results.length} total`);
+  } catch (e) {
+    console.warn("[EV Cache] rebuild failed:", e.message);
+  } finally {
+    evCache.building = false;
+  }
+}
 
 app.get("/ev/:key", async (req, res) => {
   const ev = await computeEVStats(decodeURIComponent(req.params.key));
@@ -2056,32 +2187,16 @@ app.get("/ev/:key", async (req, res) => {
 });
 
 app.get("/ev", async (req, res) => {
-  // Build full set of keys: all symbol×session×dir×vwap combos that have any ghost data
-  // Plus any keys from tpLocks or closedTrades to ensure nothing is missed
-  const { SYMBOL_CATALOG } = require("./session");
-  const sessions = { stock: ["ny"], forex: ["asia","london","ny"], index: ["asia","london","ny"], commodity: ["asia","london","ny"] };
-  const allKeys = new Set([...Object.keys(tpLocks)]);
-  for (const [sym, info] of Object.entries(SYMBOL_CATALOG)) {
-    for (const sess of (sessions[info.type] ?? ["london"])) {
-      for (const dir of ["buy","sell"]) {
-        for (const vwap of ["above","below"]) {
-          allKeys.add(`${sym}_${sess}_${dir}_${vwap}`);
-        }
-      }
-    }
+  // Return cache immediately; trigger background rebuild if stale
+  const age = Date.now() - evCache.lastBuilt;
+  if (age > EV_CACHE_TTL_MS && !evCache.building) {
+    rebuildEVCache().catch(() => {});  // fire-and-forget
   }
-  closedTrades.forEach(t => allKeys.add(buildOptimizerKey(t.symbol, t.session, t.direction, t.vwapPosition ?? "unknown")));
-
-  const results = [];
-  for (const key of allKeys) {
-    const ev = await computeEVStats(key);
-    if (!ev || ev.count === 0) { results.push({ key, count: 0, bestRR: null, bestEV: null, avgRR: null, avgTimeToSLMin: null, avgMaxSlPct: null, bestWinnerSlPct: null }); continue; }
-    // avgRR: average of maxRR values across all ghosts (already filtered >0 in computeEVStats)
-    const avgRR = ev.rrLevels.length ? null : null; // compute separately below
-    results.push({ key, ...ev });
+  // If cache is empty (first load), build synchronously and wait
+  if (evCache.data.length === 0) {
+    await rebuildEVCache().catch(() => {});
   }
-  results.sort((a, b) => (b.bestEV ?? -99) - (a.bestEV ?? -99));
-  res.json(results);
+  res.json(evCache.data);
 });
 
 app.get("/shadow", (req, res) => {
@@ -2461,6 +2576,8 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
     <span class="sb s-outside" id="hdr-sess">—</span>
     <span class="clock" id="clock">--:--:--</span>
     <button class="rbtn" onclick="loadAll()">↻ REFRESH</button>
+    <button class="rbtn" id="deploy-btn" onclick="prepareDeploy()" style="border-color:var(--r);color:var(--r)">⚡ PREPARE DEPLOY</button>
+    <span id="deploy-status" style="font-size:9px;color:var(--dim)"></span>
   </div>
 </div>
 
@@ -3146,20 +3263,57 @@ async function loadSignalStats(){
 }
 
 // ── SHADOW SL key count for KPI ──────────────────────────
+async function prepareDeploy(){
+  const statusEl=document.getElementById('deploy-status');
+  const btn=document.getElementById('deploy-btn');
+  // Step 1: Check status
+  const st=await api('/admin/deploy-status');
+  if(!st){statusEl.textContent='Error checking status';return;}
+  if(st.safeToDeployNow){statusEl.textContent='✓ Already safe to deploy — 0 positions, 0 ghosts';return;}
+  // Step 2: Confirm
+  const msg='PREPARE DEPLOY\n\n'+(st.recommendation||'')+'\n\nThis will:\n1. Close '+st.openPositions+' open MT5 position(s)\n2. Finalize '+st.activeGhosts+' active ghost(s) to DB\n\nContinue?'
+  if(!confirm(msg))return;
+  btn.disabled=true;statusEl.textContent='Closing positions...';
+  // Step 3: Close positions
+  const secret=prompt('Enter WEBHOOK_SECRET:');
+  if(!secret){btn.disabled=false;return;}
+  const r1=await fetch(\`/admin/close-all-positions?secret=\${encodeURIComponent(secret)}\`,{method:'POST'});
+  const d1=await r1.json().catch(()=>({}));
+  if(d1.status!=='OK'){statusEl.textContent='Error closing positions: '+(d1.error||'unknown');btn.disabled=false;return;}
+  statusEl.textContent=\`Closed \${d1.closed} position(s). Finalizing ghosts...\`;
+  // Step 4: Finalize ghosts
+  const r2=await fetch(\`/admin/finalize-all-ghosts?secret=\${encodeURIComponent(secret)}\`,{method:'POST'});
+  const d2=await r2.json().catch(()=>({}));
+  if(d2.status!=='OK'){statusEl.textContent='Error finalizing ghosts: '+(d2.error||'unknown');btn.disabled=false;return;}
+  statusEl.textContent=\`✓ SAFE TO DEPLOY — Closed \${d1.closed} position(s), finalized \${d2.finalized} ghost(s). Push now.\`;
+  btn.style.borderColor='var(--g)';btn.style.color='var(--g)';btn.textContent='✓ READY TO DEPLOY';
+  await loadAll();
+}
+
 async function loadShadowCount(){
   const d=await api('/shadow');
   document.getElementById('k-sl').textContent=d?.results?.length??'?';
 }
 
 async function loadAll(){
-  await Promise.all([
-    loadPositions(),
-    loadGhosts(),
-    loadEV(),
-    loadErrors(),
-    loadSignalStats(),
-    loadShadowCount(),
-  ]);
+  const tasks=[
+    {name:'positions', fn:loadPositions},
+    {name:'ghosts',    fn:loadGhosts},
+    {name:'ev',        fn:loadEV},
+    {name:'errors',    fn:loadErrors},
+    {name:'stats',     fn:loadSignalStats},
+    {name:'shadow',    fn:loadShadowCount},
+  ];
+  const results=await Promise.allSettled(tasks.map(t=>t.fn().catch(e=>{
+    console.error('[Dashboard] '+t.name+' failed:',e?.message||e);
+    return null;
+  })));
+  // Mark any failed section with a red dot indicator
+  results.forEach((r,i)=>{
+    if(r.status==='rejected'){
+      console.error('[Dashboard] '+tasks[i].name+' rejected:',r.reason);
+    }
+  });
 }
 
 document.addEventListener('DOMContentLoaded',()=>{initAll();loadAll();setInterval(loadAll,30000);});
@@ -3253,6 +3407,10 @@ async function start() {
   // FIX C: rebuild currency exposure na restore van open posities
   rebuildCurrencyExposure();
   console.log(`💱 Currency exposure rebuilt: ${JSON.stringify(Object.fromEntries(Object.entries(currencyExposure).map(([k,v])=>[k,v.toFixed(2)])))}`);
+
+  // Pre-build EV cache in background — don't block server start
+  console.log("[EV Cache] Starting background build...");
+  rebuildEVCache().catch(() => {});
 
   app.listen(PORT, () => {
     console.log(`[✓] PRONTO-AI v11.0 on port ${PORT}`);
