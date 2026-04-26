@@ -269,8 +269,8 @@ const SESSION_LABELS = {
 };
 
 // ── Data quality compliance date (FIX 8: single source of truth) ────
-const COMPLIANCE_DATE    = '2026-04-18 00:00:00';
-const COMPLIANCE_DATE_MS = new Date('2026-04-18T00:00:00.000Z').getTime();
+const COMPLIANCE_DATE    = '2026-04-26 00:00:00';
+const COMPLIANCE_DATE_MS = new Date('2026-04-26T00:00:00.000Z').getTime();
 
 module.exports = {
   COMPLIANCE_DATE,
