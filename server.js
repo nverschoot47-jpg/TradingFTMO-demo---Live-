@@ -237,7 +237,7 @@ const GHOST_MAX_RR            = 15;                       // stop at 15R peak
 const MULT_MIN_SAMPLE         = 30;
 
 // FIX 16
-const MAX_CLOSED_TRADES = 5000;
+const MAX_CLOSED_TRADES = 10000;  // verhoogd van 5000 — bij 4500+ trades was de limiet bijna bereikt
 // FIX 15
 const MAX_HISTORY       = 200;
 
@@ -599,6 +599,14 @@ const DEFAULT_TP_RR = 2.0;
 async function getOptimalTP(optimizerKey, assetType = null) {
   const locked = tpLocks[optimizerKey];
   if (locked) return locked.lockedRR;
+  // Fix 2: check evCache first — voorkomt live DB query per inkomende trade
+  // evCache wordt elke 5min rebuilt en na elke ghost finalize
+  const cached = evCache.data.find(e => e.key === optimizerKey);
+  if (cached) {
+    if ((cached.count ?? 0) < GHOST_MIN_TRADES_FOR_TP) return DEFAULT_TP_RR;
+    return cached.bestRR ?? DEFAULT_TP_RR;
+  }
+  // Fallback: directe DB query als cache nog leeg is (eerste start)
   const ev = await computeEVStats(optimizerKey);
   if (!ev || ev.count < GHOST_MIN_TRADES_FOR_TP) return DEFAULT_TP_RR;
   return ev.bestRR ?? DEFAULT_TP_RR;
@@ -688,7 +696,8 @@ function calcMaxRR(direction, entry, sl, maxPrice) {
   const dist = Math.abs(entry - sl);
   if (!dist || maxPrice == null) return 0;
   const fav = direction === "buy" ? maxPrice - entry : entry - maxPrice;
-  return parseFloat((Math.max(0, fav) / dist).toFixed(2));
+  // 3 decimalen — 2dp roundt 1.996R → 1.99 waardoor het als verlies telt bij TP sweep op 2.0R
+  return parseFloat((Math.max(0, fav) / dist).toFixed(3));
 }
 
 function calcPctSlUsed(direction, entry, sl, currentPrice) {
@@ -1160,13 +1169,15 @@ async function handlePositionClosed(pos) {
 // Fallback: "unknown" als comment ontbreekt of geen vpShort heeft.
 function parseVwapFromComment(comment) {
   if (!comment) return "unknown";
-  // Comment: NV-{dir}-{sym}-{vp}-{rr}-{sess}
   const parts = comment.split("-");
-  // Index 3 = vpShort (A/B/U), maar comment kan variëren in lengte door symKey lengte
-  // Zoek expliciet: het karakter direct na het 3e '-' dat A, B of U is
-  // Formaat: NV-[B|S]-[SYMBOL]-[A|B|U]-[RR]-[SESS]
-  // parts[0]=NV, parts[1]=dir, parts[2..n-3]=sym (sym kan '-' bevatten), parts[n-2]=rr, parts[n-1]=sess
-  // vpShort staat op index parts.length-3
+  if (parts.length < 3) return "unknown";
+  // Nieuw formaat (v16+): NV-{dir}-{sym}-{sess}-{rr}-{vp} — vp is altijd LAATSTE onderdeel
+  const last = parts[parts.length - 1];
+  if (last === "A") return "above";
+  // "B" kan de dir zijn (parts[1]) of de vp — check of het het laatste deel is EN niet ook parts[1]
+  if (last === "B" && parts.length > 2) return "below";
+  if (last === "U") return "unknown";
+  // Oud formaat fallback: NV-{dir}-{sym}-{vp}-{rr}-{sess} — vp op parts[length-3]
   if (parts.length >= 5) {
     const vp = parts[parts.length - 3];
     if (vp === "A") return "above";
@@ -1193,8 +1204,14 @@ async function restorePositionsFromMT5() {
       const dir    = lp.type === "POSITION_TYPE_BUY" ? "buy" : "sell";
       const entry  = lp.openPrice ?? lp.currentPrice ?? 0;
       const sess   = getSession(lp.time ? new Date(lp.time) : null);
-      // FIX 1: herstel vwapPosition uit MT5 comment (NV-B-SYM-A-2R-LON formaat)
-      const vpPos  = parseVwapFromComment(lp.comment ?? lp.reason ?? "");
+      // Fix 13: ghost_state is de primaire bron voor vwapPosition — betrouwbaarder dan
+      // het MT5 comment parsen. Comment is fallback voor posities zonder ghost_state.
+      const gs = ghostStateMap[id] ?? null;
+      const vpFromGhostState = gs?.vwapPosition;
+      const vpFromComment    = parseVwapFromComment(lp.comment ?? lp.reason ?? "");
+      const vpPos = (vpFromGhostState && vpFromGhostState !== "unknown")
+        ? vpFromGhostState
+        : vpFromComment;
       const optKey = buildOptimizerKey(sym, sess, dir, vpPos);
       openPositions[id] = {
         positionId: id, symbol: sym, mt5Symbol: lp.symbol,
@@ -1291,7 +1308,7 @@ async function evaluateDailyRisk() {
         // Beide multipliers werken uitsluitend op LOTS, NIET op riskEUR.
         const evScore    = ev.bestEV ?? 0;
         const newEvMult  = Math.min(4.0, parseFloat((1.0 + evScore * 10).toFixed(4))); // EV-gedreven
-        const newDayMult = parseFloat((prev.dayMult * 1.2).toFixed(4));
+        const newDayMult = Math.min(2.0, parseFloat((prev.dayMult * 1.2).toFixed(4)));
         keyRiskMult[key] = { streak: prev.streak + 1, evMult: newEvMult, dayMult: newDayMult };
         await saveKeyRiskMult(key, keyRiskMult[key]).catch(() => {});
         console.log(`[DailyRisk] ${key}: day+ → evMult=${newEvMult.toFixed(2)}× dayMult=${newDayMult.toFixed(2)}×`);
@@ -1471,6 +1488,17 @@ app.post("/webhook", async (req, res) => {
   // VWAP band exhaustion filter
   let vwapBandPct = null;
   const bandWidth = vwapUpper - vwapLower;
+
+  // Fix 9: Als vwapMid aanwezig is maar bandWidth = 0 → VWAP data ontbreekt.
+  // Vroeger werd de check overgeslagen, waardoor trades zonder VWAP band altijd doorkwamen.
+  // Risico: Pine Script stuurt soms 0 voor band waarden bij herinitialisatie.
+  if (vwapMid > 0 && bandWidth <= 0) {
+    const reason = "VWAP_BAND_MISSING: vwap_upper/lower zijn 0 of ontbreken — mogelijk indicator niet geïnitialiseerd";
+    logReject("VWAP_BAND_MISSING", { symbol: symKey, direction, reason, payload: { vwapMid, vwapUpper, vwapLower } });
+    await logSignal({ symbol: symKey, direction, session, vwapPosition, optimizerKey, tvEntry: closePrice, slPct: derivedSlPct, slPctHuman, vwap: vwapMid, vwapUpper, vwapLower, vwapBandPct: null, outcome: "REJECTED", rejectReason: reason }).catch(() => {});
+    return res.status(200).json({ status: "VWAP_BAND_MISSING", vwapMid, vwapUpper, vwapLower });
+  }
+
   if (bandWidth > 0 && vwapMid > 0) {
     const distFromMid = Math.abs(closePrice - vwapMid);
     vwapBandPct = parseFloat((distFromMid / (bandWidth / 2)).toFixed(3));
@@ -1486,10 +1514,9 @@ app.post("/webhook", async (req, res) => {
       const signalLogRow = await logSignal({ symbol: symKey, direction, session, vwapPosition, optimizerKey, tvEntry: closePrice, slPct: derivedSlPct, slPctHuman, vwap: vwapMid, vwapUpper, vwapLower, vwapBandPct, outcome: "REJECTED", rejectReason: reason }).catch(() => null);
 
       // ── Ghost 2.0: start a band ghost for this rejected signal ──────
-      // Track what would have happened — completely separate from main EV data.
       const pct = vwapBandPct;
       const bandTier = pct >= 2.5 ? "250_350" : "150_250";
-      if (pct < 3.5) {  // only track up to 350%
+      if (pct < 3.5) {
         const tempSLForBand   = calcSLFromDerivedPct(direction, closePrice, derivedSlPct);
         const enforcedSLBand  = enforceMinStop(mt5Symbol, direction, closePrice, tempSLForBand);
         startBandGhostTracker({
@@ -1646,9 +1673,12 @@ app.post("/webhook", async (req, res) => {
   // Step A: Place market order
   const sessShort = session === "london" ? "LON" : session === "ny" ? "NY" : "AS";
   const dirShort  = direction === "buy" ? "B" : "S";
-  // Fix 2: vwapPosition vanuit TV payload (above/below) — onafhankelijk van MT5 prijs
   const vpShort   = vwapPosition === "above" ? "A" : vwapPosition === "below" ? "B" : "U";
-  const comment   = `NV-${dirShort}-${symKey.slice(0, 6)}-${vpShort}-${rrLabel}-${sessShort}`.slice(0, 26);
+  // Fix 1: vpShort staat ALTIJD als laatste karakter — parseVwapFromComment leest last char.
+  // Geen .slice(0,26) meer — decimale RR in midden (bijv "1.5R") telt extra "-" mee als
+  // scheidingsteken waardoor de positie van vpShort onbetrouwbaar werd.
+  // Nieuw formaat: NV-{dir}-{sym}-{sess}-{rr}-{vp}  → vpShort altijd op positie -1
+  const comment = `NV-${dirShort}-${symKey.slice(0, 8)}-${sessShort}-${rrLabel}-${vpShort}`;
   // Resultaat: NV-B-USDCHF-A-2R-LON (buy, above VWAP, london)
   //            NV-S-XAUUSD-B-2R-LON (sell, below VWAP, london)
   // Fix 1: Haal live MT5 prijs op VOOR de order.
@@ -2156,6 +2186,17 @@ async function rebuildEVCache() {
       allKeys.add(k);
     });
 
+    // Fix 12: Haal ook alle optimizer_keys op uit ghost_trades DB — onafhankelijk van
+    // closedTrades in-memory array. Als closedTrades boven MAX_CLOSED_TRADES gaat worden
+    // oude trades verwijderd maar hun ghost data is nog in de DB aanwezig.
+    try {
+      const { pool } = require("./db");
+      const r = await pool.query(`SELECT DISTINCT optimizer_key FROM ghost_trades WHERE optimizer_key IS NOT NULL AND optimizer_key != ''`);
+      r.rows.forEach(row => allKeys.add(row.optimizer_key));
+    } catch (e) {
+      console.warn("[EV Cache] ghost_trades key scan failed:", e.message);
+    }
+
     const keyArr = [...allKeys];
     const results = [];
     // Process in chunks of 20 concurrent DB queries — avoids pool exhaustion
@@ -2561,6 +2602,9 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
 .cfbox{padding:10px 12px;background:var(--bg2);display:flex;flex-direction:column;gap:10px}
 .cftitle{font-family:var(--fh);font-size:10px;font-weight:700;color:var(--dim);letter-spacing:.6px;padding-bottom:5px;border-bottom:1px solid var(--bdr2)}
 .empty{display:flex;align-items:center;gap:10px;padding:12px 14px;color:var(--dim);font-size:10px}
+.sec-err{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--r);margin-left:6px;vertical-align:middle;animation:pulse 1.5s infinite}
+.sec-ok{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--g);margin-left:6px;vertical-align:middle}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
 .eline{flex:1;height:1px;background:var(--bdr2)}
 @media(max-width:900px){.kbar{grid-template-columns:repeat(5,1fr)}.mxg{grid-template-columns:1fr}}
 </style>
@@ -2589,16 +2633,21 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
   <div class="kpi k4"><div class="kl">TP Locks EV+</div><div class="kv y" id="k-tp">—</div></div>
   <div class="kpi k5"><div class="kl">SL Optimizer</div><div class="kv c" id="k-sl">—</div></div>
   <div class="kpi k6"><div class="kl">Session</div><div class="kv o" id="k-sess" style="font-size:13px">—</div></div>
-  <div class="kpi k7"><div class="kl">Risk %</div><div class="kv c">${(FIXED_RISK_PCT*100).toFixed(3)}%</div></div>
+  <div class="kpi k7"><div class="kl">Base Risk % / Actual</div><div class="kv c" style="font-size:13px">${(FIXED_RISK_PCT*100).toFixed(3)}% <span style="color:var(--o);font-size:10px">~${(FIXED_RISK_PCT*SL_BUFFER_MULT*100).toFixed(3)}%</span></div></div>
   <div class="kpi k8"><div class="kl">Trades / Sess</div><div class="kv b" id="k-tps">—</div></div>
   <div class="kpi k9"><div class="kl">Logged Trades</div><div class="kv b" id="k-err">—</div></div>
+</div>
+
+<div id="global-status" style="padding:4px 20px;background:var(--bg1);border-bottom:1px solid var(--bdr2);display:flex;align-items:center;justify-content:space-between;font-size:9px;color:var(--dim)">
+  <span id="gs-text">Initializing...</span>
+  <span><span id="gs-err" style="color:var(--r)"></span> <span id="gs-time"></span></span>
 </div>
 
 <div class="main">
 
 <!-- 1. OPEN POSITIONS -->
 <div class="sec">
-  <div class="sh"><span class="st g">▸ OPEN POSITIONS</span><span class="sm" id="pos-meta">loading…</span></div>
+  <div class="sh"><span class="st g">▸ OPEN POSITIONS</span><span class="sm" id="pos-meta">loading…</span><span id="pos-dot" class="sec-err" title="Loading..."></span></div>
   <div id="pos-empty" class="empty" style="display:none"><div class="eline"></div><span>0 open trades</span><div class="eline"></div></div>
   <div class="tw" id="pos-wrap">
     <table id="pos-tbl">
@@ -2621,7 +2670,7 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
 
 <!-- 2. ACTIVE GHOSTS -->
 <div class="sec">
-  <div class="sh"><span class="st p">▸ GHOST TRACKER</span><span class="sm" id="gh-meta">active ghosts — tracking until MT5 SL hit, max 15R or 2 weeks</span></div>
+  <div class="sh"><span class="st p">▸ GHOST TRACKER</span><span id="gh-dot" class="sec-err" title="Loading..."></span><span class="sm" id="gh-meta">active ghosts — tracking until MT5 SL hit, max 15R or 2 weeks</span></div>
   <div class="tw">
     <table id="gh-tbl">
       <thead><tr>
@@ -2639,7 +2688,7 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
 <!-- 3. EV / TP + SL OPTIMISER (only combos with trades) -->
 <div class="sec">
   <div class="sh">
-    <span class="st y">▸ EV / TP + SL OPTIMISER</span>
+    <span class="st y">▸ EV / TP + SL OPTIMISER</span><span id="ev-dot" class="sec-err" title="Loading..."></span>
     <span class="sm" id="ev-meta">only combos with ≥1 trade · EV locked at ≥5</span>
   </div>
   <div class="fbar">
@@ -2697,7 +2746,7 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
 
 <!-- 4. GHOST HISTORY / SL SHADOW LOG -->
 <div class="sec">
-  <div class="sh"><span class="st c">▸ GHOST HISTORY — CLOSED GHOSTS LOG</span><span class="sm" id="ghh-meta">loading…</span></div>
+  <div class="sh"><span class="st c">▸ GHOST HISTORY — CLOSED GHOSTS LOG</span><span id="ghh-dot" class="sec-err" title="Loading..."></span><span class="sm" id="ghh-meta">loading…</span></div>
   <div class="tw">
     <table id="ghh-tbl">
       <thead><tr>
@@ -2716,7 +2765,7 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
 
 <!-- 5. WEBHOOK ERRORS + VWAP BAND ANALYSIS -->
 <div class="sec">
-  <div class="sh"><span class="st r">▸ WEBHOOK ERRORS &amp; VWAP BAND ANALYSIS</span><span class="sm" id="whe-meta">loading…</span></div>
+  <div class="sh"><span class="st r">▸ WEBHOOK ERRORS &amp; VWAP BAND ANALYSIS</span><span id="whe-dot" class="sec-err" title="Loading..."></span><span class="sm" id="whe-meta">loading…</span></div>
   <div class="tabs">
     <div class="tab on" onclick="showTab('wh','errors')">Errors</div>
     <div class="tab" onclick="showTab('wh','band150')">Band 150–250%</div>
@@ -2855,7 +2904,8 @@ function sBadge(s){const m={asia:'bd-as',london:'bd-lo',ny:'bd-ny',outside:'bd-o
 function tyBadge(t){const m={forex:'bd-fx',index:'bd-ix',commodity:'bd-cm',stock:'bd-sk'};const n={forex:'FX',index:'IDX',commodity:'COM',stock:'STK'};return\`<span class="bd \${m[t]||'bd-sk'}">\${n[t]||t}</span>\`;}
 function cBadge(r){if(r==='tp')return'<span class="bd bd-tp">TP</span>';if(r==='sl')return'<span class="bd bd-sl">SL</span>';if(r==='maxRR')return'<span class="bd bd-mr">MAX-RR</span>';if(r==='timeout')return'<span class="bd bd-mn">TIMEOUT</span>';if(r==='manual')return'<span class="bd bd-mn">MAN</span>';return r?\`<span class="bd d">\${r}</span>\`:'—';}
 function slBar(p){const w=Math.min(100,Math.max(0,p||0));const c=w<50?'':w<80?' w':' d';return\`<div class="slbar"><div class="slbg"><div class="slfi\${c}" style="width:\${w}%"></div></div><span class="\${c.trim()||'g'}">\${f(p,0)}%</span></div>\`;}
-async function api(path){try{const r=await fetch(path);if(!r.ok)return null;return r.json();}catch{return null;}}
+async function api(path){try{const r=await fetch(path);if(!r.ok){console.error('[API] '+path+' returned '+r.status);return null;}return r.json();}catch(e){console.error('[API] '+path+' failed:',e.message);return null;}}
+function setDot(id,ok,msg){const el=document.getElementById(id);if(!el)return;el.className=ok?'sec-ok':'sec-err';el.title=msg||'';}
 
 // ── tab switching ─────────────────────────────────────────
 function showTab(group,name){
@@ -2914,6 +2964,7 @@ async function loadPositions(){
   const em=document.getElementById('pos-empty');
   const pw=document.getElementById('pos-wrap');
   document.getElementById('pos-meta').textContent=d?d.count+' open':'error';
+  setDot('pos-dot',!!d,d?'OK':'Failed to load positions');
   document.getElementById('k-pos').textContent=d?.count??'?';
   const pnlTotal=d?.positions?.reduce((s,p)=>s+(p.currentPnL??0),0)??null;
   const pnlEl=document.getElementById('k-pnl');
@@ -2958,6 +3009,7 @@ async function loadPositions(){
 async function loadGhosts(){
   const d=await api('/live/ghosts');
   document.getElementById('gh-meta').textContent=d?d.count+' active':'error';
+  setDot('gh-dot',!!d,d?'OK':'Failed to load ghosts');
   document.getElementById('k-gh').textContent=d?.count??'?';
   const tb=document.getElementById('gh-body');
   if(!d||!d.ghosts?.length){tb.innerHTML='<tr><td colspan="9" class="nodata">No active ghosts</td></tr>';return;}
@@ -2982,7 +3034,8 @@ async function loadEV(){
   const countD=await api('/trades?limit=1');
   const realLimit=countD?.count??5000;
   const [trD,evD,tpD]=await Promise.all([api('/trades?limit='+Math.max(realLimit,5000)),api('/ev'),api('/tp-locks')]);
-  if(!trD)return;
+  if(!trD){setDot('ev-dot',false,'Failed to load trades');return;}
+  setDot('ev-dot',true,'OK');
   _allTrades=trD.trades||[];
   _tpMap={};if(tpD)tpD.forEach(t=>{_tpMap[t.key]=t;});
   _evMap={};if(evD)evD.forEach(e=>{_evMap[e.key]=e;});
@@ -3086,6 +3139,7 @@ async function loadGhostHistory(){
   const d=await api('/ghosts/history?limit=200');
   const rows=d?.rows||d||[];
   document.getElementById('ghh-meta').textContent=rows.length+' closed ghosts';
+  setDot('ghh-dot',true,'OK');
   const tb=document.getElementById('ghh-body');
   if(!rows.length){tb.innerHTML='<tr><td colspan="10" class="nodata">No closed ghost data yet</td></tr>';return;}
   tb.innerHTML=rows.map(g=>{
@@ -3119,6 +3173,7 @@ async function loadErrors(){
   const all=Array.isArray(d)?d:[];
   const errs=all.filter(e=>['REJECTED','SL_TP_SET_FAILED','LOT_CALC_FAILED','ORDER_NOT_CONFIRMED','VWAP_BAND_EXHAUSTED','SPREAD_GUARD_CLOSE','RR_VERIFY_FAILED','CURRENCY_BUDGET_EXHAUSTED','OUTSIDE_WINDOW'].includes(e.type));
   document.getElementById('whe-meta').textContent=errs.length+' errors';
+  setDot('whe-dot',true,'OK — '+errs.length+' errors');
   document.getElementById('k-err').textContent=errs.length;
   const tb=document.getElementById('whe-body');
   if(!errs.length){tb.innerHTML='<tr><td colspan="10" class="nodata g">✓ No errors</td></tr>';return;}
@@ -3295,6 +3350,7 @@ async function loadShadowCount(){
   document.getElementById('k-sl').textContent=d?.results?.length??'?';
 }
 
+let _loadErrors=0,_lastLoad=null;
 async function loadAll(){
   const tasks=[
     {name:'positions', fn:loadPositions},
@@ -3304,16 +3360,19 @@ async function loadAll(){
     {name:'stats',     fn:loadSignalStats},
     {name:'shadow',    fn:loadShadowCount},
   ];
-  const results=await Promise.allSettled(tasks.map(t=>t.fn().catch(e=>{
-    console.error('[Dashboard] '+t.name+' failed:',e?.message||e);
-    return null;
-  })));
-  // Mark any failed section with a red dot indicator
-  results.forEach((r,i)=>{
-    if(r.status==='rejected'){
-      console.error('[Dashboard] '+tasks[i].name+' rejected:',r.reason);
-    }
-  });
+  const t0=Date.now();
+  const results=await Promise.allSettled(tasks.map(t=>
+    t.fn().catch(e=>{console.error('[Dashboard] '+t.name+' failed:',e?.message||e);return null;})
+  ));
+  const failed=results.filter((r,i)=>r.status==='rejected'||(r.status==='fulfilled'&&r.value===null));
+  _loadErrors=failed.length;_lastLoad=new Date();
+  const elapsed=Date.now()-t0;
+  const gsText=document.getElementById('gs-text');
+  const gsErr=document.getElementById('gs-err');
+  const gsTime=document.getElementById('gs-time');
+  if(gsText)gsText.textContent=_loadErrors===0?'All sections loaded OK':''+_loadErrors+' section(s) failed — check dots above';
+  if(gsErr)gsErr.textContent=_loadErrors>0?'⚠ '+_loadErrors+' error(s)':'';
+  if(gsTime)gsTime.textContent='Last refresh: '+_lastLoad.toLocaleTimeString('nl-BE',{hour:'2-digit',minute:'2-digit',second:'2-digit'})+' ('+elapsed+'ms)';
 }
 
 document.addEventListener('DOMContentLoaded',()=>{initAll();loadAll();setInterval(loadAll,30000);});
