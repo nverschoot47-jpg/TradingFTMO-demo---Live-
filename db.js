@@ -1003,15 +1003,16 @@ async function computeEVStats(optimizerKey) {
       WHERE g.optimizer_key=$1
         AND g.phantom_sl_hit=TRUE
         AND g.max_rr_before_sl IS NOT NULL
-        AND g.max_rr_before_sl > 0
+        AND g.max_rr_before_sl >= 0.5
         AND g.opened_at >= $2
         AND g.vwap_position IN ('above','below')
         AND (ct.exclude_from_ev IS NULL OR ct.exclude_from_ev = FALSE)
     `, [optimizerKey, COMPLIANCE_DATE]);
 
-    // Filter 0.00R ghosts — they went straight to SL with no movement, not useful for TP calc
-    const rows = r.rows.filter(x => (x.maxRR ?? 0) > 0);
-    if (rows.length < 1) return { key: optimizerKey, count: 0, rrLevels: [], bestRR: null, bestEV: null, avgTimeToSLMin: null, avgMaxSlPct: null };
+    // Filter 0.00R ghosts — went straight to SL, no movement
+    // Filter < 0.5R ghosts — can never hit any realistic TP level, only inflate loss count
+    const rows = r.rows.filter(x => (x.maxRR ?? 0) >= 0.5);
+    if (rows.length < 1) return { key: optimizerKey, count: 0, rrLevels: [], bestRR: null, bestEV: null, avgRR: null, avgTimeToSLMin: null, avgMaxSlPct: null, bestWinnerSlPct: null };
 
     const arr      = rows.map(x => x.maxRR);
     const timings  = rows.map(x => x.timeToSL).filter(v => v != null);
