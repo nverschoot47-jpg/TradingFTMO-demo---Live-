@@ -3063,31 +3063,30 @@ async function loadEV(){
   _allTrades=trD.trades||[];
   _tpMap={};if(tpD)tpD.forEach(t=>{_tpMap[t.key]=t;});
   document.getElementById('k-tp').textContent=Object.values(_tpMap).filter(t=>(t.evAtLock??0)>0).length;
-  // Bouw alle combos onmiddellijk op — EV data wordt apart ingeladen
+  // Bouw DIRECT alle 424 combos — tabel zichtbaar met streepjes ook zonder EV data
   _buildCombos();
-  // Laad EV data met retry totdat cache klaar is
-  await _loadEVWithRetry();
+  setDot('ev-dot',true,'Trades geladen · EV data wordt opgehaald...');
+  // EV data laden in achtergrond — NIET awaiten zodat andere secties niet blokkeren
+  _loadEVWithRetry().catch(()=>{});
 }
 
 async function _loadEVWithRetry(attempt=0){
   const MAX=12, INTERVAL=5000;
   const evD=await api('/ev');
-  const status=await api('/ev/status');
-  _evMap={};if(evD&&evD.length>0)evD.forEach(e=>{_evMap[e.key]=e;});
+  _evMap={};
   if(evD&&evD.length>0){
-    setDot('ev-dot',true,'EV cache ready — '+evD.filter(e=>e.count>0).length+' combos with data');
-    _buildCombos();// re-render with EV data
+    evD.forEach(e=>{_evMap[e.key]=e;});
+    setDot('ev-dot',true,'EV: '+evD.filter(e=>e.count>0).length+' combos met data');
+    document.getElementById('ev-meta').textContent=evD.length+' combos · '+evD.filter(e=>e.count>0).length+' met ghost data';
+    _buildCombos();
     return;
   }
-  // Cache nog leeg — toon status en retry
+  // EV cache nog leeg op server — retry in achtergrond
   if(attempt<MAX){
-    const remaining=Math.round(((MAX-attempt)*INTERVAL)/1000);
-    setDot('ev-dot',false,status?.building?'EV cache building on server...':'EV cache empty — retrying');
-    document.getElementById('ev-meta').textContent=
-      status?.building?('EV cache wordt gebouwd op server... retry '+(attempt+1)+'/'+MAX+' (nog ~'+remaining+'s)'):'Retrying...';
+    setDot('ev-dot',false,'EV cache opbouwen... ('+(attempt+1)+'/'+MAX+')');
     setTimeout(()=>_loadEVWithRetry(attempt+1),INTERVAL);
   } else {
-    setDot('ev-dot',false,'EV cache niet beschikbaar na '+MAX+' pogingen — refresh handmatig');
+    setDot('ev-dot',false,'EV cache niet beschikbaar — klik REFRESH');
   }
 }
 
@@ -3153,8 +3152,7 @@ function renderEV(){
   document.getElementById('ev-locked').textContent=d.filter(c=>c.tp&&(c.ev?.bestEV??0)>0).length;
   const tb=document.getElementById('ev-body');
   if(!d.length){
-    const evBuilding=Object.keys(_evMap).length===0;
-    tb.innerHTML='<tr><td colspan="15" class="nodata '+(evBuilding?'y':'d')+'">'+(evBuilding?'⏳ EV cache wordt gebouwd op server — secties verschijnen automatisch...':'Geen combos met huidige filters')+' </td></tr>';
+    tb.innerHTML='<tr><td colspan="15" class="nodata d">Geen combos met huidige filters</td></tr>';
     return;
   }
   tb.innerHTML=d.map(c=>{
@@ -3194,9 +3192,10 @@ function setEVF(k,v,btn){evF[k]=v;btn.closest('.fbar').querySelectorAll('.fb').f
 // ── 4. GHOST HISTORY ─────────────────────────────────────
 async function loadGhostHistory(){
   const d=await api('/ghosts/history?limit=200');
+  if(!d){setDot('ghh-dot',false,'Failed — retry in 10s');setTimeout(loadGhostHistory,10000);return;}
   const rows=d?.rows||d||[];
   document.getElementById('ghh-meta').textContent=rows.length+' closed ghosts';
-  setDot('ghh-dot',true,'OK');
+  setDot('ghh-dot',true,'OK — '+rows.length+' records');
   const tb=document.getElementById('ghh-body');
   if(!rows.length){tb.innerHTML='<tr><td colspan="10" class="nodata">No closed ghost data yet</td></tr>';return;}
   tb.innerHTML=rows.map(g=>{
@@ -3414,39 +3413,28 @@ async function loadShadowCount(){
 
 let _loadErrors=0,_lastLoad=null;
 async function loadAll(){
-  const tasks=[
-    {name:'positions', fn:loadPositions},
-    {name:'ghosts',    fn:loadGhosts},
-    {name:'ev',        fn:loadEV},
-    {name:'errors',    fn:loadErrors},
-    {name:'stats',     fn:loadSignalStats},
-    {name:'shadow',    fn:loadShadowCount},
-  ];
   const t0=Date.now();
-  const results=await Promise.allSettled(tasks.map(t=>
-    t.fn().catch(e=>{console.error('[Dashboard] '+t.name+' failed:',e?.message||e);return null;})
-  ));
-  const failed=results.filter((r,i)=>r.status==='rejected'||(r.status==='fulfilled'&&r.value===null));
-  _loadErrors=failed.length;_lastLoad=new Date();
-  const elapsed=Date.now()-t0;
-  const gsText=document.getElementById('gs-text');
-  const gsErr=document.getElementById('gs-err');
-  const gsTime=document.getElementById('gs-time');
-  if(gsText)gsText.textContent=_loadErrors===0?'All sections loaded OK':''+_loadErrors+' section(s) failed — check dots above';
-  if(gsErr)gsErr.textContent=_loadErrors>0?'⚠ '+_loadErrors+' error(s)':'';
-  if(gsTime)gsTime.textContent='Last refresh: '+_lastLoad.toLocaleTimeString('nl-BE',{hour:'2-digit',minute:'2-digit',second:'2-digit'})+' ('+elapsed+'ms)';
+  _lastLoad=new Date();
+  // Run all sections in parallel — each handles its own errors and retries
+  // Use fire-and-forget so loadAll returns quickly and status bar updates
+  Promise.all([
+    loadPositions().catch(e=>console.error('[pos]',e?.message)),
+    loadGhosts().catch(e=>console.error('[ghost]',e?.message)),
+    loadEV().catch(e=>console.error('[ev]',e?.message)),
+    loadErrors().catch(e=>console.error('[errors]',e?.message)),
+    loadSignalStats().catch(e=>console.error('[stats]',e?.message)),
+    loadShadowCount().catch(e=>console.error('[shadow]',e?.message)),
+  ]).then(()=>{
+    const elapsed=Date.now()-t0;
+    const gsText=document.getElementById('gs-text');
+    const gsTime=document.getElementById('gs-time');
+    if(gsText)gsText.textContent='Secties geladen';
+    if(gsTime)gsTime.textContent='Refresh: '+new Date().toLocaleTimeString('nl-BE',{hour:'2-digit',minute:'2-digit',second:'2-digit'})+' ('+elapsed+'ms)';
+  });
 }
 
-document.addEventListener('DOMContentLoaded',async()=>{
+document.addEventListener('DOMContentLoaded',()=>{
   initAll();
-  // Check EV cache status first — show user what's happening
-  const status=await api('/ev/status').catch(()=>null);
-  const gsText=document.getElementById('gs-text');
-  if(gsText){
-    if(status?.building)gsText.textContent='EV cache wordt gebouwd op server — secties laden zodra klaar...';
-    else if(status?.ready)gsText.textContent='EV cache klaar ('+status.count+' combos) — laden...';
-    else gsText.textContent='Server starten — laden...';
-  }
   loadAll();
   setInterval(loadAll,30000);
 });
