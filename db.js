@@ -1239,6 +1239,8 @@ async function loadAllShadowAnalysis() {
       vwapPosition:        row.vwap_position,
       snapshotsCount:      row.snapshots_count,
       positionsCount:      row.positions_count,
+      n:                   row.snapshots_count ?? 0,  // alias voor ready check
+      ready:               (row.snapshots_count ?? 0) >= 30,  // v12.1.1: consistent met runShadowOptimizer
       p50:                 row.p50_sl_used   != null ? parseFloat(row.p50_sl_used)  : null,
       p90:                 row.p90_sl_used   != null ? parseFloat(row.p90_sl_used)  : null,
       p99:                 row.p99_sl_used   != null ? parseFloat(row.p99_sl_used)  : null,
