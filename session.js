@@ -1,5 +1,5 @@
 // ===============================================================
-// session.js  v10.6  |  PRONTO-AI
+// session.js  v10.7  |  PRONTO-AI
 //
 // Changes v10.6:
 //  - No functional changes. Version bump for v10.6 release.
@@ -269,8 +269,8 @@ const SESSION_LABELS = {
 };
 
 // ── Data quality compliance date (FIX 8: single source of truth) ────
-const COMPLIANCE_DATE    = '2026-04-26 00:00:00';
-const COMPLIANCE_DATE_MS = new Date('2026-04-26T00:00:00.000Z').getTime();
+const COMPLIANCE_DATE    = '2026-04-27 07:00:00';  // 09:00 Brussels (UTC+2 summer)
+const COMPLIANCE_DATE_MS = new Date('2026-04-27T07:00:00.000Z').getTime();
 
 module.exports = {
   COMPLIANCE_DATE,
