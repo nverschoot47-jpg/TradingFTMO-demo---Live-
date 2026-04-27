@@ -201,6 +201,7 @@ const {
   saveKeyRiskMult, loadKeyRiskMults,
   fetchRealizedPnl,
   saveSpreadLog, loadSpreadStats, loadSpreadLog,
+  pool,
 } = require("./db");
 
 const {
@@ -1502,7 +1503,7 @@ app.post("/webhook", async (req, res) => {
   if (bandWidth > 0 && vwapMid > 0) {
     const distFromMid = Math.abs(closePrice - vwapMid);
     vwapBandPct = parseFloat((distFromMid / (bandWidth / 2)).toFixed(3));
-    if (vwapBandPct > 1.5) {
+    if (vwapBandPct > 2.5) {
       const reason = `VWAP_BAND_EXHAUSTED: ${(vwapBandPct * 100).toFixed(0)}% into band`;
       logReject("VWAP_BAND_EXHAUSTED", { symbol: symKey, direction, session, optimizerKey, reason, payload: {
         closePrice, vwapMid, vwapUpper, vwapLower,
@@ -1515,8 +1516,8 @@ app.post("/webhook", async (req, res) => {
 
       // ── Ghost 2.0: start a band ghost for this rejected signal ──────
       const pct = vwapBandPct;
-      const bandTier = pct >= 2.5 ? "250_350" : "150_250";
-      if (pct < 3.5) {
+      const bandTier = pct >= 3.5 ? "350_500" : "250_350";
+      if (pct < 5.0) {
         const tempSLForBand   = calcSLFromDerivedPct(direction, closePrice, derivedSlPct);
         const enforcedSLBand  = enforceMinStop(mt5Symbol, direction, closePrice, tempSLForBand);
         startBandGhostTracker({
@@ -2424,7 +2425,6 @@ app.get("/vwap-band-signals", async (req, res) => {
   const maxPct  = parseFloat(req.query.maxPct  ?? 2.5);
   const limit   = parseInt(req.query.limit    ?? 300);
   try {
-    const { pool } = require("./db");
     const r = await pool.query(`
       SELECT symbol, direction, session, vwap_position, optimizer_key,
              tv_entry, sl_pct_human, vwap_band_pct, outcome, reject_reason, received_at
