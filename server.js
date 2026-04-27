@@ -2495,7 +2495,7 @@ app.get("/band-ghosts/active", (req, res) => {
 app.get("/test", (req, res) => {
   res.json({
     status: "Railway is bereikbaar",
-    version: "12.1.0",
+    version: "12.1.1",
     time: new Date().toISOString(),
     headers: {
       "content-type": req.headers["content-type"] ?? "(geen)",
@@ -2524,7 +2524,7 @@ app.get("/health", async (req, res) => {
   const tradeWindowForex = canOpenNewTrade("EURUSD");
   const tradeWindowStock = canOpenNewTrade("AAPL");
   res.json({
-    status: "ok", version: "12.1.0", time: getBrusselsDateStr(),
+    status: "ok", version: "12.1.1", time: getBrusselsDateStr(),
     openPos: Object.keys(openPositions).length, ghosts: Object.keys(ghostTrackers).length,
     tpLocks: Object.keys(tpLocks).length, closedT: closedTrades.length, balance,
     fixedRiskPct: FIXED_RISK_PCT, marketOpen: isMarketOpen(), session: getSession(),
@@ -2556,7 +2556,7 @@ app.get(["/", "/dashboard"], async (req, res) => {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PRONTO-AI v12.1</title>
+<title>PRONTO-AI v12.1.1</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600;700&family=IBM+Plex+Sans+Condensed:wght@500;600;700&display=swap" rel="stylesheet">
 <style>
@@ -2681,7 +2681,7 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
 <div class="hdr">
   <div>
     <div class="logo">PRONTO-AI</div>
-    <div class="ver">v12.1 · TradingView → MetaApi → FTMO MT5 · Risk ${(FIXED_RISK_PCT*100).toFixed(3)}% · SL×${SL_BUFFER_MULT} · DAX Fix active</div>
+    <div class="ver">v12.1.1 · TradingView → MetaApi → FTMO MT5 · Risk ${(FIXED_RISK_PCT*100).toFixed(3)}% · SL×${SL_BUFFER_MULT} · DAX Fix active</div>
   </div>
   <div class="hdr-r">
     <span class="sb s-outside" id="hdr-sess">—</span>
@@ -2999,7 +2999,7 @@ const FOREX  = ${JSON.stringify(FOREX_SYMBOLS)};
 const INDEX  = ${JSON.stringify(INDEX_SYMBOLS)};
 const COMM   = ${JSON.stringify(COMMODITY_SYMBOLS)};
 const STOCKS = ${JSON.stringify(STOCK_SYMBOLS)};
-const TP_OPT_DATE = new Date('2026-04-20T23:00:00.000Z');
+const TP_OPT_DATE = new Date('2026-04-27T07:00:00.000Z'); // compliance datum: 27/04/2026 09:00 Brussels
 
 let _allTrades=[],_evData=[],_tpMap={},_evMap={};
 let _lastLoadMs=null;
@@ -3665,7 +3665,7 @@ async function start() {
   const missing = ["META_API_TOKEN", "META_ACCOUNT_ID", "WEBHOOK_SECRET"].filter(k => !process.env[k]);
   if (missing.length) { console.error(`[ERR] Missing env: ${missing.join(", ")}`); process.exit(1); }
 
-  console.log("🚀 PRONTO-AI v12.1 starting...");
+  console.log("🚀 PRONTO-AI v12.1.1 starting...");
   await initDB();
 
   // Load closed trades
@@ -3739,7 +3739,7 @@ async function start() {
   rebuildEVCache().catch(() => {});
 
   app.listen(PORT, () => {
-    console.log(`[✓] PRONTO-AI v12.1 on port ${PORT}`);
+    console.log(`[✓] PRONTO-AI v12.1.1 on port ${PORT}`);
     console.log(`   🔹 Dashboard:      /`);
     console.log(`   🔹 Health:         /health`);
     console.log(`   🔹 EV Table:       /ev`);
