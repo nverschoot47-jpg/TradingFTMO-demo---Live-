@@ -1,23 +1,29 @@
 // ===============================================================
-// db.js  v10.7  |  PRONTO-AI
+// db.js  v12.1  |  PRONTO-AI
+//
+// Changes v12.1:
+//  - FIX shadow_sl_analysis: ADD COLUMN IF NOT EXISTS migrations voor
+//    alle kolommen (inclusief optimizer_key) — lost
+//    "column optimizer_key does not exist" op bij oude DB schemas.
+//  - FIX saveShadowAnalysis(): accepteert nu beide formaten:
+//    * runShadowOptimizer() output: { n, p50, p75, p90, p99, recommendation }
+//    * loadShadowSnapshots() output: { snapshotsCount, positionsCount, ... }
+//    Voorheen mismatch → save faalde stil, loadAllShadowAnalysis crashte.
+//  - NEW loadSignalRejects(): per outcome + symbol + direction breakdown
+//    van afgewezen signalen — voor het dashboard reject tabel.
+//
+// Changes v10.7 (eerder):
+//  - spread_log tabel + saveSpreadLog, loadSpreadStats, loadSpreadLog.
 //
 // Changes v10.6:
 //  - key_risk_mult schema uitgebreid: ev_mult + day_mult kolommen.
-//    saveKeyRiskMult() accepteert { streak, evMult, dayMult }.
-//    loadKeyRiskMults() retourneert { streak, evMult, dayMult }.
 //  - closed_trades: ADD COLUMN exclude_from_ev BOOLEAN (Fix E).
 //  - currency_exposure tabel: NEW voor Fix C budget tracking.
 //
 // Changes v10.5:
 //  - COMPLIANCE_DATE imported from session.js (FIX 8).
-//  - lot_overrides table: saveLotOverride(), loadLotOverrides() (FIX 2).
-//  - key_risk_mult table: saveKeyRiskMult(), loadKeyRiskMults() (FIX 19).
-//  - fetchRealizedPnl(): queries deals table for actual closed P&L (FIX 4).
-//  - loadAllShadowAnalysis(): load all shadow analyses at startup (FIX 12).
-//  - loadAllTrades: LIMIT raised to 10000 (FIX J from v10.4).
-//
-// Changes v10.4 — loadAllTrades LIMIT 5000→10000 (FIX J).
-// Changes v10.3 — DATA QUALITY COMPLIANCE (18 April 2026).
+//  - lot_overrides table, key_risk_mult table, fetchRealizedPnl,
+//    loadAllShadowAnalysis (FIX 12), loadAllTrades LIMIT 10000.
 // ===============================================================
 
 // FIX 8: COMPLIANCE_DATE from single source of truth
@@ -222,6 +228,22 @@ async function initDB() {
         potential_saving_pct  NUMERIC,
         computed_at           TIMESTAMPTZ DEFAULT NOW()
       );
+      -- FIX v12.1: ensure optimizer_key column exists (safety migration voor oude DB)
+      ALTER TABLE shadow_sl_analysis ADD COLUMN IF NOT EXISTS optimizer_key TEXT;
+      ALTER TABLE shadow_sl_analysis ADD COLUMN IF NOT EXISTS symbol        TEXT;
+      ALTER TABLE shadow_sl_analysis ADD COLUMN IF NOT EXISTS session       TEXT;
+      ALTER TABLE shadow_sl_analysis ADD COLUMN IF NOT EXISTS direction     TEXT;
+      ALTER TABLE shadow_sl_analysis ADD COLUMN IF NOT EXISTS vwap_position TEXT;
+      ALTER TABLE shadow_sl_analysis ADD COLUMN IF NOT EXISTS snapshots_count     INTEGER DEFAULT 0;
+      ALTER TABLE shadow_sl_analysis ADD COLUMN IF NOT EXISTS positions_count     INTEGER DEFAULT 0;
+      ALTER TABLE shadow_sl_analysis ADD COLUMN IF NOT EXISTS p50_sl_used         NUMERIC;
+      ALTER TABLE shadow_sl_analysis ADD COLUMN IF NOT EXISTS p90_sl_used         NUMERIC;
+      ALTER TABLE shadow_sl_analysis ADD COLUMN IF NOT EXISTS p99_sl_used         NUMERIC;
+      ALTER TABLE shadow_sl_analysis ADD COLUMN IF NOT EXISTS max_sl_used         NUMERIC;
+      ALTER TABLE shadow_sl_analysis ADD COLUMN IF NOT EXISTS recommended_sl_pct  NUMERIC;
+      ALTER TABLE shadow_sl_analysis ADD COLUMN IF NOT EXISTS current_sl_too_wide BOOLEAN DEFAULT FALSE;
+      ALTER TABLE shadow_sl_analysis ADD COLUMN IF NOT EXISTS potential_saving_pct NUMERIC;
+      ALTER TABLE shadow_sl_analysis ADD COLUMN IF NOT EXISTS computed_at         TIMESTAMPTZ DEFAULT NOW();
     `);
 
     // ── tp_config ────────────────────────────────────────────────
@@ -674,7 +696,14 @@ async function loadShadowSnapshots(optimizerKey, limit = 5000) {
 
 // ── shadow_sl_analysis ─────────────────────────────────────────
 async function saveShadowAnalysis(a) {
+  // FIX v12.1: runShadowOptimizer stuurt { optimizerKey, n, p50, p75, p90, p99, maxUsed,
+  //   recommendation: { reduceTo, saving, newEV, newWR } }.
+  // Oude call-site (loadShadowSnapshots) stuurt { snapshotsCount, positionsCount }.
+  // Beide formaten worden hier afgehandeld.
   try {
+    const recPct = a.recommendation?.reduceTo ?? a.recommendedSlPct ?? null;
+    const saving  = a.recommendation?.saving   ?? a.potentialSavingPct ?? null;
+    const tooWide = recPct != null && recPct < 100;
     await pool.query(`
       INSERT INTO shadow_sl_analysis
         (optimizer_key, symbol, session, direction, vwap_position,
@@ -693,12 +722,20 @@ async function saveShadowAnalysis(a) {
         potential_saving_pct = EXCLUDED.potential_saving_pct,
         computed_at          = NOW()
     `, [
-      a.optimizerKey, a.symbol, a.session, a.direction, a.vwapPosition,
-      a.snapshotsCount ?? 0, a.positionsCount ?? 0,
-      a.p50 ?? null, a.p90 ?? null, a.p99 ?? null, a.maxUsed ?? null,
-      a.recommendedSlPct ?? null,
-      a.currentSlTooWide ?? false,
-      a.potentialSavingPct ?? null,
+      a.optimizerKey,
+      a.symbol   ?? (a.optimizerKey?.split('_')[0] ?? null),
+      a.session  ?? (a.optimizerKey?.split('_')[1] ?? null),
+      a.direction ?? (a.optimizerKey?.split('_')[2] ?? null),
+      a.vwapPosition ?? (a.optimizerKey?.split('_')[3] ?? 'unknown'),
+      a.snapshotsCount ?? a.n ?? 0,
+      a.positionsCount ?? a.n ?? 0,
+      a.p50 ?? null,
+      a.p90 ?? null,
+      a.p99 ?? null,
+      a.maxUsed ?? null,
+      recPct,
+      a.currentSlTooWide ?? tooWide,
+      saving,
     ]);
   } catch (e) { console.warn("[!] saveShadowAnalysis:", e.message); }
 }
@@ -1352,6 +1389,45 @@ async function loadBandGhostStats(bandTier) {
   } catch (e) { console.warn("[!] loadBandGhostStats:", e.message); return []; }
 }
 
+// ── loadSignalRejects (v12.1: niet-genomen trades breakdown) ───
+// Retourneert per outcome + symbol + direction het aantal afgewezen signalen
+// met de meest voorkomende reject_reason. Gebruikt voor het dashboard reject tabel.
+async function loadSignalRejects({ since } = {}) {
+  try {
+    const cutoff = since ?? COMPLIANCE_DATE;
+    const r = await pool.query(`
+      SELECT
+        outcome,
+        symbol,
+        direction,
+        session,
+        reject_reason,
+        COUNT(*)::INTEGER AS count
+      FROM signal_log
+      WHERE outcome NOT IN ('PLACED')
+        AND received_at >= $1
+      GROUP BY outcome, symbol, direction, session, reject_reason
+      ORDER BY count DESC
+      LIMIT 500
+    `, [cutoff]);
+    // Aggregeer per outcome: totaal + top pairs
+    const byOutcome = {};
+    for (const row of r.rows) {
+      const key = row.outcome;
+      if (!byOutcome[key]) byOutcome[key] = { outcome: key, total: 0, pairs: [] };
+      byOutcome[key].total += row.count;
+      byOutcome[key].pairs.push({
+        symbol:       row.symbol,
+        direction:    row.direction,
+        session:      row.session,
+        rejectReason: row.reject_reason,
+        count:        row.count,
+      });
+    }
+    return Object.values(byOutcome).sort((a, b) => b.total - a.total);
+  } catch (e) { console.warn('[!] loadSignalRejects:', e.message); return []; }
+}
+
 module.exports = {
   pool,
   initDB,
@@ -1404,6 +1480,7 @@ module.exports = {
   logSignal,
   // Signal stats
   loadSignalStats,
+  loadSignalRejects,    // v12.1: niet-genomen trades breakdown
   // EV stats
   computeEVStats,
   // Shadow winners
