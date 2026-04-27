@@ -1,11 +1,12 @@
 {
   "name": "nv-tradingview-webhook",
-  "version": "12.0.0",
-  "description": "TradingView -> MetaApi REST -> FTMO MT5 | PRONTO-AI v12.0 - Nieuw account: compliance 27/04/2026 09:00, dashboard template fix, VWAP band per asset type, geen SL/TP modify, geen lot overrides",
+  "version": "12.1.0",
+  "description": "TradingView -> MetaApi REST -> FTMO MT5 | PRONTO-AI v12.1 - shadow_sl_analysis fix, bid/ask sync fix, signal-stats/rejects endpoint",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "nodemon server.js"
+    "dev": "nodemon server.js",
+    "install:prod": "npm install --omit=dev"
   },
   "dependencies": {
     "express": "^4.19.2",
