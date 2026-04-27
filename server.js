@@ -2495,7 +2495,7 @@ app.get("/band-ghosts/active", (req, res) => {
 app.get("/test", (req, res) => {
   res.json({
     status: "Railway is bereikbaar",
-    version: "12.1.1",
+    version: "12.1.2",
     time: new Date().toISOString(),
     headers: {
       "content-type": req.headers["content-type"] ?? "(geen)",
@@ -2524,7 +2524,7 @@ app.get("/health", async (req, res) => {
   const tradeWindowForex = canOpenNewTrade("EURUSD");
   const tradeWindowStock = canOpenNewTrade("AAPL");
   res.json({
-    status: "ok", version: "12.1.1", time: getBrusselsDateStr(),
+    status: "ok", version: "12.1.2", time: getBrusselsDateStr(),
     openPos: Object.keys(openPositions).length, ghosts: Object.keys(ghostTrackers).length,
     tpLocks: Object.keys(tpLocks).length, closedT: closedTrades.length, balance,
     fixedRiskPct: FIXED_RISK_PCT, marketOpen: isMarketOpen(), session: getSession(),
@@ -2556,7 +2556,7 @@ app.get(["/", "/dashboard"], async (req, res) => {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PRONTO-AI v12.1.1</title>
+<title>PRONTO-AI v12.1.2</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600;700&family=IBM+Plex+Sans+Condensed:wght@500;600;700&display=swap" rel="stylesheet">
 <style>
@@ -2681,7 +2681,7 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
 <div class="hdr">
   <div>
     <div class="logo">PRONTO-AI</div>
-    <div class="ver">v12.1.1 · TradingView → MetaApi → FTMO MT5 · Risk ${(FIXED_RISK_PCT*100).toFixed(3)}% · SL×${SL_BUFFER_MULT} · DAX Fix active</div>
+    <div class="ver">v12.1.2 · TradingView → MetaApi → FTMO MT5 · Risk ${(FIXED_RISK_PCT*100).toFixed(3)}% · SL×${SL_BUFFER_MULT} · DAX Fix active</div>
   </div>
   <div class="hdr-r">
     <span class="sb s-outside" id="hdr-sess">—</span>
@@ -3617,7 +3617,9 @@ async function prepareDeploy(){
 
 async function loadShadowCount(){
   const d=await api('/shadow');
-  document.getElementById('k-sl').textContent=d?.results?.length??'?';
+  // Toon alleen analyses die 'ready' zijn (≥30 ghosts na compliance)
+  const ready=(d?.results||[]).filter(r=>r.ready===true).length;
+  document.getElementById('k-sl').textContent=ready;
 }
 
 let _loadErrors=0;
@@ -3665,7 +3667,7 @@ async function start() {
   const missing = ["META_API_TOKEN", "META_ACCOUNT_ID", "WEBHOOK_SECRET"].filter(k => !process.env[k]);
   if (missing.length) { console.error(`[ERR] Missing env: ${missing.join(", ")}`); process.exit(1); }
 
-  console.log("🚀 PRONTO-AI v12.1.1 starting...");
+  console.log("🚀 PRONTO-AI v12.1.2 starting...");
   await initDB();
 
   // Load closed trades
@@ -3739,7 +3741,7 @@ async function start() {
   rebuildEVCache().catch(() => {});
 
   app.listen(PORT, () => {
-    console.log(`[✓] PRONTO-AI v12.1.1 on port ${PORT}`);
+    console.log(`[✓] PRONTO-AI v12.1.2 on port ${PORT}`);
     console.log(`   🔹 Dashboard:      /`);
     console.log(`   🔹 Health:         /health`);
     console.log(`   🔹 EV Table:       /ev`);
