@@ -1353,6 +1353,7 @@ async function loadBandGhostStats(bandTier) {
 }
 
 module.exports = {
+  pool,
   initDB,
   // Trades
   saveTrade,
