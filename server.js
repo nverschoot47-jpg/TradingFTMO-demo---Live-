@@ -1994,8 +1994,11 @@ app.post("/webhook", async (req, res) => {
 });
 
 // ── REST API ──────────────────────────────────────────────────────
-app.get("/live/positions", async (req, res) => {
-  const balance = await getLiveBalance();
+app.get("/live/positions", (req, res) => {
+  // Gebruik liveBalance direct — NOOIT await getLiveBalance() hier want dat kan
+  // een MetaApi call triggeren en de response blokkeren. Balance wordt apart
+  // bijgewerkt via de 5-min cron en na elke syncOpenPositions.
+  const balance = liveBalance;
   const positions = Object.values(openPositions).map(p => {
     // ── Werkelijke EUR exposure (eerlijk) ─────────────────────────
     // riskEUR in het object is de PUUR berekende basis (balance × pct).
@@ -2625,7 +2628,7 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
 <div class="hdr">
   <div>
     <div class="logo">PRONTO-AI</div>
-    <div class="ver">v11 · TradingView → MetaApi → FTMO MT5 · Risk ${(FIXED_RISK_PCT*100).toFixed(3)}% · SL×${SL_BUFFER_MULT} · DAX Fix active</div>
+    <div class="ver">v19 · TradingView → MetaApi → FTMO MT5 · Risk ${(FIXED_RISK_PCT*100).toFixed(3)}% · SL×${SL_BUFFER_MULT} · DAX Fix active</div>
   </div>
   <div class="hdr-r">
     <span class="sb s-outside" id="hdr-sess">—</span>
@@ -2915,7 +2918,21 @@ function sBadge(s){const m={asia:'bd-as',london:'bd-lo',ny:'bd-ny',outside:'bd-o
 function tyBadge(t){const m={forex:'bd-fx',index:'bd-ix',commodity:'bd-cm',stock:'bd-sk'};const n={forex:'FX',index:'IDX',commodity:'COM',stock:'STK'};return\`<span class="bd \${m[t]||'bd-sk'}">\${n[t]||t}</span>\`;}
 function cBadge(r){if(r==='tp')return'<span class="bd bd-tp">TP</span>';if(r==='sl')return'<span class="bd bd-sl">SL</span>';if(r==='maxRR')return'<span class="bd bd-mr">MAX-RR</span>';if(r==='timeout')return'<span class="bd bd-mn">TIMEOUT</span>';if(r==='manual')return'<span class="bd bd-mn">MAN</span>';return r?\`<span class="bd d">\${r}</span>\`:'—';}
 function slBar(p){const w=Math.min(100,Math.max(0,p||0));const c=w<50?'':w<80?' w':' d';return\`<div class="slbar"><div class="slbg"><div class="slfi\${c}" style="width:\${w}%"></div></div><span class="\${c.trim()||'g'}">\${f(p,0)}%</span></div>\`;}
-async function api(path){try{const r=await fetch(path);if(!r.ok){console.error('[API] '+path+' returned '+r.status);return null;}return r.json();}catch(e){console.error('[API] '+path+' failed:',e.message);return null;}}
+async function api(path,timeoutMs=12000){
+  const ctrl=new AbortController();
+  const t=setTimeout(()=>ctrl.abort(),timeoutMs);
+  try{
+    const r=await fetch(path,{signal:ctrl.signal});
+    clearTimeout(t);
+    if(!r.ok){console.error('[API] '+path+' → '+r.status);return null;}
+    return r.json();
+  }catch(e){
+    clearTimeout(t);
+    if(e.name==='AbortError')console.error('[API] '+path+' TIMEOUT ('+timeoutMs+'ms)');
+    else console.error('[API] '+path+' failed:',e.message);
+    return null;
+  }
+}
 function setDot(id,ok,msg){const el=document.getElementById(id);if(!el)return;el.className=ok?'sec-ok':'sec-err';el.title=msg||'';}
 
 // ── tab switching ─────────────────────────────────────────
@@ -3414,23 +3431,25 @@ async function loadShadowCount(){
 let _loadErrors=0,_lastLoad=null;
 async function loadAll(){
   const t0=Date.now();
-  _lastLoad=new Date();
-  // Run all sections in parallel — each handles its own errors and retries
-  // Use fire-and-forget so loadAll returns quickly and status bar updates
-  Promise.all([
-    loadPositions().catch(e=>console.error('[pos]',e?.message)),
-    loadGhosts().catch(e=>console.error('[ghost]',e?.message)),
-    loadEV().catch(e=>console.error('[ev]',e?.message)),
-    loadErrors().catch(e=>console.error('[errors]',e?.message)),
-    loadSignalStats().catch(e=>console.error('[stats]',e?.message)),
-    loadShadowCount().catch(e=>console.error('[shadow]',e?.message)),
-  ]).then(()=>{
-    const elapsed=Date.now()-t0;
-    const gsText=document.getElementById('gs-text');
-    const gsTime=document.getElementById('gs-time');
-    if(gsText)gsText.textContent='Secties geladen';
-    if(gsTime)gsTime.textContent='Refresh: '+new Date().toLocaleTimeString('nl-BE',{hour:'2-digit',minute:'2-digit',second:'2-digit'})+' ('+elapsed+'ms)';
-  });
+  const gsText=document.getElementById('gs-text');
+  const gsTime=document.getElementById('gs-time');
+  if(gsText)gsText.textContent='Laden...';
+
+  // Hard 15s outer timeout — zelfs als een sectie hangt, update de status bar
+  const timeout=new Promise(res=>setTimeout(()=>res('timeout'),15000));
+  const work=Promise.allSettled([
+    loadPositions().catch(e=>{console.error('[pos]',e?.message);return null;}),
+    loadGhosts().catch(e=>{console.error('[ghost]',e?.message);return null;}),
+    loadEV().catch(e=>{console.error('[ev]',e?.message);return null;}),
+    loadErrors().catch(e=>{console.error('[errors]',e?.message);return null;}),
+    loadSignalStats().catch(e=>{console.error('[stats]',e?.message);return null;}),
+    loadShadowCount().catch(e=>{console.error('[shadow]',e?.message);return null;}),
+  ]);
+
+  await Promise.race([work,timeout]);
+  const elapsed=Date.now()-t0;
+  if(gsText)gsText.textContent='Geladen';
+  if(gsTime)gsTime.textContent='Refresh: '+new Date().toLocaleTimeString('nl-BE',{hour:'2-digit',minute:'2-digit',second:'2-digit'})+' ('+elapsed+'ms)';
 }
 
 document.addEventListener('DOMContentLoaded',()=>{
