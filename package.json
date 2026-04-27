@@ -1,7 +1,7 @@
 {
   "name": "nv-tradingview-webhook",
   "version": "12.0.0",
-  "description": "TradingView -> MetaApi REST -> FTMO MT5 | PRONTO-AI v12.0 - DAX consistent risk fix, dashboard redesign: EV-only combos, ghost history, VWAP band analysis tabs, combo selection table, removed lot calc/flagged/all-events clutter",
+  "description": "TradingView -> MetaApi REST -> FTMO MT5 | PRONTO-AI v12.0 - Nieuw account: compliance 27/04/2026 09:00, dashboard template fix, VWAP band per asset type, geen SL/TP modify, geen lot overrides",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
