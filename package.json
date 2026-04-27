@@ -1,7 +1,7 @@
 {
   "name": "nv-tradingview-webhook",
-  "version": "12.1.2",
-  "description": "TradingView -> MetaApi REST -> FTMO MT5 | PRONTO-AI v12.1 - shadow_sl_analysis fix, bid/ask sync fix, signal-stats/rejects endpoint",
+  "version": "12.1.3",
+  "description": "TradingView -> MetaApi REST -> FTMO MT5 | PRONTO-AI v12.1.3 - ghost maxRR fix, blocked signals dashboard",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
