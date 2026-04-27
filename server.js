@@ -1,8 +1,28 @@
 // ===============================================================
-// server.js  v12.0  |  PRONTO-AI
+// server.js  v12.1  |  PRONTO-AI
 // TradingView → MetaApi REST → FTMO MT5
 //
-// v11.3 — PHANTOM TRADE FIX + STOCK VOLUME STEP (21 April 2026):
+// v12.1 — BUGFIXES + REJECTS ENDPOINT (27 April 2026):
+//
+//  FIX S1 — loadAllShadowAnalysis "column optimizer_key does not exist":
+//    db.js voegt nu ADD COLUMN IF NOT EXISTS migrations toe voor alle
+//    kolommen van shadow_sl_analysis inclusief optimizer_key.
+//    saveShadowAnalysis() accepteert nu beide call-formaten correct
+//    (runShadowOptimizer output vs loadShadowSnapshots output).
+//
+//  FIX S2 — bid/ask null na restart:
+//    syncOpenPositions() haalt nu ook bid/ask/spread op voor posities
+//    die nog geen bid/ask hadden (bijv. na server restart).
+//    Eenmalig per positie bij de eerste sync — geen extra belasting.
+//
+//  NEW — GET /signal-stats/rejects:
+//    Breakdown van alle niet-genomen trades per outcome + symbol +
+//    direction. Toont: duplicate pairs, VWAP exhaustion, outside window,
+//    duplicate entry when open, currency budget exhausted — met counts.
+//    Handig voor post-sessie analyse en dashboard reject tabel.
+//
+// (alle v12.0 en eerder fixes blijven actief — zie v12.0 header)
+// ===============================================================
 //
 //  FIX C1 — local_ positionId guard:
 //    Als MetaApi geen positionId teruggeeft na placeOrder(), genereert de
@@ -196,6 +216,7 @@ const {
   logSignal,
   computeEVStats,
   loadSignalStats,
+  loadSignalRejects,
   loadShadowWinners,
   saveKeyRiskMult, loadKeyRiskMults,
   fetchRealizedPnl,
@@ -1090,6 +1111,17 @@ async function syncOpenPositions() {
       local.currentPrice = cur;
       local.currentPnL   = livePos.unrealizedProfit ?? 0;
       local.lastSync     = new Date().toISOString();
+
+      // v12.1: bid/ask/spread refreshen bij elke sync — ook voor herstelde posities
+      // Zo zijn bid/ask niet meer null na een restart.
+      if (livePos.currentPrice && !local.bid) {
+        const pdSync = await fetchCurrentPrice(local.mt5Symbol || local.symbol).catch(() => null);
+        if (pdSync) {
+          local.bid    = pdSync.bid;
+          local.ask    = pdSync.ask;
+          local.spread = pdSync.spread ?? 0;
+        }
+      }
 
       // FIX 13: clear restore flag after first live sync
       if (local.restoredAfterRestart) {
@@ -2356,6 +2388,27 @@ app.get("/signal-stats", async (req, res) => {
   res.json(stats);
 });
 
+// GET /signal-stats/rejects — breakdown van NIET-genomen trades
+// Toont per outcome (DUPLICATE_BLOCKED, OUTSIDE_WINDOW, VWAP_BAND_EXHAUSTED, ...)
+// welke symbolen + richting + reden het meest voorkomen.
+// Gebruik: dashboard reject tabel, post-sessie analyse.
+app.get("/signal-stats/rejects", async (req, res) => {
+  try {
+    const since = req.query.since ?? null; // optioneel: ISO date string
+    const rows  = await loadSignalRejects({ since });
+    // Bouw ook een flat top-pairs lijst voor snelle tabel weergave
+    const allPairs = rows.flatMap(r => r.pairs.map(p => ({ ...p, outcome: r.outcome })));
+    allPairs.sort((a, b) => b.count - a.count);
+    res.json({
+      byOutcome: rows,
+      topPairs:  allPairs.slice(0, 100),
+      total:     allPairs.reduce((s, p) => s + p.count, 0),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // GET /stats — dashboard KPI totals
 app.get("/stats", (req, res) => {
   res.json({
@@ -2442,7 +2495,7 @@ app.get("/band-ghosts/active", (req, res) => {
 app.get("/test", (req, res) => {
   res.json({
     status: "Railway is bereikbaar",
-    version: "12.0.0",
+    version: "12.1.0",
     time: new Date().toISOString(),
     headers: {
       "content-type": req.headers["content-type"] ?? "(geen)",
@@ -2471,7 +2524,7 @@ app.get("/health", async (req, res) => {
   const tradeWindowForex = canOpenNewTrade("EURUSD");
   const tradeWindowStock = canOpenNewTrade("AAPL");
   res.json({
-    status: "ok", version: "12.0.0", time: getBrusselsDateStr(),
+    status: "ok", version: "12.1.0", time: getBrusselsDateStr(),
     openPos: Object.keys(openPositions).length, ghosts: Object.keys(ghostTrackers).length,
     tpLocks: Object.keys(tpLocks).length, closedT: closedTrades.length, balance,
     fixedRiskPct: FIXED_RISK_PCT, marketOpen: isMarketOpen(), session: getSession(),
@@ -2491,12 +2544,19 @@ app.get(["/", "/dashboard"], async (req, res) => {
   const COMMODITY_SYMBOLS = ["XAUUSD"];
   const STOCK_SYMBOLS     = ["AAPL","AMD","AMZN","ARM","ASML","AVGO","AZN","BA","BABA","BAC","BRKB","CSCO","CVX","DIS","FDX","GE","GM","GME","GOOGL","IBM","INTC","JNJ","JPM","KO","LMT","MCD","META","MSFT","MSTR","NFLX","NKE","NVDA","PFE","PLTR","QCOM","SBUX","SNOW","T","TSLA","V","WMT","XOM","ZM"];
 
+  // Count total closed trades in DB
+  let dbTradeCount = 0;
+  try {
+    const r = await pool.query("SELECT COUNT(*) AS cnt FROM closed_trades");
+    dbTradeCount = parseInt(r.rows[0]?.cnt ?? 0, 10);
+  } catch(e) { /* non-critical */ }
+
   res.end(`<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PRONTO-AI v12</title>
+<title>PRONTO-AI v12.1</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600;700&family=IBM+Plex+Sans+Condensed:wght@500;600;700&display=swap" rel="stylesheet">
 <style>
@@ -2512,16 +2572,19 @@ html,body{background:var(--bg);color:var(--txt);font-family:var(--fn);font-size:
 .logo{font-family:var(--fh);font-size:19px;font-weight:700;letter-spacing:3px;color:var(--b);text-shadow:0 0 18px rgba(40,180,240,.3)}
 .ver{font-size:9px;color:var(--dim);letter-spacing:.4px;margin-top:1px}
 .hdr-r{display:flex;align-items:center;gap:10px}
+/* clock + update freq */
+.hdr-time-box{display:flex;flex-direction:column;align-items:flex-end;gap:1px}
 .clock{font-size:15px;font-weight:600;color:var(--c);letter-spacing:2px;min-width:76px;text-align:right}
+.upd-freq{font-size:8.5px;color:var(--dim);letter-spacing:.5px;text-align:right}
 .sb{padding:3px 9px;border-radius:2px;font-size:10px;font-weight:700;letter-spacing:.8px;font-family:var(--fh)}
 .s-asia{background:#001e2a;color:var(--c);border:1px solid var(--c)}.s-london{background:#001c18;color:var(--g);border:1px solid var(--g)}.s-ny{background:#1e0018;color:var(--p);border:1px solid var(--p)}.s-outside{background:#111;color:var(--dim);border:1px solid var(--bdr2)}
 .rbtn{background:none;border:1px solid var(--bdr2);color:var(--dim);padding:4px 10px;border-radius:2px;cursor:pointer;font-family:var(--fn);font-size:10px;transition:all .15s}
 .rbtn:hover{color:var(--b);border-color:var(--b)}
 /* KPI BAR */
-.kbar{display:grid;grid-template-columns:repeat(10,1fr);border-bottom:1px solid var(--bdr2);background:var(--bdr)}
+.kbar{display:grid;grid-template-columns:repeat(11,1fr);border-bottom:1px solid var(--bdr2);background:var(--bdr)}
 .kpi{background:var(--bg1);padding:8px 12px;position:relative;overflow:hidden}
 .kpi::after{content:'';position:absolute;bottom:0;left:0;right:0;height:2px}
-.k0::after{background:var(--g)}.k1::after{background:var(--b)}.k2::after{background:var(--p)}.k3::after{background:var(--p)}.k4::after{background:var(--y)}.k5::after{background:var(--c)}.k6::after{background:var(--o)}.k7::after{background:var(--c)}.k8::after{background:var(--b)}.k9::after{background:var(--r)}
+.k0::after{background:var(--g)}.k1::after{background:var(--b)}.k2::after{background:var(--p)}.k3::after{background:var(--p)}.k4::after{background:var(--y)}.k5::after{background:var(--c)}.k6::after{background:var(--o)}.k7::after{background:var(--c)}.k8::after{background:var(--b)}.k9::after{background:var(--r)}.k10::after{background:var(--y)}
 .kl{font-size:8px;letter-spacing:1px;color:var(--dim);text-transform:uppercase;margin-bottom:3px;font-family:var(--fh)}
 .kv{font-size:16px;font-weight:700;line-height:1;font-family:var(--fh);letter-spacing:.5px}
 /* MAIN */
@@ -2589,7 +2652,28 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
 .sec-ok{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--g);margin-left:6px;vertical-align:middle}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
 .eline{flex:1;height:1px;background:var(--bdr2)}
-@media(max-width:900px){.kbar{grid-template-columns:repeat(5,1fr)}.mxg{grid-template-columns:1fr}}
+
+/* TRADE STATS SECTION - improved */
+.stats-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:0;border-bottom:1px solid var(--bdr2)}
+.stats-cell{padding:10px 14px;border-right:1px solid var(--bdr2);background:var(--bg1)}
+.stats-cell:last-child{border-right:none}
+.stats-cell .sc-label{font-size:8px;letter-spacing:1.2px;color:var(--dim);text-transform:uppercase;margin-bottom:4px;font-family:var(--fh)}
+.stats-cell .sc-val{font-size:20px;font-weight:700;font-family:var(--fh);line-height:1}
+.stats-cell .sc-sub{font-size:9px;color:var(--dim);margin-top:2px}
+/* compliance date banner */
+.compliance-banner{display:flex;align-items:center;gap:8px;padding:5px 14px;background:rgba(240,190,32,.06);border-bottom:1px solid rgba(240,190,32,.15);font-size:9px}
+.cb-dot{width:5px;height:5px;border-radius:50%;background:var(--y)}
+/* session breakdown table */
+#st-tbl{font-size:10.5px}
+#st-tbl th{padding:6px 10px;font-size:8.5px}
+#st-tbl td{padding:5px 10px;font-size:10.5px}
+#st-tbl tbody tr{border-bottom:1px solid var(--bdr)}
+#st-tbl tfoot tr td{border-top:2px solid var(--bdr2);font-weight:700;background:var(--bg2)}
+
+/* db count badge */
+.db-count-badge{display:inline-flex;align-items:center;gap:5px;padding:2px 8px;background:rgba(0,220,212,.08);border:1px solid rgba(0,220,212,.2);border-radius:2px;font-size:9px;color:var(--c)}
+
+@media(max-width:900px){.kbar{grid-template-columns:repeat(6,1fr)}.mxg{grid-template-columns:1fr}.stats-grid{grid-template-columns:repeat(2,1fr)}}
 </style>
 </head>
 <body>
@@ -2597,11 +2681,14 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
 <div class="hdr">
   <div>
     <div class="logo">PRONTO-AI</div>
-    <div class="ver">v12.0 · TradingView → MetaApi → FTMO MT5 · Risk ${(FIXED_RISK_PCT*100).toFixed(3)}% · SL×${SL_BUFFER_MULT} · DAX Fix active</div>
+    <div class="ver">v12.1 · TradingView → MetaApi → FTMO MT5 · Risk ${(FIXED_RISK_PCT*100).toFixed(3)}% · SL×${SL_BUFFER_MULT} · DAX Fix active</div>
   </div>
   <div class="hdr-r">
     <span class="sb s-outside" id="hdr-sess">—</span>
-    <span class="clock" id="clock">--:--:--</span>
+    <div class="hdr-time-box">
+      <span class="clock" id="clock">--:--:--</span>
+      <span class="upd-freq" id="upd-freq">refresh: 30s</span>
+    </div>
     <button class="rbtn" onclick="loadAll()">↻ REFRESH</button>
     <button class="rbtn" id="deploy-btn" onclick="prepareDeploy()" style="border-color:var(--r);color:var(--r)">⚡ PREPARE DEPLOY</button>
     <span id="deploy-status" style="font-size:9px;color:var(--dim)"></span>
@@ -2609,7 +2696,7 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
 </div>
 
 <div class="kbar">
-  <div class="kpi k0"><div class="kl">Balance MT5</div><div class="kv g">€<span id="k-bal">${balance.toFixed(0)}</span></div></div>
+  <div class="kpi k0"><div class="kl">Balance MT5</div><div class="kv g">€<span id="k-bal">${balance.toFixed(0)}</span></div><div style="font-size:8px;color:var(--dim);margin-top:2px" id="k-bal-age">laden…</div></div>
   <div class="kpi k1"><div class="kl">Open Trades</div><div class="kv b" id="k-pos">—</div></div>
   <div class="kpi k2"><div class="kl">Open P&amp;L</div><div class="kv" id="k-pnl">—</div></div>
   <div class="kpi k3"><div class="kl">Ghosts Active</div><div class="kv p" id="k-gh">—</div></div>
@@ -2619,6 +2706,7 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
   <div class="kpi k7"><div class="kl">Base Risk % / Actual</div><div class="kv c" style="font-size:13px">${(FIXED_RISK_PCT*100).toFixed(3)}% <span style="color:var(--o);font-size:10px">~${(FIXED_RISK_PCT*SL_BUFFER_MULT*100).toFixed(3)}%</span></div></div>
   <div class="kpi k8"><div class="kl">Trades / Sess</div><div class="kv b" id="k-tps">—</div></div>
   <div class="kpi k9"><div class="kl">Logged Trades</div><div class="kv b" id="k-err">—</div></div>
+  <div class="kpi k10"><div class="kl">DB Trades (totaal)</div><div class="kv y">${dbTradeCount.toLocaleString()}</div></div>
 </div>
 
 <div id="global-status" style="padding:4px 20px;background:var(--bg1);border-bottom:1px solid var(--bdr2);display:flex;align-items:center;justify-content:space-between;font-size:9px;color:var(--dim)">
@@ -2628,27 +2716,45 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
 
 <div class="main">
 
-
-<!-- 0. TRADE SUMMARY STATS (boven open positions) -->
+<!-- 0. TRADE STATS -->
 <div class="sec" id="stats-sec">
-  <div class="sh"><span class="st b">▸ TRADE STATS — vanaf compliance datum</span><span class="sm" id="stats-meta">laden...</span></div>
-  <div class="strip" id="stats-strip" style="flex-wrap:wrap;gap:20px">
-    <div class="stat"><span class="sl2">Totaal trades</span><span class="sv2 b" id="st-total">—</span></div>
-    <div class="stat"><span class="sl2">VWAP Above</span><span class="sv2 b" id="st-above">—</span></div>
-    <div class="stat"><span class="sl2">VWAP Below</span><span class="sv2 p" id="st-below">—</span></div>
-    <div class="stat"><span class="sl2">Asia trades</span><span class="sv2 c" id="st-asia">—</span></div>
-    <div class="stat"><span class="sl2">London trades</span><span class="sv2 g" id="st-london">—</span></div>
-    <div class="stat"><span class="sv2 p" style="font-size:10px;margin-top:4px"><span class="sl2">NY trades</span><span class="sv2 p" id="st-ny">—</span></span></div>
-    <div class="stat"><span class="sl2">Buy signals</span><span class="sv2 g" id="st-buy">—</span></div>
-    <div class="stat"><span class="sl2">Sell signals</span><span class="sv2 r" id="st-sell">—</span></div>
-    <div class="stat"><span class="sl2">Compliance datum</span><span class="sv2 y" id="st-comp" style="font-size:10px">27/04/2026 09:00</span></div>
+  <div class="sh">
+    <span class="st b">▸ TRADE STATS — vanaf compliance datum</span>
+    <span class="sm" id="stats-meta">laden...</span>
+    <span class="db-count-badge" title="Totaal closed_trades in SQL database">🗄 ${dbTradeCount.toLocaleString()} in DB</span>
+  </div>
+  <div class="compliance-banner">
+    <span class="cb-dot"></span>
+    <span style="color:var(--y);font-weight:700">Compliance datum:</span>
+    <span style="color:var(--txt)">27/04/2026 09:00 Brussels</span>
+    <span style="color:var(--dim)">— enkel trades ná deze datum tellen mee voor EV/optimizer statistieken</span>
+  </div>
+  <div class="stats-grid">
+    <div class="stats-cell"><div class="sc-label">Totaal trades</div><div class="sc-val b" id="st-total">—</div><div class="sc-sub" id="st-total-sub"></div></div>
+    <div class="stats-cell"><div class="sc-label">VWAP Above / Below</div><div class="sc-val" style="font-size:15px"><span class="b" id="st-above">—</span> <span class="d">/</span> <span class="p" id="st-below">—</span></div><div class="sc-sub" id="st-vwap-pct"></div></div>
+    <div class="stats-cell"><div class="sc-label">Sessie verdeling</div><div class="sc-val" style="font-size:12px;display:flex;gap:8px;align-items:baseline"><span class="c" id="st-asia">—</span><span class="d" style="font-size:9px">AS</span><span class="g" id="st-london">—</span><span class="d" style="font-size:9px">LN</span><span class="p" id="st-ny">—</span><span class="d" style="font-size:9px">NY</span></div></div>
+    <div class="stats-cell"><div class="sc-label">Buy / Sell signalen</div><div class="sc-val" style="font-size:15px"><span class="g" id="st-buy">—</span> <span class="d">/</span> <span class="r" id="st-sell">—</span></div><div class="sc-sub" id="st-dir-pct"></div></div>
+    <div class="stats-cell"><div class="sc-label">Compliance datum</div><div class="sc-val y" id="st-comp" style="font-size:11px;line-height:1.3">27/04/2026<br>09:00</div></div>
   </div>
   <div style="overflow-x:auto">
-  <table id="st-tbl" style="font-size:10px">
+  <table id="st-tbl" style="font-size:10.5px">
     <thead><tr>
-      <th>Sessie</th><th>Buy Above</th><th>Buy Below</th><th>Sell Above</th><th>Sell Below</th><th>Totaal</th>
+      <th>Sessie</th>
+      <th style="color:var(--g)">Buy Above</th>
+      <th style="color:var(--g);opacity:.7">Buy Below</th>
+      <th style="color:var(--r)">Sell Above</th>
+      <th style="color:var(--r);opacity:.7">Sell Below</th>
+      <th>Totaal</th>
     </tr></thead>
-    <tbody id="st-body"><tr><td colspan="6" class="nodata">Laden...</td></tr></tbody>
+    <tbody id="st-body"></tbody>
+    <tfoot><tr>
+      <td class="y">TOTAAL</td>
+      <td id="st-ft-ba" class="g">—</td>
+      <td id="st-ft-bb" class="g">—</td>
+      <td id="st-ft-sa" class="r">—</td>
+      <td id="st-ft-sb" class="r">—</td>
+      <td id="st-ft-t" class="b">—</td>
+    </tr></tfoot>
   </table>
   </div>
 </div>
@@ -2671,12 +2777,12 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
         <th class="s" data-col="13" title="Actual risk at SL: lots×dist×lotVal as % of balance">Risk %</th>
         <th class="s" data-col="14">Opened</th>
       </tr></thead>
-      <tbody id="pos-body"><tr><td colspan="15" class="nodata">Loading…</td></tr></tbody>
+      <tbody id="pos-body"></tbody>
     </table>
   </div>
 </div>
 
-<!-- 2. ACTIVE GHOSTS -->
+<!-- 2. ACTIVE GHOSTS — per trade -->
 <div class="sec">
   <div class="sh"><span class="st p">▸ GHOST TRACKER</span><span id="gh-dot" class="sec-err" title="Loading..."></span><span class="sm" id="gh-meta">active ghosts — tracking until MT5 SL hit, max 15R or 2 weeks</span></div>
   <div class="tw">
@@ -2688,16 +2794,16 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
         <th title="% of original SL distance consumed so far">SL Used%</th>
         <th class="s" data-col="7">Elapsed</th><th class="s" data-col="8">Opened</th>
       </tr></thead>
-      <tbody id="gh-body"><tr><td colspan="9" class="nodata">Loading…</td></tr></tbody>
+      <tbody id="gh-body"></tbody>
     </table>
   </div>
 </div>
 
-<!-- 3. EV / TP + SL OPTIMISER (only combos with trades) -->
+<!-- 3. EV / TP + SL OPTIMISER — ALL combos, 0 trades shown -->
 <div class="sec">
   <div class="sh">
     <span class="st y">▸ EV / TP + SL OPTIMISER</span><span id="ev-dot" class="sec-err" title="Loading..."></span>
-    <span class="sm" id="ev-meta">only combos with ≥1 trade · EV locked at ≥5</span>
+    <span class="sm" id="ev-meta">alle combinaties · EV locked bij ≥5</span>
   </div>
   <div class="fbar">
     <span class="fl">Type:</span>
@@ -2720,14 +2826,15 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
     <button class="fb" onclick="setEVF('vwap','above',this)">Above</button>
     <button class="fb" onclick="setEVF('vwap','below',this)">Below</button>
     &nbsp;<span class="fl">Min ghosts:</span>
-    <button class="fb on" onclick="setEVF('min','1',this)">1+</button>
+    <button class="fb on" onclick="setEVF('min','0',this)">Alle</button>
+    <button class="fb" onclick="setEVF('min','1',this)">1+</button>
     <button class="fb" onclick="setEVF('min','5',this)">5+ (EV ready)</button>
     <button class="fb" onclick="setEVF('min','10',this)">10+</button>
   </div>
   <div class="strip">
-    <div class="stat"><span class="sl2">Combos w/ data</span><span class="sv2 b" id="ev-count">—</span></div>
-    <div class="stat"><span class="sl2">Total trades</span><span class="sv2 c" id="ev-trades">—</span></div>
-    <div class="stat"><span class="sl2">With ghost data</span><span class="sv2 b" id="ev-winpct">—</span></div>
+    <div class="stat"><span class="sl2">Totaal combos</span><span class="sv2 b" id="ev-count">—</span></div>
+    <div class="stat"><span class="sl2">Met ghost data</span><span class="sv2 c" id="ev-trades">—</span></div>
+    <div class="stat"><span class="sl2">0 ghosts</span><span class="sv2 d" id="ev-zero">—</span></div>
     <div class="stat"><span class="sl2">Total P&amp;L</span><span class="sv2" id="ev-pnl">—</span></div>
     <div class="stat"><span class="sl2">EV+ locked</span><span class="sv2 y" id="ev-locked">—</span></div>
   </div>
@@ -2736,37 +2843,43 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
       <thead><tr>
         <th class="s" data-col="0">Symbol</th><th>Type</th><th class="s" data-col="2">Session</th>
         <th class="s" data-col="3">Dir</th><th class="s" data-col="4">VWAP</th>
-        <th class="s" data-col="5" title="Closed ghost trades with maxRR>0"># Ghosts</th>
-        <th class="s" data-col="6">Best TP RR</th>
-        <th class="s" data-col="7">Avg RR</th>
-        <th class="s" data-col="8">EV</th>
+        <th class="s" data-col="5" title="Closed ghost trades met maxRR>0"># Ghosts</th>
+        <th class="s" data-col="6"># Trades</th>
+        <th class="s" data-col="7">Best TP RR</th>
+        <th class="s" data-col="8">Avg RR</th>
+        <th class="s" data-col="9">EV</th>
         <th>EV Status</th>
-        <th class="s" data-col="10">TP Lock</th>
-        <th class="s" data-col="11" title="Avg minutes from open to phantom SL hit">Avg T→SL</th>
-        <th class="s" data-col="12" title="Avg max SL% used — basis for SL tightening (read only)">Avg SL%</th>
-        <th class="s" data-col="13" title="Best SL% from winning ghost trades (read only)">Best SL% (W)</th>
-        <th class="s" data-col="14">Total P&amp;L</th>
+        <th class="s" data-col="11">TP Lock</th>
+        <th class="s" data-col="12" title="Avg minutes from open to phantom SL hit">Avg T→SL</th>
+        <th class="s" data-col="13" title="Avg max SL% used">Avg SL%</th>
+        <th class="s" data-col="14" title="Best SL% from winning ghost trades">Best SL% (W)</th>
+        <th class="s" data-col="15">Total P&amp;L</th>
       </tr></thead>
-      <tbody id="ev-body"><tr><td colspan="15" class="nodata">Loading…</td></tr></tbody>
+      <tbody id="ev-body"></tbody>
     </table>
   </div>
 </div>
 
-<!-- 4. GHOST HISTORY / SL SHADOW LOG -->
+<!-- 4. GHOST HISTORY — COMBINED aggregated per optimizer_key -->
 <div class="sec">
   <div class="sh"><span class="st c">▸ GHOST HISTORY — CLOSED GHOSTS LOG</span><span id="ghh-dot" class="sec-err" title="Loading..."></span><span class="sm" id="ghh-meta">loading…</span></div>
+  <div style="padding:5px 12px;background:var(--bg2);border-bottom:1px solid var(--bdr2);font-size:9px;color:var(--dim)">
+    Gecombineerde weergave per optimizer-combinatie (sym+sess+dir+vwap) · individuele ghost trades te zien in Ghost Tracker hierboven
+  </div>
   <div class="tw">
     <table id="ghh-tbl">
       <thead><tr>
         <th class="s" data-col="0">Symbol</th><th>Type</th><th class="s" data-col="2">Session</th>
         <th class="s" data-col="3">Dir</th><th class="s" data-col="4">VWAP</th>
-        <th class="s" data-col="5" title="Highest RR reached before phantom SL">Max RR</th>
-        <th class="s" data-col="6" title="Max SL% used (adverse excursion)">Max SL%</th>
-        <th class="s" data-col="7" title="Minutes from open to phantom SL hit">T→SL min</th>
-        <th>Close Reason</th>
-        <th class="s" data-col="9">Opened</th>
+        <th class="s" data-col="5"># Ghosts</th>
+        <th class="s" data-col="6" title="Hoogste RR bereikt">Best Max RR</th>
+        <th class="s" data-col="7" title="Gemiddelde Max RR">Avg Max RR</th>
+        <th class="s" data-col="8" title="Gemiddelde Max SL% used">Avg SL%</th>
+        <th class="s" data-col="9" title="Gemiddelde minuten tot phantom SL">Avg T→SL</th>
+        <th class="s" data-col="10">Close Reason</th>
+        <th class="s" data-col="11">Laatste ghost</th>
       </tr></thead>
-      <tbody id="ghh-body"><tr><td colspan="10" class="nodata">Loading…</td></tr></tbody>
+      <tbody id="ghh-body"></tbody>
     </table>
   </div>
 </div>
@@ -2779,7 +2892,6 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
     <div class="tab" onclick="showTab('wh','band150')">Band 150–250%</div>
     <div class="tab" onclick="showTab('wh','band250')">Band 250–350%</div>
   </div>
-  <!-- Errors tab -->
   <div class="tpane on" id="wh-tab-errors">
     <div class="tw">
       <table id="whe-tbl">
@@ -2788,11 +2900,10 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
           <th class="s" data-col="3">Dir</th><th class="s" data-col="4">Session</th><th class="s" data-col="5">VWAP</th>
           <th>Entry</th><th>SL%</th><th>Band%</th><th>Detail / Reason</th>
         </tr></thead>
-        <tbody id="whe-body"><tr><td colspan="10" class="nodata">Loading…</td></tr></tbody>
+        <tbody id="whe-body"></tbody>
       </table>
     </div>
   </div>
-  <!-- Band 150-250% tab -->
   <div class="tpane" id="wh-tab-band150">
     <div style="padding:7px 12px;background:var(--bg2);font-size:9px;color:var(--dim);border-bottom:1px solid var(--bdr2)">
       <b class="o">Ghost 2.0 — Band 150%–250%.</b> Each rejected signal spawns a ghost tracker that runs until phantom SL / 15RR / 2 weeks.
@@ -2809,11 +2920,10 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
           <th>Symbol</th><th>Session</th><th>Dir</th><th>VWAP</th>
           <th>n Ghosts</th><th>Avg Max RR</th><th>Max RR</th><th>Avg SL%</th><th>Avg T→SL</th>
         </tr></thead>
-        <tbody id="band150-body"><tr><td colspan="9" class="nodata">Loading tab to see data…</td></tr></tbody>
+        <tbody id="band150-body"></tbody>
       </table>
     </div>
   </div>
-  <!-- Band 250-350% tab -->
   <div class="tpane" id="wh-tab-band250">
     <div style="padding:7px 12px;background:var(--bg2);font-size:9px;color:var(--dim);border-bottom:1px solid var(--bdr2)">
       <b class="r">Ghost 2.0 — Band 250%–350%.</b> Extreme outliers tracked separately. Read-only — never added to main optimizer.
@@ -2829,7 +2939,7 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
           <th>Symbol</th><th>Session</th><th>Dir</th><th>VWAP</th>
           <th>n Ghosts</th><th>Avg Max RR</th><th>Max RR</th><th>Avg SL%</th><th>Avg T→SL</th>
         </tr></thead>
-        <tbody id="band250-body"><tr><td colspan="9" class="nodata">Loading tab to see data…</td></tr></tbody>
+        <tbody id="band250-body"></tbody>
       </table>
     </div>
   </div>
@@ -2856,7 +2966,7 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
   </div>
 </div>
 
-<!-- 7. COMBO SELECTION TABLE (replaces Optimisation Suggestions) -->
+<!-- 7. COMBO SELECTION TABLE -->
 <div class="sec">
   <div class="sh"><span class="st p">▸ COMBO SELECTION — CUT &amp; UPGRADE</span><span class="sm">all traded combos ranked · use to decide what to keep, cut, or focus on</span></div>
   <div class="fbar">
@@ -2877,7 +2987,7 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
         <th>#</th><th>Symbol</th><th>Type</th><th>Session</th><th>Dir</th><th>VWAP</th>
         <th># Ghosts</th><th>Avg RR</th><th>EV</th><th>Total P&amp;L</th><th>Action</th>
       </tr></thead>
-      <tbody id="cf-body"><tr><td colspan="12" class="nodata">Loading…</td></tr></tbody>
+      <tbody id="cf-body"></tbody>
     </table>
   </div>
 </div>
@@ -2892,7 +3002,8 @@ const STOCKS = ${JSON.stringify(STOCK_SYMBOLS)};
 const TP_OPT_DATE = new Date('2026-04-20T23:00:00.000Z');
 
 let _allTrades=[],_evData=[],_tpMap={},_evMap={};
-const evF={type:'all',sess:'all',dir:'all',vwap:'all',min:'1'};
+let _lastLoadMs=null;
+const evF={type:'all',sess:'all',dir:'all',vwap:'all',min:'0'};
 const cfF={show:'all',sort:'ev'};
 
 // ── helpers ──────────────────────────────────────────────
@@ -2912,6 +3023,7 @@ function sBadge(s){const m={asia:'bd-as',london:'bd-lo',ny:'bd-ny',outside:'bd-o
 function tyBadge(t){const m={forex:'bd-fx',index:'bd-ix',commodity:'bd-cm',stock:'bd-sk'};const n={forex:'FX',index:'IDX',commodity:'COM',stock:'STK'};return\`<span class="bd \${m[t]||'bd-sk'}">\${n[t]||t}</span>\`;}
 function cBadge(r){if(r==='tp')return'<span class="bd bd-tp">TP</span>';if(r==='sl')return'<span class="bd bd-sl">SL</span>';if(r==='maxRR')return'<span class="bd bd-mr">MAX-RR</span>';if(r==='timeout')return'<span class="bd bd-mn">TIMEOUT</span>';if(r==='manual')return'<span class="bd bd-mn">MAN</span>';return r?\`<span class="bd d">\${r}</span>\`:'—';}
 function slBar(p){const w=Math.min(100,Math.max(0,p||0));const c=w<50?'':w<80?' w':' d';return\`<div class="slbar"><div class="slbg"><div class="slfi\${c}" style="width:\${w}%"></div></div><span class="\${c.trim()||'g'}">\${f(p,0)}%</span></div>\`;}
+
 async function api(path,timeoutMs=12000){
   const ctrl=new AbortController();
   const t=setTimeout(()=>ctrl.abort(),timeoutMs);
@@ -2928,6 +3040,12 @@ async function api(path,timeoutMs=12000){
   }
 }
 function setDot(id,ok,msg){const el=document.getElementById(id);if(!el)return;el.className=ok?'sec-ok':'sec-err';el.title=msg||'';}
+
+// ── empty table helper (geen LOADING tekst) ───────────────
+function emptyRow(cols,msg=''){
+  if(!msg) return \`<tr>\${Array(cols).fill('<td></td>').join('')}</tr>\`;
+  return \`<tr><td colspan="\${cols}" class="nodata" style="color:var(--dim);opacity:.5">\${msg}</td></tr>\`;
+}
 
 // ── tab switching ─────────────────────────────────────────
 function showTab(group,name){
@@ -2959,9 +3077,10 @@ function sortBy(id,col){
 }
 function initAll(){['pos-tbl','ev-tbl','gh-tbl','ghh-tbl','whe-tbl','cf-tbl','mx-fx','mx-ix','mx-cm','mx-sk'].forEach(initSort);}
 
-// ── clock ─────────────────────────────────────────────────
+// ── clock + update countdown ─────────────────────────────
 const SESS_LABELS={asia:'ASIA',london:'LONDON',ny:'NY',outside:'OUTSIDE'};
 const SESS_CLS={asia:'s-asia',london:'s-london',ny:'s-ny',outside:'s-outside'};
+let _nextRefreshSec=30;
 function updateClock(){
   const d=new Date();
   const bx=new Intl.DateTimeFormat('en-US',{timeZone:'Europe/Brussels',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}).formatToParts(d);
@@ -2976,30 +3095,52 @@ function updateClock(){
   const hdrEl=document.getElementById('hdr-sess');
   hdrEl.textContent=SESS_LABELS[sess];hdrEl.className='sb '+SESS_CLS[sess];
   document.getElementById('k-sess').textContent=SESS_LABELS[sess];
+  // update freq countdown
+  const freqEl=document.getElementById('upd-freq');
+  if(freqEl){
+    if(_lastLoadMs){
+      const elapsed=Math.floor((Date.now()-_lastLoadMs)/1000);
+      const remaining=Math.max(0,30-elapsed%30);
+      freqEl.textContent=\`refresh: 30s · volgende in \${remaining}s\`;
+    }
+  }
+  // balance KPI age
+  const balAgeEl=document.getElementById('k-bal-age');
+  if(balAgeEl&&_lastLoadMs){
+    const secAgo=Math.floor((Date.now()-_lastLoadMs)/1000);
+    balAgeEl.textContent=secAgo<60?secAgo+'s geleden':(Math.floor(secAgo/60))+'m geleden';
+  }
 }
 setInterval(updateClock,1000);updateClock();
 
 
 // ── 0. TRADE STATS SECTION ───────────────────────────────────────
 async function loadTradeStats(){
-  // Load trades after compliance date (27/04/2026 09:00 Brussels)
   const COMPLIANCE = new Date('2026-04-27T07:00:00.000Z');
   const d = await api('/trades?limit=10000');
   if(!d){document.getElementById('stats-meta').textContent='fout bij laden';return;}
   const trades = (d.trades||[]).filter(t => t.openedAt && new Date(t.openedAt) >= COMPLIANCE);
   const total = trades.length;
   document.getElementById('stats-meta').textContent = total + ' trades na compliance datum';
-  document.getElementById('st-total').textContent = total;
-  document.getElementById('st-above').textContent = trades.filter(t=>t.vwapPosition==='above').length;
-  document.getElementById('st-below').textContent = trades.filter(t=>t.vwapPosition==='below').length;
+  document.getElementById('st-total').textContent = total||'0';
+  document.getElementById('st-total-sub').textContent = 'gesloten trades';
+  const abv=trades.filter(t=>t.vwapPosition==='above').length;
+  const blw=trades.filter(t=>t.vwapPosition==='below').length;
+  document.getElementById('st-above').textContent = abv;
+  document.getElementById('st-below').textContent = blw;
+  if(total>0) document.getElementById('st-vwap-pct').textContent=\`\${((abv/total)*100).toFixed(0)}% / \${((blw/total)*100).toFixed(0)}%\`;
   document.getElementById('st-asia').textContent   = trades.filter(t=>t.session==='asia').length;
   document.getElementById('st-london').textContent = trades.filter(t=>t.session==='london').length;
   document.getElementById('st-ny').textContent     = trades.filter(t=>t.session==='ny').length;
-  document.getElementById('st-buy').textContent    = trades.filter(t=>t.direction==='buy').length;
-  document.getElementById('st-sell').textContent   = trades.filter(t=>t.direction==='sell').length;
-  // Per session breakdown table
+  const buys=trades.filter(t=>t.direction==='buy').length;
+  const sells=trades.filter(t=>t.direction==='sell').length;
+  document.getElementById('st-buy').textContent    = buys;
+  document.getElementById('st-sell').textContent   = sells;
+  if(total>0) document.getElementById('st-dir-pct').textContent=\`\${((buys/total)*100).toFixed(0)}% / \${((sells/total)*100).toFixed(0)}%\`;
+  // Session breakdown
   const sessions = ['asia','london','ny'];
   const tb = document.getElementById('st-body');
+  let ba_t=0,bb_t=0,sa_t=0,sb_t=0;
   const rows = sessions.map(sess => {
     const st = trades.filter(t=>t.session===sess);
     const ba = st.filter(t=>t.direction==='buy'&&t.vwapPosition==='above').length;
@@ -3007,26 +3148,21 @@ async function loadTradeStats(){
     const sa = st.filter(t=>t.direction==='sell'&&t.vwapPosition==='above').length;
     const sb = st.filter(t=>t.direction==='sell'&&t.vwapPosition==='below').length;
     const tot = st.length;
-    const sCls = {asia:'c',london:'g',ny:'p'}[sess]||'d';
+    ba_t+=ba;bb_t+=bb;sa_t+=sa;sb_t+=sb;
     return \`<tr>
       <td>\${sBadge(sess)}</td>
-      <td class="g fw">\${ba||'—'}</td><td class="g">\${bb||'—'}</td>
-      <td class="r fw">\${sa||'—'}</td><td class="r">\${sb||'—'}</td>
-      <td class="\${sCls} fw">\${tot||'—'}</td>
+      <td class="g fw">\${ba||'0'}</td><td class="g">\${bb||'0'}</td>
+      <td class="r fw">\${sa||'0'}</td><td class="r">\${sb||'0'}</td>
+      <td class="b fw">\${tot||'0'}</td>
     </tr>\`;
   });
-  // Total row
-  const ba_t = trades.filter(t=>t.direction==='buy'&&t.vwapPosition==='above').length;
-  const bb_t = trades.filter(t=>t.direction==='buy'&&t.vwapPosition==='below').length;
-  const sa_t = trades.filter(t=>t.direction==='sell'&&t.vwapPosition==='above').length;
-  const sb_t = trades.filter(t=>t.direction==='sell'&&t.vwapPosition==='below').length;
-  rows.push(\`<tr style="border-top:1px solid var(--bdr2);font-weight:700">
-    <td class="y">TOTAAL</td>
-    <td class="g">\${ba_t}</td><td class="g">\${bb_t}</td>
-    <td class="r">\${sa_t}</td><td class="r">\${sb_t}</td>
-    <td class="b">\${total}</td>
-  </tr>\`);
   tb.innerHTML = rows.join('');
+  // footer totals
+  document.getElementById('st-ft-ba').textContent=ba_t;
+  document.getElementById('st-ft-bb').textContent=bb_t;
+  document.getElementById('st-ft-sa').textContent=sa_t;
+  document.getElementById('st-ft-sb').textContent=sb_t;
+  document.getElementById('st-ft-t').textContent=total;
 }
 
 // ── 1. OPEN POSITIONS ────────────────────────────────────
@@ -3038,7 +3174,7 @@ async function loadPositions(){
   if(!d){
     setDot('pos-dot',false,'Failed — server error or timeout');
     document.getElementById('pos-meta').textContent='error — will retry';
-    if(tb)tb.innerHTML='<tr><td colspan="15" class="nodata r">⚠ Failed to load — auto-retry in 10s</td></tr>';
+    if(tb)tb.innerHTML=emptyRow(15,'⚠ Verbindingsfout — auto-retry in 10s');
     setTimeout(loadPositions,10000);return;
   }
   document.getElementById('pos-meta').textContent=d.count+' open';
@@ -3052,17 +3188,14 @@ async function loadPositions(){
   const bal=d.balance||1;
   tb.innerHTML=d.positions.map(p=>{
     const slU=p.slPctUsed||0;
-    // RR now: distance traveled in direction / SL distance
     const slDist=p.sl&&p.entry?Math.abs(p.entry-p.sl):0;
     const priceDist=p.currentPrice&&p.entry?
       (p.direction==='buy'?(p.currentPrice-p.entry):(p.entry-p.currentPrice)):null;
     const rrNow=slDist>0&&priceDist!=null?parseFloat((priceDist/slDist).toFixed(2)):null;
     const rrNowCls=rrNow==null?'d':rrNow>=1?'g':rrNow>=0?'y':'r';
     const tpRR=p.tpRRActual??p.tpRR;
-    // actualRiskPct directly from API — falls back to riskPct if null
     const riskPctShow=p.actualRiskPct??p.riskPct;
     const riskPctCls=riskPctShow==null?'d':riskPctShow>0.35?'r':riskPctShow>0.25?'o':'g';
-    // price decimals by type
     const isFx=FOREX.includes(p.symbol);const isIdx=INDEX.includes(p.symbol);
     const dec=isFx?5:isIdx?2:2;
     return\`<tr class="\${tClass(p.symbol)}">
@@ -3083,7 +3216,7 @@ async function loadPositions(){
   }).join('');
 }
 
-// ── 2. ACTIVE GHOSTS ─────────────────────────────────────
+// ── 2. ACTIVE GHOSTS — per trade ─────────────────────────
 async function loadGhosts(){
   const d=await api('/live/ghosts');
   if(!d){
@@ -3095,7 +3228,7 @@ async function loadGhosts(){
   setDot('gh-dot',true,'OK');
   document.getElementById('k-gh').textContent=d?.count??'?';
   const tb=document.getElementById('gh-body');
-  if(!d||!d.ghosts?.length){tb.innerHTML='<tr><td colspan="9" class="nodata">No active ghosts</td></tr>';return;}
+  if(!d||!d.ghosts?.length){tb.innerHTML=emptyRow(9);return;}
   tb.innerHTML=d.ghosts.map(g=>{
     const type=sTypeName(g.symbol);
     return\`<tr class="\${tClass(g.symbol)}">
@@ -3112,10 +3245,7 @@ async function loadGhosts(){
   }).join('');
 }
 
-// ── 3. EV / TP + SL OPTIMISER ────────────────────────────
-// EV cache op server kan 10-30s nodig hebben bij eerste start.
-// loadEV laadt trades en TP locks onmiddellijk.
-// EV data wordt apart opgehaald — als cache nog leeg is, wordt na 5s opnieuw geprobeerd (max 12×).
+// ── 3. EV / TP + SL OPTIMISER — ALL combos ───────────────
 async function loadEV(){
   const countD=await api('/trades?limit=1');
   const realLimit=countD?.count??5000;
@@ -3124,10 +3254,8 @@ async function loadEV(){
   _allTrades=trD.trades||[];
   _tpMap={};if(tpD)tpD.forEach(t=>{_tpMap[t.key]=t;});
   document.getElementById('k-tp').textContent=Object.values(_tpMap).filter(t=>(t.evAtLock??0)>0).length;
-  // Bouw DIRECT alle 424 combos — tabel zichtbaar met streepjes ook zonder EV data
   _buildCombos();
   setDot('ev-dot',true,'Trades geladen · EV data wordt opgehaald...');
-  // EV data laden in achtergrond — NIET awaiten zodat andere secties niet blokkeren
   _loadEVWithRetry().catch(()=>{});
 }
 
@@ -3138,11 +3266,9 @@ async function _loadEVWithRetry(attempt=0){
   if(evD&&evD.length>0){
     evD.forEach(e=>{_evMap[e.key]=e;});
     setDot('ev-dot',true,'EV: '+evD.filter(e=>e.count>0).length+' combos met data');
-    document.getElementById('ev-meta').textContent=evD.length+' combos · '+evD.filter(e=>e.count>0).length+' met ghost data';
     _buildCombos();
     return;
   }
-  // EV cache nog leeg op server — retry in achtergrond
   if(attempt<MAX){
     setDot('ev-dot',false,'EV cache opbouwen... ('+(attempt+1)+'/'+MAX+')');
     setTimeout(()=>_loadEVWithRetry(attempt+1),INTERVAL);
@@ -3153,7 +3279,6 @@ async function _loadEVWithRetry(attempt=0){
 
 function _buildCombos(){
   document.getElementById('k-tp').textContent=Object.values(_tpMap).filter(t=>(t.evAtLock??0)>0).length;
-  // Build combos — ALL symbol/session/dir/vwap combos, even with 0 closed trades
   const combos=[];
   const allSyms=[...FOREX,...INDEX,...COMM,...STOCKS];
   for(const sym of allSyms){
@@ -3163,19 +3288,14 @@ function _buildCombos(){
       for(const dir of['buy','sell']){
         for(const vwap of['above','below']){
           const key=sym+'_'+sess+'_'+dir+'_'+vwap;
-          // Closed MT5 trades — for P&L and combo activity indicator
           const trades=_allTrades.filter(t=>
             t.symbol===sym&&t.session===sess&&t.direction===dir&&
             t.vwapPosition===vwap&&t.closedAt!=null&&
             t.openedAt&&new Date(t.openedAt)>=TP_OPT_DATE
           );
           const totalPnl=trades.reduce((s,t)=>s+(t.realizedPnlEUR??t.currentPnL??0),0);
-          // EV data comes from ghost_trades via server /ev endpoint
           const ev=_evMap[key]??null;
           const tp=_tpMap[key]??null;
-          // avgRR from ghosts (server-computed ev.rrLevels[0].winRate is for all RR levels)
-          // Just use ev.bestRR and ev.avgMaxSlPct from server
-          const avgRR=ev?.avgRR??null;
           combos.push({sym,sess,dir,vwap,key,trades,totalPnl,type,ev,tp});
         }
       }
@@ -3193,51 +3313,57 @@ function renderEV(){
   if(evF.sess!=='all')d=d.filter(c=>c.sess===evF.sess);
   if(evF.dir!=='all')d=d.filter(c=>c.dir===evF.dir);
   if(evF.vwap!=='all')d=d.filter(c=>c.vwap===evF.vwap);
-  // min filter: based on ghost count from EV data
   if(evF.min==='5')d=d.filter(c=>(c.ev?.count??0)>=5);
   else if(evF.min==='10')d=d.filter(c=>(c.ev?.count??0)>=10);
-  else if(evF.min!=='1')d=d.filter(c=>(c.ev?.count??0)>=parseInt(evF.min));
-  // Sort: EV+ first, then by EV desc, then by ghost count
+  else if(evF.min==='1')d=d.filter(c=>(c.ev?.count??0)>=1);
+  // evF.min==='0' = toon alles, ook 0 ghosts
   d.sort((a,b)=>{
+    // First: combos with ghost data, then without
+    const ha=(a.ev?.count??0)>0, hb=(b.ev?.count??0)>0;
+    if(ha!==hb)return ha?-1:1;
     const ea=a.ev?.bestEV??-999,eb=b.ev?.bestEV??-999;
     if(eb!==ea)return eb-ea;
     return (b.ev?.count??0)-(a.ev?.count??0);
   });
   const withData=d.filter(c=>c.ev&&c.ev.count>0);
+  const withZero=d.filter(c=>!c.ev||c.ev.count===0);
   const pnl=d.reduce((s,c)=>s+c.totalPnl,0);
-  document.getElementById('ev-meta').textContent=d.length+' combos · '+withData.length+' met ghost data'+(_evMap&&Object.keys(_evMap).length===0?' · ⏳ EV data laden...':'');
-  document.getElementById('ev-count').textContent=d.length;
-  document.getElementById('ev-trades').textContent=withData.length+'/'+d.length;
-  document.getElementById('ev-winpct').textContent='—'; // win% is ghost-based (see EV column)
+  const totalCombos=d.length;
+  document.getElementById('ev-meta').textContent=totalCombos+' combos · '+withData.length+' met ghost data'+(_evMap&&Object.keys(_evMap).length===0?' · ⏳ EV data laden...':'');
+  document.getElementById('ev-count').textContent=totalCombos;
+  document.getElementById('ev-trades').textContent=withData.length;
+  document.getElementById('ev-zero').textContent=withZero.length;
   const pEl=document.getElementById('ev-pnl');pEl.textContent=(pnl>=0?'+':'')+'€'+pnl.toFixed(0);pEl.className='sv2 '+pC(pnl);
   document.getElementById('ev-locked').textContent=d.filter(c=>c.tp&&(c.ev?.bestEV??0)>0).length;
   const tb=document.getElementById('ev-body');
   if(!d.length){
-    tb.innerHTML='<tr><td colspan="15" class="nodata d">Geen combos met huidige filters</td></tr>';
+    tb.innerHTML=emptyRow(16,'Geen combos met huidige filters');
     return;
   }
   tb.innerHTML=d.map(c=>{
     const ev=c.ev;const tp=c.tp;
     const evV=ev?.bestEV??null;
     const ghostN=ev?.count??0;
+    const tradeN=c.trades?.length??0;
     const ready=ghostN>=5;
-    // bestTP: locked RR from TP lock > server EV bestRR > null (never show 1.0R default)
     const bestTP=tp?tp.lockedRR:(ev?.bestRR??null);
     const avgTimeMin=ev?.avgTimeToSLMin??null;
     const avgSlPct=ev?.avgMaxSlPct??null;
-    // Best SL% from winners: from ev data (server computes this)
     const bestSlW=ev?.bestWinnerSlPct??null;
-    return\`<tr class="\${tClass(c.sym)}\${ghostN===0?' opacity:0.45':''}">
+    // row opacity: lighter if no data at all
+    const rowStyle=ghostN===0&&tradeN===0?' style="opacity:.45"':'';
+    return\`<tr class="\${tClass(c.sym)}"\${rowStyle}>
       <td data-val="\${c.sym}" class="b fw">\${c.sym}</td>
       <td>\${tyBadge(c.type)}</td>
       <td>\${sBadge(c.sess)}</td>
       <td>\${dBadge(c.dir)}</td>
       <td>\${vBadge(c.vwap)}</td>
-      <td data-val="\${ghostN}" class="\${ready?'y fw':ghostN>0?'c':'d'}">\${ghostN===0?'<span class="d">—</span>':ghostN+(ready?'':' <span class="d" style="font-size:8px">('+(5-ghostN)+'→5)</span>')}</td>
+      <td data-val="\${ghostN}" class="\${ready?'y fw':ghostN>0?'c':'d'}">\${ghostN===0?'<span class="d">0</span>':ghostN+(ready?'':' <span class="d" style="font-size:8px">('+(5-ghostN)+'→5)</span>')}</td>
+      <td data-val="\${tradeN}" class="\${tradeN>0?'b':'d'}">\${tradeN}</td>
       <td data-val="\${bestTP??-99}" class="\${bestTP?'g fw':'d'}">\${bestTP!=null?f(bestTP,1)+'R':'—'}</td>
       <td data-val="\${ev?.avgRR??-99}" class="\${(ev?.avgRR??0)>=1?'g':'d'}">\${ev?.avgRR!=null?f(ev.avgRR,2)+'R':'—'}</td>
       <td data-val="\${evV??-999}" class="\${evC(evV)} fw">\${evV!=null?evV.toFixed(3):'—'}</td>
-      <td>\${ready?(evV!=null?(evV>0?'<span class="bd bd-evp">EV+ ✓</span>':'<span class="bd bd-evn">EV-</span>'):'<span class="bd d">pending</span>'):('<span class="d" style="font-size:9px">'+(ghostN>0?'need '+(5-ghostN)+' more':'no data')+'</span>')</td>
+      <td>\${ready?(evV!=null?(evV>0?'<span class="bd bd-evp">EV+ ✓</span>':'<span class="bd bd-evn">EV-</span>'):'<span class="bd d">pending</span>'):('<span class="d" style="font-size:9px">'+(ghostN>0?'need '+(5-ghostN)+' more':'geen data')+'</span>')}</td>
       <td>\${tp?\`<span class="bd bd-lck">★ \${tp.lockedRR.toFixed(1)}R</span>\`:'<span class="d">—</span>'}</td>
       <td data-val="\${avgTimeMin??9999}" class="d">\${avgTimeMin!=null?avgTimeMin+'min':'—'}</td>
       <td data-val="\${avgSlPct??-1}" class="\${avgSlPct!=null?(avgSlPct<50?'g':avgSlPct<80?'y':'o'):'d'}" title="Avg max SL% used — lower = can tighten">\${avgSlPct!=null?f(avgSlPct,1)+'%':'—'}</td>
@@ -3250,36 +3376,64 @@ function renderEV(){
 function setEVF(k,v,btn){evF[k]=v;btn.closest('.fbar').querySelectorAll('.fb').forEach(b=>{if(b.getAttribute('onclick')?.includes("'"+k+"'"))b.classList.remove('on');});btn.classList.add('on');renderEV();}
 
 
-// ── 4. GHOST HISTORY ─────────────────────────────────────
+// ── 4. GHOST HISTORY — COMBINED per optimizer_key ────────
 async function loadGhostHistory(){
-  const d=await api('/ghosts/history?limit=200');
+  const d=await api('/ghosts/history?limit=2000');
   if(!d){setDot('ghh-dot',false,'Failed — retry in 10s');setTimeout(loadGhostHistory,10000);return;}
   const rows=d?.rows||d||[];
-  document.getElementById('ghh-meta').textContent=rows.length+' closed ghosts';
   setDot('ghh-dot',true,'OK — '+rows.length+' records');
-  const tb=document.getElementById('ghh-body');
-  if(!rows.length){tb.innerHTML='<tr><td colspan="10" class="nodata">No closed ghost data yet</td></tr>';return;}
-  tb.innerHTML=rows.map(g=>{
-    const type=sTypeName(g.symbol||'');
+
+  // Aggregate by optimizer key
+  const byKey={};
+  for(const g of rows){
+    const key=g.optimizerKey||(g.symbol+'_'+g.session+'_'+g.direction+'_'+(g.vwapPosition||'unknown'));
+    if(!byKey[key]) byKey[key]={
+      sym:g.symbol,sess:g.session,dir:g.direction,vwap:g.vwapPosition,
+      count:0,bestMaxRR:0,sumRR:0,sumSLPct:0,nSL:0,sumTime:0,nTime:0,
+      lastOpenedAt:g.openedAt,reasons:{}
+    };
+    const b=byKey[key];
+    b.count++;
     const maxRR=g.maxRRBeforeSL??g.maxRR??0;
-    const maxSlP=g.maxSlPctUsed??g.slPctUsed??null;
-    const tMin=g.timeToSLMin??null;
+    b.bestMaxRR=Math.max(b.bestMaxRR,maxRR);
+    b.sumRR+=maxRR;
+    const slPct=g.maxSlPctUsed??g.slPctUsed;
+    if(slPct!=null){b.sumSLPct+=slPct;b.nSL++;}
+    const tMin=g.timeToSLMin;
+    if(tMin!=null){b.sumTime+=tMin;b.nTime++;}
     let cr=g.stopReason||g.closeReason||'sl';
     if(maxRR>=15)cr='maxRR';
     else if(tMin!=null&&tMin>=20160)cr='timeout';
     else if(cr==='phantom_sl'||cr==='sl')cr='sl';
     else if(cr==='timeout_72h')cr='timeout';
-    return\`<tr class="\${tClass(g.symbol||'')}">
-      <td data-val="\${g.symbol}" class="b fw">\${g.symbol||'—'}</td>
+    b.reasons[cr]=(b.reasons[cr]||0)+1;
+    if(g.openedAt>b.lastOpenedAt)b.lastOpenedAt=g.openedAt;
+  }
+  const combined=Object.values(byKey);
+  document.getElementById('ghh-meta').textContent=combined.length+' combinaties · '+rows.length+' individuele ghosts';
+  const tb=document.getElementById('ghh-body');
+  if(!combined.length){tb.innerHTML=emptyRow(12);return;}
+  combined.sort((a,b)=>b.count-a.count);
+  tb.innerHTML=combined.map(g=>{
+    const type=sTypeName(g.sym||'');
+    const avgRR=g.count>0?(g.sumRR/g.count):0;
+    const avgSL=g.nSL>0?(g.sumSLPct/g.nSL):null;
+    const avgT=g.nTime>0?Math.round(g.sumTime/g.nTime):null;
+    // dominant reason
+    const topReason=Object.entries(g.reasons).sort((a,b)=>b[1]-a[1])[0]?.[0]||'sl';
+    return\`<tr class="\${tClass(g.sym||'')}">
+      <td data-val="\${g.sym}" class="b fw">\${g.sym||'—'}</td>
       <td>\${tyBadge(type)}</td>
-      <td>\${sBadge(g.session)}</td>
-      <td>\${dBadge(g.direction)}</td>
-      <td>\${vBadge(g.vwapPosition)}</td>
-      <td data-val="\${maxRR}" class="\${maxRR>0?'g':'d'} fw">\${f(maxRR,2)}R</td>
-      <td data-val="\${maxSlP??-1}" class="\${maxSlP!=null?(maxSlP<50?'g':maxSlP<80?'y':'o'):'d'}">\${maxSlP!=null?f(maxSlP,0)+'%':'—'}</td>
-      <td data-val="\${tMin??9999}" class="d">\${tMin!=null?tMin+'min':'—'}</td>
-      <td>\${cBadge(cr)}</td>
-      <td data-val="\${g.openedAt||''}" class="d" style="font-size:9px">\${dtTs(g.openedAt)}</td>
+      <td>\${sBadge(g.sess)}</td>
+      <td>\${dBadge(g.dir)}</td>
+      <td>\${vBadge(g.vwap)}</td>
+      <td data-val="\${g.count}" class="\${g.count>=5?'y fw':'c'}">\${g.count}</td>
+      <td data-val="\${g.bestMaxRR}" class="\${g.bestMaxRR>0?'g':'d'} fw">\${f(g.bestMaxRR,2)}R</td>
+      <td data-val="\${avgRR}" class="\${avgRR>=1?'g':avgRR>0?'y':'d'}">\${f(avgRR,2)}R</td>
+      <td data-val="\${avgSL??-1}" class="\${avgSL!=null?(avgSL<50?'g':avgSL<80?'y':'o'):'d'}">\${avgSL!=null?f(avgSL,0)+'%':'—'}</td>
+      <td data-val="\${avgT??9999}" class="d">\${avgT!=null?avgT+'min':'—'}</td>
+      <td>\${cBadge(topReason)}</td>
+      <td data-val="\${g.lastOpenedAt||''}" class="d" style="font-size:9px">\${dtTs(g.lastOpenedAt)}</td>
     </tr>\`;
   }).join('');
 }
@@ -3325,7 +3479,7 @@ async function loadBandSignals(minPct,maxPct,prefix){
   const tb=document.getElementById(prefix+'-body');
   const strip=document.getElementById(prefix+'-strip');
   if(!rows.length){
-    tb.innerHTML=\`<tr><td colspan="9" class="nodata">No ghost data yet for \${tier.replace('_','%–')}% — ghosts start on next rejected signal</td></tr>\`;
+    tb.innerHTML=emptyRow(9,\`Geen ghost data voor \${tier.replace('_','%–')}%\`);
     if(strip)strip.style.display='none';return;
   }
   const totalN=rows.reduce((s,r)=>s+(+r.n||0),0);
@@ -3362,10 +3516,9 @@ function buildMatrix(combos){
       return'<tr>'+[
         \`<td class="sym">\${sym}</td>\`,
         ...[['buy','above'],['buy','below'],['sell','above'],['sell','below']].map(([dir,vwap])=>{
-          const sess=STOCKS.includes(sym)?'ny':null; // for stocks show ny only
+          const sess=STOCKS.includes(sym)?'ny':null;
           const keys=sess?[sym+'_'+sess+'_'+dir+'_'+vwap]:
             ['asia','london','ny'].map(s=>sym+'_'+s+'_'+dir+'_'+vwap);
-          // aggregate across sessions for non-stocks
           const cs=keys.map(k=>byKey[k]).filter(Boolean);
           const n=cs.reduce((s,c)=>s+c.trades.length,0);
           if(!n)return\`<td class="ez">—</td>\`;
@@ -3386,7 +3539,6 @@ function buildMatrix(combos){
 // ── 7. COMBO SELECTION ────────────────────────────────────
 function renderComboFilter(combos){
   let d=[...combos];
-  // Only show combos with ghost data or closed trades for combo filter
   if(cfF.show==='all')d=d.filter(c=>(c.ev?.count??0)>0||c.trades?.length>0||c.totalPnl!==0);
   else if(cfF.show==='ev+')d=d.filter(c=>(c.ev?.bestEV??0)>0);
   else if(cfF.show==='ev-')d=d.filter(c=>c.ev?.bestEV!=null&&c.ev.bestEV<0);
@@ -3396,7 +3548,7 @@ function renderComboFilter(combos){
   else if(cfF.sort==='winpct')d.sort((a,b)=>(b.ev?.bestEV??-999)-(a.ev?.bestEV??-999));
   else if(cfF.sort==='trades')d.sort((a,b)=>(b.ev?.count??0)-(a.ev?.count??0));
   const tb=document.getElementById('cf-body');
-  if(!d.length){tb.innerHTML='<tr><td colspan="11" class="nodata">No traded combos yet</td></tr>';return;}
+  if(!d.length){tb.innerHTML=emptyRow(11,'No traded combos yet');return;}
   tb.innerHTML=d.map((c,i)=>{
     const evV=c.ev?.bestEV??null;
     const ghostN=c.ev?.count??0;
@@ -3415,7 +3567,7 @@ function renderComboFilter(combos){
       <td>\${sBadge(c.sess)}</td>
       <td>\${dBadge(c.dir)}</td>
       <td>\${vBadge(c.vwap)}</td>
-      <td class="\${ready?'y fw':ghostN>0?'c':'d'}">\${ghostN||'—'}</td>
+      <td class="\${ready?'y fw':ghostN>0?'c':'d'}">\${ghostN||'0'}</td>
       <td class="\${(c.ev?.avgRR??0)>=1?'g':c.ev?.avgRR!=null?'r':'d'}">\${c.ev?.avgRR!=null?f(c.ev.avgRR,2)+'R':'—'}</td>
       <td class="\${evC(evV)} fw">\${evV!=null?evV.toFixed(3):'—'}</td>
       <td class="\${pC(c.totalPnl)}">\${eu(c.totalPnl)}</td>
@@ -3443,22 +3595,18 @@ async function loadSignalStats(){
 async function prepareDeploy(){
   const statusEl=document.getElementById('deploy-status');
   const btn=document.getElementById('deploy-btn');
-  // Step 1: Check status
   const st=await api('/admin/deploy-status');
   if(!st){statusEl.textContent='Error checking status';return;}
   if(st.safeToDeployNow){statusEl.textContent='✓ Already safe to deploy — 0 positions, 0 ghosts';return;}
-  // Step 2: Confirm
-  const msg='PREPARE DEPLOY\n\n'+(st.recommendation||'')+'\n\nThis will:\n1. Close '+st.openPositions+' open MT5 position(s)\n2. Finalize '+st.activeGhosts+' active ghost(s) to DB\n\nContinue?'
+  const msg='PREPARE DEPLOY\\n\\n'+(st.recommendation||'')+'\\n\\nThis will:\\n1. Close '+st.openPositions+' open MT5 position(s)\\n2. Finalize '+st.activeGhosts+' active ghost(s) to DB\\n\\nContinue?'
   if(!confirm(msg))return;
   btn.disabled=true;statusEl.textContent='Closing positions...';
-  // Step 3: Close positions
   const secret=prompt('Enter WEBHOOK_SECRET:');
   if(!secret){btn.disabled=false;return;}
   const r1=await fetch(\`/admin/close-all-positions?secret=\${encodeURIComponent(secret)}\`,{method:'POST'});
   const d1=await r1.json().catch(()=>({}));
   if(d1.status!=='OK'){statusEl.textContent='Error closing positions: '+(d1.error||'unknown');btn.disabled=false;return;}
   statusEl.textContent=\`Closed \${d1.closed} position(s). Finalizing ghosts...\`;
-  // Step 4: Finalize ghosts
   const r2=await fetch(\`/admin/finalize-all-ghosts?secret=\${encodeURIComponent(secret)}\`,{method:'POST'});
   const d2=await r2.json().catch(()=>({}));
   if(d2.status!=='OK'){statusEl.textContent='Error finalizing ghosts: '+(d2.error||'unknown');btn.disabled=false;return;}
@@ -3472,14 +3620,14 @@ async function loadShadowCount(){
   document.getElementById('k-sl').textContent=d?.results?.length??'?';
 }
 
-let _loadErrors=0,_lastLoad=null;
+let _loadErrors=0;
 async function loadAll(){
   const t0=Date.now();
+  _lastLoadMs=t0;
   const gsText=document.getElementById('gs-text');
   const gsTime=document.getElementById('gs-time');
   if(gsText)gsText.textContent='Laden...';
 
-  // Hard 15s outer timeout — zelfs als een sectie hangt, update de status bar
   const timeout=new Promise(res=>setTimeout(()=>res('timeout'),15000));
   const work=Promise.allSettled([
     loadTradeStats().catch(e=>{console.error('[stats]',e?.message);return null;}),
@@ -3508,6 +3656,7 @@ document.addEventListener('DOMContentLoaded',()=>{
 });
 
 
+
 // 404
 app.use((req, res) => res.status(404).json({ error: "Route not found", route: `${req.method} ${req.originalUrl}` }));
 
@@ -3516,7 +3665,7 @@ async function start() {
   const missing = ["META_API_TOKEN", "META_ACCOUNT_ID", "WEBHOOK_SECRET"].filter(k => !process.env[k]);
   if (missing.length) { console.error(`[ERR] Missing env: ${missing.join(", ")}`); process.exit(1); }
 
-  console.log("🚀 PRONTO-AI v12.0 starting...");
+  console.log("🚀 PRONTO-AI v12.1 starting...");
   await initDB();
 
   // Load closed trades
@@ -3590,16 +3739,16 @@ async function start() {
   rebuildEVCache().catch(() => {});
 
   app.listen(PORT, () => {
-    console.log(`[✓] PRONTO-AI v12.0 on port ${PORT}`);
+    console.log(`[✓] PRONTO-AI v12.1 on port ${PORT}`);
     console.log(`   🔹 Dashboard:      /`);
     console.log(`   🔹 Health:         /health`);
     console.log(`   🔹 EV Table:       /ev`);
     console.log(`   🔹 Shadow SL:      /shadow`);
     console.log(`   🔹 TP Locks:       /tp-locks`);
     console.log(`   🔹 Risk Config:    /risk-config`);
-    console.log(`   🔹 Lot Overrides:  /lot-overrides`);
     console.log(`   🔹 Risk Mults:     /risk-multipliers`);
     console.log(`   🔹 Signal Stats:   /signal-stats`);
+    console.log(`   🔹 Rejects:        /signal-stats/rejects`);
     console.log(`   🔹 Spread Stats:   /spread-stats?symbol=EURUSD&session=london`);
     console.log(`   🔹 Spread Log:     /spread-log?symbol=EURUSD&limit=200`);
     console.log(`   🔹 Webhook:        POST /webhook?secret=<secret>`);
