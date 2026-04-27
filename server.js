@@ -1,6 +1,24 @@
 // ===============================================================
-// server.js  v12.1  |  PRONTO-AI
+// server.js  v12.1.3  |  PRONTO-AI
 // TradingView → MetaApi REST → FTMO MT5
+//
+// v12.1.3 — GHOST TRACKER maxRR FIX + BLOCKED TRADES DASHBOARD (27 April 2026):
+//
+//  FIX G1 — Ghost tick maxPrice sync:
+//    Ghost tick neemt nu de BESTE prijs van 3 bronnen:
+//    1. fetchCurrentPrice() (eigen MT5 call)
+//    2. openPositions[id].maxPrice (bijgehouden door syncOpenPositions elke 55s)
+//    3. openPositions[id].currentPrice (actuele prijs)
+//    Gunstige pieken die tussen ghost ticks (30s) vielen worden nu niet meer gemist.
+//
+//  FIX G2 — /live/ghosts maxRR display:
+//    Dashboard endpoint gebruikt nu ook bestMaxPrice (beste van g.maxPrice
+//    en openPositions.maxPrice) voor eerlijke maxRR weergave.
+//
+//  NEW B1 — Blocked signals teller in dashboard:
+//    Trade Stats sectie toont nu een tweede blok met geblokkeerde signalen:
+//    totaal geblokt + opdeling per reject-reden categorie.
+//    Telt vanuit signals_log tabel (outcome=REJECTED/BLOCKED/SKIPPED).
 //
 // v12.1 — BUGFIXES + REJECTS ENDPOINT (27 April 2026):
 //
@@ -830,7 +848,25 @@ function startGhostTracker(pos, restoreData = null) {
       const phantomSL = g.sl;  // fixed at trade-open, never changes
 
       const priceData = await fetchCurrentPrice(mt5Symbol);
-      const price     = priceData?.mid ?? null;
+      const rawPrice  = priceData?.mid ?? null;
+
+      // FIX v12.1.3: sync maxPrice vanuit openPositions tracker (syncOpenPositions loopt
+      // onafhankelijk en pikt gunstige pieken op die tussen ghost ticks vallen).
+      // Neem de BESTE van: live MT5 prijs + openPositions.maxPrice + eigen maxPrice.
+      const livePos   = openPositions[positionId];
+      const livePosMaxPrice = livePos?.maxPrice ?? null;
+      const livePosCurrentPrice = livePos?.currentPrice ?? null;
+
+      // Beste kandidaat prijs = meest gunstige van alle bronnen
+      let price = rawPrice;
+      if (direction === "buy") {
+        if (livePosMaxPrice != null && livePosMaxPrice > (price ?? -Infinity)) price = livePosMaxPrice;
+        if (livePosCurrentPrice != null && livePosCurrentPrice > (price ?? -Infinity)) price = livePosCurrentPrice;
+      } else {
+        if (livePosMaxPrice != null && livePosMaxPrice < (price ?? Infinity)) price = livePosMaxPrice;
+        if (livePosCurrentPrice != null && livePosCurrentPrice < (price ?? Infinity)) price = livePosCurrentPrice;
+      }
+
       if (price !== null) {
         // Track max favorable movement
         const better = direction === "buy" ? price > maxPrice : price < maxPrice;
@@ -2061,15 +2097,26 @@ app.get("/live/positions", (req, res) => {
 
 app.get("/live/ghosts", (req, res) => {
   const ghosts = Object.values(ghostTrackers).map(g => {
-    const livePos  = openPositions[g.positionId];
-    const liveSL   = livePos?.sl ?? g.sl;
-    const livePrice = livePos?.currentPrice ?? g.maxPrice;
+    const livePos     = openPositions[g.positionId];
+    const liveSL      = livePos?.sl ?? g.sl;
+    const livePrice   = livePos?.currentPrice ?? g.maxPrice;
+
+    // FIX v12.1.3: neem de beste maxPrice van alle bronnen voor eerlijke maxRR display.
+    // openPositions.maxPrice wordt bijgewerkt door syncOpenPositions() elke 55s — pikt
+    // gunstige pieken op die tussen ghost ticks (30s) vallen.
+    let bestMaxPrice = g.maxPrice ?? g.entry;
+    const livePosMax = livePos?.maxPrice;
+    if (livePosMax != null) {
+      if (g.direction === "buy"  && livePosMax > bestMaxPrice) bestMaxPrice = livePosMax;
+      if (g.direction === "sell" && livePosMax < bestMaxPrice) bestMaxPrice = livePosMax;
+    }
+
     return {
       positionId: g.positionId, symbol: g.symbol, optimizerKey: g.optimizerKey,
       direction: g.direction, session: g.session, vwapPosition: g.vwapPosition,
-      entry: g.entry, sl: liveSL, maxPrice: g.maxPrice,
+      entry: g.entry, sl: liveSL, maxPrice: bestMaxPrice,
       phantomSL: liveSL,
-      maxRR: calcMaxRR(g.direction, g.entry, liveSL, g.maxPrice),
+      maxRR: calcMaxRR(g.direction, g.entry, liveSL, bestMaxPrice),
       tpRRUsed: g.tpRRUsed,
       elapsedMin: Math.round((Date.now() - g.startTs) / 60000),
       openedAt: g.openedAt,
@@ -2757,6 +2804,48 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
     </tr></tfoot>
   </table>
   </div>
+
+  <!-- BLOCKED SIGNALS BLOCK — v12.1.3 -->
+  <div style="margin-top:14px;border-top:1px solid var(--bdr2);padding-top:12px">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
+      <span style="color:var(--r);font-size:11px;font-weight:700;letter-spacing:.06em">▸ GEBLOKKEERDE SIGNALEN</span>
+      <span style="color:var(--dim);font-size:9px" id="blk-meta">laden...</span>
+    </div>
+    <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:10px">
+      <div style="background:var(--bg2);border:1px solid var(--bdr2);border-radius:4px;padding:8px 14px;min-width:90px">
+        <div style="color:var(--dim);font-size:8px;margin-bottom:2px">TOTAAL GEBLOKT</div>
+        <div style="color:var(--r);font-size:20px;font-weight:700" id="blk-total">—</div>
+      </div>
+      <div style="background:var(--bg2);border:1px solid var(--bdr2);border-radius:4px;padding:8px 14px;min-width:90px">
+        <div style="color:var(--dim);font-size:8px;margin-bottom:2px">DUPLICATE</div>
+        <div style="color:var(--o);font-size:20px;font-weight:700" id="blk-dup">—</div>
+      </div>
+      <div style="background:var(--bg2);border:1px solid var(--bdr2);border-radius:4px;padding:8px 14px;min-width:90px">
+        <div style="color:var(--dim);font-size:8px;margin-bottom:2px">VWAP EXHAUSTED</div>
+        <div style="color:var(--y);font-size:20px;font-weight:700" id="blk-vwap">—</div>
+      </div>
+      <div style="background:var(--bg2);border:1px solid var(--bdr2);border-radius:4px;padding:8px 14px;min-width:90px">
+        <div style="color:var(--dim);font-size:8px;margin-bottom:2px">BUITEN WINDOW</div>
+        <div style="color:var(--dim);font-size:20px;font-weight:700" id="blk-win">—</div>
+      </div>
+      <div style="background:var(--bg2);border:1px solid var(--bdr2);border-radius:4px;padding:8px 14px;min-width:90px">
+        <div style="color:var(--dim);font-size:8px;margin-bottom:2px">CURRENCY BUDGET</div>
+        <div style="color:var(--c);font-size:20px;font-weight:700" id="blk-cur">—</div>
+      </div>
+      <div style="background:var(--bg2);border:1px solid var(--bdr2);border-radius:4px;padding:8px 14px;min-width:90px">
+        <div style="color:var(--dim);font-size:8px;margin-bottom:2px">OVERIGE</div>
+        <div style="color:var(--dim);font-size:20px;font-weight:700" id="blk-oth">—</div>
+      </div>
+    </div>
+    <div style="overflow-x:auto">
+    <table id="blk-tbl" style="font-size:10px">
+      <thead><tr>
+        <th>Reden</th><th>Symbol</th><th>Dir</th><th>Sessie</th><th style="color:var(--r)">Aantal</th>
+      </tr></thead>
+      <tbody id="blk-body"><tr><td colspan="5" style="color:var(--dim);text-align:center">laden...</td></tr></tbody>
+    </table>
+    </div>
+  </div>
 </div>
 
 <!-- 1. OPEN POSITIONS -->
@@ -3163,6 +3252,42 @@ async function loadTradeStats(){
   document.getElementById('st-ft-sa').textContent=sa_t;
   document.getElementById('st-ft-sb').textContent=sb_t;
   document.getElementById('st-ft-t').textContent=total;
+}
+
+// ── 0b. BLOCKED SIGNALS ── v12.1.3 ───────────────────────────────
+async function loadBlockedSignals(){
+  const d = await api('/signal-stats/rejects');
+  if(!d){ document.getElementById('blk-meta').textContent='fout bij laden'; return; }
+  const total = d.total ?? 0;
+  document.getElementById('blk-meta').textContent = total + ' geblokkeerde signalen (alle tijd)';
+  document.getElementById('blk-total').textContent = total || '0';
+
+  // Tel per categorie
+  const byO = {};
+  (d.byOutcome||[]).forEach(r => { byO[r.outcome] = r.pairs?.reduce((s,p)=>s+p.count,0) ?? 0; });
+  const dupCount  = (byO['DUPLICATE_OPEN']??0) + (byO['DUPLICATE_BLOCKED']??0) + (byO['DUPLICATE']??0);
+  const vwapCount = (byO['VWAP_BAND_EXHAUSTED']??0) + (byO['VWAP_EXHAUSTED']??0);
+  const winCount  = (byO['OUTSIDE_WINDOW']??0) + (byO['OUTSIDE_HOURS']??0);
+  const curCount  = (byO['CURRENCY_BUDGET']??0) + (byO['BUDGET_EXHAUSTED']??0);
+  const othCount  = total - dupCount - vwapCount - winCount - curCount;
+
+  document.getElementById('blk-dup').textContent  = dupCount  || '0';
+  document.getElementById('blk-vwap').textContent = vwapCount || '0';
+  document.getElementById('blk-win').textContent  = winCount  || '0';
+  document.getElementById('blk-cur').textContent  = curCount  || '0';
+  document.getElementById('blk-oth').textContent  = Math.max(0, othCount) || '0';
+
+  // Top pairs tabel
+  const tb = document.getElementById('blk-body');
+  const top = (d.topPairs||[]).slice(0, 30);
+  if(!top.length){ tb.innerHTML='<tr><td colspan="5" style="color:var(--dim);text-align:center">geen geblokkeerde signalen</td></tr>'; return; }
+  tb.innerHTML = top.map(p => \`<tr>
+    <td style="color:var(--o);font-size:9px;max-width:220px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="\${p.outcome}">\${p.outcome}</td>
+    <td class="b fw">\${p.symbol||'?'}</td>
+    <td>\${p.direction?dBadge(p.direction):'-'}</td>
+    <td>\${p.session?sBadge(p.session):'-'}</td>
+    <td class="r fw">\${p.count}</td>
+  </tr>\`).join('');
 }
 
 // ── 1. OPEN POSITIONS ────────────────────────────────────
@@ -3633,6 +3758,7 @@ async function loadAll(){
   const timeout=new Promise(res=>setTimeout(()=>res('timeout'),15000));
   const work=Promise.allSettled([
     loadTradeStats().catch(e=>{console.error('[stats]',e?.message);return null;}),
+    loadBlockedSignals().catch(e=>{console.error('[blocked]',e?.message);return null;}),
     loadPositions().catch(e=>{console.error('[pos]',e?.message);return null;}),
     loadGhosts().catch(e=>{console.error('[ghost]',e?.message);return null;}),
     loadEV().catch(e=>{console.error('[ev]',e?.message);return null;}),
