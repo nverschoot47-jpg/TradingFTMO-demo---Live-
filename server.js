@@ -1,5 +1,5 @@
 // ===============================================================
-// server.js  v11.3  |  PRONTO-AI
+// server.js  v12.0  |  PRONTO-AI
 // TradingView → MetaApi REST → FTMO MT5
 //
 // v11.3 — PHANTOM TRADE FIX + STOCK VOLUME STEP (21 April 2026):
@@ -197,7 +197,6 @@ const {
   computeEVStats,
   loadSignalStats,
   loadShadowWinners,
-  saveLotOverride, loadLotOverrides,
   saveKeyRiskMult, loadKeyRiskMults,
   fetchRealizedPnl,
   saveSpreadLog, loadSpreadStats, loadSpreadLog,
@@ -549,9 +548,7 @@ async function recalcLotsAfterSL(symbol, entry, sl) {
     if (!dist) return;
     // v10.6: puur balance × pct (geen multipliers in baseLots)
     const baseLots = parseFloat((balance * pct / (dist * lotVal)).toFixed(2));
-    lotOverrides[symbol] = baseLots;
-    await saveLotOverride(symbol, baseLots).catch(() => {});
-    console.log(`[LotRecalc] ${symbol} → base lots = ${baseLots} (persisted to DB)`);
+    console.log(`[LotRecalc] ${symbol} → base lots = ${baseLots} (v12: geen override opslaan)`);
     logEvent({ type: "LOT_RECALC", symbol, baseLots, slDist: dist, balance, riskPct: pct });
   } catch (e) { console.warn("[LotRecalc]", e.message); }
 }
@@ -1503,7 +1500,9 @@ app.post("/webhook", async (req, res) => {
   if (bandWidth > 0 && vwapMid > 0) {
     const distFromMid = Math.abs(closePrice - vwapMid);
     vwapBandPct = parseFloat((distFromMid / (bandWidth / 2)).toFixed(3));
-    if (vwapBandPct > 2.5) {
+    // VWAP band threshold: stocks 250% (NY market hours only), forex/index/commodity 150%
+    const vwapBandThreshold = assetType === 'stock' ? 2.5 : 1.5;
+    if (vwapBandPct > vwapBandThreshold) {
       const reason = `VWAP_BAND_EXHAUSTED: ${(vwapBandPct * 100).toFixed(0)}% into band`;
       logReject("VWAP_BAND_EXHAUSTED", { symbol: symKey, direction, session, optimizerKey, reason, payload: {
         closePrice, vwapMid, vwapUpper, vwapLower,
@@ -1516,7 +1515,9 @@ app.post("/webhook", async (req, res) => {
 
       // ── Ghost 2.0: start a band ghost for this rejected signal ──────
       const pct = vwapBandPct;
-      const bandTier = pct >= 3.5 ? "350_500" : "250_350";
+      const bandTier = assetType === 'stock'
+        ? (pct >= 3.5 ? "350_500" : "250_350")
+        : (pct >= 2.5 ? "250_350" : "150_250");
       if (pct < 5.0) {
         const tempSLForBand   = calcSLFromDerivedPct(direction, closePrice, derivedSlPct);
         const enforcedSLBand  = enforceMinStop(mt5Symbol, direction, closePrice, tempSLForBand);
@@ -1622,18 +1623,11 @@ app.post("/webhook", async (req, res) => {
   const tempDist = Math.abs((closePrice || 1) - tempSL);
 
   let lots;
-  if (lotOverrides[symKey]) {
-    // Lot override: baseLots × evMult × dayMult (of ×1 voor neutraal)
-    const base = lotOverrides[symKey];
-    lots = isEvPlus
-      ? parseFloat((base * evMult * dayMult).toFixed(2))
-      : parseFloat((base).toFixed(2));
-    console.log(`[Lots] ${symKey}: override=${base} evMult=${evMult.toFixed(2)} dayMult=${dayMult.toFixed(2)} = ${lots}`);
-  } else {
-    // Live lotVal van MT5 spec — gecached na eerste keer
+  {
+    // v12.0: geen lot overrides meer — altijd live MT5 spec berekening
     const calcResult = await calcLots(symKey, mt5Symbol, assetType, closePrice || 1, tempSL, riskEUR, evMult, dayMult);
     lots = calcResult.lots;
-    lotVal = calcResult.lotVal; // update lotVal met live waarde voor currency budget check
+    lotVal = calcResult.lotVal;
     console.log(`[Lots] ${symKey}: ${calcResult.source} lotVal=${lotVal} baseLots→${lots}`);
   }
 
@@ -1920,32 +1914,14 @@ app.post("/webhook", async (req, res) => {
     console.warn(`[TP_RR_TOO_LOW] ${positionId}: actualTPRR=${rrCheck.actualTPRR}R`);
   }
 
-  // Step D: Verfijn SL + TP op werkelijke executionPrice — retry 3×
-  // Pre-order SL/TP (preMt5SL/preMt5TP) zijn al actief als fallback in MT5.
-  let slTpSet = false;
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      await metaFetch(`/positions/${positionId}`, { method: "PUT", body: JSON.stringify({ stopLoss: mt5SL, takeProfit: mt5TP }) }, 8000);
-      console.log(`[SL/TP] ✓ ${positionId} → SL=${mt5SL} TP=${mt5TP} (${tpRR}R) exec=${executionPrice} attempt=${attempt}`);
-      if (preMt5SL !== mt5SL || preMt5TP !== mt5TP) {
-        console.log(`[SL/TP] Verfijnd t.o.v. pre-order: SL ${preMt5SL}→${mt5SL} TP ${preMt5TP}→${mt5TP} (slippage=${slippage})`);
-      }
-      slTpSet = true; break;
-    } catch (e) {
-      console.warn(`[SL/TP] attempt ${attempt}/3 failed: ${e.message}`);
-      if (attempt < 3) await new Promise(r => setTimeout(r, 2000 * attempt));
-    }
-  }
-  if (!slTpSet) {
-    // Pre-order SL/TP (preMt5SL/preMt5TP) zijn nog steeds actief in MT5 — trade heeft SL/TP
-    console.warn(`[SL/TP] Modify mislukt na 3 pogingen — pre-order SL=${preMt5SL} TP=${preMt5TP} blijft actief`);
-    logEvent({ type: "SL_TP_MODIFY_FAILED_USING_PRE", positionId, symbol: symKey,
-      preSL: preMt5SL, preTP: preMt5TP, refinedSL: mt5SL, refinedTP: mt5TP,
-      executionPrice, slippage, note: "pre-order SL/TP actief als fallback" });
-    // Gebruik pre-order waarden zodat openPositions correct is
-    mt5SL = preMt5SL;
-    mt5TP = preMt5TP;
-  }
+  // Step D: Geen SL/TP modify meer — pre-order waarden blijven actief.
+  // Pre-order SL (preMt5SL) en TP (preMt5TP) zijn al actief in MT5 bij de order.
+  // MetaApi REST modify was instabiel en leverde SL_TP_MODIFY_FAILED events op.
+  // v12.0: SL/TP direct meegegeven bij placeOrder() — dat is de enige bron van truth.
+  // Gebruik pre-order waarden als definitieve SL/TP:
+  mt5SL = preMt5SL;
+  mt5TP = preMt5TP;
+  console.log(`[SL/TP] Pre-order actief: ${positionId} SL=${mt5SL} TP=${mt5TP} (${tpRR}R) exec=${executionPrice}`);
 
   // Register position
   const latencyMs = Date.now() - webhookReceivedAt;
@@ -2366,14 +2342,7 @@ app.get("/trades", (req, res) => {
   res.json({ count: filtered.length, trades: filtered.slice(0, parseInt(limit)) });
 });
 
-app.get("/lot-overrides", (req, res) => {
-  const entries = Object.entries(lotOverrides).map(([sym, lots]) => ({
-    symbol: sym, lots, envVar: `LOTS_${sym}`,
-    riskPct: getSymbolRiskPct(sym),
-    note: "Loaded from DB — persists across restarts",
-  }));
-  res.json({ count: entries.length, overrides: entries });
-});
+// /lot-overrides endpoint verwijderd in v12.0 — lot overrides niet meer in gebruik
 
 app.get("/risk-multipliers", (req, res) => {
   const entries = Object.entries(keyRiskMult).map(([key, v]) => ({ key, ...v }));
@@ -2473,7 +2442,7 @@ app.get("/band-ghosts/active", (req, res) => {
 app.get("/test", (req, res) => {
   res.json({
     status: "Railway is bereikbaar",
-    version: "11.0.0",
+    version: "12.0.0",
     time: new Date().toISOString(),
     headers: {
       "content-type": req.headers["content-type"] ?? "(geen)",
@@ -2502,7 +2471,7 @@ app.get("/health", async (req, res) => {
   const tradeWindowForex = canOpenNewTrade("EURUSD");
   const tradeWindowStock = canOpenNewTrade("AAPL");
   res.json({
-    status: "ok", version: "11.0.0", time: getBrusselsDateStr(),
+    status: "ok", version: "12.0.0", time: getBrusselsDateStr(),
     openPos: Object.keys(openPositions).length, ghosts: Object.keys(ghostTrackers).length,
     tpLocks: Object.keys(tpLocks).length, closedT: closedTrades.length, balance,
     fixedRiskPct: FIXED_RISK_PCT, marketOpen: isMarketOpen(), session: getSession(),
@@ -2527,7 +2496,7 @@ app.get(["/", "/dashboard"], async (req, res) => {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PRONTO-AI v11</title>
+<title>PRONTO-AI v12</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600;700&family=IBM+Plex+Sans+Condensed:wght@500;600;700&display=swap" rel="stylesheet">
 <style>
@@ -2628,7 +2597,7 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
 <div class="hdr">
   <div>
     <div class="logo">PRONTO-AI</div>
-    <div class="ver">v19 · TradingView → MetaApi → FTMO MT5 · Risk ${(FIXED_RISK_PCT*100).toFixed(3)}% · SL×${SL_BUFFER_MULT} · DAX Fix active</div>
+    <div class="ver">v12.0 · TradingView → MetaApi → FTMO MT5 · Risk ${(FIXED_RISK_PCT*100).toFixed(3)}% · SL×${SL_BUFFER_MULT} · DAX Fix active</div>
   </div>
   <div class="hdr-r">
     <span class="sb s-outside" id="hdr-sess">—</span>
@@ -2658,6 +2627,31 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
 </div>
 
 <div class="main">
+
+
+<!-- 0. TRADE SUMMARY STATS (boven open positions) -->
+<div class="sec" id="stats-sec">
+  <div class="sh"><span class="st b">▸ TRADE STATS — vanaf compliance datum</span><span class="sm" id="stats-meta">laden...</span></div>
+  <div class="strip" id="stats-strip" style="flex-wrap:wrap;gap:20px">
+    <div class="stat"><span class="sl2">Totaal trades</span><span class="sv2 b" id="st-total">—</span></div>
+    <div class="stat"><span class="sl2">VWAP Above</span><span class="sv2 b" id="st-above">—</span></div>
+    <div class="stat"><span class="sl2">VWAP Below</span><span class="sv2 p" id="st-below">—</span></div>
+    <div class="stat"><span class="sl2">Asia trades</span><span class="sv2 c" id="st-asia">—</span></div>
+    <div class="stat"><span class="sl2">London trades</span><span class="sv2 g" id="st-london">—</span></div>
+    <div class="stat"><span class="sv2 p" style="font-size:10px;margin-top:4px"><span class="sl2">NY trades</span><span class="sv2 p" id="st-ny">—</span></span></div>
+    <div class="stat"><span class="sl2">Buy signals</span><span class="sv2 g" id="st-buy">—</span></div>
+    <div class="stat"><span class="sl2">Sell signals</span><span class="sv2 r" id="st-sell">—</span></div>
+    <div class="stat"><span class="sl2">Compliance datum</span><span class="sv2 y" id="st-comp" style="font-size:10px">27/04/2026 09:00</span></div>
+  </div>
+  <div style="overflow-x:auto">
+  <table id="st-tbl" style="font-size:10px">
+    <thead><tr>
+      <th>Sessie</th><th>Buy Above</th><th>Buy Below</th><th>Sell Above</th><th>Sell Below</th><th>Totaal</th>
+    </tr></thead>
+    <tbody id="st-body"><tr><td colspan="6" class="nodata">Laden...</td></tr></tbody>
+  </table>
+  </div>
+</div>
 
 <!-- 1. OPEN POSITIONS -->
 <div class="sec">
@@ -2985,6 +2979,56 @@ function updateClock(){
 }
 setInterval(updateClock,1000);updateClock();
 
+
+// ── 0. TRADE STATS SECTION ───────────────────────────────────────
+async function loadTradeStats(){
+  // Load trades after compliance date (27/04/2026 09:00 Brussels)
+  const COMPLIANCE = new Date('2026-04-27T07:00:00.000Z');
+  const d = await api('/trades?limit=10000');
+  if(!d){document.getElementById('stats-meta').textContent='fout bij laden';return;}
+  const trades = (d.trades||[]).filter(t => t.openedAt && new Date(t.openedAt) >= COMPLIANCE);
+  const total = trades.length;
+  document.getElementById('stats-meta').textContent = total + ' trades na compliance datum';
+  document.getElementById('st-total').textContent = total;
+  document.getElementById('st-above').textContent = trades.filter(t=>t.vwapPosition==='above').length;
+  document.getElementById('st-below').textContent = trades.filter(t=>t.vwapPosition==='below').length;
+  document.getElementById('st-asia').textContent   = trades.filter(t=>t.session==='asia').length;
+  document.getElementById('st-london').textContent = trades.filter(t=>t.session==='london').length;
+  document.getElementById('st-ny').textContent     = trades.filter(t=>t.session==='ny').length;
+  document.getElementById('st-buy').textContent    = trades.filter(t=>t.direction==='buy').length;
+  document.getElementById('st-sell').textContent   = trades.filter(t=>t.direction==='sell').length;
+  // Per session breakdown table
+  const sessions = ['asia','london','ny'];
+  const tb = document.getElementById('st-body');
+  const rows = sessions.map(sess => {
+    const st = trades.filter(t=>t.session===sess);
+    const ba = st.filter(t=>t.direction==='buy'&&t.vwapPosition==='above').length;
+    const bb = st.filter(t=>t.direction==='buy'&&t.vwapPosition==='below').length;
+    const sa = st.filter(t=>t.direction==='sell'&&t.vwapPosition==='above').length;
+    const sb = st.filter(t=>t.direction==='sell'&&t.vwapPosition==='below').length;
+    const tot = st.length;
+    const sCls = {asia:'c',london:'g',ny:'p'}[sess]||'d';
+    return \`<tr>
+      <td>\${sBadge(sess)}</td>
+      <td class="g fw">\${ba||'—'}</td><td class="g">\${bb||'—'}</td>
+      <td class="r fw">\${sa||'—'}</td><td class="r">\${sb||'—'}</td>
+      <td class="\${sCls} fw">\${tot||'—'}</td>
+    </tr>\`;
+  });
+  // Total row
+  const ba_t = trades.filter(t=>t.direction==='buy'&&t.vwapPosition==='above').length;
+  const bb_t = trades.filter(t=>t.direction==='buy'&&t.vwapPosition==='below').length;
+  const sa_t = trades.filter(t=>t.direction==='sell'&&t.vwapPosition==='above').length;
+  const sb_t = trades.filter(t=>t.direction==='sell'&&t.vwapPosition==='below').length;
+  rows.push(\`<tr style="border-top:1px solid var(--bdr2);font-weight:700">
+    <td class="y">TOTAAL</td>
+    <td class="g">\${ba_t}</td><td class="g">\${bb_t}</td>
+    <td class="r">\${sa_t}</td><td class="r">\${sb_t}</td>
+    <td class="b">\${total}</td>
+  </tr>\`);
+  tb.innerHTML = rows.join('');
+}
+
 // ── 1. OPEN POSITIONS ────────────────────────────────────
 async function loadPositions(){
   const d=await api('/live/positions');
@@ -3193,7 +3237,7 @@ function renderEV(){
       <td data-val="\${bestTP??-99}" class="\${bestTP?'g fw':'d'}">\${bestTP!=null?f(bestTP,1)+'R':'—'}</td>
       <td data-val="\${ev?.avgRR??-99}" class="\${(ev?.avgRR??0)>=1?'g':'d'}">\${ev?.avgRR!=null?f(ev.avgRR,2)+'R':'—'}</td>
       <td data-val="\${evV??-999}" class="\${evC(evV)} fw">\${evV!=null?evV.toFixed(3):'—'}</td>
-      <td>\${ready?(evV!=null?(evV>0?'<span class="bd bd-evp">EV+ ✓</span>':'<span class="bd bd-evn">EV-</span>'):'<span class="bd d">pending</span>'):'<span class="d" style="font-size:9px">\${ghostN>0?'need '+(5-ghostN)+' more':'no data'}</span>'}</td>
+      <td>\${ready?(evV!=null?(evV>0?'<span class="bd bd-evp">EV+ ✓</span>':'<span class="bd bd-evn">EV-</span>'):'<span class="bd d">pending</span>'):('<span class="d" style="font-size:9px">'+(ghostN>0?'need '+(5-ghostN)+' more':'no data')+'</span>')</td>
       <td>\${tp?\`<span class="bd bd-lck">★ \${tp.lockedRR.toFixed(1)}R</span>\`:'<span class="d">—</span>'}</td>
       <td data-val="\${avgTimeMin??9999}" class="d">\${avgTimeMin!=null?avgTimeMin+'min':'—'}</td>
       <td data-val="\${avgSlPct??-1}" class="\${avgSlPct!=null?(avgSlPct<50?'g':avgSlPct<80?'y':'o'):'d'}" title="Avg max SL% used — lower = can tighten">\${avgSlPct!=null?f(avgSlPct,1)+'%':'—'}</td>
@@ -3438,6 +3482,7 @@ async function loadAll(){
   // Hard 15s outer timeout — zelfs als een sectie hangt, update de status bar
   const timeout=new Promise(res=>setTimeout(()=>res('timeout'),15000));
   const work=Promise.allSettled([
+    loadTradeStats().catch(e=>{console.error('[stats]',e?.message);return null;}),
     loadPositions().catch(e=>{console.error('[pos]',e?.message);return null;}),
     loadGhosts().catch(e=>{console.error('[ghost]',e?.message);return null;}),
     loadEV().catch(e=>{console.error('[ev]',e?.message);return null;}),
@@ -3471,7 +3516,7 @@ async function start() {
   const missing = ["META_API_TOKEN", "META_ACCOUNT_ID", "WEBHOOK_SECRET"].filter(k => !process.env[k]);
   if (missing.length) { console.error(`[ERR] Missing env: ${missing.join(", ")}`); process.exit(1); }
 
-  console.log("🚀 PRONTO-AI v11.1 starting...");
+  console.log("🚀 PRONTO-AI v12.0 starting...");
   await initDB();
 
   // Load closed trades
@@ -3489,11 +3534,6 @@ async function start() {
   for (const row of shadowRows) shadowResults[row.optimizerKey] = row;
   console.log(`🌑 ${shadowRows.length} shadow analyses loaded`);
 
-  // FIX 2: Load lot overrides from DB
-  const dbLotOverrides = await loadLotOverrides();
-  Object.assign(lotOverrides, dbLotOverrides);
-  console.log(`📦 ${Object.keys(lotOverrides).length} lot overrides loaded from DB`);
-
   // FIX 19: Load key risk multipliers from DB
   const dbKeyMults = await loadKeyRiskMults();
   Object.assign(keyRiskMult, dbKeyMults);
@@ -3509,9 +3549,6 @@ async function start() {
       symbolRiskMap[sym] = pct;
       await upsertSymbolRisk(sym, pct);
     }
-    // Env lot overrides still supported (override DB value)
-    const lotKey = `LOTS_${sym}`;
-    if (process.env[lotKey]) lotOverrides[sym] = parseFloat(process.env[lotKey]);
   }
   console.log(`💰 Symbol risk overrides: ${Object.keys(symbolRiskMap).length}`);
 
@@ -3553,7 +3590,7 @@ async function start() {
   rebuildEVCache().catch(() => {});
 
   app.listen(PORT, () => {
-    console.log(`[✓] PRONTO-AI v11.0 on port ${PORT}`);
+    console.log(`[✓] PRONTO-AI v12.0 on port ${PORT}`);
     console.log(`   🔹 Dashboard:      /`);
     console.log(`   🔹 Health:         /health`);
     console.log(`   🔹 EV Table:       /ev`);
