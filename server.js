@@ -2804,48 +2804,6 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
     </tr></tfoot>
   </table>
   </div>
-
-  <!-- BLOCKED SIGNALS BLOCK — v12.1.3 -->
-  <div style="margin-top:14px;border-top:1px solid var(--bdr2);padding-top:12px">
-    <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
-      <span style="color:var(--r);font-size:11px;font-weight:700;letter-spacing:.06em">▸ GEBLOKKEERDE SIGNALEN</span>
-      <span style="color:var(--dim);font-size:9px" id="blk-meta">laden...</span>
-    </div>
-    <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:10px">
-      <div style="background:var(--bg2);border:1px solid var(--bdr2);border-radius:4px;padding:8px 14px;min-width:90px">
-        <div style="color:var(--dim);font-size:8px;margin-bottom:2px">TOTAAL GEBLOKT</div>
-        <div style="color:var(--r);font-size:20px;font-weight:700" id="blk-total">—</div>
-      </div>
-      <div style="background:var(--bg2);border:1px solid var(--bdr2);border-radius:4px;padding:8px 14px;min-width:90px">
-        <div style="color:var(--dim);font-size:8px;margin-bottom:2px">DUPLICATE</div>
-        <div style="color:var(--o);font-size:20px;font-weight:700" id="blk-dup">—</div>
-      </div>
-      <div style="background:var(--bg2);border:1px solid var(--bdr2);border-radius:4px;padding:8px 14px;min-width:90px">
-        <div style="color:var(--dim);font-size:8px;margin-bottom:2px">VWAP EXHAUSTED</div>
-        <div style="color:var(--y);font-size:20px;font-weight:700" id="blk-vwap">—</div>
-      </div>
-      <div style="background:var(--bg2);border:1px solid var(--bdr2);border-radius:4px;padding:8px 14px;min-width:90px">
-        <div style="color:var(--dim);font-size:8px;margin-bottom:2px">BUITEN WINDOW</div>
-        <div style="color:var(--dim);font-size:20px;font-weight:700" id="blk-win">—</div>
-      </div>
-      <div style="background:var(--bg2);border:1px solid var(--bdr2);border-radius:4px;padding:8px 14px;min-width:90px">
-        <div style="color:var(--dim);font-size:8px;margin-bottom:2px">CURRENCY BUDGET</div>
-        <div style="color:var(--c);font-size:20px;font-weight:700" id="blk-cur">—</div>
-      </div>
-      <div style="background:var(--bg2);border:1px solid var(--bdr2);border-radius:4px;padding:8px 14px;min-width:90px">
-        <div style="color:var(--dim);font-size:8px;margin-bottom:2px">OVERIGE</div>
-        <div style="color:var(--dim);font-size:20px;font-weight:700" id="blk-oth">—</div>
-      </div>
-    </div>
-    <div style="overflow-x:auto">
-    <table id="blk-tbl" style="font-size:10px">
-      <thead><tr>
-        <th>Reden</th><th>Symbol</th><th>Dir</th><th>Sessie</th><th style="color:var(--r)">Aantal</th>
-      </tr></thead>
-      <tbody id="blk-body"><tr><td colspan="5" style="color:var(--dim);text-align:center">laden...</td></tr></tbody>
-    </table>
-    </div>
-  </div>
 </div>
 
 <!-- 1. OPEN POSITIONS -->
@@ -2881,7 +2839,8 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
         <th class="s" data-col="3">Dir</th><th class="s" data-col="4">VWAP</th>
         <th class="s" data-col="5" title="Highest RR reached">Max RR</th>
         <th title="% of original SL distance consumed so far">SL Used%</th>
-        <th class="s" data-col="7">Elapsed</th><th class="s" data-col="8">Opened</th>
+        <th class="s" data-col="7" title="Est. time until phantom SL is hit at current pace">Time to SL</th>
+        <th class="s" data-col="8">Elapsed</th><th class="s" data-col="9">Opened</th>
       </tr></thead>
       <tbody id="gh-body"></tbody>
     </table>
@@ -3081,6 +3040,33 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
   </div>
 </div>
 
+<!-- 8. SIGNAAL ANALYSE — geblokkeerd + errors + VWAP band (v12.1.3) -->
+<div class="sec">
+  <div class="sh">
+    <span class="st r">▸ SIGNAAL ANALYSE — geblokkeerd &amp; errors</span>
+    <span class="sm" id="blk-meta">laden...</span>
+    <span id="blk-dot" class="sec-err" title="Loading..."></span>
+  </div>
+  <!-- KPI strip -->
+  <div class="strip" style="margin-bottom:10px">
+    <div class="stat"><span class="sl2">Totaal geblokt</span><span class="sv2 r fw" id="blk-total">—</span></div>
+    <div class="stat"><span class="sl2">Duplicate</span><span class="sv2 o" id="blk-dup">—</span></div>
+    <div class="stat"><span class="sl2">VWAP Exhausted</span><span class="sv2 y" id="blk-vwap">—</span></div>
+    <div class="stat"><span class="sl2">Buiten Window</span><span class="sv2 d" id="blk-win">—</span></div>
+    <div class="stat"><span class="sl2">Currency Budget</span><span class="sv2 c" id="blk-cur">—</span></div>
+    <div class="stat"><span class="sl2">Webhook Errors</span><span class="sv2 r" id="blk-whe">—</span></div>
+    <div class="stat"><span class="sl2">Overige</span><span class="sv2 d" id="blk-oth">—</span></div>
+  </div>
+  <div class="tw">
+    <table id="blk-tbl" style="font-size:10px">
+      <thead><tr>
+        <th>Categorie</th><th>Reden</th><th>Symbol</th><th>Dir</th><th>Sessie</th><th style="color:var(--r)">Aantal</th><th>Timestamp</th>
+      </tr></thead>
+      <tbody id="blk-body"><tr><td colspan="7" style="color:var(--dim);text-align:center">laden...</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
 </div><!-- /main -->
 
 <script>
@@ -3256,38 +3242,93 @@ async function loadTradeStats(){
 
 // ── 0b. BLOCKED SIGNALS ── v12.1.3 ───────────────────────────────
 async function loadBlockedSignals(){
-  const d = await api('/signal-stats/rejects');
-  if(!d){ document.getElementById('blk-meta').textContent='fout bij laden'; return; }
-  const total = d.total ?? 0;
-  document.getElementById('blk-meta').textContent = total + ' geblokkeerde signalen (alle tijd)';
-  document.getElementById('blk-total').textContent = total || '0';
+  const COMPLIANCE = new Date('2026-04-27T07:00:00.000Z');
 
-  // Tel per categorie
+  // Fetch rejects (compliance-gefilterd via since param) + webhook errors history
+  const [rejectD, histD] = await Promise.all([
+    api('/signal-stats/rejects?since=2026-04-27T07:00:00.000Z'),
+    api('/history'),
+  ]);
+
+  setDot('blk-dot', !!(rejectD||histD), rejectD ? 'OK' : 'Fout bij laden');
+  if(!rejectD && !histD){
+    document.getElementById('blk-meta').textContent='fout bij laden';
+    return;
+  }
+
+  // ── Rejects van signals_log (al compliance-gefilterd via ?since) ──
+  const allPairs = (rejectD?.topPairs||[]);
   const byO = {};
-  (d.byOutcome||[]).forEach(r => { byO[r.outcome] = r.pairs?.reduce((s,p)=>s+p.count,0) ?? 0; });
-  const dupCount  = (byO['DUPLICATE_OPEN']??0) + (byO['DUPLICATE_BLOCKED']??0) + (byO['DUPLICATE']??0);
-  const vwapCount = (byO['VWAP_BAND_EXHAUSTED']??0) + (byO['VWAP_EXHAUSTED']??0);
-  const winCount  = (byO['OUTSIDE_WINDOW']??0) + (byO['OUTSIDE_HOURS']??0);
-  const curCount  = (byO['CURRENCY_BUDGET']??0) + (byO['BUDGET_EXHAUSTED']??0);
-  const othCount  = total - dupCount - vwapCount - winCount - curCount;
+  (rejectD?.byOutcome||[]).forEach(r => {
+    byO[r.outcome] = r.pairs?.reduce((s,p)=>s+p.count,0) ?? 0;
+  });
+  const dupCount  = (byO['DUPLICATE_OPEN']??0)+(byO['DUPLICATE_BLOCKED']??0)+(byO['DUPLICATE']??0);
+  const vwapCount = (byO['VWAP_BAND_EXHAUSTED']??0)+(byO['VWAP_EXHAUSTED']??0);
+  const winCount  = (byO['OUTSIDE_WINDOW']??0)+(byO['OUTSIDE_HOURS']??0);
+  const curCount  = (byO['CURRENCY_BUDGET']??0)+(byO['BUDGET_EXHAUSTED']??0);
+  const rejectTotal = rejectD?.total ?? 0;
 
-  document.getElementById('blk-dup').textContent  = dupCount  || '0';
-  document.getElementById('blk-vwap').textContent = vwapCount || '0';
-  document.getElementById('blk-win').textContent  = winCount  || '0';
-  document.getElementById('blk-cur').textContent  = curCount  || '0';
-  document.getElementById('blk-oth').textContent  = Math.max(0, othCount) || '0';
+  // ── Webhook errors uit /history (compliance-gefilterd client-side) ──
+  const ERROR_TYPES = ['REJECTED','SL_TP_SET_FAILED','LOT_CALC_FAILED','ORDER_NOT_CONFIRMED',
+    'VWAP_BAND_EXHAUSTED','SPREAD_GUARD_CLOSE','RR_VERIFY_FAILED',
+    'CURRENCY_BUDGET_EXHAUSTED','OUTSIDE_WINDOW'];
+  const allHist = Array.isArray(histD) ? histD : [];
+  const errRows = allHist.filter(e =>
+    ERROR_TYPES.includes(e.type) &&
+    e.ts && new Date(e.ts) >= COMPLIANCE
+  );
+  const wheCount = errRows.length;
+  const othCount = Math.max(0, rejectTotal - dupCount - vwapCount - winCount - curCount);
+  const grandTotal = rejectTotal + wheCount;
 
-  // Top pairs tabel
+  document.getElementById('blk-meta').textContent =
+    \`\${grandTotal} geblokkeerde signalen + errors · ná compliance datum\`;
+  document.getElementById('blk-total').textContent = grandTotal || '0';
+  document.getElementById('blk-dup').textContent   = dupCount   || '0';
+  document.getElementById('blk-vwap').textContent  = vwapCount  || '0';
+  document.getElementById('blk-win').textContent   = winCount   || '0';
+  document.getElementById('blk-cur').textContent   = curCount   || '0';
+  document.getElementById('blk-whe').textContent   = wheCount   || '0';
+  document.getElementById('blk-oth').textContent   = othCount   || '0';
+
+  // ── Gecombineerde tabel ──
   const tb = document.getElementById('blk-body');
-  const top = (d.topPairs||[]).slice(0, 30);
-  if(!top.length){ tb.innerHTML='<tr><td colspan="5" style="color:var(--dim);text-align:center">geen geblokkeerde signalen</td></tr>'; return; }
-  tb.innerHTML = top.map(p => \`<tr>
-    <td style="color:var(--o);font-size:9px;max-width:220px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="\${p.outcome}">\${p.outcome}</td>
-    <td class="b fw">\${p.symbol||'?'}</td>
-    <td>\${p.direction?dBadge(p.direction):'-'}</td>
-    <td>\${p.session?sBadge(p.session):'-'}</td>
-    <td class="r fw">\${p.count}</td>
-  </tr>\`).join('');
+
+  // Reject rows
+  const rejectRows = allPairs.slice(0,25).map(p => ({
+    cat: 'BLOCKED', reason: p.outcome, symbol: p.symbol||'?',
+    dir: p.direction||null, session: p.session||null,
+    count: p.count, ts: null,
+  }));
+
+  // Webhook error rows (max 25, meest recent eerst)
+  const errTableRows = errRows.slice(0,25).map(e => ({
+    cat: 'ERROR', reason: e.type, symbol: e.symbol||e.payload?.symbol||'?',
+    dir: e.direction||e.payload?.direction||null,
+    session: e.session||e.payload?.session||null,
+    count: null, ts: e.ts||null,
+  }));
+
+  const combined = [...rejectRows, ...errTableRows]
+    .sort((a,b) => (b.count||1) - (a.count||1));
+
+  if(!combined.length){
+    tb.innerHTML=\`<tr><td colspan="7" style="color:var(--dim);text-align:center">geen geblokkeerde signalen ná compliance datum</td></tr>\`;
+    return;
+  }
+
+  tb.innerHTML = combined.map(r => {
+    const catCls = r.cat === 'ERROR' ? 'r' : 'o';
+    return \`<tr>
+      <td><span class="bd bd-sl" style="font-size:8px">\${r.cat}</span></td>
+      <td style="color:var(--\${catCls});font-size:9px;max-width:200px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="\${r.reason}">\${r.reason}</td>
+      <td class="b fw">\${r.symbol}</td>
+      <td>\${r.dir ? dBadge(r.dir) : '—'}</td>
+      <td>\${r.session ? sBadge(r.session) : '—'}</td>
+      <td class="r fw">\${r.count != null ? r.count : '1'}</td>
+      <td class="d" style="font-size:9px">\${r.ts ? dtTs(r.ts) : '—'}</td>
+    </tr>\`;
+  }).join('');
 }
 
 // ── 1. OPEN POSITIONS ────────────────────────────────────
@@ -3353,9 +3394,21 @@ async function loadGhosts(){
   setDot('gh-dot',true,'OK');
   document.getElementById('k-gh').textContent=d?.count??'?';
   const tb=document.getElementById('gh-body');
-  if(!d||!d.ghosts?.length){tb.innerHTML=emptyRow(9);return;}
+  if(!d||!d.ghosts?.length){tb.innerHTML=emptyRow(10);return;}
   tb.innerHTML=d.ghosts.map(g=>{
     const type=sTypeName(g.symbol);
+    // Estimate time to SL: if slPctUsed > 0 and elapsed > 0, extrapolate
+    let timeToSL = '—';
+    if(g.slPctUsed > 0 && g.elapsedMin > 0 && g.slPctUsed < 100) {
+      const minsPerPct = g.elapsedMin / g.slPctUsed;
+      const remaining = Math.round((100 - g.slPctUsed) * minsPerPct);
+      if(remaining < 60) timeToSL = \`~\${remaining}m\`;
+      else if(remaining < 1440) timeToSL = \`~\${Math.round(remaining/60)}h\`;
+      else timeToSL = \`>\${Math.round(remaining/1440)}d\`;
+    } else if(g.slPctUsed === 0) {
+      timeToSL = \`∞\`;
+    }
+    const timeToSLCls = g.slPctUsed >= 75 ? 'r' : g.slPctUsed >= 40 ? 'o' : 'd';
     return\`<tr class="\${tClass(g.symbol)}">
       <td data-val="\${g.symbol}" class="b fw">\${g.symbol}</td>
       <td>\${tyBadge(type)}</td>
@@ -3364,6 +3417,7 @@ async function loadGhosts(){
       <td>\${vBadge(g.vwapPosition)}</td>
       <td data-val="\${g.maxRR??-99}" class="\${(g.maxRR??0)>0?'g':'d'} fw">\${f(g.maxRR,2)}R</td>
       <td>\${slBar(g.slPctUsed)}</td>
+      <td data-val="\${g.slPctUsed??0}" class="\${timeToSLCls} fw">\${timeToSL}</td>
       <td data-val="\${g.elapsedMin}" class="d">\${g.elapsedMin}min</td>
       <td data-val="\${g.openedAt}" class="d" style="font-size:9px">\${dtTs(g.openedAt)}</td>
     </tr>\`;
@@ -3793,7 +3847,7 @@ async function start() {
   const missing = ["META_API_TOKEN", "META_ACCOUNT_ID", "WEBHOOK_SECRET"].filter(k => !process.env[k]);
   if (missing.length) { console.error(`[ERR] Missing env: ${missing.join(", ")}`); process.exit(1); }
 
-  console.log("🚀 PRONTO-AI v12.1.2 starting...");
+  console.log("🚀 PRONTO-AI v12.1.3 starting...");
   await initDB();
 
   // Load closed trades
