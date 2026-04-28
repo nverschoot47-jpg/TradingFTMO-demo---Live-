@@ -3187,7 +3187,7 @@ const FOREX  = ${JSON.stringify(FOREX_SYMBOLS)};
 const INDEX  = ${JSON.stringify(INDEX_SYMBOLS)};
 const COMM   = ${JSON.stringify(COMMODITY_SYMBOLS)};
 const STOCKS = ${JSON.stringify(STOCK_SYMBOLS)};
-const TP_OPT_DATE = new Date('2026-04-27T07:00:00.000Z'); // compliance datum: 27/04/2026 09:00 Brussels
+const TP_OPT_DATE = new Date('2026-04-28T12:00:00.000Z'); // compliance datum: 28/04/2026 14:00 Brussels
 
 let _allTrades=[],_evData=[],_tpMap={},_evMap={};
 let _lastLoadMs=null;
@@ -3304,7 +3304,7 @@ setInterval(updateClock,1000);updateClock();
 
 // ── 0. TRADE STATS SECTION ───────────────────────────────────────
 async function loadTradeStats(){
-  const COMPLIANCE = new Date('2026-04-27T07:00:00.000Z');
+  const COMPLIANCE = new Date('2026-04-28T12:00:00.000Z');
   const d = await api('/trades?limit=10000');
   if(!d){document.getElementById('stats-meta').textContent='fout bij laden';return;}
   const trades = (d.trades||[]).filter(t => t.openedAt && new Date(t.openedAt) >= COMPLIANCE);
@@ -3355,11 +3355,11 @@ async function loadTradeStats(){
 
 // ── 0b. BLOCKED SIGNALS ── v12.1.3 ───────────────────────────────
 async function loadBlockedSignals(){
-  const COMPLIANCE = new Date('2026-04-27T07:00:00.000Z');
+  const COMPLIANCE = new Date('2026-04-28T12:00:00.000Z');
 
   // Fetch rejects (compliance-gefilterd via since param) + webhook errors history
   const [rejectD, histD] = await Promise.all([
-    api('/signal-stats/rejects?since=2026-04-27T07:00:00.000Z'),
+    api('/signal-stats/rejects?since=2026-04-28T12:00:00.000Z'),
     api('/history'),
   ]);
 
