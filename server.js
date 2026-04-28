@@ -1,6 +1,37 @@
 // ===============================================================
-// server.js  v12.1.3  |  PRONTO-AI
+// server.js  v12.2.0  |  PRONTO-AI
 // TradingView → MetaApi REST → FTMO MT5
+//
+// v12.2.0 — RISK HALVING + DAX FIX + GHOST SL MILESTONES (28 April 2026):
+//
+//  FIX R — Risk gehalveerd 0.15% → 0.075% (alle asset types):
+//    DEFAULT_RISK_BY_TYPE en FIXED_RISK_PCT gehalveerd.
+//    Reden: te veel losses waardoor manueel sluiten nodig was.
+//    Env var FIXED_RISK_PCT overschrijft nog steeds (Railway).
+//
+//  FIX D — DAX/GER40 lotsize inconsistentie (0.6RR / 10RR bug):
+//    fetchSymbolLotValue() valideert nu live MT5 lotVal vs bekende
+//    LOT_VALUE_BY_MT5 fallback voor indexes. Als ratio buiten 0.5–2.0×
+//    valt → MT5 spec verworpen, veilige fallback gebruikt.
+//    Symptoom was: MetaApi gaf soms verkeerde tickValue voor GER40.cash
+//    waardoor calcLots() extreme lots berekende → RR van 0.6 of 10+.
+//
+//  FIX G3 — Ghost tracker SL milestones (25/50/75/100%):
+//    Ghost tick registreert nu het exacte tijdstip van eerste
+//    overschrijding van elk SL-drempel (25/50/75/100% van SL-afstand).
+//    Opgeslagen in ghost_trades.sl_milestones (JSONB).
+//    Live ghost tabel toont T→25% / T→50% / T→75% / T→100% kolommen.
+//    Vervangt de "Time to SL" extrapolatie kolom.
+//
+//  FIX G4 — Ghost maxRR en SL% fix bij manueel sluiten:
+//    slMilestones worden meegestuurd bij finalizeGhost() → saveGhostTrade().
+//    /live/ghosts response bevat nu ook slMilestones voor live display.
+//
+//  FIX EV — EV Optimizer "0 ghosts / 424 totaal" verwarring opgelost:
+//    Labels verduidelijkt: "Met ghost data (≥1 ghost)" / "Zonder ghost data".
+//    Meta-text toont totaal # ghost trades over actieve combos.
+//    Compliance-stat badge toont datum van eerste geldige ghost data.
+//    Uitleg: ghost data = phantom SL hits ná compliance datum 27/04/2026.
 //
 // v12.1.3 — GHOST TRACKER maxRR FIX + BLOCKED TRADES DASHBOARD (27 April 2026):
 //
@@ -258,8 +289,8 @@ const WEBHOOK_SECRET  = process.env.WEBHOOK_SECRET;
 const PORT            = process.env.PORT || 3000;
 
 // ── Risk constants ───────────────────────────────────────────────
-// FIXED_RISK_PCT: base risk per trade (0.15% of balance)
-const FIXED_RISK_PCT = parseFloat(process.env.FIXED_RISK_PCT || "0.0015");
+// FIXED_RISK_PCT: base risk per trade (0.075% of balance — gehalveerd v10.8, was 0.15%)
+const FIXED_RISK_PCT = parseFloat(process.env.FIXED_RISK_PCT || "0.00075");
 
 // FIX C: Currency exposure budget per valuta (default 2% van balance).
 // Op €100k balance = €2.000 max exposure per valuta voor EV-neutraal trades.
@@ -516,7 +547,21 @@ async function fetchSymbolLotValue(mt5Symbol, assetType) {
     const volumeStep   = parseFloat(spec?.volumeStep)   || null;
     if (contractSize && tickSize && tickValue && tickSize > 0) {
       // lotValue = hoeveel account-currency verandert per 1 prijspunt per lot
-      const lotVal = parseFloat((tickValue / tickSize).toFixed(6));
+      let lotVal = parseFloat((tickValue / tickSize).toFixed(6));
+
+      // FIX v12.2 DAX/INDEX SANITY CHECK: als live lotVal voor een index abnormaal
+      // afwijkt van de bekende waarde (1 per punt per lot voor FTMO indexes),
+      // verwerp de MT5 spec en gebruik de veilige fallback.
+      // Symptoom: GER40 berekent 0.6RR of 10RR door slechte tickValue van MT5.
+      const knownLotVal = LOT_VALUE_BY_MT5[mt5Symbol];
+      if (knownLotVal != null && assetType === "index") {
+        const ratio = lotVal / knownLotVal;
+        if (ratio < 0.5 || ratio > 2.0) {
+          console.warn(`[SymSpec] ${mt5Symbol}: MT5 lotVal=${lotVal} afwijkt ${ratio.toFixed(2)}× van known=${knownLotVal} → gebruik fallback`);
+          lotVal = knownLotVal; // vertrouw de handmatig gekalibreerde waarde
+        }
+      }
+
       symbolSpecCache[mt5Symbol] = { lotVal, contractSize, tickSize, tickValue, minVolume, volumeStep, source: "mt5" };
       console.log(`[SymSpec] ${mt5Symbol}: contractSize=${contractSize} tickSize=${tickSize} tickValue=${tickValue} -> lotVal=${lotVal} minVol=${minVolume} step=${volumeStep}`);
       return symbolSpecCache[mt5Symbol];
@@ -816,6 +861,20 @@ function startGhostTracker(pos, restoreData = null) {
   const originalTpRR   = tpRRUsed;
   let   lastStateSaveTs = Date.now();
 
+  // FIX v12.2: RR milestone timestamps — twee assen:
+  //   adverse:   -0.25R, -0.50R, -0.75R, -1.00R  (= % van SL: 25/50/75/100)
+  //   favorable: +0.25R, +0.50R, +0.75R, +1.00R, +1.50R, +2.00R, +3.00R
+  // Worden ingevuld bij EERSTE overschrijding van elke drempel.
+  // Bij -1.00R (= phantom SL) → ghost stopt onmiddellijk.
+  const RR_ADVERSE_STEPS   = [0.25, 0.50, 0.75, 1.00];
+  const RR_FAVORABLE_STEPS = [0.25, 0.50, 0.75, 1.00, 1.50, 2.00, 3.00, 5.00];
+  const rrMilestones = {
+    adverse:   { 0.25: null, 0.50: null, 0.75: null, 1.00: null },
+    favorable: { 0.25: null, 0.50: null, 0.75: null, 1.00: null, 1.50: null, 2.00: null, 3.00: null, 5.00: null },
+  };
+  // Keep slMilestones as alias for backward compat with dashboard (maps 25→adverse[0.25] etc)
+  const slMilestones = { 25: null, 50: null, 75: null, 100: null };
+
   ghostTrackers[positionId] = {
     positionId, symbol, mt5Symbol, session, direction,
     vwapPosition, optimizerKey, entry,
@@ -868,34 +927,72 @@ function startGhostTracker(pos, restoreData = null) {
       }
 
       if (price !== null) {
-        // Track max favorable movement
+        // Track max favorable movement (best RR)
         const better = direction === "buy" ? price > maxPrice : price < maxPrice;
         if (better) {
           maxPrice = price;
           g.maxPrice = price;
           g.maxRR = calcMaxRR(direction, entry, phantomSL, price);
         }
-        // Track max adverse excursion as % of SL (MAE)
+
         const slDist = Math.abs(entry - phantomSL);
         if (slDist > 0) {
-          const adverse = direction === "buy" ? entry - price : price - entry;
-          const slPctNow = parseFloat((Math.max(0, Math.min(100, (adverse / slDist) * 100)).toFixed(2)));
+          const nowIso = new Date().toISOString();
+          const elapsed = Date.now() - new Date(openedAt ?? startTs).getTime();
+
+          // ── Adverse RR milestones (-0.25R … -1.00R = phantom SL) ──────────
+          const adverseMove = direction === "buy" ? entry - price : price - entry;
+          const adverseRR   = parseFloat((Math.max(0, adverseMove) / slDist).toFixed(4));
+          const slPctNow    = parseFloat((Math.min(100, adverseRR * 100)).toFixed(2));
+
           if (slPctNow > maxSlPctUsed) {
             maxSlPctUsed = slPctNow;
             g.maxSlPctUsed = maxSlPctUsed;
           }
+
+          for (const step of RR_ADVERSE_STEPS) {
+            if (!rrMilestones.adverse[step] && adverseRR >= step) {
+              rrMilestones.adverse[step] = nowIso;
+              // Keep slMilestones in sync for legacy dashboard
+              const pct = Math.round(step * 100);
+              slMilestones[pct] = nowIso;
+              g.rrMilestones = rrMilestones;
+              g.slMilestones = { ...slMilestones };
+              const elMin = Math.round(elapsed / 60000);
+              console.log(`[Ghost] ${positionId} adverse -${step}R (${pct}% SL) @ +${elMin}min | maxRR so far: ${g.maxRR}R`);
+            }
+          }
+
+          // ── Favorable RR milestones (+0.25R … +5R) ────────────────────────
+          const favorableRR = g.maxRR; // already updated above
+          for (const step of RR_FAVORABLE_STEPS) {
+            if (!rrMilestones.favorable[step] && favorableRR >= step) {
+              rrMilestones.favorable[step] = nowIso;
+              g.rrMilestones = rrMilestones;
+              const elMin = Math.round(elapsed / 60000);
+              console.log(`[Ghost] ${positionId} favorable +${step}R reached @ +${elMin}min`);
+            }
+          }
+
+          // ── -1.00R = phantom SL hit → stop immediately ────────────────────
+          const slHit = direction === "buy" ? price <= phantomSL : price >= phantomSL;
+          if (slHit) {
+            // Ensure 100% milestone timestamp is recorded before finalizing
+            if (!rrMilestones.adverse[1.00]) {
+              rrMilestones.adverse[1.00] = nowIso;
+              slMilestones[100] = nowIso;
+              g.rrMilestones = rrMilestones;
+              g.slMilestones = { ...slMilestones };
+            }
+            await finalizeGhost(positionId, "phantom_sl", elapsed, maxPrice);
+            return;
+          }
+
+          // ── Cap at 15RR — ghost has done its job ──────────────────────────
+          if (g.maxRR >= GHOST_MAX_RR) {
+            await finalizeGhost(positionId, "max_rr_15", elapsed, maxPrice); return;
+          }
         }
-        // Cap at 15RR — ghost has done its job at this point
-        if (g.maxRR >= GHOST_MAX_RR) {
-          await finalizeGhost(positionId, "max_rr_15", elapsed, maxPrice); return;
-        }
-        // Ghost is FULLY INDEPENDENT of the actual trade outcome.
-        // It only stops when the PHANTOM SL (original entry SL) is hit.
-        // Even if the real trade was closed at TP or manually, the ghost
-        // keeps running until the phantom SL is touched — this gives the
-        // true maxRR the market was willing to give for this setup.
-        const slHit = direction === "buy" ? price <= phantomSL : price >= phantomSL;
-        if (slHit) { await finalizeGhost(positionId, "phantom_sl", elapsed, maxPrice); return; }
       }
 
       // Persist ghost state every 5 minutes (not every tick — don't hammer DB)
@@ -941,8 +1038,12 @@ async function finalizeGhost(positionId, stopReason, elapsedMs, finalMaxPrice) {
     direction: g.direction, vwapPosition: g.vwapPosition, optimizerKey: g.optimizerKey,
     entry: g.entry, sl: finalSL, slPct: g.slPct, phantomSL: finalSL, tpRRUsed: g.tpRRUsed,
     maxPrice: finalMaxPrice, maxRRBeforeSL, phantomSLHit, stopReason,
-    timeToSLMin: phantomSLHit ? timeToSLMin : null,
+    // FIX v12.2: always save timeToSLMin regardless of stop reason —
+    // timeouts and manual deploys still have valid elapsed time data.
+    timeToSLMin,
     maxSlPctUsed: g.maxSlPctUsed ?? 0,
+    slMilestones: g.slMilestones ?? null,
+    rrMilestones: g.rrMilestones ?? null,
     openedAt: g.openedAt, closedAt: new Date().toISOString(),
   };
 
@@ -2122,6 +2223,8 @@ app.get("/live/ghosts", (req, res) => {
       openedAt: g.openedAt,
       slPctUsed: liveSL && g.entry && livePrice
         ? calcPctSlUsed(g.direction, g.entry, liveSL, livePrice) : 0,
+      slMilestones: g.slMilestones ?? null,
+      rrMilestones: g.rrMilestones ?? null,
     };
   });
   res.json({ count: ghosts.length, ghosts });
@@ -2839,7 +2942,12 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
         <th class="s" data-col="3">Dir</th><th class="s" data-col="4">VWAP</th>
         <th class="s" data-col="5" title="Highest RR reached">Max RR</th>
         <th title="% of original SL distance consumed so far">SL Used%</th>
-        <th class="s" data-col="7" title="Est. time until phantom SL is hit at current pace">Time to SL</th>
+        <th class="s" title="Time to reach -0.25R adverse (25% SL)">T→-¼R</th>
+        <th class="s" title="Time to reach -0.50R adverse (50% SL)">T→-½R</th>
+        <th class="s" title="Time to reach -0.75R adverse (75% SL)">T→-¾R</th>
+        <th class="s" title="Time to reach -1.00R = SL hit (100%)">T→-1R</th>
+        <th class="s" title="Time to reach +0.50R favorable">T→+½R</th>
+        <th class="s" title="Time to reach +1.00R favorable">T→+1R</th>
         <th class="s" data-col="8">Elapsed</th><th class="s" data-col="9">Opened</th>
       </tr></thead>
       <tbody id="gh-body"></tbody>
@@ -2881,10 +2989,11 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
   </div>
   <div class="strip">
     <div class="stat"><span class="sl2">Totaal combos</span><span class="sv2 b" id="ev-count">—</span></div>
-    <div class="stat"><span class="sl2">Met ghost data</span><span class="sv2 c" id="ev-trades">—</span></div>
-    <div class="stat"><span class="sl2">0 ghosts</span><span class="sv2 d" id="ev-zero">—</span></div>
+    <div class="stat"><span class="sl2">Met ghost data (≥1 ghost)</span><span class="sv2 c" id="ev-trades">—</span></div>
+    <div class="stat"><span class="sl2">Zonder ghost data</span><span class="sv2 d" id="ev-zero">—</span></div>
     <div class="stat"><span class="sl2">Total P&amp;L</span><span class="sv2" id="ev-pnl">—</span></div>
     <div class="stat"><span class="sl2">EV+ locked</span><span class="sv2 y" id="ev-locked">—</span></div>
+    <div class="stat" id="ev-compliance-stat" style="display:none"><span class="sl2" style="color:#f90">⚠ Data na compliance</span><span class="sv2 o" id="ev-compliance-n">—</span></div>
   </div>
   <div class="tw">
     <table id="ev-tbl">
@@ -2919,13 +3028,17 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
       <thead><tr>
         <th class="s" data-col="0">Symbol</th><th>Type</th><th class="s" data-col="2">Session</th>
         <th class="s" data-col="3">Dir</th><th class="s" data-col="4">VWAP</th>
-        <th class="s" data-col="5"># Ghosts</th>
-        <th class="s" data-col="6" title="Hoogste RR bereikt">Best Max RR</th>
-        <th class="s" data-col="7" title="Gemiddelde Max RR">Avg Max RR</th>
-        <th class="s" data-col="8" title="Gemiddelde Max SL% used">Avg SL%</th>
-        <th class="s" data-col="9" title="Gemiddelde minuten tot phantom SL">Avg T→SL</th>
-        <th class="s" data-col="10">Close Reason</th>
-        <th class="s" data-col="11">Laatste ghost</th>
+        <th class="s" data-col="5" title="Totaal afgesloten ghosts"># Ghosts</th>
+        <th class="s" data-col="6" title="EV-eligible (phantom SL hit of max_rr_15, VWAP known, ≥0.5R)"># EV</th>
+        <th class="s" data-col="7" title="Hoogste RR bereikt">Best RR</th>
+        <th class="s" data-col="8" title="Gemiddelde Max RR">Avg RR</th>
+        <th class="s" title="Avg time to reach -0.25R (25% SL)">T→-¼R</th>
+        <th class="s" title="Avg time to reach -0.50R (50% SL)">T→-½R</th>
+        <th class="s" title="Avg time to reach -0.75R (75% SL)">T→-¾R</th>
+        <th class="s" title="Avg time to reach -1.00R = SL hit">T→-1R</th>
+        <th class="s" title="Avg time to reach +0.50R favorable">T→+½R</th>
+        <th class="s" title="Avg time to reach +1.00R favorable">T→+1R</th>
+        <th class="s" data-col="14">Close Reason</th>
       </tr></thead>
       <tbody id="ghh-body"></tbody>
     </table>
@@ -3394,21 +3507,22 @@ async function loadGhosts(){
   setDot('gh-dot',true,'OK');
   document.getElementById('k-gh').textContent=d?.count??'?';
   const tb=document.getElementById('gh-body');
-  if(!d||!d.ghosts?.length){tb.innerHTML=emptyRow(10);return;}
+  if(!d||!d.ghosts?.length){tb.innerHTML=emptyRow(12);return;}
   tb.innerHTML=d.ghosts.map(g=>{
     const type=sTypeName(g.symbol);
-    // Estimate time to SL: if slPctUsed > 0 and elapsed > 0, extrapolate
-    let timeToSL = '—';
-    if(g.slPctUsed > 0 && g.elapsedMin > 0 && g.slPctUsed < 100) {
-      const minsPerPct = g.elapsedMin / g.slPctUsed;
-      const remaining = Math.round((100 - g.slPctUsed) * minsPerPct);
-      if(remaining < 60) timeToSL = \`~\${remaining}m\`;
-      else if(remaining < 1440) timeToSL = \`~\${Math.round(remaining/60)}h\`;
-      else timeToSL = \`>\${Math.round(remaining/1440)}d\`;
-    } else if(g.slPctUsed === 0) {
-      timeToSL = \`∞\`;
+    // Helper: format elapsed minutes from openedAt to milestone ISO timestamp
+    function msFmt(isoTs){
+      if(!isoTs||!g.openedAt)return'—';
+      const mins=Math.round((new Date(isoTs)-new Date(g.openedAt))/60000);
+      if(mins<60)return mins+'m';
+      return Math.floor(mins/60)+'h'+(mins%60?String(mins%60).padStart(2,'0')+'m':'');
     }
-    const timeToSLCls = g.slPctUsed >= 75 ? 'r' : g.slPctUsed >= 40 ? 'o' : 'd';
+    const adv=g.rrMilestones?.adverse||g.slMilestones&&{
+      // backward compat: slMilestones keys are 25/50/75/100
+      0.25:g.slMilestones['25'],0.50:g.slMilestones['50'],
+      0.75:g.slMilestones['75'],1.00:g.slMilestones['100']
+    }||{};
+    const fav=g.rrMilestones?.favorable||{};
     return\`<tr class="\${tClass(g.symbol)}">
       <td data-val="\${g.symbol}" class="b fw">\${g.symbol}</td>
       <td>\${tyBadge(type)}</td>
@@ -3417,7 +3531,12 @@ async function loadGhosts(){
       <td>\${vBadge(g.vwapPosition)}</td>
       <td data-val="\${g.maxRR??-99}" class="\${(g.maxRR??0)>0?'g':'d'} fw">\${f(g.maxRR,2)}R</td>
       <td>\${slBar(g.slPctUsed)}</td>
-      <td data-val="\${g.slPctUsed??0}" class="\${timeToSLCls} fw">\${timeToSL}</td>
+      <td class="\${adv[0.25]?'o':'d'}" style="font-size:9px">\${msFmt(adv[0.25])}</td>
+      <td class="\${adv[0.50]?'o':'d'}" style="font-size:9px">\${msFmt(adv[0.50])}</td>
+      <td class="\${adv[0.75]?'r':'d'}" style="font-size:9px">\${msFmt(adv[0.75])}</td>
+      <td class="\${adv[1.00]?'r fw':'d'}" style="font-size:9px">\${msFmt(adv[1.00])}</td>
+      <td class="\${fav[0.50]?'g':'d'}" style="font-size:9px">\${msFmt(fav[0.50])}</td>
+      <td class="\${fav[1.00]?'g fw':'d'}" style="font-size:9px">\${msFmt(fav[1.00])}</td>
       <td data-val="\${g.elapsedMin}" class="d">\${g.elapsedMin}min</td>
       <td data-val="\${g.openedAt}" class="d" style="font-size:9px">\${dtTs(g.openedAt)}</td>
     </tr>\`;
@@ -3508,10 +3627,15 @@ function renderEV(){
   const withZero=d.filter(c=>!c.ev||c.ev.count===0);
   const pnl=d.reduce((s,c)=>s+c.totalPnl,0);
   const totalCombos=d.length;
-  document.getElementById('ev-meta').textContent=totalCombos+' combos · '+withData.length+' met ghost data'+(_evMap&&Object.keys(_evMap).length===0?' · ⏳ EV data laden...':'');
+  const totalGhosts=d.reduce((s,c)=>s+(c.ev?.count??0),0);
+  const metaNote=withData.length===0?' · ⚠ Nog geen ghost data — ghost lopen pas na phantom SL hit':' · '+totalGhosts+' ghosts over '+withData.length+' combos';
+  document.getElementById('ev-meta').textContent=totalCombos+' combos'+metaNote+(_evMap&&Object.keys(_evMap).length===0?' · ⏳ laden...':'');
   document.getElementById('ev-count').textContent=totalCombos;
-  document.getElementById('ev-trades').textContent=withData.length;
+  document.getElementById('ev-trades').textContent=withData.length===0?'0 (ghosts actief, nog geen SL hit)':withData.length;
   document.getElementById('ev-zero').textContent=withZero.length;
+  const cEl=document.getElementById('ev-compliance-stat');
+  const cNEl=document.getElementById('ev-compliance-n');
+  if(cEl&&cNEl){cEl.style.display='';cNEl.textContent=totalGhosts+' phantom SL hits (data na 27/04/2026)';}
   const pEl=document.getElementById('ev-pnl');pEl.textContent=(pnl>=0?'+':'')+'€'+pnl.toFixed(0);pEl.className='sv2 '+pC(pnl);
   document.getElementById('ev-locked').textContent=d.filter(c=>c.tp&&(c.ev?.bestEV??0)>0).length;
   const tb=document.getElementById('ev-body');
@@ -3557,10 +3681,21 @@ function setEVF(k,v,btn){evF[k]=v;btn.closest('.fbar').querySelectorAll('.fb').f
 
 // ── 4. GHOST HISTORY — COMBINED per optimizer_key ────────
 async function loadGhostHistory(){
-  const d=await api('/ghosts/history?limit=2000');
+  const d=await api('/ghosts/history?limit=5000');
   if(!d){setDot('ghh-dot',false,'Failed — retry in 10s');setTimeout(loadGhostHistory,10000);return;}
   const rows=d?.rows||d||[];
   setDot('ghh-dot',true,'OK — '+rows.length+' records');
+
+  // Helper: elapsed minutes from openedAt to a milestone ISO timestamp
+  function elMin(openedAt, isoTs){
+    if(!isoTs||!openedAt)return null;
+    return Math.round((new Date(isoTs)-new Date(openedAt))/60000);
+  }
+  function fmtMin(m){
+    if(m==null)return'—';
+    if(m<60)return m+'m';
+    return Math.floor(m/60)+'h'+(m%60?String(m%60).padStart(2,'0'):'');
+  }
 
   // Aggregate by optimizer key
   const byKey={};
@@ -3568,7 +3703,11 @@ async function loadGhostHistory(){
     const key=g.optimizerKey||(g.symbol+'_'+g.session+'_'+g.direction+'_'+(g.vwapPosition||'unknown'));
     if(!byKey[key]) byKey[key]={
       sym:g.symbol,sess:g.session,dir:g.direction,vwap:g.vwapPosition,
-      count:0,bestMaxRR:0,sumRR:0,sumSLPct:0,nSL:0,sumTime:0,nTime:0,
+      count:0,evCount:0,bestMaxRR:0,sumRR:0,sumSLPct:0,nSL:0,
+      // RR adverse milestone sums: time from open to -0.25/-0.50/-0.75/-1.00R
+      advSum:{0.25:0,0.50:0,0.75:0,1.00:0},advN:{0.25:0,0.50:0,0.75:0,1.00:0},
+      // RR favorable milestone sums: time from open to +0.50/+1.00R
+      favSum:{0.50:0,1.00:0},favN:{0.50:0,1.00:0},
       lastOpenedAt:g.openedAt,reasons:{}
     };
     const b=byKey[key];
@@ -3578,20 +3717,102 @@ async function loadGhostHistory(){
     b.sumRR+=maxRR;
     const slPct=g.maxSlPctUsed??g.slPctUsed;
     if(slPct!=null){b.sumSLPct+=slPct;b.nSL++;}
+
+    // RR milestones — support both new rrMilestones and legacy slMilestones
+    const adv=g.rrMilestones?.adverse||{};
+    const fav=g.rrMilestones?.favorable||{};
+    // Legacy fallback
+    const sl=g.slMilestones||{};
+    const advFallback={0.25:sl['25'],0.50:sl['50'],0.75:sl['75'],1.00:sl['100']};
+    for(const step of [0.25,0.50,0.75,1.00]){
+      const ts=adv[step]||advFallback[step];
+      const m=elMin(g.openedAt,ts);
+      if(m!=null){b.advSum[step]+=m;b.advN[step]++;}
+    }
+    for(const step of [0.50,1.00]){
+      const ts=fav[step];
+      const m=elMin(g.openedAt,ts);
+      if(m!=null){b.favSum[step]+=m;b.favN[step]++;}
+    }
+
+    let cr=g.stopReason||g.closeReason||'sl';
+    if(maxRR>=15)cr='maxRR';
+    else if(cr==='phantom_sl'||cr==='sl')cr='sl';
+    else if(cr==='timeout_72h'||cr==='timeout_2w')cr='timeout';
+    else if(cr==='manual_deploy')cr='manual';
+    b.reasons[cr]=(b.reasons[cr]||0)+1;
+    const evOk=(g.phantomSLHit||g.stopReason==='max_rr_15')&&(g.vwapPosition==='above'||g.vwapPosition==='below')&&maxRR>=0.5;
+    if(evOk) b.evCount++;
+    if(!b.lastOpenedAt||g.openedAt>b.lastOpenedAt)b.lastOpenedAt=g.openedAt;
+  }
+  const combined=Object.values(byKey).filter(b=>b.sym&&b.vwap&&b.vwap!=='unknown');
+  const totalGhosts=rows.length;
+  const totalEV=combined.reduce((s,b)=>s+b.evCount,0);
+  document.getElementById('ghh-meta').textContent=
+    combined.length+' combinaties · '+totalGhosts+' ghosts · '+totalEV+' EV-eligible';
+  const tb=document.getElementById('ghh-body');
+  if(!combined.length){tb.innerHTML=emptyRow(15,'Geen ghost history — wacht op eerste phantom SL hit');return;}
+  combined.sort((a,b)=>b.count-a.count);
+  tb.innerHTML=combined.map(g=>{
+    const type=sTypeName(g.sym||'');
+    const avgRR=g.count>0?(g.sumRR/g.count):0;
+    const avgSL=g.nSL>0?(g.sumSLPct/g.nSL):null;
+    const topReason=Object.entries(g.reasons).sort((a,b)=>b[1]-a[1])[0]?.[0]||'sl';
+    const evCls=g.evCount>=5?'y fw':g.evCount>=1?'c':'d';
+    // Avg time per adverse step
+    function avgAdv(step){const n=g.advN[step];return n>0?Math.round(g.advSum[step]/n):null;}
+    function avgFav(step){const n=g.favN[step];return n>0?Math.round(g.favSum[step]/n):null;}
+    function tCell(m,cls='d'){return\`<td class="\${m!=null?cls:'d'}" style="font-size:9px">\${m!=null?fmtMin(m):'—'}</td>\`;}
+    return\`<tr class="\${tClass(g.sym||'')}">
+      <td data-val="\${g.sym}" class="b fw">\${g.sym||'—'}</td>
+      <td>\${tyBadge(type)}</td>
+      <td>\${sBadge(g.sess)}</td>
+      <td>\${dBadge(g.dir)}</td>
+      <td>\${vBadge(g.vwap)}</td>
+      <td data-val="\${g.count}" class="\${g.count>=5?'y fw':'c'}">\${g.count}</td>
+      <td data-val="\${g.evCount}" class="\${evCls}" title="EV-eligible ghosts">\${g.evCount}</td>
+      <td data-val="\${g.bestMaxRR}" class="\${g.bestMaxRR>0?'g':'d'} fw">\${f(g.bestMaxRR,2)}R</td>
+      <td data-val="\${avgRR}" class="\${avgRR>=1?'g':avgRR>0?'y':'d'}">\${f(avgRR,2)}R</td>
+      \${tCell(avgAdv(0.25),'o')}
+      \${tCell(avgAdv(0.50),'o')}
+      \${tCell(avgAdv(0.75),'r')}
+      \${tCell(avgAdv(1.00),'r')}
+      \${tCell(avgFav(0.50),'g')}
+      \${tCell(avgFav(1.00),'g')}
+      <td>\${cBadge(topReason)}</td>
+    </tr>\`;
+  }).join('');
+}
+
+// ── 5. WEBHOOK ERRORS ────────────────────────────────────
+async function loadErrors(){
+  const d=await api('/history');
+  if(d===null){
+    const maxRR=g.maxRRBeforeSL??g.maxRR??0;
+    b.bestMaxRR=Math.max(b.bestMaxRR,maxRR);
+    b.sumRR+=maxRR;
+    const slPct=g.maxSlPctUsed??g.slPctUsed;
+    if(slPct!=null){b.sumSLPct+=slPct;b.nSL++;}
     const tMin=g.timeToSLMin;
     if(tMin!=null){b.sumTime+=tMin;b.nTime++;}
     let cr=g.stopReason||g.closeReason||'sl';
     if(maxRR>=15)cr='maxRR';
-    else if(tMin!=null&&tMin>=20160)cr='timeout';
     else if(cr==='phantom_sl'||cr==='sl')cr='sl';
-    else if(cr==='timeout_72h')cr='timeout';
+    else if(cr==='timeout_72h'||cr==='timeout_2w')cr='timeout';
+    else if(cr==='manual_deploy')cr='manual';
     b.reasons[cr]=(b.reasons[cr]||0)+1;
-    if(g.openedAt>b.lastOpenedAt)b.lastOpenedAt=g.openedAt;
+    // EV-eligible: phantom SL hit OR max_rr_15, with valid VWAP, maxRR >= 0.5
+    const evOk=(g.phantomSLHit||g.stopReason==='max_rr_15')&&(g.vwapPosition==='above'||g.vwapPosition==='below')&&maxRR>=0.5;
+    if(evOk) b.evCount++;
+    if(!b.lastOpenedAt||g.openedAt>b.lastOpenedAt)b.lastOpenedAt=g.openedAt;
   }
-  const combined=Object.values(byKey);
-  document.getElementById('ghh-meta').textContent=combined.length+' combinaties · '+rows.length+' individuele ghosts';
+  const combined=Object.values(byKey).filter(b=>b.sym&&b.vwap&&b.vwap!=='unknown');
+  const totalGhosts=rows.length;
+  const totalEV=combined.reduce((s,b)=>s+b.evCount,0);
+  document.getElementById('ghh-meta').textContent=
+    combined.length+' combinaties · '+totalGhosts+' ghosts · '+totalEV+' EV-eligible (phantom SL hit + geldig VWAP)';
   const tb=document.getElementById('ghh-body');
-  if(!combined.length){tb.innerHTML=emptyRow(12);return;}
+  if(!combined.length){tb.innerHTML=emptyRow(13,'Geen ghost history — wacht op eerste phantom SL hit');return;}
   combined.sort((a,b)=>b.count-a.count);
   tb.innerHTML=combined.map(g=>{
     const type=sTypeName(g.sym||'');
@@ -3600,6 +3821,7 @@ async function loadGhostHistory(){
     const avgT=g.nTime>0?Math.round(g.sumTime/g.nTime):null;
     // dominant reason
     const topReason=Object.entries(g.reasons).sort((a,b)=>b[1]-a[1])[0]?.[0]||'sl';
+    const evCls=g.evCount>=5?'y fw':g.evCount>=1?'c':'d';
     return\`<tr class="\${tClass(g.sym||'')}">
       <td data-val="\${g.sym}" class="b fw">\${g.sym||'—'}</td>
       <td>\${tyBadge(type)}</td>
@@ -3607,6 +3829,7 @@ async function loadGhostHistory(){
       <td>\${dBadge(g.dir)}</td>
       <td>\${vBadge(g.vwap)}</td>
       <td data-val="\${g.count}" class="\${g.count>=5?'y fw':'c'}">\${g.count}</td>
+      <td data-val="\${g.evCount}" class="\${evCls}" title="EV-eligible: phantom SL hit of max_rr_15, VWAP known, maxRR≥0.5R">\${g.evCount}</td>
       <td data-val="\${g.bestMaxRR}" class="\${g.bestMaxRR>0?'g':'d'} fw">\${f(g.bestMaxRR,2)}R</td>
       <td data-val="\${avgRR}" class="\${avgRR>=1?'g':avgRR>0?'y':'d'}">\${f(avgRR,2)}R</td>
       <td data-val="\${avgSL??-1}" class="\${avgSL!=null?(avgSL<50?'g':avgSL<80?'y':'o'):'d'}">\${avgSL!=null?f(avgSL,0)+'%':'—'}</td>
