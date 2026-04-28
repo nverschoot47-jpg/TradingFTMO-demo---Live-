@@ -274,8 +274,8 @@ const SESSION_LABELS = {
 };
 
 // ── Data quality compliance date (FIX 8: single source of truth) ────
-const COMPLIANCE_DATE    = '2026-04-27 07:00:00';  // 09:00 Brussels (UTC+2 summer)
-const COMPLIANCE_DATE_MS = new Date('2026-04-27T07:00:00.000Z').getTime();
+const COMPLIANCE_DATE    = '2026-04-28 12:00:00';  // 14:00 Brussels (UTC+2 summer) — v10.8
+const COMPLIANCE_DATE_MS = new Date('2026-04-28T12:00:00.000Z').getTime();
 
 module.exports = {
   COMPLIANCE_DATE,
