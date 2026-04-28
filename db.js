@@ -28,6 +28,13 @@
 
 // FIX 8: COMPLIANCE_DATE from single source of truth
 const { COMPLIANCE_DATE, COMPLIANCE_DATE_MS } = require('./session');
+
+// FIX v12.2: EV_DATA_CUTOFF is the EARLIEST date for valid ghost EV data.
+// This is separate from COMPLIANCE_DATE (which marks the latest fresh-start for display).
+// Ghosts from 2026-04-18 onward have valid execution_price + vwap_band_pct.
+// computeEVStats and countGhostsByKey use this older cutoff so they count ALL valid ghosts,
+// not just ones opened after the most recent compliance date marker.
+const EV_DATA_CUTOFF = '2026-04-18 00:00:00';
 //  - DATE GATE: computeEVStats(), countGhostsByKey() now filter
 //    ghost_trades to opened_at >= '2026-04-18' only.
 //    Pre-compliance trades had missing execution_price / vwap_band_pct
@@ -161,6 +168,8 @@ async function initDB() {
         created_at          TIMESTAMPTZ DEFAULT NOW()
       );
       ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS max_sl_pct_used NUMERIC DEFAULT 0;
+      ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS sl_milestones   JSONB;
+      ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS rr_milestones   JSONB;
       CREATE INDEX IF NOT EXISTS idx_ghost_trades_key     ON ghost_trades (optimizer_key);
       CREATE INDEX IF NOT EXISTS idx_ghost_trades_symbol  ON ghost_trades (symbol);
       CREATE INDEX IF NOT EXISTS idx_ghost_trades_closed  ON ghost_trades (closed_at);
@@ -570,8 +579,8 @@ async function saveGhostTrade(g) {
         (position_id, symbol, session, direction, vwap_position, optimizer_key,
          entry, sl, sl_pct, phantom_sl, tp_rr_used,
          max_price, max_rr_before_sl, phantom_sl_hit, stop_reason,
-         time_to_sl_min, max_sl_pct_used, opened_at, closed_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+         time_to_sl_min, max_sl_pct_used, sl_milestones, rr_milestones, opened_at, closed_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
       ON CONFLICT DO NOTHING
     `, [
       g.positionId      ?? null,
@@ -588,6 +597,8 @@ async function saveGhostTrade(g) {
       g.stopReason      ?? null,
       g.timeToSLMin     ?? null,
       g.maxSlPctUsed    ?? 0,
+      g.slMilestones    ? JSON.stringify(g.slMilestones) : null,
+      g.rrMilestones    ? JSON.stringify(g.rrMilestones) : null,
       g.openedAt        ?? null,
       g.closedAt        ?? null,
     ]);
@@ -597,7 +608,11 @@ async function saveGhostTrade(g) {
 async function loadGhostTrades(optimizerKey = null, limitRows = 200) {
   try {
     const vals = [];
-    let where = "WHERE phantom_sl_hit = TRUE";
+    // FIX v12.2: verwijder phantom_sl_hit = TRUE filter — dit sloot alle andere
+    // stop-redenen (timeout_2w, max_rr_15, timeout_72h, manual_deploy) uit.
+    // Ghost history moet ALLE afgesloten ghosts tonen, ongeacht stop-reden.
+    // closed_at IS NOT NULL = ghost is gefinaliseerd (niet meer actief).
+    let where = "WHERE closed_at IS NOT NULL";
     if (optimizerKey) { vals.push(optimizerKey); where += ` AND optimizer_key = $${vals.length}`; }
     const r = await pool.query(`
       SELECT
@@ -615,6 +630,8 @@ async function loadGhostTrades(optimizerKey = null, limitRows = 200) {
         stop_reason          AS "stopReason",
         time_to_sl_min       AS "timeToSLMin",
         CAST(max_sl_pct_used AS FLOAT) AS "maxSlPctUsed",
+        sl_milestones        AS "slMilestones",
+        rr_milestones        AS "rrMilestones",
         opened_at            AS "openedAt",
         closed_at            AS "closedAt"
       FROM ghost_trades
@@ -632,13 +649,15 @@ async function countGhostsByKey(optimizerKey) {
       // DATA QUALITY: only count ghosts from 18/04/2026 onward with valid VWAP.
       // Pre-compliance rows had missing execution_price and vwap_band_pct.
       // 'unknown' vwap_position produces meaningless optimizer keys.
+      // FIX v12.2: use EV_DATA_CUTOFF (not COMPLIANCE_DATE) and include max_rr_15 ghosts.
       `SELECT COUNT(*) AS cnt FROM ghost_trades
        WHERE optimizer_key=$1
-         AND phantom_sl_hit=TRUE
+         AND closed_at IS NOT NULL
          AND max_rr_before_sl IS NOT NULL
          AND opened_at >= $2
-         AND vwap_position IN ('above','below')`,
-      [optimizerKey, COMPLIANCE_DATE]
+         AND vwap_position IN ('above','below')
+         AND (phantom_sl_hit = TRUE OR stop_reason = 'max_rr_15')`,
+      [optimizerKey, EV_DATA_CUTOFF]
     );
     return parseInt(r.rows[0]?.cnt ?? 0, 10);
   } catch (e) { return 0; }
@@ -1038,13 +1057,17 @@ async function computeEVStats(optimizerKey) {
       FROM ghost_trades g
       LEFT JOIN closed_trades ct ON ct.position_id = g.position_id
       WHERE g.optimizer_key=$1
-        AND g.phantom_sl_hit=TRUE
+        AND g.closed_at IS NOT NULL
         AND g.max_rr_before_sl IS NOT NULL
-        AND g.max_rr_before_sl >= 0.5
+        AND g.max_rr_before_sl >= 0
         AND g.opened_at >= $2
         AND g.vwap_position IN ('above','below')
         AND (ct.exclude_from_ev IS NULL OR ct.exclude_from_ev = FALSE)
-    `, [optimizerKey, COMPLIANCE_DATE]);
+        AND (
+          g.phantom_sl_hit = TRUE
+          OR g.stop_reason = 'max_rr_15'
+        )
+    `, [optimizerKey, EV_DATA_CUTOFF]);
 
     // Filter 0.00R ghosts — went straight to SL, no movement
     // Filter < 0.5R ghosts — can never hit any realistic TP level, only inflate loss count
