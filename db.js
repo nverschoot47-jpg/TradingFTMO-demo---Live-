@@ -29,12 +29,10 @@
 // FIX 8: COMPLIANCE_DATE from single source of truth
 const { COMPLIANCE_DATE, COMPLIANCE_DATE_MS } = require('./session');
 
-// FIX v12.2: EV_DATA_CUTOFF is the EARLIEST date for valid ghost EV data.
-// This is separate from COMPLIANCE_DATE (which marks the latest fresh-start for display).
-// Ghosts from 2026-04-18 onward have valid execution_price + vwap_band_pct.
-// computeEVStats and countGhostsByKey use this older cutoff so they count ALL valid ghosts,
-// not just ones opened after the most recent compliance date marker.
-const EV_DATA_CUTOFF = '2026-04-18 00:00:00';
+// FIX v12.2: EV_DATA_CUTOFF — earliest date for valid ghost EV data.
+// Aligned with COMPLIANCE_DATE: 28/04/2026 14:00 Brussels (12:00 UTC).
+// All ghost data before this timestamp is excluded from EV calculations.
+const EV_DATA_CUTOFF = '2026-04-28 12:00:00';
 //  - DATE GATE: computeEVStats(), countGhostsByKey() now filter
 //    ghost_trades to opened_at >= '2026-04-18' only.
 //    Pre-compliance trades had missing execution_price / vwap_band_pct
