@@ -1,7 +1,12 @@
 // ===============================================================
-// session.js  v10.7  |  PRONTO-AI
+// session.js  v10.8  |  PRONTO-AI
 //
-// Changes v10.6:
+// Changes v10.8:
+//  - DEFAULT_RISK_BY_TYPE gehalveerd: 0.0015 → 0.00075 (0.075% per trade).
+//    Reden: te veel losses waardoor manueel sluiten nodig was.
+//    Geldt voor forex, stock, index, commodity.
+//
+// Changes v10.7:
 //  - No functional changes. Version bump for v10.6 release.
 //
 // Changes v10.5:
@@ -33,10 +38,10 @@ const DAYS_MAP = {
 // or via the DB symbol_risk_config table.
 // ================================================================
 const DEFAULT_RISK_BY_TYPE = {
-  forex:     0.0015,   // 0.15% per trade
-  stock:     0.0015,   // 0.15% per trade
-  index:     0.0015,   // 0.15% per trade
-  commodity: 0.0015,   // 0.15% per trade
+  forex:     0.00075,   // 0.075% per trade (was 0.15% — gehalveerd v10.8)
+  stock:     0.00075,   // 0.075% per trade (was 0.15% — gehalveerd v10.8)
+  index:     0.00075,   // 0.075% per trade (was 0.15% — gehalveerd v10.8)
+  commodity: 0.00075,   // 0.075% per trade (was 0.15% — gehalveerd v10.8)
 };
 
 // ── Approved symbol catalog ─────────────────────────────────────
