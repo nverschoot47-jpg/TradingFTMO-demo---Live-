@@ -1,6 +1,37 @@
 // ===============================================================
-// server.js  v12.2.0  |  PRONTO-AI
+// server.js  v12.3.0  |  PRONTO-AI
 // TradingView → MetaApi REST → FTMO MT5
+//
+// v12.3.0 — RISK HALVED + NY DEAD ZONE + STOCK 2× SL + GHOST FIXES (30 April 2026):
+//
+//  FIX R2 — Risk nogmaals gehalveerd 0.075% → 0.0375% (alle asset types):
+//    FIXED_RISK_PCT default: 0.00075 → 0.000375.
+//    DEFAULT_RISK_BY_TYPE in session.js ook gehalveerd.
+//    Reden: verder risicobeperking zodat nooit manueel gesloten hoeft te worden.
+//    Env var FIXED_RISK_PCT overschrijft nog steeds (Railway).
+//
+//  FIX NY — NY Dead Zone blokkering 15:30–18:00 Brussels:
+//    canOpenNewTrade() in session.js blokkeert nu forex, commodity en stocks
+//    van 15:30 tot 18:00 Brussels tijd (= NYSE open tot 2,5u daarna).
+//    Reden: hoge spread + lage liquiditeit direct na NYSE open.
+//    Indexes (DE30EUR, NAS100USD, UK100GBP, US30USD) zijn NIET geblokkeerd.
+//    Reject label: NY_DEAD_ZONE in signal_log.
+//
+//  FIX SK — Stocks krijgen 2× SL buffer (3.0× totaal, was 1.5×):
+//    calcSLFromDerivedPct() gebruikt nu STOCK_SL_BUFFER_MULT=3.0 voor stocks
+//    in plaats van de standaard SL_BUFFER_MULT=1.5.
+//    Reden: stock CFDs hebben grotere spreads en worden te snel uitgetikt.
+//    Lot sizing herberekent op de bredere SL-afstand → zelfde riskEUR.
+//
+//  FIX GH1 — Ghost stopt nu correct bij echte SL-hit:
+//    handlePositionClosed() roept nu finalizeGhost() aan bij closeReason==="sl".
+//    Voorheen bleef de ghost doorlopen terwijl de trade al gesloten was.
+//    stopReason: "real_sl_hit" in ghost_trades.
+//
+//  FIX GH2 — ghost_state slaat slPct/riskEUR/evMult/dayMult op:
+//    restorePositionsFromMT5() leest nu ook riskPct, riskEUR, evMult, dayMult
+//    terug uit ghost_state zodat dashboard na restart de juiste risk% toont.
+//    ghost_state tabel krijgt ADD COLUMN IF NOT EXISTS migrations in db.js.
 //
 // v12.2.0 — RISK HALVING + DAX FIX + GHOST SL MILESTONES (28 April 2026):
 //
@@ -280,6 +311,8 @@ const {
   normalizeSymbol, getSymbolInfo,
   getVwapPosition, buildOptimizerKey,
   COMPLIANCE_DATE, COMPLIANCE_DATE_MS,
+  SL_BUFFER_MULT: SESSION_SL_BUFFER_MULT,
+  STOCK_SL_BUFFER_MULT,
 } = require("./session");
 
 // ── Config ───────────────────────────────────────────────────────
@@ -289,8 +322,8 @@ const WEBHOOK_SECRET  = process.env.WEBHOOK_SECRET;
 const PORT            = process.env.PORT || 3000;
 
 // ── Risk constants ───────────────────────────────────────────────
-// FIXED_RISK_PCT: base risk per trade (0.075% of balance — gehalveerd v10.8, was 0.15%)
-const FIXED_RISK_PCT = parseFloat(process.env.FIXED_RISK_PCT || "0.00075");
+// FIXED_RISK_PCT: base risk per trade (0.0375% of balance — nogmaals gehalveerd v12.3, was 0.075%)
+const FIXED_RISK_PCT = parseFloat(process.env.FIXED_RISK_PCT || "0.000375");
 
 // FIX C: Currency exposure budget per valuta (default 2% van balance).
 // Op €100k balance = €2.000 max exposure per valuta voor EV-neutraal trades.
@@ -311,8 +344,11 @@ const MAX_CLOSED_TRADES = 10000;  // verhoogd van 5000 — bij 4500+ trades was 
 // FIX 15
 const MAX_HISTORY       = 200;
 
-// SL buffer: MT5 SL placed at sl_pct × 1.5 to absorb spread + timing lag
-const SL_BUFFER_MULT = 1.5;
+// SL buffer multipliers — geïmporteerd uit session.js (v12.3):
+//   SL_BUFFER_MULT       = 1.5 → standaard voor forex, index, commodity
+//   STOCK_SL_BUFFER_MULT = 3.0 → stocks: 2× de standaard buffer (spread fix)
+// SESSION_SL_BUFFER_MULT is de alias voor de geïmporteerde SL_BUFFER_MULT.
+const SL_BUFFER_MULT = SESSION_SL_BUFFER_MULT;  // = 1.5, backward compat alias
 
 // Min stop distances per MT5 symbol
 const MIN_STOP = {
@@ -648,15 +684,18 @@ function deriveSLPct(tvEntryPrice, tvSLPrice) {
 }
 
 // MT5 SL berekening op basis van executionPrice + derivedSlPct.
-// ×1.5 buffer absorbeert slippage/delay én geeft shadow SL optimizer ruimte.
-function calcSLFromDerivedPct(direction, executionPrice, derivedSlPct) {
-  const buffered = derivedSlPct * SL_BUFFER_MULT;
+// ×1.5 buffer voor forex/index/commodity absorbeert slippage/delay.
+// ×3.0 buffer voor stocks (STOCK_SL_BUFFER_MULT) — grotere spread.
+// assetType is optioneel: als niet opgegeven → standaard SL_BUFFER_MULT.
+function calcSLFromDerivedPct(direction, executionPrice, derivedSlPct, assetType = null) {
+  const mult     = assetType === "stock" ? STOCK_SL_BUFFER_MULT : SL_BUFFER_MULT;
+  const buffered = derivedSlPct * mult;
   return direction === "buy"
     ? parseFloat((executionPrice * (1 - buffered)).toFixed(5))
     : parseFloat((executionPrice * (1 + buffered)).toFixed(5));
 }
 
-// Backwards compat alias
+// Backwards compat alias — geen assetType beschikbaar op call sites die deze gebruiken
 function calcSLFromPct(direction, mt5Entry, slPct) {
   return calcSLFromDerivedPct(direction, mt5Entry, slPct);
 }
@@ -889,7 +928,10 @@ function startGhostTracker(pos, restoreData = null) {
   // Write initial state to DB (or update if restored)
   saveGhostState({ positionId, optimizerKey, symbol, mt5Symbol, session, direction,
     vwapPosition, entry, sl: originalSL, slPct: originalSlPct, tpRRUsed: originalTpRR,
-    maxPrice, maxRR: restoreData?.maxRR ?? 0, maxSlPctUsed, openedAt }).catch(() => {});
+    maxPrice, maxRR: restoreData?.maxRR ?? 0, maxSlPctUsed, openedAt,
+    riskPct: pos.riskPct ?? null, riskEUR: pos.riskEUR ?? null,
+    evMult: pos.evMult ?? 1.0, dayMult: pos.dayMult ?? 1.0,
+  }).catch(() => {});
 
   async function tick() {
     try {
@@ -999,7 +1041,10 @@ function startGhostTracker(pos, restoreData = null) {
       if (Date.now() - lastStateSaveTs > 5 * 60 * 1000) {
         saveGhostState({ positionId, optimizerKey, symbol, mt5Symbol, session, direction,
           vwapPosition, entry, sl: g.sl, slPct: originalSlPct, tpRRUsed: originalTpRR,
-          maxPrice, maxRR: g.maxRR, maxSlPctUsed, openedAt }).catch(() => {});
+          maxPrice, maxRR: g.maxRR, maxSlPctUsed, openedAt,
+          riskPct: pos.riskPct ?? null, riskEUR: pos.riskEUR ?? null,
+          evMult: pos.evMult ?? 1.0, dayMult: pos.dayMult ?? 1.0,
+        }).catch(() => {});
         lastStateSaveTs = Date.now();
       }
 
@@ -1321,6 +1366,18 @@ async function handlePositionClosed(pos) {
   }
   if (closeReason === "sl") {
     await recalcLotsAfterSL(pos.symbol, pos.entry, pos.sl).catch(() => {});
+    // FIX GH1 (v12.3): Ghost afsluiten bij echte SL-hit.
+    // De phantom SL = echte SL, dus de ghost zou ook onmiddellijk stoppen.
+    // Maar zonder dit blijft de ghost in memory doorlopen na het sluiten van de trade.
+    // finalizeGhost() slaat de ghost op in DB met correcte maxRR en stopReason.
+    if (ghostTrackers[pos.positionId]) {
+      const elapsedMs = Date.now() - new Date(pos.openedAt ?? 0).getTime();
+      const finalMaxPrice = pos.maxPrice ?? pos.currentPrice ?? pos.entry;
+      console.log(`[Ghost] ${pos.positionId}: real SL hit — finalizing ghost (stopReason=real_sl_hit)`);
+      await finalizeGhost(pos.positionId, "real_sl_hit", elapsedMs, finalMaxPrice).catch(e =>
+        console.warn(`[Ghost] finalizeGhost on SL hit failed: ${e.message}`)
+      );
+    }
   }
 
   // FIX C: rebuild currency exposure na close van EV-neutrale forex positie
@@ -1380,19 +1437,31 @@ async function restorePositionsFromMT5() {
         ? vpFromGhostState
         : vpFromComment;
       const optKey = buildOptimizerKey(sym, sess, dir, vpPos);
+
+      // FIX GH2 (v12.3): gebruik riskPct/riskEUR/evMult/dayMult uit ghost_state als
+      // die beschikbaar zijn. Dit voorkomt dat het dashboard na een restart 0 toont
+      // voor deze velden. Fallback: FIXED_RISK_PCT voor posities zonder ghost_state.
+      const restoredRiskPct = gs?.riskPct  ?? FIXED_RISK_PCT;
+      const restoredRiskEUR = gs?.riskEUR  ?? 0;
+      const restoredEvMult  = gs?.evMult   ?? 1.0;
+      const restoredDayMult = gs?.dayMult  ?? 1.0;
+
       openPositions[id] = {
         positionId: id, symbol: sym, mt5Symbol: lp.symbol,
         direction: dir, vwapPosition: vpPos, optimizerKey: optKey,
         entry, sl: lp.stopLoss ?? 0, tp: lp.takeProfit ?? null,
-        lots: lp.volume ?? 0.01, riskEUR: 0, riskPct: FIXED_RISK_PCT,
+        lots: lp.volume ?? 0.01,
+        riskEUR: restoredRiskEUR,
+        riskPct: restoredRiskPct,
+        evMult:  restoredEvMult,
+        dayMult: restoredDayMult,
         session: sess, openedAt: lp.time ?? new Date().toISOString(),
         maxPrice: entry, maxRR: 0, currentPnL: lp.unrealizedProfit ?? 0,
-        slPct: null, restoredAfterRestart: true,
+        slPct: gs?.slPct ?? null, restoredAfterRestart: true,
       };
-      console.log(`[Restart] ${sym} (${id}): vwapPosition='${vpPos}' (comment='${lp.comment ?? ""}')`);
+      console.log(`[Restart] ${sym} (${id}): vwapPosition='${vpPos}' riskPct=${(restoredRiskPct*100).toFixed(4)}% riskEUR=€${restoredRiskEUR.toFixed(2)} evMult=×${restoredEvMult.toFixed(2)}`);
       if (openPositions[id].sl > 0) {
         // Pass persisted ghost state if available — preserves maxPrice across deploys
-        const gs = ghostStateMap[id] ?? null;
         if (gs) console.log(`[Restart] Ghost ${sym} (${id}): restoring maxPrice=${gs.maxPrice} maxRR=${gs.maxRR}R maxSlPct=${gs.maxSlPctUsed}%`);
         startGhostTracker(openPositions[id], gs);
       }
@@ -1785,7 +1854,8 @@ app.post("/webhook", async (req, res) => {
   // op dezelfde SL-afstand die straks naar MT5 gaat. Zonder dit: bij een krappe TV SL
   // (bijv. 2pt DAX) rekende calcLots op 2pt, maar MT5 SL werd 10pt → werkelijk risk 5×
   // hoger dan bedoeld. Nu is tempSL altijd ≥ minStop afstand, consistente lot sizing.
-  const tempSLRaw = calcSLFromDerivedPct(direction, closePrice || 1, derivedSlPct);
+  // v12.3: stocks gebruiken 3× buffer → bredere tempSL → juiste (lagere) lots.
+  const tempSLRaw = calcSLFromDerivedPct(direction, closePrice || 1, derivedSlPct, assetType);
   const tempSL    = enforceMinStop(mt5Symbol, direction, closePrice || 1, tempSLRaw);
   const symInfoL = getSymbolInfo(symKey);
   let   lotVal   = LOT_VALUE[symInfoL?.type || "stock"] ?? 1; // fallback, overschreven door live MT5 spec
@@ -1869,9 +1939,9 @@ app.post("/webhook", async (req, res) => {
 
   // Bereken SL/TP op live MT5 prijs vóór de order
   // derivedSlPct = |tvEntry - tvSL| / tvEntry (al berekend bovenaan)
-  // Zelfde % op MT5 live prijs toepassen, met ×1.5 buffer
+  // Zelfde % op MT5 live prijs toepassen, met buffer (×1.5 standaard, ×3.0 voor stocks)
   const preMt5SL = enforceMinStop(mt5Symbol, direction,
-    preExecPrice, calcSLFromDerivedPct(direction, preExecPrice, derivedSlPct));
+    preExecPrice, calcSLFromDerivedPct(direction, preExecPrice, derivedSlPct, assetType));
   const preMt5TP = applyTPFloorGuard(direction, preExecPrice, preMt5SL,
     calcTPPrice(direction, preExecPrice, preMt5SL, tpRR));
   console.log(`[PreOrder] SL=${preMt5SL} TP=${preMt5TP} (${tpRR}R) op preExec=${preExecPrice} | derivedSlPct=${slPctHuman}`);
@@ -1960,9 +2030,9 @@ app.post("/webhook", async (req, res) => {
     }).catch(() => {});
   }
 
-  // FIX 5: spread guard uses buffered SL distance
+  // FIX 5: spread guard uses buffered SL distance (stocks: 3× buffer)
   if (assetType === "stock" && spread > 0) {
-    const guardSLDist = Math.abs(executionPrice - calcSLFromDerivedPct(direction, executionPrice, derivedSlPct));
+    const guardSLDist = Math.abs(executionPrice - calcSLFromDerivedPct(direction, executionPrice, derivedSlPct, assetType));
     if (guardSLDist > 0 && spread > 0.25 * guardSLDist) {
       const reason = `SPREAD_GUARD: spread ${spread.toFixed(5)} > 25% of buffered SL dist ${guardSLDist.toFixed(5)}`;
       logReject("SPREAD_GUARD_CLOSE", { symbol: symKey, direction, session, optimizerKey, reason, payload: {
@@ -1978,9 +2048,10 @@ app.post("/webhook", async (req, res) => {
     }
   }
 
-  // Step C: FIX A — SL berekening op executionPrice met derivedSlPct × 1.5 buffer.
+  // Step C: FIX A — SL berekening op executionPrice met derivedSlPct × buffer.
   // derivedSlPct komt van server (TV absolute prijzen), NIET van TV payload.
-  let mt5SL = calcSLFromDerivedPct(direction, executionPrice, derivedSlPct);
+  // Stocks: ×3.0 buffer (STOCK_SL_BUFFER_MULT), overige: ×1.5 (SL_BUFFER_MULT).
+  let mt5SL = calcSLFromDerivedPct(direction, executionPrice, derivedSlPct, assetType);
   mt5SL     = enforceMinStop(mt5Symbol, direction, executionPrice, mt5SL);
 
   // Fix 6: Log the full SL conversion chain for audit
@@ -2645,7 +2716,7 @@ app.get("/band-ghosts/active", (req, res) => {
 app.get("/test", (req, res) => {
   res.json({
     status: "Railway is bereikbaar",
-    version: "12.1.2",
+    version: "12.3.0",
     time: new Date().toISOString(),
     headers: {
       "content-type": req.headers["content-type"] ?? "(geen)",
@@ -2674,13 +2745,15 @@ app.get("/health", async (req, res) => {
   const tradeWindowForex = canOpenNewTrade("EURUSD");
   const tradeWindowStock = canOpenNewTrade("AAPL");
   res.json({
-    status: "ok", version: "12.1.2", time: getBrusselsDateStr(),
+    status: "ok", version: "12.3.0", time: getBrusselsDateStr(),
     openPos: Object.keys(openPositions).length, ghosts: Object.keys(ghostTrackers).length,
     tpLocks: Object.keys(tpLocks).length, closedT: closedTrades.length, balance,
     fixedRiskPct: FIXED_RISK_PCT, marketOpen: isMarketOpen(), session: getSession(),
     tradeWindowForex: tradeWindowForex.allowed, tradeWindowStocks: tradeWindowStock.allowed,
     lotOverrides: Object.keys(lotOverrides).length, evKeyMults: Object.keys(keyRiskMult).length,
     multMinSample: MULT_MIN_SAMPLE, slBufferMult: SL_BUFFER_MULT,
+    stockSlBufferMult: STOCK_SL_BUFFER_MULT,
+    nyDeadZone: "1530-1800 Brussels (forex/commodity/stock geblokkeerd)",
   });
 });
 
@@ -2706,7 +2779,7 @@ app.get(["/", "/dashboard"], async (req, res) => {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PRONTO-AI v12.1.2</title>
+<title>PRONTO-AI v12.3.0</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600;700&family=IBM+Plex+Sans+Condensed:wght@500;600;700&display=swap" rel="stylesheet">
 <style>
@@ -2831,7 +2904,7 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
 <div class="hdr">
   <div>
     <div class="logo">PRONTO-AI</div>
-    <div class="ver">v12.1.2 · TradingView → MetaApi → FTMO MT5 · Risk ${(FIXED_RISK_PCT*100).toFixed(3)}% · SL×${SL_BUFFER_MULT} · DAX Fix active</div>
+    <div class="ver">v12.3.0 · TradingView → MetaApi → FTMO MT5 · Risk ${(FIXED_RISK_PCT*100).toFixed(4)}% · SL×${SL_BUFFER_MULT} · Stock SL×${STOCK_SL_BUFFER_MULT} · NY Dead Zone 15:30–18:00</div>
   </div>
   <div class="hdr-r">
     <span class="sb s-outside" id="hdr-sess">—</span>
@@ -4070,7 +4143,7 @@ async function start() {
   const missing = ["META_API_TOKEN", "META_ACCOUNT_ID", "WEBHOOK_SECRET"].filter(k => !process.env[k]);
   if (missing.length) { console.error(`[ERR] Missing env: ${missing.join(", ")}`); process.exit(1); }
 
-  console.log("🚀 PRONTO-AI v12.1.3 starting...");
+  console.log("🚀 PRONTO-AI v12.3.0 starting...");
   await initDB();
 
   // Load closed trades
@@ -4144,7 +4217,7 @@ async function start() {
   rebuildEVCache().catch(() => {});
 
   app.listen(PORT, () => {
-    console.log(`[✓] PRONTO-AI v12.1.2 on port ${PORT}`);
+    console.log(`[✓] PRONTO-AI v12.3.0 on port ${PORT}`);
     console.log(`   🔹 Dashboard:      /`);
     console.log(`   🔹 Health:         /health`);
     console.log(`   🔹 EV Table:       /ev`);
@@ -4160,7 +4233,7 @@ async function start() {
     console.log(`   💵 Fixed risk:     ${(FIXED_RISK_PCT*100).toFixed(3)}% | Balance: €${liveBalance.toFixed(2)}`);
     console.log(`   🌍 MetaApi regio:  ${META_REGION} (wijzig via META_API_REGION env als 504 errors)`);
     console.log(`   💰 Curr budget:    ${(CURRENCY_BUDGET_PCT*100).toFixed(1)}% per valuta | TP floor: ${MIN_TP_RR_FLOOR}R`);
-    console.log(`   🕐 Ghost max:      72h | SL buffer: ×${SL_BUFFER_MULT}`);
+    console.log(`   🕐 Ghost max:      72h | SL buffer: ×${SL_BUFFER_MULT} | Stock SL buffer: ×${STOCK_SL_BUFFER_MULT}`);
     console.log(`   📊 Mult threshold: ${MULT_MIN_SAMPLE} ghost samples`);
   });
 }
