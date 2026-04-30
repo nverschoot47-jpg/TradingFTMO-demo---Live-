@@ -1,5 +1,13 @@
 // ===============================================================
-// db.js  v12.1  |  PRONTO-AI
+// db.js  v12.3  |  PRONTO-AI
+//
+// Changes v12.3:
+//  - FIX GH2: ghost_state tabel krijgt extra kolommen voor risk/ev data:
+//    risk_pct, risk_eur, ev_mult, day_mult via ADD COLUMN IF NOT EXISTS.
+//    restorePositionsFromMT5() in server.js leest deze terug bij restart
+//    zodat dashboard na restart correcte risk% toont voor herstelde posities.
+//  - saveGhostState() accepteert nu ook riskPct, riskEUR, evMult, dayMult.
+//  - loadAllGhostStates() retourneert nu ook riskPct, riskEUR, evMult, dayMult.
 //
 // Changes v12.1:
 //  - FIX shadow_sl_analysis: ADD COLUMN IF NOT EXISTS migrations voor
@@ -193,6 +201,12 @@ async function initDB() {
         opened_at         TIMESTAMPTZ,
         updated_at        TIMESTAMPTZ DEFAULT NOW()
       );
+      -- FIX GH2 (v12.3): extra kolommen voor risk/ev data zodat dashboard na restart
+      -- de juiste risk% toont voor herstelde posities (waren null na restart).
+      ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS risk_pct  NUMERIC;
+      ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS risk_eur  NUMERIC;
+      ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS ev_mult   NUMERIC DEFAULT 1.0;
+      ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS day_mult  NUMERIC DEFAULT 1.0;
     `);
 
     // ── shadow_snapshots ─────────────────────────────────────────
@@ -1274,18 +1288,26 @@ async function loadAllShadowAnalysis() {
 }
 
 // ── ghost_state (restart persistence) ─────────────────────────
+// FIX GH2 (v12.3): risk_pct, risk_eur, ev_mult, day_mult meegestuurd zodat
+// dashboard na restart de juiste risk% toont voor herstelde posities.
 async function saveGhostState(g) {
   try {
     await pool.query(`
       INSERT INTO ghost_state
         (position_id, optimizer_key, symbol, mt5_symbol, session, direction,
          vwap_position, entry, sl, sl_pct, tp_rr_used,
-         max_price, max_rr, max_sl_pct_used, opened_at, updated_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,NOW())
+         max_price, max_rr, max_sl_pct_used, opened_at,
+         risk_pct, risk_eur, ev_mult, day_mult,
+         updated_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,NOW())
       ON CONFLICT (position_id) DO UPDATE SET
         max_price       = EXCLUDED.max_price,
         max_rr          = EXCLUDED.max_rr,
         max_sl_pct_used = EXCLUDED.max_sl_pct_used,
+        risk_pct        = COALESCE(EXCLUDED.risk_pct, ghost_state.risk_pct),
+        risk_eur        = COALESCE(EXCLUDED.risk_eur, ghost_state.risk_eur),
+        ev_mult         = COALESCE(EXCLUDED.ev_mult,  ghost_state.ev_mult),
+        day_mult        = COALESCE(EXCLUDED.day_mult, ghost_state.day_mult),
         updated_at      = NOW()
     `, [
       g.positionId, g.optimizerKey, g.symbol, g.mt5Symbol ?? g.symbol,
@@ -1293,6 +1315,8 @@ async function saveGhostState(g) {
       g.entry, g.sl, g.slPct ?? null, g.tpRRUsed ?? null,
       g.maxPrice ?? g.entry, g.maxRR ?? 0, g.maxSlPctUsed ?? 0,
       g.openedAt ?? null,
+      g.riskPct ?? null, g.riskEUR ?? null,
+      g.evMult ?? 1.0, g.dayMult ?? 1.0,
     ]);
   } catch (e) { console.warn('[!] saveGhostState:', e.message); }
 }
@@ -1313,7 +1337,11 @@ async function loadAllGhostStates() {
         CAST(max_price        AS FLOAT) AS "maxPrice",
         CAST(max_rr           AS FLOAT) AS "maxRR",
         CAST(max_sl_pct_used  AS FLOAT) AS "maxSlPctUsed",
-        opened_at             AS "openedAt"
+        opened_at             AS "openedAt",
+        CAST(risk_pct         AS FLOAT) AS "riskPct",
+        CAST(risk_eur         AS FLOAT) AS "riskEUR",
+        CAST(ev_mult          AS FLOAT) AS "evMult",
+        CAST(day_mult         AS FLOAT) AS "dayMult"
       FROM ghost_state
     `);
     return r.rows;
