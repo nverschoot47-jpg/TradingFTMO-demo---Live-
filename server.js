@@ -1,8 +1,63 @@
 // ===============================================================
-// server.js  v12.3.0  |  PRONTO-AI
+// server.js  v12.4.0  |  PRONTO-AI
 // TradingView → MetaApi REST → FTMO MT5
 //
-// v12.3.0 — RISK HALVED + NY DEAD ZONE + STOCK 2× SL + GHOST FIXES (30 April 2026):
+// v12.4.0 — STABILITY FIXES (30 April 2026):
+//
+//  FIX 1 — closeReason detectie met tolerantie + maxRR fallback:
+//    handlePositionClosed() gebruikt nu 5% SL-afstand als tolerantie
+//    om spread/requote variatie op te vangen. Secundaire check op
+//    maxRR < 0.05R classificeert twijfelgevallen als "sl".
+//    Voorkomt dat SL-hits als "manual" geclassificeerd worden →
+//    GH1 (ghost stoppen) en recalcLotsAfterSL triggeren nu correct.
+//
+//  FIX 2 — derivedSlPct validatie aangepast voor stock 3× buffer:
+//    Maximale TV SL is nu 5% / slBufferForType:
+//      Stocks (×3.0): max 1.67% TV SL → max 5.0% MT5 SL
+//      Overige (×1.5): max 3.33% TV SL → max 5.0% MT5 SL
+//    Voorkomt extreme MT5 SL bij grote TV SL op stocks.
+//
+//  FIX 4 — deals tabel aangemaakt + MetaAPI history-deals integratie:
+//    deals tabel in DB voor commission + swap + profit per positie.
+//    fetchAndSaveDealsForPosition() haalt /history-deals/time op na
+//    elke SL/TP close en slaat deals op via saveDeal().
+//    fetchRealizedPnl() berekent nu netto P&L = profit + commission + swap.
+//    handlePositionClosed() roept fetchAndSaveDealsForPosition() aan
+//    vóór fetchRealizedPnl() zodat de waarde altijd correct is.
+//
+//  FIX 5 — Stocks NY dead zone verduidelijkt: effectief 16:00–18:00:
+//    Stocks starten pas om 16:00; dead zone blokkering 16:00–18:00.
+//    Stocks zijn tradebaar vanaf 18:00 Brussels (12:00 ET).
+//    Comment in session.js verduidelijkt de intentie.
+//
+//  FIX 8 — evMult/dayMult in openPositions bijgewerkt na nightly optimizer:
+//    evaluateDailyRisk() update na afloop pos.evMult/pos.dayMult voor alle
+//    open posities zodat ghost_state periodic save actuele multipliers opslaat.
+//
+//  FIX 9 — liveBalance cold start fix:
+//    Default balance is nu 0 (was 50000). getLiveBalance() probeert tot
+//    3× MT5 te bereiken bij cold start. Laatste fallback: 100000 met waarschuwing.
+//    Voorkomt verkeerde lot berekeningen in de eerste minuten na deploy.
+//
+//  FIX 10 — Spread guard voor stocks gebruikt ongebufferde SL-afstand:
+//    Was: spread > 0.25 × buffered SL dist (3× te groot door STOCK_SL_BUFFER_MULT)
+//    Nu:  spread > 0.25 × unbuffered SL dist (derivedSlPct × executionPrice)
+//    Spread guard is nu weer even streng als voor de 3× buffer introductie.
+//
+//  FIX 11 — recalcLotsAfterSL dead code verwijderd:
+//    Functie berekende baseLots na SL-hit maar sloeg niets op (lotOverrides
+//    verwijderd in v11.0). Aanroep in handlePositionClosed ook verwijderd.
+//
+//  FIX 12 — stopReason "timeout_72h" gecorrigeerd naar "timeout_2w":
+//    GHOST_MAX_MS is 14 dagen. 04:00 cleanup cron logt nu "timeout_2w".
+//    DB-records die al "timeout_72h" bevatten zijn niet geraakt (geen migratie).
+//
+//  FIX 14 — evaluateDailyRisk DB-fallback bij lege closedTrades array:
+//    Na een deploy midden op de dag is closedTrades[] leeg. De 02:00 cron
+//    evaluateDailyRisk() miste dan alle trades van die dag voor keyRiskMult.
+//    Nu: DB-query fallback als in-memory array 0 trades voor vandaag toont.
+//
+// v12.4.0 — RISK HALVED + NY DEAD ZONE + STOCK 2× SL + GHOST FIXES (30 April 2026):
 //
 //  FIX R2 — Risk nogmaals gehalveerd 0.075% → 0.0375% (alle asset types):
 //    FIXED_RISK_PCT default: 0.00075 → 0.000375.
@@ -300,6 +355,7 @@ const {
   loadShadowWinners,
   saveKeyRiskMult, loadKeyRiskMults,
   fetchRealizedPnl,
+  saveDeal,
   saveSpreadLog, loadSpreadStats, loadSpreadLog,
   pool,
 } = require("./db");
@@ -393,7 +449,10 @@ const LOT_VALUE_BY_MT5 = {
 };
 
 // ── Live balance cache ────────────────────────────────────────────
-let liveBalance   = 50000;
+// FIX v12.4: default 0 (niet 50000) zodat lot berekeningen geblokkeerd
+// worden totdat de echte balance van MT5 is opgehaald bij startup.
+// getLiveBalance() wacht actief op de eerste succesvolle fetch.
+let liveBalance   = 0;
 let liveBalanceAt = 0;
 
 // ── MetaApi ───────────────────────────────────────────────────────
@@ -446,6 +505,45 @@ async function fetchCurrentPrice(mt5Symbol) {
 }
 async function placeOrder(payload) { return metaFetch("/trade", { method: "POST", body: JSON.stringify(payload) }, 12000); }
 
+// FIX v12.4: haal history-deals op voor een positie na close.
+// MetaAPI endpoint: GET /history-deals/time/{from}/{to}
+// Filtert op positionId om de deals voor 1 specifieke trade te vinden.
+// Haalt deals op over een venster van 5 minuten rondom nu (deals komen snel binnen).
+// Slaat elk deal op via saveDeal() voor netto P&L berekening (incl. commission + swap).
+async function fetchAndSaveDealsForPosition(positionId, symbol) {
+  try {
+    const toMs   = Date.now() + 30000;           // 30s in de toekomst als buffer
+    const fromMs = toMs - (10 * 60 * 1000);      // 10 minuten terug
+    const from   = new Date(fromMs).toISOString();
+    const to     = new Date(toMs).toISOString();
+    const data   = await metaFetch(`/history-deals/time/${encodeURIComponent(from)}/${encodeURIComponent(to)}`, {}, 8000);
+    const deals  = Array.isArray(data) ? data : (data?.deals ?? []);
+    let saved = 0;
+    for (const d of deals) {
+      const dPosId = String(d.positionId ?? d.position_id ?? "");
+      if (dPosId !== String(positionId)) continue;
+      await saveDeal({
+        positionId:  String(positionId),
+        dealId:      String(d.id ?? d.dealId ?? `${positionId}_${saved}`),
+        symbol:      d.symbol ?? symbol ?? null,
+        type:        d.type   ?? null,
+        profit:      parseFloat(d.profit     ?? 0),
+        commission:  parseFloat(d.commission ?? 0),
+        swap:        parseFloat(d.swap       ?? 0),
+        volume:      d.volume != null ? parseFloat(d.volume) : null,
+        price:       d.price  != null ? parseFloat(d.price)  : null,
+        time:        d.time   ?? null,
+      }).catch(() => {});
+      saved++;
+    }
+    if (saved > 0) console.log(`[Deals] ${positionId}: ${saved} deal(s) opgeslagen (symbol=${symbol})`);
+    return saved;
+  } catch (e) {
+    console.warn(`[Deals] fetchAndSaveDeals ${positionId} failed: ${e.message}`);
+    return 0;
+  }
+}
+
 // ── In-memory state ───────────────────────────────────────────────
 const openPositions  = {};
 const closedTrades   = [];
@@ -475,9 +573,29 @@ function logEvent(entry) {
 }
 
 // ── Balance helpers ───────────────────────────────────────────────
+// FIX v12.4: als balance nog 0 is (cold start, MT5 nog niet bereikt),
+// probeer tot 3× met 2s tussenpoos te fetchen voor we terugvallen.
+// Dit voorkomt verkeerde lot berekeningen in de eerste minuten na deploy.
 async function getLiveBalance() {
-  if (Date.now() - liveBalanceAt > 5 * 60 * 1000) {
-    try { await fetchAccountInfo(); } catch {}
+  if (liveBalance > 0 && Date.now() - liveBalanceAt < 5 * 60 * 1000) {
+    return liveBalance;
+  }
+  // Probeer live balance op te halen — tot 3 pogingen
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      await fetchAccountInfo();
+      if (liveBalance > 0) return liveBalance;
+    } catch (e) {
+      console.warn(`[Balance] Fetch poging ${attempt}/3 mislukt: ${e.message}`);
+    }
+    if (attempt < 3) await new Promise(r => setTimeout(r, 2000));
+  }
+  // Absolute fallback: als MT5 écht niet bereikbaar is, gebruik laatste
+  // bekende waarde of 100000 als ultieme veilige default (beter dan 50k).
+  if (liveBalance <= 0) {
+    console.warn("[Balance] ⚠ Kon geen live balance ophalen — fallback 100000. Lots kunnen incorrect zijn!");
+    liveBalance = 100000;
+    liveBalanceAt = Date.now();
   }
   return liveBalance;
 }
@@ -652,26 +770,9 @@ async function calcLots(symbol, mt5Sym, assetType, entry, sl, riskEUR, evMult, d
   return { lots, lotVal, source: spec.source };
 }
 
-// ── Recalculate base lots after SL hit ────────────────────────────
-// FIX 2: persists to DB immediately.
-async function recalcLotsAfterSL(symbol, entry, sl) {
-  try {
-    const balance = await getLiveBalance();
-    const pct     = getSymbolRiskPct(symbol);
-    const info    = getSymbolInfo(symbol);
-    const type    = info?.type || "stock";
-    const mt5Sym  = info?.mt5 || symbol;
-    // Gebruik live lotVal van MT5 spec als gecached, anders fallback
-    const cachedSpec = symbolSpecCache[mt5Sym];
-    const lotVal  = cachedSpec?.lotVal ?? LOT_VALUE_BY_MT5[mt5Sym] ?? LOT_VALUE[type] ?? 1;
-    const dist    = Math.abs(entry - sl);
-    if (!dist) return;
-    // v10.6: puur balance × pct (geen multipliers in baseLots)
-    const baseLots = parseFloat((balance * pct / (dist * lotVal)).toFixed(2));
-    console.log(`[LotRecalc] ${symbol} → base lots = ${baseLots} (v12: geen override opslaan)`);
-    logEvent({ type: "LOT_RECALC", symbol, baseLots, slDist: dist, balance, riskPct: pct });
-  } catch (e) { console.warn("[LotRecalc]", e.message); }
-}
+// FIX v12.4: recalcLotsAfterSL verwijderd — was dead code.
+// De functie berekende nieuwe baseLots na SL-hit maar sloeg niets op.
+// lotOverrides werden al verwijderd in v11.0 (FIX R4). Geen vervanging nodig.
 
 // ── SL helpers ───────────────────────────────────────────────────
 // FIX A: server berekent derivedSlPct van absolute TV prijzen.
@@ -1318,20 +1419,45 @@ async function syncOpenPositions() {
 // ── handlePositionClosed (FIX 6: price-based closeReason, FIX 4: realPnl) ──
 async function handlePositionClosed(pos) {
   const lastPrice = pos.currentPrice ?? pos.maxPrice ?? pos.entry;
+
+  // FIX v12.4: verbeterde closeReason detectie.
+  // Primair: vergelijk lastPrice met SL/TP met een 5% tolerantie op de SL-afstand
+  // om spread/slippage-variatie op te vangen. Dit voorkomt dat een SL-hit
+  // als "manual" geclassificeerd wordt omdat de prijs al teruggetrokken is.
   let closeReason;
-  if (pos.tp != null) {
-    const tpHit = pos.direction === "buy" ? lastPrice >= pos.tp : lastPrice <= pos.tp;
+  const slDist = pos.sl > 0 ? Math.abs(pos.entry - pos.sl) : 0;
+  const tolerance = slDist * 0.05; // 5% van SL-afstand als marge
+
+  if (pos.tp != null && pos.tp > 0) {
+    const tpHit = pos.direction === "buy"
+      ? lastPrice >= (pos.tp - tolerance)
+      : lastPrice <= (pos.tp + tolerance);
     if (tpHit) closeReason = "tp";
   }
   if (!closeReason && pos.sl > 0) {
-    const slHit = pos.direction === "buy" ? lastPrice <= pos.sl : lastPrice >= pos.sl;
+    const slHit = pos.direction === "buy"
+      ? lastPrice <= (pos.sl + tolerance)
+      : lastPrice >= (pos.sl - tolerance);
     if (slHit) closeReason = "sl";
+  }
+  // Secundaire check: als maxRR vrijwel 0 is (< 0.05R) bij close → waarschijnlijk SL
+  // Dit vangt het geval op waarbij price al teruggetrokken is van SL bij de sync.
+  if (!closeReason && pos.sl > 0 && slDist > 0) {
+    const maxRRCheck = pos.maxRR ?? calcMaxRR(pos.direction, pos.entry, pos.sl, lastPrice);
+    if (maxRRCheck < 0.05) closeReason = "sl";
   }
   if (!closeReason) closeReason = "manual";
 
   const hitTP = closeReason === "tp";
   const maxRR = pos.maxRR ?? calcMaxRR(pos.direction, pos.entry, pos.sl, pos.maxPrice ?? pos.entry);
   const now   = new Date().toISOString();
+
+  // FIX v12.4: haal MetaAPI history-deals op voor deze positie en sla ze op in DB.
+  // Dit vult de deals tabel zodat fetchRealizedPnl() de echte netto P&L kan berekenen
+  // (profit + commission + swap). Alleen voor SL/TP closes — niet voor manual.
+  if (closeReason !== "manual") {
+    await fetchAndSaveDealsForPosition(pos.positionId, pos.mt5Symbol ?? pos.symbol).catch(() => {});
+  }
 
   // FIX 4: fetch actual realized P&L from MT5 for sl/tp; use currentPnL for manual
   let realizedPnl = pos.currentPnL ?? 0;
@@ -1365,7 +1491,6 @@ async function handlePositionClosed(pos) {
     console.log(`[Ghost] ${pos.positionId}: manual close — ghost continues (trueMaxRR will be written on finalize)`);
   }
   if (closeReason === "sl") {
-    await recalcLotsAfterSL(pos.symbol, pos.entry, pos.sl).catch(() => {});
     // FIX GH1 (v12.3): Ghost afsluiten bij echte SL-hit.
     // De phantom SL = echte SL, dus de ghost zou ook onmiddellijk stoppen.
     // Maar zonder dit blijft de ghost in memory doorlopen na het sluiten van de trade.
@@ -1507,12 +1632,46 @@ async function takeShadowSnapshots() {
 async function evaluateDailyRisk() {
   try {
     const todayStr = getBrusselsDateOnly();
-    const todayT   = closedTrades.filter(t =>
+
+    // FIX v12.4: als closedTrades leeg is (eerste startup na deploy midden in de dag
+    // terwijl trades al eerder die dag geopend/gesloten waren), herlees dan uit DB.
+    // Zo mist evaluateDailyRisk() nooit trades die vóór de deploy zijn gesloten.
+    let todayT = closedTrades.filter(t =>
       t.closedAt &&
       getBrusselsDateOnly(t.closedAt) === todayStr &&
       new Date(t.closedAt).getTime() >= COMPLIANCE_DATE_MS &&
       (t.vwapPosition === "above" || t.vwapPosition === "below")
     );
+
+    if (todayT.length === 0) {
+      // Fallback: directe DB query voor vandaag
+      try {
+        const r = await pool.query(`
+          SELECT
+            optimizer_key    AS "optimizerKey",
+            realized_pnl_eur AS "pnl",
+            closed_at        AS "closedAt",
+            vwap_position    AS "vwapPosition"
+          FROM closed_trades
+          WHERE closed_at >= $1
+            AND closed_at IS NOT NULL
+            AND closed_at >= $2
+            AND vwap_position IN ('above','below')
+        `, [
+          `${todayStr}T00:00:00`,
+          new Date(COMPLIANCE_DATE_MS).toISOString(),
+        ]);
+        todayT = r.rows.map(row => ({
+          optimizerKey: row.optimizerKey,
+          pnl: parseFloat(row.pnl ?? 0),
+          closedAt: row.closedAt,
+          vwapPosition: row.vwapPosition,
+        }));
+        if (todayT.length > 0) console.log(`[DailyRisk] DB fallback: ${todayT.length} trade(s) gevonden voor ${todayStr}`);
+      } catch (e) {
+        console.warn('[DailyRisk] DB fallback mislukt:', e.message);
+      }
+    }
     // FIX 7: use realizedPnlEUR
     const totalPnl = todayT.reduce((s, t) => s + (t.realizedPnlEUR ?? t.currentPnL ?? 0), 0);
 
@@ -1554,6 +1713,16 @@ async function evaluateDailyRisk() {
         if ((prev.dayMult ?? 1.0) > 1.0 || (prev.evMult ?? 1.0) > 1.0) {
           console.log(`[DailyRisk] ${key}: reset → ×1.0 (hadTrades=${hadTrades}, evPos=${isEvPositive}, dayPos=${isDayPositive})`);
         }
+      }
+    }
+
+    // FIX v12.4: update evMult/dayMult in open posities zodat ghost_state periodic
+    // save de actuele multipliers opslaat, niet de verouderde snapshot.
+    for (const pos of Object.values(openPositions)) {
+      const km = keyRiskMult[pos.optimizerKey];
+      if (km) {
+        pos.evMult  = km.evMult  ?? 1.0;
+        pos.dayMult = km.dayMult ?? 1.0;
       }
     }
 
@@ -1613,14 +1782,14 @@ cron.schedule("0 4 * * 1-5", async () => {
         optimizerKey: g.optimizerKey, entry: g.entry, sl: g.sl, slPct: g.slPct,
         phantomSL: g.sl, tpRRUsed: g.tpRRUsed,
         maxPrice: g.maxPrice, maxRRBeforeSL: calcMaxRR(g.direction, g.entry, g.sl, g.maxPrice),
-        phantomSLHit: false, stopReason: "timeout_72h",
+        phantomSLHit: false, stopReason: "timeout_2w",   // FIX v12.4: was "timeout_72h" (fout — is 14 dagen)
         timeToSLMin: null, openedAt: g.openedAt, closedAt: new Date().toISOString(),
       }).catch(() => {});
       delete ghostTrackers[id];
       cleaned++;
     }
   }
-  if (cleaned > 0) { console.log(`[04:00] ${cleaned} ghost(s) cleaned up`); logEvent({ type: "GHOST_CLEANUP_72H", count: cleaned }); }
+  if (cleaned > 0) { console.log(`[04:00] ${cleaned} ghost(s) cleaned up (timeout_2w)`); logEvent({ type: "GHOST_CLEANUP_2W", count: cleaned }); }
 }, { timezone: "Europe/Brussels" });
 
 
@@ -1699,12 +1868,23 @@ app.post("/webhook", async (req, res) => {
 
   // Server berekent derivedSlPct — sl_pct van TV volledig genegeerd.
   const derivedSlPct = deriveSLPct(tvEntry, tvSL);
-  if (!derivedSlPct || derivedSlPct <= 0 || derivedSlPct > 0.05) {
+
+  // FIX v12.4: validatie rekent met de EFFECTIEVE MT5 SL-afstand na buffer.
+  // Voor stocks is de buffer 3×, dus de TV SL mag maximaal 5%/3 = 1.67% zijn.
+  // Voor overige assets: buffer 1.5×, dus max 5%/1.5 = 3.33%.
+  // De grens van 5% geldt voor de MT5 SL (na buffer), niet de TV SL.
+  const slBufferForType  = assetType === "stock" ? STOCK_SL_BUFFER_MULT : SL_BUFFER_MULT;
+  const maxDerivedSlPct  = 0.05 / slBufferForType;  // 1.67% voor stocks, 3.33% voor rest
+
+  if (!derivedSlPct || derivedSlPct <= 0 || derivedSlPct > maxDerivedSlPct) {
     const slPctHuman = derivedSlPct ? (derivedSlPct * 100).toFixed(3) + "%" : "invalid";
-    const reason = `SL_INVALID: derivedSlPct=${slPctHuman} (entry=${tvEntry}, sl=${tvSL}). Moet > 0 en <= 5%.`;
+    const mt5SlPct   = derivedSlPct ? (derivedSlPct * slBufferForType * 100).toFixed(3) + "%" : "?";
+    const reason = `SL_INVALID: derivedSlPct=${slPctHuman} → MT5 SL≈${mt5SlPct} (max ${(maxDerivedSlPct*100).toFixed(2)}% voor ${assetType}, entry=${tvEntry}, sl=${tvSL}).`;
     logReject("SL_INVALID", { symbol: symKey, direction, reason, payload: {
       tvEntry, tvSL, derivedSlPct: derivedSlPct ?? "null",
-      slPctHuman, assetType, mt5Symbol,
+      slPctHuman, assetType, mt5Symbol, slBufferForType,
+      maxDerivedSlPct: (maxDerivedSlPct*100).toFixed(2) + "%",
+      mt5SlPct,
       sessionHigh: sessionHigh ?? "NaN→null", sessionLow: sessionLow ?? "NaN→null",
     }});
     logEvent({ type: "REJECTED", reason, symbol: symKey, direction });
@@ -2030,18 +2210,23 @@ app.post("/webhook", async (req, res) => {
     }).catch(() => {});
   }
 
-  // FIX 5: spread guard uses buffered SL distance (stocks: 3× buffer)
+  // FIX 5: spread guard voor stocks.
+  // FIX v12.4: de guard vergelijkt spread met de ONGEBUFFERDE SL-afstand (derivedSlPct ×1,
+  // niet ×3) zodat de drempel niet meeschaalt met de bredere buffer.
+  // Rationale: spread is een fixed kost; de SL-buffer beschermt tegen slippage maar
+  // verandert de economische betekenis van de spread-ratio niet.
+  // Blokkeer als spread > 25% van de originele (ongebufferde) SL-afstand.
   if (assetType === "stock" && spread > 0) {
-    const guardSLDist = Math.abs(executionPrice - calcSLFromDerivedPct(direction, executionPrice, derivedSlPct, assetType));
-    if (guardSLDist > 0 && spread > 0.25 * guardSLDist) {
-      const reason = `SPREAD_GUARD: spread ${spread.toFixed(5)} > 25% of buffered SL dist ${guardSLDist.toFixed(5)}`;
+    const unbufferedSLDist = Math.abs(executionPrice * derivedSlPct); // originele TV SL-afstand
+    if (unbufferedSLDist > 0 && spread > 0.25 * unbufferedSLDist) {
+      const reason = `SPREAD_GUARD: spread ${spread.toFixed(5)} > 25% of unbuffered SL dist ${unbufferedSLDist.toFixed(5)}`;
       logReject("SPREAD_GUARD_CLOSE", { symbol: symKey, direction, session, optimizerKey, reason, payload: {
-        positionId, spread: spread.toFixed(5), guardSLDist: guardSLDist.toFixed(5),
-        spreadPct: (spread / guardSLDist * 100).toFixed(1) + "% of SL dist",
+        positionId, spread: spread.toFixed(5), unbufferedSLDist: unbufferedSLDist.toFixed(5),
+        spreadPct: (spread / unbufferedSLDist * 100).toFixed(1) + "% of unbuffered SL dist",
         executionPrice, lots, assetType,
         sessionHigh: sessionHigh ?? "NaN→null", sessionLow: sessionLow ?? "NaN→null",
       }});
-      logEvent({ type: "SPREAD_GUARD_CLOSE", symbol: symKey, direction, positionId, spread, slDist: guardSLDist, reason });
+      logEvent({ type: "SPREAD_GUARD_CLOSE", symbol: symKey, direction, positionId, spread, slDist: unbufferedSLDist, reason });
       await logSignal({ symbol: symKey, direction, session, vwapPosition, optimizerKey, tvEntry: closePrice, slPct: derivedSlPct, slPctHuman, vwap: vwapMid, vwapBandPct, outcome: "SPREAD_GUARD_CLOSE", rejectReason: reason }).catch(() => {});
       try { await closePosition(positionId); } catch {}
       return res.status(200).json({ status: "SPREAD_GUARD_CLOSE", reason, positionId });
@@ -2779,7 +2964,7 @@ app.get(["/", "/dashboard"], async (req, res) => {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PRONTO-AI v12.3.0</title>
+<title>PRONTO-AI v12.4.0</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600;700&family=IBM+Plex+Sans+Condensed:wght@500;600;700&display=swap" rel="stylesheet">
 <style>
@@ -2904,7 +3089,7 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
 <div class="hdr">
   <div>
     <div class="logo">PRONTO-AI</div>
-    <div class="ver">v12.3.0 · TradingView → MetaApi → FTMO MT5 · Risk ${(FIXED_RISK_PCT*100).toFixed(4)}% · SL×${SL_BUFFER_MULT} · Stock SL×${STOCK_SL_BUFFER_MULT} · NY Dead Zone 15:30–18:00</div>
+    <div class="ver">v12.4.0 · TradingView → MetaApi → FTMO MT5 · Risk ${(FIXED_RISK_PCT*100).toFixed(4)}% · SL×${SL_BUFFER_MULT} · Stock SL×${STOCK_SL_BUFFER_MULT} · NY Dead Zone 15:30–18:00</div>
   </div>
   <div class="hdr-r">
     <span class="sb s-outside" id="hdr-sess">—</span>
@@ -4143,7 +4328,7 @@ async function start() {
   const missing = ["META_API_TOKEN", "META_ACCOUNT_ID", "WEBHOOK_SECRET"].filter(k => !process.env[k]);
   if (missing.length) { console.error(`[ERR] Missing env: ${missing.join(", ")}`); process.exit(1); }
 
-  console.log("🚀 PRONTO-AI v12.3.0 starting...");
+  console.log("🚀 PRONTO-AI v12.4.0 starting...");
   await initDB();
 
   // Load closed trades
@@ -4217,7 +4402,7 @@ async function start() {
   rebuildEVCache().catch(() => {});
 
   app.listen(PORT, () => {
-    console.log(`[✓] PRONTO-AI v12.3.0 on port ${PORT}`);
+    console.log(`[✓] PRONTO-AI v12.4.0 on port ${PORT}`);
     console.log(`   🔹 Dashboard:      /`);
     console.log(`   🔹 Health:         /health`);
     console.log(`   🔹 EV Table:       /ev`);
