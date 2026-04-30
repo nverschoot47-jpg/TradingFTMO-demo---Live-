@@ -1010,10 +1010,10 @@ function startGhostTracker(pos, restoreData = null) {
   // Worden ingevuld bij EERSTE overschrijding van elke drempel.
   // Bij -1.00R (= phantom SL) → ghost stopt onmiddellijk.
   const RR_ADVERSE_STEPS   = [0.25, 0.50, 0.75, 1.00];
-  const RR_FAVORABLE_STEPS = [0.25, 0.50, 0.75, 1.00, 1.50, 2.00, 3.00, 5.00];
+  const RR_FAVORABLE_STEPS = [0.25, 0.50, 0.75, 1.00, 1.50, 2.00, 3.00, 4.00, 5.00, 10.00, 15.00];
   const rrMilestones = {
     adverse:   { 0.25: null, 0.50: null, 0.75: null, 1.00: null },
-    favorable: { 0.25: null, 0.50: null, 0.75: null, 1.00: null, 1.50: null, 2.00: null, 3.00: null, 5.00: null },
+    favorable: { 0.25: null, 0.50: null, 0.75: null, 1.00: null, 1.50: null, 2.00: null, 3.00: null, 4.00: null, 5.00: null, 10.00: null, 15.00: null },
   };
   // Keep slMilestones as alias for backward compat with dashboard (maps 25→adverse[0.25] etc)
   const slMilestones = { 25: null, 50: null, 75: null, 100: null };
@@ -3309,101 +3309,28 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
 
 <!-- 2. ACTIVE GHOSTS — per trade -->
 <div class="sec">
-  <div class="sh"><span class="st p">▸ GHOST TRACKER</span><span id="gh-dot" class="sec-err" title="Loading..."></span><span class="sm" id="gh-meta">active ghosts — tracking until MT5 SL hit, max 15R or 2 weeks</span></div>
-  <div class="gh-view-toggle">
-    <button class="gh-view-btn on" id="gh-btn-flat" onclick="setGhostView('flat')">Individueel</button>
-    <button class="gh-view-btn" id="gh-btn-grouped" onclick="setGhostView('grouped')">Per Combo (Grouped)</button>
-  </div>
+  <div class="sh"><span class="st p">▸ GHOST TRACKER</span><span id="gh-dot" class="sec-err" title="Loading..."></span><span class="sm" id="gh-meta">active ghosts — tracking until phantom SL hit, max 15R or 2 weeks</span></div>
   <div id="gh-flat-view" class="tw">
     <table id="gh-tbl">
       <thead><tr>
         <th class="s" data-col="0">Symbol</th><th>Type</th><th class="s" data-col="2">Session</th>
         <th class="s" data-col="3">Dir</th><th class="s" data-col="4">VWAP</th>
-        <th class="s" data-col="5" title="Highest RR reached">Max RR</th>
-        <th title="% of original SL distance consumed so far">SL Used%</th>
-        <th class="s" title="Time to reach -0.25R adverse (25% SL)">T→-¼R</th>
-        <th class="s" title="Time to reach -0.50R adverse (50% SL)">T→-½R</th>
-        <th class="s" title="Time to reach -0.75R adverse (75% SL)">T→-¾R</th>
-        <th class="s" title="Time to reach -1.00R = SL hit (100%)">T→-1R</th>
-        <th class="s" title="Time to reach +0.50R favorable">T→+½R</th>
-        <th class="s" title="Time to reach +1.00R favorable">T→+1R</th>
+        <th class="s" data-col="5" title="Highest RR reached so far">Max RR</th>
+        <th class="s" title="Time to reach -0.25R adverse">T→-¼R</th>
+        <th class="s" title="Time to reach -0.50R adverse">T→-½R</th>
+        <th class="s" title="Time to reach -0.75R adverse">T→-¾R</th>
+        <th class="s" title="Time to reach phantom SL = -1R">T→-1R</th>
+        <th class="s" title="Time to reach +1R favorable">T→+1R</th>
+        <th class="s" title="Time to reach +2R favorable">T→+2R</th>
+        <th class="s" title="Time to reach +3R favorable">T→+3R</th>
+        <th class="s" title="Time to reach +4R favorable">T→+4R</th>
+        <th class="s" title="Time to reach +5R favorable">T→+5R</th>
+        <th class="s" title="Time to reach +10R favorable">T→+10R</th>
+        <th class="s" title="Time to reach +15R (max)">T→+15R</th>
         <th class="s" data-col="8">Elapsed</th><th class="s" data-col="9">Opened</th>
       </tr></thead>
       <tbody id="gh-body"></tbody>
     </table>
-  </div>
-  <div id="gh-grouped-view" style="display:none" class="tw">
-    <div style="padding:5px 12px;background:var(--bg2);border-bottom:1px solid var(--bdr2);font-size:9px;color:var(--dim)">
-      Gegroepeerd per optimizer-combo (sym+sess+dir+vwap) · gemiddeld TP RR, SL% gebruik, max RR uit ghost history
-    </div>
-    <table id="gh-grp-tbl">
-      <thead><tr>
-        <th class="s" data-col="0">Symbol</th><th class="s" data-col="1">Session</th>
-        <th class="s" data-col="2">Dir</th><th class="s" data-col="3">VWAP</th>
-        <th class="s" data-col="4" title="Totaal afgesloten ghosts voor deze combo"># Ghosts</th>
-        <th class="s" data-col="5" title="Gemiddeld max RR bereikt door ghosts van deze combo">Avg Max RR</th>
-        <th class="s" data-col="6" title="Hoogste max RR bereikt">Best RR</th>
-        <th class="s" data-col="7" title="Gemiddeld TP RR target gebruikt">Avg TP RR</th>
-        <th class="s" data-col="8" title="Gemiddeld % SL afstand geconsumeerd">Avg SL%</th>
-        <th class="s" data-col="9" title="Aantal keer phantom SL geraakt">SL Hits</th>
-        <th class="s" data-col="10">Laatste</th>
-      </tr></thead>
-      <tbody id="gh-grp-body"></tbody>
-    </table>
-  </div>
-</div>
-
-<!-- 2B. PERFORMANCE SAMENVATTING — investeerder KPI's (v12.5) -->
-<div class="sec">
-  <div class="sh">
-    <span class="st g">▸ PERFORMANCE SAMENVATTING</span><span id="perf-dot" class="sec-err" title="Loading..."></span>
-    <span class="sm" id="perf-meta">loading…</span>
-  </div>
-  <div class="perf-grid">
-    <div class="perf-cell">
-      <div class="pc-label">Win Rate</div>
-      <div class="pc-val g" id="perf-wr">—</div>
-      <div class="pc-sub" id="perf-wr-sub">TP / (TP+SL)</div>
-    </div>
-    <div class="perf-cell">
-      <div class="pc-label">Profit Factor</div>
-      <div class="pc-val" id="perf-pf">—</div>
-      <div class="pc-sub">Gross Wins / Losses</div>
-    </div>
-    <div class="perf-cell">
-      <div class="pc-label">Avg Winner</div>
-      <div class="pc-val g" id="perf-aw">—</div>
-      <div class="pc-sub">per TP trade</div>
-    </div>
-    <div class="perf-cell">
-      <div class="pc-label">Avg Loser</div>
-      <div class="pc-val r" id="perf-al">—</div>
-      <div class="pc-sub">per SL trade</div>
-    </div>
-    <div class="perf-cell">
-      <div class="pc-label">Expectancy</div>
-      <div class="pc-val" id="perf-exp">—</div>
-      <div class="pc-sub">avg P&amp;L/trade</div>
-    </div>
-    <div class="perf-cell">
-      <div class="pc-label">Max Drawdown</div>
-      <div class="pc-val r" id="perf-dd">—</div>
-      <div class="pc-sub">cumulatief</div>
-    </div>
-    <div class="perf-cell">
-      <div class="pc-label">Total P&amp;L</div>
-      <div class="pc-val" id="perf-pnl">—</div>
-      <div class="pc-sub">post-compliance</div>
-    </div>
-    <div class="perf-cell">
-      <div class="pc-label">Trades</div>
-      <div class="pc-val b" id="perf-tot">—</div>
-      <div class="pc-sub" id="perf-tot-sub">TP / SL</div>
-    </div>
-  </div>
-  <div class="pnl-chart-wrap">
-    <div class="pnl-chart-title">Cumulatieve P&amp;L Curve (post-compliance, tp/sl trades)</div>
-    <canvas id="pnl-canvas" height="70" style="width:100%;display:block;max-height:70px"></canvas>
   </div>
 </div>
 
@@ -3488,8 +3415,13 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
         <th class="s" title="Avg time to reach -0.50R (50% SL)">T→-½R</th>
         <th class="s" title="Avg time to reach -0.75R (75% SL)">T→-¾R</th>
         <th class="s" title="Avg time to reach -1.00R = SL hit">T→-1R</th>
-        <th class="s" title="Avg time to reach +0.50R favorable">T→+½R</th>
-        <th class="s" title="Avg time to reach +1.00R favorable">T→+1R</th>
+        <th class="s" title="Avg time to reach +1R favorable">T→+1R</th>
+        <th class="s" title="Avg time to reach +2R favorable">T→+2R</th>
+        <th class="s" title="Avg time to reach +3R favorable">T→+3R</th>
+        <th class="s" title="Avg time to reach +4R favorable">T→+4R</th>
+        <th class="s" title="Avg time to reach +5R favorable">T→+5R</th>
+        <th class="s" title="Avg time to reach +10R favorable">T→+10R</th>
+        <th class="s" title="Avg time to reach +15R (max)">T→+15R</th>
         <th class="s" data-col="14">Close Reason</th>
         <th class="s" title="MAE p50: mediaan max adverse excursie van survivors (niet-SL ghosts)">MAE p50</th>
         <th class="s" title="MAE p75: 75e percentiel adverse excursie van survivors">MAE p75</th>
@@ -3719,7 +3651,7 @@ function sortBy(id,col){
   });
   rows.forEach(r=>tb.appendChild(r));
 }
-function initAll(){['pos-tbl','ev-tbl','gh-tbl','gh-grp-tbl','ghh-tbl','whe-tbl','cf-tbl','mx-fx','mx-ix','mx-cm','mx-sk'].forEach(initSort);}
+function initAll(){['pos-tbl','ev-tbl','gh-tbl','ghh-tbl','whe-tbl','cf-tbl','mx-fx','mx-ix','mx-cm','mx-sk'].forEach(initSort);}
 
 // ── clock + update countdown ─────────────────────────────
 const SESS_LABELS={asia:'ASIA',london:'LONDON',ny:'NY',outside:'OUTSIDE'};
@@ -3976,36 +3908,54 @@ async function loadGhosts(){
   setDot('gh-dot',true,'OK');
   document.getElementById('k-gh').textContent=d?.count??'?';
   const tb=document.getElementById('gh-body');
-  if(!d||!d.ghosts?.length){tb.innerHTML=emptyRow(12);return;}
+  if(!d||!d.ghosts?.length){tb.innerHTML=emptyRow(19);return;}
   tb.innerHTML=d.ghosts.map(g=>{
     const type=sTypeName(g.symbol);
-    // Helper: format elapsed minutes from openedAt to milestone ISO timestamp
+    // Formatteer minuten vanaf entry naar milestone
     function msFmt(isoTs){
       if(!isoTs||!g.openedAt)return'—';
       const mins=Math.round((new Date(isoTs)-new Date(g.openedAt))/60000);
       if(mins<60)return mins+'m';
       return Math.floor(mins/60)+'h'+(mins%60?String(mins%60).padStart(2,'0')+'m':'');
     }
-    const adv=g.rrMilestones?.adverse||g.slMilestones&&{
-      // backward compat: slMilestones keys are 25/50/75/100
-      0.25:g.slMilestones['25'],0.50:g.slMilestones['50'],
-      0.75:g.slMilestones['75'],1.00:g.slMilestones['100']
-    }||{};
+    // Adverse milestones: keys 0.25 / 0.50 / 0.75 / 1.00 in rrMilestones.adverse
+    const adv=g.rrMilestones?.adverse||{};
+    // Backward compat: slMilestones keys 25/50/75/100
+    if(!adv[0.25]&&g.slMilestones){
+      adv[0.25]=g.slMilestones['25'];
+      adv[0.50]=g.slMilestones['50'];
+      adv[0.75]=g.slMilestones['75'];
+      adv[1.00]=g.slMilestones['100'];
+    }
+    // Favorable milestones: keys 1/2/3/4/5/10/15 in rrMilestones.favorable
     const fav=g.rrMilestones?.favorable||{};
+    // Helper cell: adverse = oranje/rood, favorable = groen
+    function advCell(key,cls='o'){
+      const t=msFmt(adv[key]);
+      return\`<td class="\${adv[key]?cls:'d'}" style="font-size:9px">\${t}</td>\`;
+    }
+    function favCell(key){
+      const t=msFmt(fav[key]);
+      return\`<td class="\${fav[key]?'g':'d'}" style="font-size:9px">\${t}</td>\`;
+    }
     return\`<tr class="\${tClass(g.symbol)}">
       <td data-val="\${g.symbol}" class="b fw">\${g.symbol}</td>
       <td>\${tyBadge(type)}</td>
       <td>\${sBadge(g.session)}</td>
       <td>\${dBadge(g.direction)}</td>
       <td>\${vBadge(g.vwapPosition)}</td>
-      <td data-val="\${g.maxRR??-99}" class="\${(g.maxRR??0)>0?'g':'d'} fw">\${f(g.maxRR,2)}R</td>
-      <td>\${slBar(g.slPctUsed)}</td>
-      <td class="\${adv[0.25]?'o':'d'}" style="font-size:9px">\${msFmt(adv[0.25])}</td>
-      <td class="\${adv[0.50]?'o':'d'}" style="font-size:9px">\${msFmt(adv[0.50])}</td>
-      <td class="\${adv[0.75]?'r':'d'}" style="font-size:9px">\${msFmt(adv[0.75])}</td>
-      <td class="\${adv[1.00]?'r fw':'d'}" style="font-size:9px">\${msFmt(adv[1.00])}</td>
-      <td class="\${fav[0.50]?'g':'d'}" style="font-size:9px">\${msFmt(fav[0.50])}</td>
-      <td class="\${fav[1.00]?'g fw':'d'}" style="font-size:9px">\${msFmt(fav[1.00])}</td>
+      <td data-val="\${g.maxRR??-99}" class="\${(g.maxRR??0)>=1?'g fw':(g.maxRR??0)>0?'y':'d'}">\${f(g.maxRR,2)}R</td>
+      \${advCell(0.25,'o')}
+      \${advCell(0.50,'o')}
+      \${advCell(0.75,'r')}
+      \${advCell(1.00,'r fw')}
+      \${favCell(1)}
+      \${favCell(2)}
+      \${favCell(3)}
+      \${favCell(4)}
+      \${favCell(5)}
+      \${favCell(10)}
+      \${favCell(15)}
       <td data-val="\${g.elapsedMin}" class="d">\${g.elapsedMin}min</td>
       <td data-val="\${g.openedAt}" class="d" style="font-size:9px">\${dtTs(g.openedAt)}</td>
     </tr>\`;
@@ -4080,10 +4030,19 @@ function renderEV(){
   if(evF.sess!=='all')d=d.filter(c=>c.sess===evF.sess);
   if(evF.dir!=='all')d=d.filter(c=>c.dir===evF.dir);
   if(evF.vwap!=='all')d=d.filter(c=>c.vwap===evF.vwap);
-  if(evF.min==='5')d=d.filter(c=>(c.ev?.count??0)>=5);
-  else if(evF.min==='10')d=d.filter(c=>(c.ev?.count??0)>=10);
-  else if(evF.min==='1')d=d.filter(c=>(c.ev?.count??0)>=1);
-  // evF.min==='0' = toon alles, ook 0 ghosts
+  // Standaard: enkel combos tonen met minstens 1 afgewerkte ghost
+  // (phantom SL hit, 15R bereikt of 15 dagen timeout — NIET actieve lege ghosts)
+  if(evF.min==='0'){
+    // "Alle" filter: toon enkel combos met ghost data (>=1 afgewerkte ghost)
+    // 0-ghost combos zijn nutteloos — geen data = geen beslissing mogelijk
+    d=d.filter(c=>(c.ev?.count??0)>=1);
+  } else if(evF.min==='5'){
+    d=d.filter(c=>(c.ev?.count??0)>=5);
+  } else if(evF.min==='10'){
+    d=d.filter(c=>(c.ev?.count??0)>=10);
+  } else if(evF.min==='1'){
+    d=d.filter(c=>(c.ev?.count??0)>=1);
+  }
   d.sort((a,b)=>{
     // First: combos with ghost data, then without
     const ha=(a.ev?.count??0)>0, hb=(b.ev?.count??0)>0;
@@ -4175,8 +4134,8 @@ async function loadGhostHistory(){
       count:0,evCount:0,bestMaxRR:0,sumRR:0,sumSLPct:0,nSL:0,
       // RR adverse milestone sums: time from open to -0.25/-0.50/-0.75/-1.00R
       advSum:{0.25:0,0.50:0,0.75:0,1.00:0},advN:{0.25:0,0.50:0,0.75:0,1.00:0},
-      // RR favorable milestone sums: time from open to +0.50/+1.00R
-      favSum:{0.50:0,1.00:0},favN:{0.50:0,1.00:0},
+      // RR favorable milestone sums: 1/2/3/4/5/10/15R
+      favSum:{1:0,2:0,3:0,4:0,5:0,10:0,15:0},favN:{1:0,2:0,3:0,4:0,5:0,10:0,15:0},
       lastOpenedAt:g.openedAt,reasons:{}
     };
     const b=byKey[key];
@@ -4198,8 +4157,9 @@ async function loadGhostHistory(){
       const m=elMin(g.openedAt,ts);
       if(m!=null){b.advSum[step]+=m;b.advN[step]++;}
     }
-    for(const step of [0.50,1.00]){
-      const ts=fav[step];
+    // Favorable: probeer exact key, dan ook 1.00/2.00/3.00/4.00/5.00/10.00/15.00
+    for(const step of [1,2,3,4,5,10,15]){
+      const ts=fav[step]||fav[parseFloat(step+'.00')]||fav[step+'.00']||null;
       const m=elMin(g.openedAt,ts);
       if(m!=null){b.favSum[step]+=m;b.favN[step]++;}
     }
@@ -4257,8 +4217,13 @@ async function loadGhostHistory(){
       \${tCell(avgAdv(0.50),'o')}
       \${tCell(avgAdv(0.75),'r')}
       \${tCell(avgAdv(1.00),'r')}
-      \${tCell(avgFav(0.50),'g')}
-      \${tCell(avgFav(1.00),'g')}
+      \${tCell(avgFav(1),'g')}
+      \${tCell(avgFav(2),'g')}
+      \${tCell(avgFav(3),'g')}
+      \${tCell(avgFav(4),'g')}
+      \${tCell(avgFav(5),'g')}
+      \${tCell(avgFav(10),'g')}
+      \${tCell(avgFav(15),'g')}
       <td>\${cBadge(topReason)}</td>
       \${maePctCell(maeP50,40,65)}
       \${maePctCell(maeP75,50,75)}
@@ -4453,102 +4418,6 @@ async function loadShadowCount(){
 }
 
 let _loadErrors=0;
-// ── Ghost view toggle (v12.5) ──────────────────────────────
-let _ghostView='flat';
-function setGhostView(mode){
-  _ghostView=mode;
-  document.getElementById('gh-btn-flat').classList.toggle('on',mode==='flat');
-  document.getElementById('gh-btn-grouped').classList.toggle('on',mode==='grouped');
-  document.getElementById('gh-flat-view').style.display=mode==='flat'?'':'none';
-  document.getElementById('gh-grouped-view').style.display=mode==='grouped'?'':'none';
-  if(mode==='grouped')loadGhostGroupedView();
-}
-
-// ── Grouped ghost history view (v12.5) ─────────────────────
-async function loadGhostGroupedView(){
-  const d=await api('/ghosts/grouped');
-  const tb=document.getElementById('gh-grp-body');
-  if(!d||!d.rows?.length){
-    if(tb)tb.innerHTML=emptyRow(11,'Geen grouped ghost data — wacht op afgesloten ghosts');
-    return;
-  }
-  tb.innerHTML=d.rows.map(g=>{
-    const slHitRate=g.n>0?Math.round(g.slHits/g.n*100):0;
-    return\`<tr class="\${tClass(g.symbol||'')}">
-      <td class="b fw">\${g.symbol||'—'}</td>
-      <td>\${sBadge(g.session)}</td>
-      <td>\${dBadge(g.direction)}</td>
-      <td>\${vBadge(g.vwapPosition)}</td>
-      <td class="\${g.n>=5?'y fw':'c'}">\${g.n}</td>
-      <td class="\${(g.avgMaxRR||0)>=1?'g':'y'} fw">\${g.avgMaxRR!=null?f(g.avgMaxRR,2)+'R':'—'}</td>
-      <td class="g fw">\${g.bestMaxRR!=null?f(g.bestMaxRR,2)+'R':'—'}</td>
-      <td class="y">\${g.avgTpRR!=null?f(g.avgTpRR,2)+'R':'—'}</td>
-      <td class="\${(g.avgSlPct||0)<50?'g':(g.avgSlPct||0)<80?'y':'r'}">\${g.avgSlPct!=null?f(g.avgSlPct,1)+'%':'—'}</td>
-      <td class="\${slHitRate>50?'r':slHitRate>30?'o':'g'}">\${g.slHits} (\${slHitRate}%)</td>
-      <td class="d" style="font-size:9px">\${dtTs(g.lastOpened)}</td>
-    </tr>\`;
-  }).join('');
-}
-
-// ── Performance samenvatting (v12.5) ───────────────────────
-async function loadPerformance(){
-  const d=await api('/performance');
-  setDot('perf-dot',!!d,'OK');
-  if(!d){document.getElementById('perf-meta').textContent='error';return;}
-  const pfEl=(id,val)=>{const el=document.getElementById(id);if(el)el.textContent=val;};
-  const wrCls=d.winRate>=60?'g fw':d.winRate>=50?'y fw':'r fw';
-  const pfCls=(d.profitFactor||0)>=1.5?'g fw':(d.profitFactor||0)>=1?'y fw':'r fw';
-  document.getElementById('perf-wr').className='pc-val '+wrCls;
-  pfEl('perf-wr',d.winRate+'%');
-  pfEl('perf-wr-sub','TP '+d.tpCount+' / SL '+d.slCount);
-  document.getElementById('perf-pf').className='pc-val '+(pfCls);
-  pfEl('perf-pf',d.profitFactor!=null?d.profitFactor+'×':'—');
-  pfEl('perf-aw','€'+d.avgWinner.toFixed(0));
-  pfEl('perf-al','€'+d.avgLoser.toFixed(0));
-  const expCls=(d.avgPnlPerTrade||0)>0?'g fw':'r fw';
-  document.getElementById('perf-exp').className='pc-val '+expCls;
-  pfEl('perf-exp',(d.avgPnlPerTrade>=0?'+':'')+'€'+d.avgPnlPerTrade.toFixed(0));
-  pfEl('perf-dd','€'+d.maxDrawdown.toFixed(0));
-  const pnlCls=(d.totalPnl||0)>0?'g fw':'r fw';
-  document.getElementById('perf-pnl').className='pc-val '+pnlCls;
-  pfEl('perf-pnl',(d.totalPnl>=0?'+':'')+'€'+d.totalPnl.toFixed(0));
-  document.getElementById('perf-tot').className='pc-val b fw';
-  pfEl('perf-tot',d.total);
-  pfEl('perf-tot-sub','TP '+d.tpCount+' / SL '+d.slCount);
-  document.getElementById('perf-meta').textContent=
-    d.total+' trades · WR '+d.winRate+'% · PF '+(d.profitFactor??'—')+'× · DD €'+d.maxDrawdown.toFixed(0);
-  // Teken P&L curve
-  if(d.pnlCurve&&d.pnlCurve.length>1){
-    const canvas=document.getElementById('pnl-canvas');
-    if(canvas){
-      const ctx=canvas.getContext('2d');
-      const W=canvas.offsetWidth||canvas.width;const H=70;
-      canvas.width=W;canvas.height=H;
-      const pts=d.pnlCurve;
-      const vals=pts.map(p=>p.pnl);
-      const mn=Math.min(0,...vals);const mx=Math.max(0,...vals);
-      const rng=mx-mn||1;
-      const toX=i=>Math.round(i/(pts.length-1)*(W-2))+1;
-      const toY=v=>Math.round(H-2-((v-mn)/rng)*(H-4))+1;
-      ctx.clearRect(0,0,W,H);
-      // Zero line
-      ctx.strokeStyle='rgba(46,64,96,.5)';ctx.lineWidth=1;ctx.setLineDash([3,3]);
-      ctx.beginPath();ctx.moveTo(0,toY(0));ctx.lineTo(W,toY(0));ctx.stroke();
-      ctx.setLineDash([]);
-      // P&L curve
-      ctx.strokeStyle=(vals[vals.length-1]||0)>=0?'#00e8a0':'#ff2d55';ctx.lineWidth=1.5;
-      ctx.beginPath();ctx.moveTo(toX(0),toY(vals[0]));
-      for(let i=1;i<vals.length;i++)ctx.lineTo(toX(i),toY(vals[i]));
-      ctx.stroke();
-      // Fill under curve
-      ctx.globalAlpha=0.12;
-      ctx.fillStyle=(vals[vals.length-1]||0)>=0?'#00e8a0':'#ff2d55';
-      ctx.lineTo(toX(vals.length-1),toY(0));ctx.lineTo(toX(0),toY(0));ctx.closePath();ctx.fill();
-      ctx.globalAlpha=1;
-    }
-  }
-}
-
 // ── MAE stats laden en in ghh-tbl mergen (v12.5) ──────────
 let _maeData={};
 async function loadMAE(){
@@ -4575,7 +4444,6 @@ async function loadAll(){
     loadErrors().catch(e=>{console.error('[errors]',e?.message);return null;}),
     loadSignalStats().catch(e=>{console.error('[stats]',e?.message);return null;}),
     loadShadowCount().catch(e=>{console.error('[shadow]',e?.message);return null;}),
-    loadPerformance().catch(e=>{console.error('[perf]',e?.message);return null;}),
     loadMAE().catch(e=>{console.error('[mae]',e?.message);return null;}),
   ]);
 
