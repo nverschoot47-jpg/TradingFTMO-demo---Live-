@@ -1,10 +1,26 @@
 // ===============================================================
-// session.js  v10.8  |  PRONTO-AI
+// session.js  v10.9  |  PRONTO-AI
+//
+// Changes v10.9:
+//  - DEFAULT_RISK_BY_TYPE gehalveerd: 0.00075 → 0.000375 (0.0375% per trade).
+//    Reden: verdere risicobeperking zodat nooit manueel gesloten hoeft te worden.
+//    Geldt voor forex, stock, index, commodity.
+//
+//  - NY DEAD ZONE: canOpenNewTrade() blokkeert nu trades van 15:30 t/m 18:00
+//    Brussels tijd voor forex, commodity en stocks.
+//    Reden: hoge spread + lage liquiditeit in de eerste 2,5u na NYSE open.
+//    Indexes (DE30EUR, UK100GBP, NAS100USD, US30USD) zijn NIET geblokkeerd
+//    in deze periode — die hebben hun eigen NY open dynamiek.
+//    Session-label: "NY_DEAD_ZONE" in reject logs.
+//
+//  - STOCK SL_BUFFER_MULT: STOCK_SL_BUFFER_MULT = 3.0 geëxporteerd.
+//    Stocks krijgen 3.0× SL buffer (in plaats van 1.5× voor forex/commodity).
+//    Reden: stocks hebben grotere spread en worden te snel uitgetikt.
+//    server.js gebruikt STOCK_SL_BUFFER_MULT voor calcSLFromDerivedPct()
+//    wanneer assetType === 'stock'.
 //
 // Changes v10.8:
 //  - DEFAULT_RISK_BY_TYPE gehalveerd: 0.0015 → 0.00075 (0.075% per trade).
-//    Reden: te veel losses waardoor manueel sluiten nodig was.
-//    Geldt voor forex, stock, index, commodity.
 //
 // Changes v10.7:
 //  - No functional changes. Version bump for v10.6 release.
@@ -38,11 +54,31 @@ const DAYS_MAP = {
 // or via the DB symbol_risk_config table.
 // ================================================================
 const DEFAULT_RISK_BY_TYPE = {
-  forex:     0.00075,   // 0.075% per trade (was 0.15% — gehalveerd v10.8)
-  stock:     0.00075,   // 0.075% per trade (was 0.15% — gehalveerd v10.8)
-  index:     0.00075,   // 0.075% per trade (was 0.15% — gehalveerd v10.8)
-  commodity: 0.00075,   // 0.075% per trade (was 0.15% — gehalveerd v10.8)
+  forex:     0.000375,   // 0.0375% per trade (was 0.075% — gehalveerd v10.9)
+  stock:     0.000375,   // 0.0375% per trade (was 0.075% — gehalveerd v10.9)
+  index:     0.000375,   // 0.0375% per trade (was 0.075% — gehalveerd v10.9)
+  commodity: 0.000375,   // 0.0375% per trade (was 0.075% — gehalveerd v10.9)
 };
+
+// ================================================================
+// ── SL BUFFER MULTIPLIERS ─────────────────────────────────────────
+// SL buffer: MT5 SL placed at sl_pct × mult to absorb spread + timing lag.
+// Stocks krijgen een dubbele buffer (3.0×) t.o.v. standaard (1.5×)
+// omdat stock CFDs op FTMO grotere spreads hebben en anders te snel
+// worden uitgetikt door willekeurige spread-pieken.
+// ================================================================
+const SL_BUFFER_MULT       = 1.5;   // standaard: forex, index, commodity
+const STOCK_SL_BUFFER_MULT = 3.0;   // stocks: 2× de standaard buffer
+
+// ================================================================
+// ── NY DEAD ZONE ──────────────────────────────────────────────────
+// Geen nieuwe trades van 15:30 tot 18:00 Brussels tijd voor
+// forex, commodity en stocks. Reden: hoge spread + lage liquiditeit
+// in de openingsperiode van de NYSE.
+// Indexes zijn NIET geblokkeerd — die volgen eigen NYSE open dynamiek.
+// ================================================================
+const NY_DEAD_ZONE_START = 1530;  // 15:30 Brussels (hhmm formaat)
+const NY_DEAD_ZONE_END   = 1800;  // 18:00 Brussels (hhmm formaat)
 
 // ── Approved symbol catalog ─────────────────────────────────────
 // ONLY these symbols are accepted. type determines lot/risk calc.
@@ -192,7 +228,15 @@ function isMarketOpen(date = null) {
 
 // ── Can a NEW trade be opened? ───────────────────────────────────
 // Stocks:              16:00–21:00 Brussels only (NYSE/NASDAQ open)
-// Forex/Index/Commodity: 02:00–21:00 Brussels mon-fri
+//                      MAAR: geblokkeerd 15:30–18:00 (NY dead zone)
+// Forex/Commodity:     02:00–21:00 Brussels mon-fri
+//                      MAAR: geblokkeerd 15:30–18:00 (NY dead zone)
+// Indexes:             02:00–21:00 Brussels mon-fri (geen dead zone)
+//
+// NY DEAD ZONE (v10.9): 15:30–18:00 Brussels = 13:30–16:00 UTC
+// = NYSE open tot 2,5u daarna. Hoge spread, lage liquiditeit voor
+// forex + commodities + stocks. Indexes uitgezonderd.
+//
 // Returns { allowed: boolean, reason: string }
 function canOpenNewTrade(rawSymbol, date = null) {
   const { day, hhmm } = getBrusselsComponents(date);
@@ -212,12 +256,36 @@ function canOpenNewTrade(rawSymbol, date = null) {
         reason:  `STOCK_OUTSIDE_MARKET: ${hhmm} (stocks need 1600–2100 Brussels)`,
       };
     }
-  } else {
-    // Forex, index, commodity: 02:00–21:00
+    // NY dead zone check voor stocks (16:00 start is NA dead zone einde van 18:00,
+    // dus stocks zijn sowieso pas actief na 18:00 tenzij hhmm >= 1800 al is bereikt)
+    // Stocks starten pas om 16:00 en dead zone eindigt om 18:00 — check 1600–1800 block.
+    if (hhmm >= NY_DEAD_ZONE_START && hhmm < NY_DEAD_ZONE_END) {
+      return {
+        allowed: false,
+        reason:  `NY_DEAD_ZONE: ${hhmm} (stocks geblokkeerd 1530–1800 Brussels — hoge spread NYSE open)`,
+      };
+    }
+  } else if (type === "index") {
+    // Indexes: 02:00–21:00 — GEEN dead zone
     if (hhmm < 200 || hhmm >= 2100) {
       return {
         allowed: false,
         reason:  `OUTSIDE_WINDOW: ${hhmm} (need 0200–2100 Brussels)`,
+      };
+    }
+  } else {
+    // Forex + commodity: 02:00–21:00 met NY dead zone 15:30–18:00
+    if (hhmm < 200 || hhmm >= 2100) {
+      return {
+        allowed: false,
+        reason:  `OUTSIDE_WINDOW: ${hhmm} (need 0200–2100 Brussels)`,
+      };
+    }
+    // NY dead zone: blokkeer forex en commodity 15:30–18:00
+    if (hhmm >= NY_DEAD_ZONE_START && hhmm < NY_DEAD_ZONE_END) {
+      return {
+        allowed: false,
+        reason:  `NY_DEAD_ZONE: ${hhmm} (${type} geblokkeerd 1530–1800 Brussels — hoge spread NYSE open)`,
       };
     }
   }
@@ -285,6 +353,10 @@ module.exports = {
   DEFAULT_RISK_BY_TYPE,
   SESSION_LABELS,
   TIMEZONE,
+  SL_BUFFER_MULT,
+  STOCK_SL_BUFFER_MULT,
+  NY_DEAD_ZONE_START,
+  NY_DEAD_ZONE_END,
   getBrusselsComponents,
   getBrusselsDateStr,
   getBrusselsDateOnly,
