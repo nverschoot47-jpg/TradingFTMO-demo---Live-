@@ -1,5 +1,12 @@
 // ===============================================================
-// session.js  v10.9  |  PRONTO-AI
+// session.js  v12.5  |  PRONTO-AI
+//
+// Changes v12.5 (dashboard optimalisaties):
+//  - Versie bump: consistentie met server.js v12.5.0 en package.json v12.5.0.
+//  - Geen functionele wijzigingen aan sessie-logica of risicoberekening.
+//  - Nieuwe features zitten in server.js (SL milestone timing, performance
+//    KPI endpoint, MAE stats, ghost grouped view) en db.js (loadPerformanceSummary,
+//    loadMAEStats, loadGhostGrouped).
 //
 // Changes v10.9:
 //  - DEFAULT_RISK_BY_TYPE gehalveerd: 0.00075 → 0.000375 (0.0375% per trade).
@@ -77,8 +84,8 @@ const STOCK_SL_BUFFER_MULT = 3.0;   // stocks: 2× de standaard buffer
 // in de openingsperiode van de NYSE.
 // Indexes zijn NIET geblokkeerd — die volgen eigen NYSE open dynamiek.
 // ================================================================
-const NY_DEAD_ZONE_START = 1520;  // 15:20 Brussels (hhmm formaat)
-const NY_DEAD_ZONE_END   = 1805;  // 18:05 Brussels (hhmm formaat)
+const NY_DEAD_ZONE_START = 1530;  // 15:30 Brussels (hhmm formaat)
+const NY_DEAD_ZONE_END   = 1800;  // 18:00 Brussels (hhmm formaat)
 
 // ── Approved symbol catalog ─────────────────────────────────────
 // ONLY these symbols are accepted. type determines lot/risk calc.
