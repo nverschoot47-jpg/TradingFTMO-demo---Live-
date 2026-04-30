@@ -77,8 +77,8 @@ const STOCK_SL_BUFFER_MULT = 3.0;   // stocks: 2× de standaard buffer
 // in de openingsperiode van de NYSE.
 // Indexes zijn NIET geblokkeerd — die volgen eigen NYSE open dynamiek.
 // ================================================================
-const NY_DEAD_ZONE_START = 1530;  // 15:30 Brussels (hhmm formaat)
-const NY_DEAD_ZONE_END   = 1800;  // 18:00 Brussels (hhmm formaat)
+const NY_DEAD_ZONE_START = 1520;  // 15:20 Brussels (hhmm formaat)
+const NY_DEAD_ZONE_END   = 1805;  // 18:05 Brussels (hhmm formaat)
 
 // ── Approved symbol catalog ─────────────────────────────────────
 // ONLY these symbols are accepted. type determines lot/risk calc.
@@ -249,20 +249,22 @@ function canOpenNewTrade(rawSymbol, date = null) {
   const type    = info?.type ?? "unknown";
 
   if (type === "stock") {
-    // Stocks: only during NY session (16:00–21:00 Brussels)
+    // Stocks: only during NY session (16:00–21:00 Brussels = NYSE/NASDAQ uren)
     if (hhmm < 1600 || hhmm >= 2100) {
       return {
         allowed: false,
         reason:  `STOCK_OUTSIDE_MARKET: ${hhmm} (stocks need 1600–2100 Brussels)`,
       };
     }
-    // NY dead zone check voor stocks (16:00 start is NA dead zone einde van 18:00,
-    // dus stocks zijn sowieso pas actief na 18:00 tenzij hhmm >= 1800 al is bereikt)
-    // Stocks starten pas om 16:00 en dead zone eindigt om 18:00 — check 1600–1800 block.
-    if (hhmm >= NY_DEAD_ZONE_START && hhmm < NY_DEAD_ZONE_END) {
+    // NY dead zone check voor stocks: 16:00–18:00 geblokkeerd.
+    // NYSE opent om 15:30 Brussels (09:30 ET). De eerste 2,5u (15:30–18:00) is
+    // de spread op stock CFDs hoog door opening volatiliteit.
+    // Stocks starten pas om 16:00, dus de effectieve blokkering is 16:00–18:00.
+    // Bedoeling: stocks pas traden vanaf 18:00 Brussels (12:00 ET).
+    if (hhmm >= 1600 && hhmm < NY_DEAD_ZONE_END) {
       return {
         allowed: false,
-        reason:  `NY_DEAD_ZONE: ${hhmm} (stocks geblokkeerd 1530–1800 Brussels — hoge spread NYSE open)`,
+        reason:  `NY_DEAD_ZONE: ${hhmm} (stocks geblokkeerd 1600–1800 Brussels — opening spread NYSE)`,
       };
     }
   } else if (type === "index") {
