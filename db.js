@@ -207,6 +207,7 @@ async function initDB() {
       ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS risk_eur  NUMERIC;
       ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS ev_mult   NUMERIC DEFAULT 1.0;
       ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS day_mult  NUMERIC DEFAULT 1.0;
+      ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS sl_milestones JSONB DEFAULT '{}'::jsonb;
     `);
 
     // ── shadow_snapshots ─────────────────────────────────────────
@@ -1315,6 +1316,186 @@ async function fetchRealizedPnl(positionId) {
   }
 }
 
+// ── loadPerformanceSummary (v12.5: investeerder KPI's) ────────
+// Retourneert win rate, profit factor, expectancy, max drawdown
+// op basis van gesloten trades na compliance datum.
+// Alleen trades met close_reason IN ('tp','sl') — geen manual.
+async function loadPerformanceSummary() {
+  try {
+    const r = await pool.query(`
+      SELECT
+        COUNT(*)                                          AS total,
+        COUNT(*) FILTER (WHERE hit_tp = TRUE)             AS tp_count,
+        COUNT(*) FILTER (WHERE close_reason = 'sl')       AS sl_count,
+        COALESCE(AVG(realized_pnl_eur) FILTER (WHERE hit_tp = TRUE), 0)          AS avg_winner,
+        COALESCE(AVG(realized_pnl_eur) FILTER (WHERE close_reason = 'sl'), 0)    AS avg_loser,
+        COALESCE(SUM(realized_pnl_eur) FILTER (WHERE hit_tp = TRUE), 0)          AS gross_wins,
+        COALESCE(ABS(SUM(realized_pnl_eur) FILTER (WHERE close_reason = 'sl')), 0) AS gross_losses,
+        COALESCE(SUM(realized_pnl_eur), 0)               AS total_pnl,
+        COALESCE(AVG(realized_pnl_eur), 0)               AS avg_pnl_per_trade
+      FROM closed_trades
+      WHERE opened_at >= $1
+        AND close_reason IN ('tp','sl')
+        AND (exclude_from_ev IS NULL OR exclude_from_ev = FALSE)
+    `, [EV_DATA_CUTOFF]);
+
+    const row = r.rows[0];
+    const total      = parseInt(row.total ?? 0);
+    const tpCount    = parseInt(row.tp_count ?? 0);
+    const slCount    = parseInt(row.sl_count ?? 0);
+    const grossWins  = parseFloat(row.gross_wins   ?? 0);
+    const grossLoss  = parseFloat(row.gross_losses ?? 0);
+    const winRate    = total > 0 ? parseFloat((tpCount / total * 100).toFixed(1)) : 0;
+    const profitFactor = grossLoss > 0 ? parseFloat((grossWins / grossLoss).toFixed(2)) : null;
+
+    // Cumulatieve P&L reeks voor drawdown berekening
+    const pnlR = await pool.query(`
+      SELECT realized_pnl_eur, closed_at
+      FROM closed_trades
+      WHERE opened_at >= $1
+        AND close_reason IN ('tp','sl')
+        AND (exclude_from_ev IS NULL OR exclude_from_ev = FALSE)
+        AND realized_pnl_eur IS NOT NULL
+      ORDER BY closed_at ASC
+    `, [EV_DATA_CUTOFF]);
+
+    let maxDrawdown = 0, peak = 0, cumPnl = 0;
+    const pnlCurve = [];
+    for (const tr of pnlR.rows) {
+      cumPnl += parseFloat(tr.realized_pnl_eur ?? 0);
+      pnlCurve.push({ at: tr.closed_at, pnl: parseFloat(cumPnl.toFixed(2)) });
+      if (cumPnl > peak) peak = cumPnl;
+      const dd = peak - cumPnl;
+      if (dd > maxDrawdown) maxDrawdown = dd;
+    }
+
+    return {
+      total, tpCount, slCount, winRate,
+      avgWinner:     parseFloat(parseFloat(row.avg_winner ?? 0).toFixed(2)),
+      avgLoser:      parseFloat(parseFloat(row.avg_loser  ?? 0).toFixed(2)),
+      grossWins:     parseFloat(grossWins.toFixed(2)),
+      grossLosses:   parseFloat(grossLoss.toFixed(2)),
+      profitFactor,
+      totalPnl:      parseFloat(parseFloat(row.total_pnl ?? 0).toFixed(2)),
+      avgPnlPerTrade: parseFloat(parseFloat(row.avg_pnl_per_trade ?? 0).toFixed(2)),
+      maxDrawdown:   parseFloat(maxDrawdown.toFixed(2)),
+      pnlCurve:      pnlCurve.slice(-200), // max 200 punten voor grafiek
+    };
+  } catch (e) { console.warn('[!] loadPerformanceSummary:', e.message); return null; }
+}
+
+// ── loadMAEStats (v12.5: MAE percentiles per optimizer_key) ────
+// Max Adverse Excursion analyse voor SL inkortings beslissingen.
+// Gebaseerd op ghost_trades die NIET gestopt zijn door phantom SL
+// (survivors = trades die doorgingen voorbij het drempel zonder geraakt te worden).
+// Per key: p50 / p75 / p90 MAE — als p90 < 50% → halveren van SL is safe.
+async function loadMAEStats(since) {
+  try {
+    const cutoff = since ?? EV_DATA_CUTOFF;
+    const r = await pool.query(`
+      SELECT
+        optimizer_key                                               AS "optimizerKey",
+        COUNT(*)                                                    AS n_total,
+        COUNT(*) FILTER (WHERE phantom_sl_hit = FALSE
+          AND stop_reason NOT IN ('real_sl_hit'))                   AS n_survivors,
+        COUNT(*) FILTER (WHERE phantom_sl_hit = TRUE)               AS n_sl_hit,
+        CAST(PERCENTILE_CONT(0.50) WITHIN GROUP(ORDER BY max_sl_pct_used)
+             FILTER (WHERE phantom_sl_hit = FALSE
+               AND stop_reason NOT IN ('real_sl_hit')) AS FLOAT)    AS mae_p50,
+        CAST(PERCENTILE_CONT(0.75) WITHIN GROUP(ORDER BY max_sl_pct_used)
+             FILTER (WHERE phantom_sl_hit = FALSE
+               AND stop_reason NOT IN ('real_sl_hit')) AS FLOAT)    AS mae_p75,
+        CAST(PERCENTILE_CONT(0.90) WITHIN GROUP(ORDER BY max_sl_pct_used)
+             FILTER (WHERE phantom_sl_hit = FALSE
+               AND stop_reason NOT IN ('real_sl_hit')) AS FLOAT)    AS mae_p90,
+        CAST(AVG(max_sl_pct_used)
+             FILTER (WHERE phantom_sl_hit = FALSE
+               AND stop_reason NOT IN ('real_sl_hit')) AS FLOAT)    AS mae_avg
+      FROM ghost_trades
+      WHERE opened_at >= $1
+        AND closed_at IS NOT NULL
+        AND vwap_position IN ('above','below')
+        AND max_sl_pct_used IS NOT NULL
+      GROUP BY optimizer_key
+      HAVING COUNT(*) >= 3
+      ORDER BY optimizer_key
+    `, [cutoff]);
+
+    return r.rows.map(row => {
+      const p90 = row.mae_p90 != null ? parseFloat(parseFloat(row.mae_p90).toFixed(1)) : null;
+      // Aanbeveling: veilig halveren als p90 < 50%, inkorten naar 75% als p90 < 75%
+      let slReduction = null;
+      if (p90 != null) {
+        if      (p90 < 40)  slReduction = { pct: 40,  label: '✅ SAFE: SL → 40%',  color: 'g' };
+        else if (p90 < 50)  slReduction = { pct: 50,  label: '✅ SAFE: SL → 50%',  color: 'g' };
+        else if (p90 < 65)  slReduction = { pct: 65,  label: '⚠ MILD: SL → 65%',  color: 'y' };
+        else if (p90 < 80)  slReduction = { pct: 80,  label: '⚠ MILD: SL → 80%',  color: 'y' };
+        else                slReduction = { pct: null, label: '❌ RISICO: houd SL',  color: 'r' };
+      }
+      return {
+        optimizerKey:  row.optimizerKey,
+        nTotal:        parseInt(row.n_total),
+        nSurvivors:    parseInt(row.n_survivors ?? 0),
+        nSLHit:        parseInt(row.n_sl_hit    ?? 0),
+        maeP50:        row.mae_p50  != null ? parseFloat(parseFloat(row.mae_p50).toFixed(1))  : null,
+        maeP75:        row.mae_p75  != null ? parseFloat(parseFloat(row.mae_p75).toFixed(1))  : null,
+        maeP90:        p90,
+        maeAvg:        row.mae_avg  != null ? parseFloat(parseFloat(row.mae_avg).toFixed(1))  : null,
+        slReduction,
+      };
+    });
+  } catch (e) { console.warn('[!] loadMAEStats:', e.message); return []; }
+}
+
+// ── loadGhostGrouped (v12.5: ghost info per optimizer_key voor grouped view) ──
+// Gebruikt voor de "grouped" tab in ghost tracker: TP/SL info per combo.
+// Retourneert actieve ghosts gegroepeerd per optimizer_key met TP + SL details.
+async function loadGhostGrouped() {
+  try {
+    const r = await pool.query(`
+      SELECT
+        optimizer_key                                               AS "optimizerKey",
+        symbol, session, direction,
+        vwap_position                                               AS "vwapPosition",
+        COUNT(*)                                                    AS n,
+        COUNT(*) FILTER (WHERE phantom_sl_hit = FALSE
+          AND stop_reason IS NULL)                                  AS n_open_estimate,
+        CAST(AVG(CASE WHEN max_rr_before_sl IS NOT NULL
+              THEN max_rr_before_sl END) AS FLOAT)                  AS avg_max_rr,
+        CAST(MAX(CASE WHEN max_rr_before_sl IS NOT NULL
+              THEN max_rr_before_sl END) AS FLOAT)                  AS best_max_rr,
+        CAST(AVG(max_sl_pct_used) AS FLOAT)                         AS avg_sl_pct,
+        CAST(AVG(tp_rr_used)      AS FLOAT)                         AS avg_tp_rr,
+        CAST(AVG(CAST(sl_pct AS FLOAT)) AS FLOAT)                   AS avg_sl_dist_pct,
+        MAX(opened_at)                                              AS last_opened,
+        COUNT(*) FILTER (WHERE phantom_sl_hit = TRUE)               AS sl_hits
+      FROM ghost_trades
+      WHERE closed_at IS NOT NULL
+        AND opened_at >= $1
+        AND vwap_position IN ('above','below')
+      GROUP BY optimizer_key, symbol, session, direction, vwap_position
+      ORDER BY last_opened DESC
+      LIMIT 200
+    `, [EV_DATA_CUTOFF]);
+
+    return r.rows.map(row => ({
+      optimizerKey:   row.optimizerKey,
+      symbol:         row.symbol,
+      session:        row.session,
+      direction:      row.direction,
+      vwapPosition:   row.vwapPosition,
+      n:              parseInt(row.n),
+      avgMaxRR:       row.avg_max_rr  != null ? parseFloat(parseFloat(row.avg_max_rr).toFixed(3)) : null,
+      bestMaxRR:      row.best_max_rr != null ? parseFloat(parseFloat(row.best_max_rr).toFixed(3)) : null,
+      avgSlPct:       row.avg_sl_pct  != null ? parseFloat(parseFloat(row.avg_sl_pct).toFixed(1)) : null,
+      avgTpRR:        row.avg_tp_rr   != null ? parseFloat(parseFloat(row.avg_tp_rr).toFixed(2)) : null,
+      avgSlDistPct:   row.avg_sl_dist_pct != null ? parseFloat(parseFloat(row.avg_sl_dist_pct).toFixed(3)) : null,
+      slHits:         parseInt(row.sl_hits ?? 0),
+      lastOpened:     row.last_opened,
+    }));
+  } catch (e) { console.warn('[!] loadGhostGrouped:', e.message); return []; }
+}
+
 // ── loadAllShadowAnalysis (FIX 12: load all keys at startup) ───
 async function loadAllShadowAnalysis() {
   try {
@@ -1350,9 +1531,9 @@ async function saveGhostState(g) {
         (position_id, optimizer_key, symbol, mt5_symbol, session, direction,
          vwap_position, entry, sl, sl_pct, tp_rr_used,
          max_price, max_rr, max_sl_pct_used, opened_at,
-         risk_pct, risk_eur, ev_mult, day_mult,
+         risk_pct, risk_eur, ev_mult, day_mult, sl_milestones,
          updated_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,NOW())
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,NOW())
       ON CONFLICT (position_id) DO UPDATE SET
         max_price       = EXCLUDED.max_price,
         max_rr          = EXCLUDED.max_rr,
@@ -1361,6 +1542,7 @@ async function saveGhostState(g) {
         risk_eur        = COALESCE(EXCLUDED.risk_eur, ghost_state.risk_eur),
         ev_mult         = COALESCE(EXCLUDED.ev_mult,  ghost_state.ev_mult),
         day_mult        = COALESCE(EXCLUDED.day_mult, ghost_state.day_mult),
+        sl_milestones   = COALESCE(EXCLUDED.sl_milestones, ghost_state.sl_milestones),
         updated_at      = NOW()
     `, [
       g.positionId, g.optimizerKey, g.symbol, g.mt5Symbol ?? g.symbol,
@@ -1370,6 +1552,9 @@ async function saveGhostState(g) {
       g.openedAt ?? null,
       g.riskPct ?? null, g.riskEUR ?? null,
       g.evMult ?? 1.0, g.dayMult ?? 1.0,
+      g.slMilestones && Object.keys(g.slMilestones).length > 0
+        ? JSON.stringify(g.slMilestones)
+        : null,
     ]);
   } catch (e) { console.warn('[!] saveGhostState:', e.message); }
 }
@@ -1394,7 +1579,8 @@ async function loadAllGhostStates() {
         CAST(risk_pct         AS FLOAT) AS "riskPct",
         CAST(risk_eur         AS FLOAT) AS "riskEUR",
         CAST(ev_mult          AS FLOAT) AS "evMult",
-        CAST(day_mult         AS FLOAT) AS "dayMult"
+        CAST(day_mult         AS FLOAT) AS "dayMult",
+        sl_milestones         AS "slMilestones"
       FROM ghost_state
     `);
     return r.rows;
@@ -1590,4 +1776,8 @@ module.exports = {
   computeEVStats,
   // Shadow winners
   loadShadowWinners,
+  // v12.5: nieuwe functies
+  loadPerformanceSummary,
+  loadMAEStats,
+  loadGhostGrouped,
 };
