@@ -1,7 +1,7 @@
 {
   "name": "nv-tradingview-webhook",
-  "version": "12.4.0",
-  "description": "TradingView -> MetaApi REST -> FTMO MT5 | PRONTO-AI v12.3.0 - risk halved, NY dead zone, stock 2x SL, ghost SL-hit fix",
+  "version": "12.5.0",
+  "description": "TradingView -> MetaApi REST -> FTMO MT5 | PRONTO-AI v12.5.0 - SL milestone timing, performance KPI's, MAE SL-inkort analyse, ghost grouped view",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
