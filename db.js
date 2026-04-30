@@ -1,7 +1,7 @@
 // ===============================================================
-// db.js  v12.3  |  PRONTO-AI
+// db.js  v12.4  |  PRONTO-AI
 //
-// Changes v12.3:
+// Changes v12.4:
 //  - FIX GH2: ghost_state tabel krijgt extra kolommen voor risk/ev data:
 //    risk_pct, risk_eur, ev_mult, day_mult via ADD COLUMN IF NOT EXISTS.
 //    restorePositionsFromMT5() in server.js leest deze terug bij restart
@@ -201,7 +201,7 @@ async function initDB() {
         opened_at         TIMESTAMPTZ,
         updated_at        TIMESTAMPTZ DEFAULT NOW()
       );
-      -- FIX GH2 (v12.3): extra kolommen voor risk/ev data zodat dashboard na restart
+      -- FIX GH2 (v12.4): extra kolommen voor risk/ev data zodat dashboard na restart
       -- de juiste risk% toont voor herstelde posities (waren null na restart).
       ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS risk_pct  NUMERIC;
       ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS risk_eur  NUMERIC;
@@ -462,6 +462,28 @@ async function initDB() {
       CREATE INDEX IF NOT EXISTS idx_spread_log_sym     ON spread_log (symbol, logged_at DESC);
       CREATE INDEX IF NOT EXISTS idx_spread_log_session ON spread_log (session, hour_brussels);
       CREATE INDEX IF NOT EXISTS idx_spread_log_ts      ON spread_log (logged_at DESC);
+    `);
+
+    // ── deals (FIX v12.4: gerealiseerde P&L per positie — MetaAPI history) ──
+    // Wordt gevuld door saveDeal() na elke gesloten trade via /history-deals.
+    // fetchRealizedPnl() raadpleegt eerst deze tabel, dan MetaAPI live.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS deals (
+        id            SERIAL      PRIMARY KEY,
+        position_id   TEXT        NOT NULL,
+        deal_id       TEXT        UNIQUE,
+        symbol        TEXT,
+        type          TEXT,
+        profit        NUMERIC     DEFAULT 0,
+        commission    NUMERIC     DEFAULT 0,
+        swap          NUMERIC     DEFAULT 0,
+        volume        NUMERIC,
+        price         NUMERIC,
+        time          TIMESTAMPTZ,
+        created_at    TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_deals_position ON deals (position_id);
+      CREATE INDEX IF NOT EXISTS idx_deals_time     ON deals (time DESC);
     `);
 
     await client.query("COMMIT");
@@ -1243,21 +1265,52 @@ async function loadSpreadLog({ symbol, session, limit = 500 } = {}) {
     return r.rows;
   } catch (e) { console.warn('[!] loadSpreadLog:', e.message); return []; }
 }
-// Tries to get the actual realized P&L for a closed position from
-// the MetaApi deals history. Falls back to null if not available.
-// Note: this queries the deals table if it exists in the DB schema.
-// In practice the caller catches errors and falls back to currentPnL.
+// ── deals — gerealiseerde P&L opslaan (FIX v12.4) ─────────────
+// Wordt aangeroepen door server.js na fetchHistoryDeals().
+// deal: { positionId, dealId, symbol, type, profit, commission, swap, volume, price, time }
+async function saveDeal(deal) {
+  try {
+    await pool.query(`
+      INSERT INTO deals (position_id, deal_id, symbol, type, profit, commission, swap, volume, price, time)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+      ON CONFLICT (deal_id) DO UPDATE SET
+        profit     = EXCLUDED.profit,
+        commission = EXCLUDED.commission,
+        swap       = EXCLUDED.swap
+    `, [
+      deal.positionId ?? null,
+      deal.dealId     ?? null,
+      deal.symbol     ?? null,
+      deal.type       ?? null,
+      deal.profit     ?? 0,
+      deal.commission ?? 0,
+      deal.swap       ?? 0,
+      deal.volume     ?? null,
+      deal.price      ?? null,
+      deal.time       ?? null,
+    ]);
+  } catch (e) { console.warn('[!] saveDeal:', e.message); }
+}
+
+// FIX v12.4: fetchRealizedPnl haalt nu profit+commission+swap op uit deals tabel.
+// Als die tabel leeg is (nog geen deals voor deze positie), retourneert null.
+// Caller (handlePositionClosed) valt dan terug op currentPnL.
 async function fetchRealizedPnl(positionId) {
   try {
     const r = await pool.query(`
-      SELECT SUM(CAST(profit AS FLOAT)) AS realized_pnl
+      SELECT
+        SUM(CAST(profit     AS FLOAT)) AS profit,
+        SUM(CAST(commission AS FLOAT)) AS commission,
+        SUM(CAST(swap       AS FLOAT)) AS swap
       FROM deals
       WHERE position_id = $1
     `, [positionId]);
-    const val = r.rows[0]?.realized_pnl;
-    return val != null ? parseFloat(val) : null;
+    const row = r.rows[0];
+    if (!row || row.profit == null) return null;
+    // Netto P&L = profit + commission + swap (commission en swap zijn negatief op FTMO)
+    return parseFloat(((row.profit ?? 0) + (row.commission ?? 0) + (row.swap ?? 0)).toFixed(2));
   } catch {
-    // deals table may not exist — non-critical, return null
+    // deals tabel niet beschikbaar — non-critical, caller valt terug op currentPnL
     return null;
   }
 }
@@ -1288,7 +1341,7 @@ async function loadAllShadowAnalysis() {
 }
 
 // ── ghost_state (restart persistence) ─────────────────────────
-// FIX GH2 (v12.3): risk_pct, risk_eur, ev_mult, day_mult meegestuurd zodat
+// FIX GH2 (v12.4): risk_pct, risk_eur, ev_mult, day_mult meegestuurd zodat
 // dashboard na restart de juiste risk% toont voor herstelde posities.
 async function saveGhostState(g) {
   try {
@@ -1518,8 +1571,9 @@ module.exports = {
   // Key risk multipliers (FIX 19 + v10.6 evMult/dayMult)
   saveKeyRiskMult,
   loadKeyRiskMults,
-  // Realized P&L (FIX 4)
+  // Realized P&L (FIX 4 + v12.4: deals tabel)
   fetchRealizedPnl,
+  saveDeal,
   // Spread log (v10.7)
   saveSpreadLog,
   loadSpreadStats,
