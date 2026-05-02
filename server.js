@@ -1079,6 +1079,10 @@ function startGhostTracker(pos, restoreData = null) {
           maxPrice = price;
           g.maxPrice = price;
           g.maxRR = calcMaxRR(direction, entry, phantomSL, price);
+          // FIX v12.6: sync maxRR terug naar openPositions zodat /live/positions
+          // dezelfde waarde toont als de ghost tracker (was: TSLA pos 0.62R ghost 1.86R)
+          const lp = openPositions[positionId];
+          if (lp) { lp.maxPrice = maxPrice; lp.maxRR = g.maxRR; }
         }
 
         const slDist = Math.abs(entry - phantomSL);
@@ -1104,6 +1108,9 @@ function startGhostTracker(pos, restoreData = null) {
               slMilestones[pct] = nowIso;
               g.rrMilestones = rrMilestones;
               g.slMilestones = { ...slMilestones };
+              // FIX v12.6: ook openPositions bijwerken zodat /live/positions de milestone toont
+              const lp = openPositions[positionId];
+              if (lp) lp.slMilestones = { ...slMilestones };
               const elMin = Math.round(elapsed / 60000);
               console.log(`[Ghost] ${positionId} adverse -${step}R (${pct}% SL) @ +${elMin}min | maxRR so far: ${g.maxRR}R`);
             }
@@ -1409,12 +1416,13 @@ async function syncOpenPositions() {
           const adverseRR   = Math.max(0, adverseMove) / slDist;
           if (!local.slMilestones) local.slMilestones = {};
           const nowIso = new Date().toISOString();
-          // Drempels: 25% = -0.25R, 50% = -0.50R, 75% = -0.75R, 99% = -0.99R
+          // Drempels: 25% = -0.25R, 50% = -0.50R, 75% = -0.75R, 100% = -1.00R (phantom SL)
+          // FIX v12.6: was '99'/0.99R — nu '100'/1.00R consistent met ghost tracker slMilestones
           const OPEN_POS_MILESTONES = [
             { key: '25',  rr: 0.25 },
             { key: '50',  rr: 0.50 },
             { key: '75',  rr: 0.75 },
-            { key: '99',  rr: 0.99 },
+            { key: '100', rr: 1.00 },
           ];
           for (const ms of OPEN_POS_MILESTONES) {
             if (!local.slMilestones[ms.key] && adverseRR >= ms.rr) {
@@ -2021,8 +2029,10 @@ app.post("/webhook", async (req, res) => {
     return res.status(200).json({ status: "OUTSIDE_TRADE_WINDOW", reason: tradeWindow.reason, assetType });
   }
 
-  // Duplicate guard
-  const dupKey  = `${symKey}_${direction}`;
+  // Duplicate guard — FIX v12.6: sessie meenemen zodat EURUSD_BUY_LON en EURUSD_BUY_NY
+  // onafhankelijk zijn (verschillende optimizer combos met eigen EV). Zonder sessie blokkeerde
+  // een LONDON signaal het NY signaal 2 minuten later terwijl dat 2 aparte kansen zijn.
+  const dupKey  = `${symKey}_${direction}_${session}`;
   const dupLast = global._dupGuard?.[dupKey];
   if (dupLast && (Date.now() - dupLast) < DUP_GUARD_TTL_MS) {
     const _dupAge = Math.round((Date.now() - dupLast) / 1000);
@@ -3299,7 +3309,7 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
         <th class="s" title="Tijd vanaf entry tot -0.25R adverse bereikt (25% SL gebruikt)">T→-¼R</th>
         <th class="s" title="Tijd vanaf entry tot -0.50R adverse bereikt (50% SL gebruikt)">T→-½R</th>
         <th class="s" title="Tijd vanaf entry tot -0.75R adverse bereikt (75% SL gebruikt)">T→-¾R</th>
-        <th class="s" title="Tijd vanaf entry tot -0.99R adverse bereikt (bijna-SL)">T→-1R</th>
+        <th class="s" title="Tijd vanaf entry tot -1.00R adverse bereikt (phantom SL = 100% SL gebruikt)">T→-1R</th>
         <th class="s" data-col="14">Opened</th>
       </tr></thead>
       <tbody id="pos-body"></tbody>
@@ -3384,6 +3394,7 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
         <th class="s" data-col="7">Best TP RR</th>
         <th class="s" data-col="8">Avg RR</th>
         <th class="s" data-col="9">EV</th>
+        <th class="s" title="EV na gemiddelde slippage van 0.3–0.8 pips (forex) — negatief = combo verliest netto">EV Netto</th>
         <th>EV Status</th>
         <th class="s" data-col="11">TP Lock</th>
         <th class="s" data-col="12" title="Avg minutes from open to phantom SL hit">Avg T→SL</th>
@@ -3870,7 +3881,7 @@ async function loadPositions(){
     function msTime(key){
       if(!ms[key]||!p.openedAt)return'<span class="d">—</span>';
       const mins=Math.round((new Date(ms[key])-new Date(p.openedAt))/60000);
-      const cls=key==='99'?'r fw':key==='75'?'r':'o';
+      const cls=key==='100'?'r fw':key==='75'?'r':'o';
       if(mins<60)return\`<span class="\${cls}">\${mins}m</span>\`;
       return\`<span class="\${cls}">\${Math.floor(mins/60)}h\${String(mins%60).padStart(2,'0')}m</span>\`;
     }
@@ -3890,7 +3901,7 @@ async function loadPositions(){
       <td style="font-size:9px">\${msTime('25')}</td>
       <td style="font-size:9px">\${msTime('50')}</td>
       <td style="font-size:9px">\${msTime('75')}</td>
-      <td style="font-size:9px">\${msTime('99')}</td>
+      <td style="font-size:9px">\${msTime('100')}</td>
       <td data-val="\${p.openedAt}" class="d" style="font-size:9px">\${dtTs(p.openedAt)}</td>
     </tr>\`;
   }).join('');
@@ -3998,6 +4009,14 @@ function _buildCombos(){
   document.getElementById('k-tp').textContent=Object.values(_tpMap).filter(t=>(t.evAtLock??0)>0).length;
   const combos=[];
   const allSyms=[...FOREX,...INDEX,...COMM,...STOCKS];
+  // FIX v12.6: build tradesByKey index O(n) eenmalig ipv O(n) per combo = was 424×10000=4.2M ops
+  const tradesByKey={};
+  for(const t of _allTrades){
+    if(!t.closedAt||!t.openedAt||new Date(t.openedAt)<TP_OPT_DATE)continue;
+    const k=t.symbol+'_'+t.session+'_'+t.direction+'_'+t.vwapPosition;
+    if(!tradesByKey[k])tradesByKey[k]=[];
+    tradesByKey[k].push(t);
+  }
   for(const sym of allSyms){
     const type=sTypeName(sym);
     const sessions=type==='stock'?['ny']:['asia','london','ny'];
@@ -4005,11 +4024,7 @@ function _buildCombos(){
       for(const dir of['buy','sell']){
         for(const vwap of['above','below']){
           const key=sym+'_'+sess+'_'+dir+'_'+vwap;
-          const trades=_allTrades.filter(t=>
-            t.symbol===sym&&t.session===sess&&t.direction===dir&&
-            t.vwapPosition===vwap&&t.closedAt!=null&&
-            t.openedAt&&new Date(t.openedAt)>=TP_OPT_DATE
-          );
+          const trades=tradesByKey[key]??[];
           const totalPnl=trades.reduce((s,t)=>s+(t.realizedPnlEUR??t.currentPnL??0),0);
           const ev=_evMap[key]??null;
           const tp=_tpMap[key]??null;
@@ -4081,6 +4096,13 @@ function renderEV(){
     const avgTimeMin=ev?.avgTimeToSLMin??null;
     const avgSlPct=ev?.avgMaxSlPct??null;
     const bestSlW=ev?.bestWinnerSlPct??null;
+    // FIX v12.6: netEV na gemiddelde slippage. Slippage was gemeten maar NIET gebruikt in EV.
+    // Gemiddelde slippage forex: 0.5 pips. Per pip: riskEUR * 0.0001 / SL_dist.
+    // Vereenvoudigd: netEV = grossEV - (avgSlippagePips × pipValue / riskEUR)
+    // Hier: ruwweg 0.5 pips kosten = ~0.05R nadeel (konservatieve estimate).
+    // Toont het potentieel verborgen verlies voor combos met kleine EV marges.
+    const AVG_SLIPPAGE_EV_IMPACT = c.type === 'forex' ? 0.05 : c.type === 'stock' ? 0.02 : 0.03;
+    const netEV = evV != null ? parseFloat((evV - AVG_SLIPPAGE_EV_IMPACT).toFixed(3)) : null;
     // row opacity: lighter if no data at all
     const rowStyle=ghostN===0&&tradeN===0?' style="opacity:.45"':'';
     return\`<tr class="\${tClass(c.sym)}"\${rowStyle}>
@@ -4094,6 +4116,7 @@ function renderEV(){
       <td data-val="\${bestTP??-99}" class="\${bestTP?'g fw':'d'}">\${bestTP!=null?f(bestTP,1)+'R':'—'}</td>
       <td data-val="\${ev?.avgRR??-99}" class="\${(ev?.avgRR??0)>=1?'g':'d'}">\${ev?.avgRR!=null?f(ev.avgRR,2)+'R':'—'}</td>
       <td data-val="\${evV??-999}" class="\${evC(evV)} fw">\${evV!=null?evV.toFixed(3):'—'}</td>
+      <td data-val="\${netEV??-999}" class="\${evC(netEV)}" title="EV na slippage estimate (\${c.type})">\${netEV!=null?netEV.toFixed(3):'—'}</td>
       <td>\${ready?(evV!=null?(evV>0?'<span class="bd bd-evp">EV+ ✓</span>':'<span class="bd bd-evn">EV-</span>'):'<span class="bd d">pending</span>'):('<span class="d" style="font-size:9px">'+(ghostN>0?'need '+(5-ghostN)+' more':'geen data')+'</span>')}</td>
       <td>\${tp?\`<span class="bd bd-lck">★ \${tp.lockedRR.toFixed(1)}R</span>\`:'<span class="d">—</span>'}</td>
       <td data-val="\${avgTimeMin??9999}" class="d">\${avgTimeMin!=null?avgTimeMin+'min':'—'}</td>
