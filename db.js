@@ -40,7 +40,8 @@ const { COMPLIANCE_DATE, COMPLIANCE_DATE_MS } = require('./session');
 // FIX v12.2: EV_DATA_CUTOFF — earliest date for valid ghost EV data.
 // Aligned with COMPLIANCE_DATE: 28/04/2026 14:00 Brussels (12:00 UTC).
 // All ghost data before this timestamp is excluded from EV calculations.
-const EV_DATA_CUTOFF = '2026-04-28 12:00:00';
+// FIX v12.6: env var override — set EV_DATA_CUTOFF in Railway env to change without redeploy.
+const EV_DATA_CUTOFF = process.env.EV_DATA_CUTOFF || '2026-04-28 12:00:00';
 //  - DATE GATE: computeEVStats(), countGhostsByKey() now filter
 //    ghost_trades to opened_at >= '2026-04-18' only.
 //    Pre-compliance trades had missing execution_price / vwap_band_pct
