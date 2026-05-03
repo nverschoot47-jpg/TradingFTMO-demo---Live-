@@ -1004,16 +1004,19 @@ function startGhostTracker(pos, restoreData = null) {
   const originalTpRR   = tpRRUsed;
   let   lastStateSaveTs = Date.now();
 
-  // FIX v12.2: RR milestone timestamps — twee assen:
+  // FIX v12.4: RR milestone timestamps — twee assen:
   //   adverse:   -0.25R, -0.50R, -0.75R, -1.00R  (= % van SL: 25/50/75/100)
-  //   favorable: +0.25R, +0.50R, +0.75R, +1.00R, +1.50R, +2.00R, +3.00R
+  //   favorable: +0.1R stappen t/m 15.0R (elk 0.1R één kolom)
   // Worden ingevuld bij EERSTE overschrijding van elke drempel.
   // Bij -1.00R (= phantom SL) → ghost stopt onmiddellijk.
   const RR_ADVERSE_STEPS   = [0.25, 0.50, 0.75, 1.00];
-  const RR_FAVORABLE_STEPS = [0.25, 0.50, 0.75, 1.00, 1.50, 2.00, 3.00, 4.00, 5.00, 10.00, 15.00];
+  // Per 0.1R van 0.1 t/m 15.0 = 150 stappen
+  const RR_FAVORABLE_STEPS = Array.from({length: 150}, (_, i) => parseFloat(((i + 1) * 0.1).toFixed(1)));
+  const favorableInit = {};
+  for (const s of RR_FAVORABLE_STEPS) favorableInit[s] = null;
   const rrMilestones = {
     adverse:   { 0.25: null, 0.50: null, 0.75: null, 1.00: null },
-    favorable: { 0.25: null, 0.50: null, 0.75: null, 1.00: null, 1.50: null, 2.00: null, 3.00: null, 4.00: null, 5.00: null, 10.00: null, 15.00: null },
+    favorable: { ...favorableInit },
   };
   // Keep slMilestones as alias for backward compat with dashboard (maps 25→adverse[0.25] etc)
   const slMilestones = { 25: null, 50: null, 75: null, 100: null };
@@ -2505,6 +2508,10 @@ app.get("/live/positions", (req, res) => {
       isEvPlus: p.isEvPlus ?? false,
       scaleFactor: p.scaleFactor ?? 1.0,
       slMilestones: p.slMilestones ?? null,
+      // v12.4: sync rrMilestones vanuit ghost tracker voor volledige tijdsdata op open posities
+      rrMilestones: ghostTrackers[p.positionId]?.rrMilestones ?? null,
+      // v12.4: sync maxRR vanuit ghost tracker (open positie maxRR was altijd 0)
+      maxRR: ghostTrackers[p.positionId]?.maxRR ?? p.maxRR ?? 0,
     };
   });
   res.json({ count: positions.length, balance, positions });
@@ -3290,16 +3297,28 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
         <th class="s" data-col="0">Pair</th><th class="s" data-col="1">Dir</th><th class="s" data-col="2">VWAP</th><th class="s" data-col="3">Session</th>
         <th class="s" data-col="4">Entry MT5</th><th class="s" data-col="5">SL MT5</th><th class="s" data-col="6">TP MT5</th>
         <th class="s" data-col="7" title="Current RR: (price-entry)/SL dist">RR Now</th>
-        <th class="s" data-col="8" title="Highest RR reached since open">Max RR</th>
+        <th class="s" data-col="8" title="Highest RR reached since open (synced from ghost)">Max RR</th>
         <th title="% of SL already consumed">SL Used</th>
         <th class="s" data-col="10" title="TP RR: (TP-entry)/SL dist">Entry→TP RR</th>
         <th class="s" data-col="11">P&amp;L €</th>
         <th class="s" data-col="12">Lots</th>
         <th class="s" data-col="13" title="Actual risk at SL: lots×dist×lotVal as % of balance">Risk %</th>
-        <th class="s" title="Tijd vanaf entry tot -0.25R adverse bereikt (25% SL gebruikt)">T→-¼R</th>
-        <th class="s" title="Tijd vanaf entry tot -0.50R adverse bereikt (50% SL gebruikt)">T→-½R</th>
-        <th class="s" title="Tijd vanaf entry tot -0.75R adverse bereikt (75% SL gebruikt)">T→-¾R</th>
-        <th class="s" title="Tijd vanaf entry tot -0.99R adverse bereikt (bijna-SL)">T→-1R</th>
+        <th class="s" title="T tot -0.25R adverse">T→-¼R</th>
+        <th class="s" title="T tot -0.50R adverse">T→-½R</th>
+        <th class="s" title="T tot -0.75R adverse">T→-¾R</th>
+        <th class="s" title="T tot -1.00R (phantom SL)">T→-1R</th>
+        <th class="s" title="T tot +0.1R">+0.1</th><th class="s" title="T tot +0.2R">+0.2</th><th class="s" title="T tot +0.3R">+0.3</th>
+        <th class="s" title="T tot +0.4R">+0.4</th><th class="s" title="T tot +0.5R">+0.5</th><th class="s" title="T tot +0.6R">+0.6</th>
+        <th class="s" title="T tot +0.7R">+0.7</th><th class="s" title="T tot +0.8R">+0.8</th><th class="s" title="T tot +0.9R">+0.9</th>
+        <th class="s" title="T tot +1.0R">+1R</th><th class="s" title="T tot +1.1R">+1.1</th><th class="s" title="T tot +1.2R">+1.2</th>
+        <th class="s" title="T tot +1.3R">+1.3</th><th class="s" title="T tot +1.4R">+1.4</th><th class="s" title="T tot +1.5R">+1.5</th>
+        <th class="s" title="T tot +1.6R">+1.6</th><th class="s" title="T tot +1.7R">+1.7</th><th class="s" title="T tot +1.8R">+1.8</th>
+        <th class="s" title="T tot +1.9R">+1.9</th><th class="s" title="T tot +2.0R">+2R</th><th class="s" title="T tot +2.5R">+2.5</th>
+        <th class="s" title="T tot +3.0R">+3R</th><th class="s" title="T tot +3.5R">+3.5</th><th class="s" title="T tot +4.0R">+4R</th>
+        <th class="s" title="T tot +4.5R">+4.5</th><th class="s" title="T tot +5.0R">+5R</th><th class="s" title="T tot +6R">+6R</th>
+        <th class="s" title="T tot +7R">+7R</th><th class="s" title="T tot +8R">+8R</th><th class="s" title="T tot +9R">+9R</th>
+        <th class="s" title="T tot +10R">+10R</th><th class="s" title="T tot +11R">+11R</th><th class="s" title="T tot +12R">+12R</th>
+        <th class="s" title="T tot +13R">+13R</th><th class="s" title="T tot +14R">+14R</th><th class="s" title="T tot +15R">+15R</th>
         <th class="s" data-col="14">Opened</th>
       </tr></thead>
       <tbody id="pos-body"></tbody>
@@ -3313,23 +3332,52 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
   <div id="gh-flat-view" class="tw">
     <table id="gh-tbl">
       <thead><tr>
+      <thead><tr>
         <th class="s" data-col="0">Symbol</th><th>Type</th><th class="s" data-col="2">Session</th>
         <th class="s" data-col="3">Dir</th><th class="s" data-col="4">VWAP</th>
         <th class="s" data-col="5" title="Highest RR reached so far">Max RR</th>
-        <th class="s" title="Time to reach -0.25R adverse">T→-¼R</th>
-        <th class="s" title="Time to reach -0.50R adverse">T→-½R</th>
-        <th class="s" title="Time to reach -0.75R adverse">T→-¾R</th>
-        <th class="s" title="Time to reach phantom SL = -1R">T→-1R</th>
-        <th class="s" title="Time to reach +1R favorable">T→+1R</th>
-        <th class="s" title="Time to reach +2R favorable">T→+2R</th>
-        <th class="s" title="Time to reach +3R favorable">T→+3R</th>
-        <th class="s" title="Time to reach +4R favorable">T→+4R</th>
-        <th class="s" title="Time to reach +5R favorable">T→+5R</th>
-        <th class="s" title="Time to reach +10R favorable">T→+10R</th>
-        <th class="s" title="Time to reach +15R (max)">T→+15R</th>
+        <th class="s" title="T tot -0.25R adverse">T→-¼R</th>
+        <th class="s" title="T tot -0.50R adverse">T→-½R</th>
+        <th class="s" title="T tot -0.75R adverse">T→-¾R</th>
+        <th class="s" title="T tot -1.00R (phantom SL)">T→-1R</th>
+        <th class="s" title="T tot +0.1R">+0.1</th>
+        <th class="s" title="T tot +0.2R">+0.2</th>
+        <th class="s" title="T tot +0.3R">+0.3</th>
+        <th class="s" title="T tot +0.4R">+0.4</th>
+        <th class="s" title="T tot +0.5R">+0.5</th>
+        <th class="s" title="T tot +0.6R">+0.6</th>
+        <th class="s" title="T tot +0.7R">+0.7</th>
+        <th class="s" title="T tot +0.8R">+0.8</th>
+        <th class="s" title="T tot +0.9R">+0.9</th>
+        <th class="s" title="T tot +1.0R">+1.0</th>
+        <th class="s" title="T tot +1.1R">+1.1</th>
+        <th class="s" title="T tot +1.2R">+1.2</th>
+        <th class="s" title="T tot +1.3R">+1.3</th>
+        <th class="s" title="T tot +1.4R">+1.4</th>
+        <th class="s" title="T tot +1.5R">+1.5</th>
+        <th class="s" title="T tot +1.6R">+1.6</th>
+        <th class="s" title="T tot +1.7R">+1.7</th>
+        <th class="s" title="T tot +1.8R">+1.8</th>
+        <th class="s" title="T tot +1.9R">+1.9</th>
+        <th class="s" title="T tot +2.0R">+2.0</th>
+        <th class="s" title="T tot +2.5R">+2.5</th>
+        <th class="s" title="T tot +3.0R">+3.0</th>
+        <th class="s" title="T tot +3.5R">+3.5</th>
+        <th class="s" title="T tot +4.0R">+4.0</th>
+        <th class="s" title="T tot +4.5R">+4.5</th>
+        <th class="s" title="T tot +5.0R">+5.0</th>
+        <th class="s" title="T tot +6R">+6R</th>
+        <th class="s" title="T tot +7R">+7R</th>
+        <th class="s" title="T tot +8R">+8R</th>
+        <th class="s" title="T tot +9R">+9R</th>
+        <th class="s" title="T tot +10R">+10R</th>
+        <th class="s" title="T tot +11R">+11R</th>
+        <th class="s" title="T tot +12R">+12R</th>
+        <th class="s" title="T tot +13R">+13R</th>
+        <th class="s" title="T tot +14R">+14R</th>
+        <th class="s" title="T tot +15R">+15R</th>
         <th class="s" data-col="8">Elapsed</th><th class="s" data-col="9">Opened</th>
       </tr></thead>
-      <tbody id="gh-body"></tbody>
     </table>
   </div>
 </div>
@@ -3575,7 +3623,7 @@ const FOREX  = ${JSON.stringify(FOREX_SYMBOLS)};
 const INDEX  = ${JSON.stringify(INDEX_SYMBOLS)};
 const COMM   = ${JSON.stringify(COMMODITY_SYMBOLS)};
 const STOCKS = ${JSON.stringify(STOCK_SYMBOLS)};
-const TP_OPT_DATE = new Date('2026-04-28T12:00:00.000Z'); // compliance datum: 28/04/2026 14:00 Brussels
+const TP_OPT_DATE = new Date('2026-05-03T00:00:00.000Z'); // compliance datum: 03/05/2026 00:00 UTC — v12.4
 
 let _allTrades=[],_evData=[],_tpMap={},_evMap={};
 let _lastLoadMs=null;
@@ -3692,7 +3740,7 @@ setInterval(updateClock,1000);updateClock();
 
 // ── 0. TRADE STATS SECTION ───────────────────────────────────────
 async function loadTradeStats(){
-  const COMPLIANCE = new Date('2026-04-28T12:00:00.000Z');
+  const COMPLIANCE = new Date('2026-05-03T00:00:00.000Z');
   const d = await api('/trades?limit=10000');
   if(!d){document.getElementById('stats-meta').textContent='fout bij laden';return;}
   const trades = (d.trades||[]).filter(t => t.openedAt && new Date(t.openedAt) >= COMPLIANCE);
@@ -3743,11 +3791,11 @@ async function loadTradeStats(){
 
 // ── 0b. BLOCKED SIGNALS ── v12.1.3 ───────────────────────────────
 async function loadBlockedSignals(){
-  const COMPLIANCE = new Date('2026-04-28T12:00:00.000Z');
+  const COMPLIANCE = new Date('2026-05-03T00:00:00.000Z');
 
   // Fetch rejects (compliance-gefilterd via since param) + webhook errors history
   const [rejectD, histD] = await Promise.all([
-    api('/signal-stats/rejects?since=2026-04-28T12:00:00.000Z'),
+    api('/signal-stats/rejects?since=2026-05-03T00:00:00.000Z'),
     api('/history'),
   ]);
 
@@ -3867,12 +3915,24 @@ async function loadPositions(){
     const dec=isFx?5:isIdx?2:2;
     // SL milestone timing: tijd van entry tot elke adverse drempel
     const ms=p.slMilestones??{};
-    function msTime(key){
-      if(!ms[key]||!p.openedAt)return'<span class="d">—</span>';
-      const mins=Math.round((new Date(ms[key])-new Date(p.openedAt))/60000);
-      const cls=key==='99'?'r fw':key==='75'?'r':'o';
-      if(mins<60)return\`<span class="\${cls}">\${mins}m</span>\`;
-      return\`<span class="\${cls}">\${Math.floor(mins/60)}h\${String(mins%60).padStart(2,'0')}m</span>\`;
+    const rrMs=p.rrMilestones??{};
+    const advMs=rrMs.adverse??{};
+    const favMs=rrMs.favorable??{};
+    // Adverse timing helper (from slMilestones legacy keys)
+    function advTime(key,cls){
+      const v=advMs[key]??ms[{'0.25':'25','0.50':'50','0.75':'75','1.00':'100'}[key]];
+      if(!v||!p.openedAt)return'<td class="d" style="font-size:9px">—</td>';
+      const mins=Math.round((new Date(v)-new Date(p.openedAt))/60000);
+      const t=mins<60?mins+'m':Math.floor(mins/60)+'h'+(mins%60?String(mins%60).padStart(2,'0')+'m':'');
+      return\`<td class="\${cls}" style="font-size:9px">\${t}</td>\`;
+    }
+    // Favorable timing helper (from rrMilestones.favorable)
+    function favTime(key){
+      const v=favMs[key];
+      if(!v||!p.openedAt)return'<td class="d" style="font-size:9px">—</td>';
+      const mins=Math.round((new Date(v)-new Date(p.openedAt))/60000);
+      const t=mins<60?mins+'m':Math.floor(mins/60)+'h'+(mins%60?String(mins%60).padStart(2,'0')+'m':'');
+      return\`<td class="g" style="font-size:9px">\${t}</td>\`;
     }
     return\`<tr class="\${tClass(p.symbol)}">
       <td data-val="\${p.symbol}" class="b fw">\${p.symbol}</td>
@@ -3887,10 +3947,14 @@ async function loadPositions(){
       <td data-val="\${p.currentPnL??-99999}" class="\${pC(p.currentPnL)} fw">\${eu(p.currentPnL)}</td>
       <td data-val="\${p.lots}" class="c">\${f(p.lots,2)}</td>
       <td data-val="\${riskPctShow??-1}" class="\${riskPctCls} fw">\${riskPctShow!=null?f(riskPctShow,3)+'%':'—'}</td>
-      <td style="font-size:9px">\${msTime('25')}</td>
-      <td style="font-size:9px">\${msTime('50')}</td>
-      <td style="font-size:9px">\${msTime('75')}</td>
-      <td style="font-size:9px">\${msTime('99')}</td>
+      \${advTime('0.25','o')}\${advTime('0.50','o')}\${advTime('0.75','r')}\${advTime('1.00','r fw')}
+      \${favTime(0.1)}\${favTime(0.2)}\${favTime(0.3)}\${favTime(0.4)}\${favTime(0.5)}
+      \${favTime(0.6)}\${favTime(0.7)}\${favTime(0.8)}\${favTime(0.9)}\${favTime(1.0)}
+      \${favTime(1.1)}\${favTime(1.2)}\${favTime(1.3)}\${favTime(1.4)}\${favTime(1.5)}
+      \${favTime(1.6)}\${favTime(1.7)}\${favTime(1.8)}\${favTime(1.9)}\${favTime(2.0)}
+      \${favTime(2.5)}\${favTime(3.0)}\${favTime(3.5)}\${favTime(4.0)}\${favTime(4.5)}
+      \${favTime(5.0)}\${favTime(6.0)}\${favTime(7.0)}\${favTime(8.0)}\${favTime(9.0)}
+      \${favTime(10.0)}\${favTime(11.0)}\${favTime(12.0)}\${favTime(13.0)}\${favTime(14.0)}\${favTime(15.0)}
       <td data-val="\${p.openedAt}" class="d" style="font-size:9px">\${dtTs(p.openedAt)}</td>
     </tr>\`;
   }).join('');
@@ -3949,13 +4013,14 @@ async function loadGhosts(){
       \${advCell(0.50,'o')}
       \${advCell(0.75,'r')}
       \${advCell(1.00,'r fw')}
-      \${favCell(1)}
-      \${favCell(2)}
-      \${favCell(3)}
-      \${favCell(4)}
-      \${favCell(5)}
-      \${favCell(10)}
-      \${favCell(15)}
+      \${favCell(0.1)}\${favCell(0.2)}\${favCell(0.3)}\${favCell(0.4)}\${favCell(0.5)}
+      \${favCell(0.6)}\${favCell(0.7)}\${favCell(0.8)}\${favCell(0.9)}\${favCell(1.0)}
+      \${favCell(1.1)}\${favCell(1.2)}\${favCell(1.3)}\${favCell(1.4)}\${favCell(1.5)}
+      \${favCell(1.6)}\${favCell(1.7)}\${favCell(1.8)}\${favCell(1.9)}\${favCell(2.0)}
+      \${favCell(2.5)}\${favCell(3.0)}\${favCell(3.5)}\${favCell(4.0)}\${favCell(4.5)}
+      \${favCell(5.0)}\${favCell(6.0)}\${favCell(7.0)}\${favCell(8.0)}\${favCell(9.0)}
+      \${favCell(10.0)}\${favCell(11.0)}\${favCell(12.0)}\${favCell(13.0)}\${favCell(14.0)}\${favCell(15.0)}
+
       <td data-val="\${g.elapsedMin}" class="d">\${g.elapsedMin}min</td>
       <td data-val="\${g.openedAt}" class="d" style="font-size:9px">\${dtTs(g.openedAt)}</td>
     </tr>\`;
