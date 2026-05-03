@@ -1781,4 +1781,4 @@ module.exports = {
   loadPerformanceSummary,
   loadMAEStats,
   loadGhostGrouped,
-};
+}
