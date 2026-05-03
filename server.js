@@ -1004,19 +1004,16 @@ function startGhostTracker(pos, restoreData = null) {
   const originalTpRR   = tpRRUsed;
   let   lastStateSaveTs = Date.now();
 
-  // FIX v12.4: RR milestone timestamps — twee assen:
+  // FIX v12.2: RR milestone timestamps — twee assen:
   //   adverse:   -0.25R, -0.50R, -0.75R, -1.00R  (= % van SL: 25/50/75/100)
-  //   favorable: +0.1R stappen t/m 15.0R (elk 0.1R één kolom)
+  //   favorable: +0.25R, +0.50R, +0.75R, +1.00R, +1.50R, +2.00R, +3.00R
   // Worden ingevuld bij EERSTE overschrijding van elke drempel.
   // Bij -1.00R (= phantom SL) → ghost stopt onmiddellijk.
   const RR_ADVERSE_STEPS   = [0.25, 0.50, 0.75, 1.00];
-  // Per 0.1R van 0.1 t/m 15.0 = 150 stappen
-  const RR_FAVORABLE_STEPS = Array.from({length: 150}, (_, i) => parseFloat(((i + 1) * 0.1).toFixed(1)));
-  const favorableInit = {};
-  for (const s of RR_FAVORABLE_STEPS) favorableInit[s] = null;
+  const RR_FAVORABLE_STEPS = [0.25, 0.50, 0.75, 1.00, 1.50, 2.00, 3.00, 4.00, 5.00, 10.00, 15.00];
   const rrMilestones = {
     adverse:   { 0.25: null, 0.50: null, 0.75: null, 1.00: null },
-    favorable: { ...favorableInit },
+    favorable: { 0.25: null, 0.50: null, 0.75: null, 1.00: null, 1.50: null, 2.00: null, 3.00: null, 4.00: null, 5.00: null, 10.00: null, 15.00: null },
   };
   // Keep slMilestones as alias for backward compat with dashboard (maps 25→adverse[0.25] etc)
   const slMilestones = { 25: null, 50: null, 75: null, 100: null };
@@ -2508,10 +2505,6 @@ app.get("/live/positions", (req, res) => {
       isEvPlus: p.isEvPlus ?? false,
       scaleFactor: p.scaleFactor ?? 1.0,
       slMilestones: p.slMilestones ?? null,
-      // v12.4: sync rrMilestones vanuit ghost tracker voor volledige tijdsdata op open posities
-      rrMilestones: ghostTrackers[p.positionId]?.rrMilestones ?? null,
-      // v12.4: sync maxRR vanuit ghost tracker (open positie maxRR was altijd 0)
-      maxRR: ghostTrackers[p.positionId]?.maxRR ?? p.maxRR ?? 0,
     };
   });
   res.json({ count: positions.length, balance, positions });
@@ -3054,339 +3047,418 @@ app.get(["/", "/dashboard"], async (req, res) => {
   const COMMODITY_SYMBOLS = ["XAUUSD"];
   const STOCK_SYMBOLS     = ["AAPL","AMD","AMZN","ARM","ASML","AVGO","AZN","BA","BABA","BAC","BRKB","CSCO","CVX","DIS","FDX","GE","GM","GME","GOOGL","IBM","INTC","JNJ","JPM","KO","LMT","MCD","META","MSFT","MSTR","NFLX","NKE","NVDA","PFE","PLTR","QCOM","SBUX","SNOW","T","TSLA","V","WMT","XOM","ZM"];
 
-  // Count total closed trades in DB
   let dbTradeCount = 0;
   try {
     const r = await pool.query("SELECT COUNT(*) AS cnt FROM closed_trades");
     dbTradeCount = parseInt(r.rows[0]?.cnt ?? 0, 10);
-  } catch(e) { /* non-critical */ }
+  } catch(e) {}
+
+  // Generate favorable RR steps: 0.1 to 15.0 per 0.1 = 150 steps
+  // But for display we show selective columns in the header
+  const FAV_DISPLAY = [0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0,1.1,1.2,1.3,1.4,1.5,1.6,1.7,1.8,1.9,2.0,2.5,3.0,3.5,4.0,4.5,5.0,6.0,7.0,8.0,9.0,10.0,11.0,12.0,13.0,14.0,15.0];
+  const favHeaders = FAV_DISPLAY.map(v => `<th class="s rrh" title="T to +${v}R">${v<1?'+'+v:v>=10?'+'+v+'R':'+'+v}</th>`).join('');
+  const favColCount = FAV_DISPLAY.length;
 
   res.end(`<!DOCTYPE html>
-<html lang="en">
+<html lang="nl">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PRONTO-AI v12.5.0</title>
+<title>PRONTO·AI — v13.0</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600;700&family=IBM+Plex+Sans+Condensed:wght@500;600;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=JetBrains+Mono:wght@300;400;500;600;700&display=swap" rel="stylesheet">
 <style>
-:root{
-  --bg:#060810;--bg1:#090c15;--bg2:#0c1020;--card:#0e1428;
-  --bdr:#141e33;--bdr2:#1c2a42;--txt:#a8c0dc;--dim:#2e4060;--dim2:#162030;
-  --g:#00e8a0;--r:#ff2d55;--b:#28b4f0;--y:#f0be20;--p:#a878ff;--c:#00dcd4;--o:#ff8020;
-  --fn:'IBM Plex Mono',monospace;--fh:'IBM Plex Sans Condensed',sans-serif;
+:root {
+  --bg:#03050a; --s1:#060a12; --s2:#090e18; --s3:#0c1220;
+  --bdr:#111b2e; --bdr2:#192840; --bdr3:#1f3050;
+  --txt:#b8d0e8; --dim:#304860; --dim2:#0a1020;
+  --g:#00e8a0; --r:#ff2a50; --b:#18b4f8; --y:#f0be18;
+  --p:#a870ff; --c:#00d8d0; --o:#ff8018;
+  --fn:'JetBrains Mono',monospace; --fh:'Space Grotesk',sans-serif;
+  --glow-b:0 0 20px rgba(24,180,248,.15);
+  --glow-g:0 0 20px rgba(0,232,160,.15);
 }
-*{box-sizing:border-box;margin:0;padding:0}
-html,body{background:var(--bg);color:var(--txt);font-family:var(--fn);font-size:11px;line-height:1.4;overflow-x:hidden}
-.hdr{position:sticky;top:0;z-index:100;background:var(--bg1);border-bottom:1px solid var(--bdr2);padding:8px 20px;display:flex;align-items:center;justify-content:space-between;gap:12px}
-.logo{font-family:var(--fh);font-size:19px;font-weight:700;letter-spacing:3px;color:var(--b);text-shadow:0 0 18px rgba(40,180,240,.3)}
-.ver{font-size:9px;color:var(--dim);letter-spacing:.4px;margin-top:1px}
-.hdr-r{display:flex;align-items:center;gap:10px}
-/* clock + update freq */
-.hdr-time-box{display:flex;flex-direction:column;align-items:flex-end;gap:1px}
-.clock{font-size:15px;font-weight:600;color:var(--c);letter-spacing:2px;min-width:76px;text-align:right}
-.upd-freq{font-size:8.5px;color:var(--dim);letter-spacing:.5px;text-align:right}
-.sb{padding:3px 9px;border-radius:2px;font-size:10px;font-weight:700;letter-spacing:.8px;font-family:var(--fh)}
-.s-asia{background:#001e2a;color:var(--c);border:1px solid var(--c)}.s-london{background:#001c18;color:var(--g);border:1px solid var(--g)}.s-ny{background:#1e0018;color:var(--p);border:1px solid var(--p)}.s-outside{background:#111;color:var(--dim);border:1px solid var(--bdr2)}
-.rbtn{background:none;border:1px solid var(--bdr2);color:var(--dim);padding:4px 10px;border-radius:2px;cursor:pointer;font-family:var(--fn);font-size:10px;transition:all .15s}
-.rbtn:hover{color:var(--b);border-color:var(--b)}
-/* KPI BAR */
-.kbar{display:grid;grid-template-columns:repeat(11,1fr);border-bottom:1px solid var(--bdr2);background:var(--bdr)}
-.kpi{background:var(--bg1);padding:8px 12px;position:relative;overflow:hidden}
-.kpi::after{content:'';position:absolute;bottom:0;left:0;right:0;height:2px}
-.k0::after{background:var(--g)}.k1::after{background:var(--b)}.k2::after{background:var(--p)}.k3::after{background:var(--p)}.k4::after{background:var(--y)}.k5::after{background:var(--c)}.k6::after{background:var(--o)}.k7::after{background:var(--c)}.k8::after{background:var(--b)}.k9::after{background:var(--r)}.k10::after{background:var(--y)}
-.kl{font-size:8px;letter-spacing:1px;color:var(--dim);text-transform:uppercase;margin-bottom:3px;font-family:var(--fh)}
-.kv{font-size:16px;font-weight:700;line-height:1;font-family:var(--fh);letter-spacing:.5px}
-/* MAIN */
-.main{padding:12px 16px;display:flex;flex-direction:column;gap:12px}
-.sec{border:1px solid var(--bdr2);border-radius:3px;overflow:hidden}
-.sh{padding:7px 12px;background:var(--bg2);border-bottom:1px solid var(--bdr2);display:flex;align-items:center;justify-content:space-between;gap:8px}
-.st{font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.8px}
-.sm{font-size:9px;color:var(--dim);letter-spacing:.4px}
-/* TABLE */
-.tw{overflow-x:auto}
-table{width:100%;border-collapse:collapse;font-size:10.5px}
-thead tr{background:var(--bg2);border-bottom:1px solid var(--bdr2)}
-th{padding:5px 7px;text-align:left;font-size:8.5px;letter-spacing:.7px;color:var(--dim);text-transform:uppercase;white-space:nowrap;font-family:var(--fh);font-weight:600;user-select:none}
-th.s{cursor:pointer}th.s:hover{color:var(--b)}
-th.s.asc::after{content:' ↑';color:var(--b)}th.s.desc::after{content:' ↓';color:var(--b)}
-td{padding:4px 7px;border-bottom:1px solid var(--bdr);white-space:nowrap;vertical-align:middle}
-tbody tr:hover{background:rgba(40,180,240,.035)}
-tbody tr:last-child td{border-bottom:none}
-.nodata{text-align:center;padding:14px;color:var(--dim);font-size:10px;letter-spacing:.4px}
-/* BADGES */
-.bd{display:inline-block;padding:2px 5px;border-radius:2px;font-size:8.5px;font-weight:700;letter-spacing:.4px;font-family:var(--fh)}
-.bd-buy{background:rgba(0,232,160,.12);color:var(--g);border:1px solid rgba(0,232,160,.25)}.bd-sell{background:rgba(255,45,85,.12);color:var(--r);border:1px solid rgba(255,45,85,.25)}
-.bd-ab{background:rgba(40,180,240,.12);color:var(--b);border:1px solid rgba(40,180,240,.25)}.bd-bw{background:rgba(168,120,255,.12);color:var(--p);border:1px solid rgba(168,120,255,.25)}
-.bd-tp{background:rgba(0,232,160,.15);color:var(--g)}.bd-sl{background:rgba(255,45,85,.15);color:var(--r)}.bd-mn{background:rgba(240,190,32,.12);color:var(--y)}
-.bd-as{background:rgba(0,220,212,.1);color:var(--c)}.bd-lo{background:rgba(0,232,160,.1);color:var(--g)}.bd-ny{background:rgba(168,120,255,.1);color:var(--p)}.bd-out{background:rgba(46,64,96,.15);color:var(--dim)}
-.bd-evp{background:rgba(0,232,160,.18);color:var(--g);border:1px solid rgba(0,232,160,.3)}.bd-evn{background:rgba(255,45,85,.15);color:var(--r);border:1px solid rgba(255,45,85,.25)}
-.bd-lck{background:rgba(240,190,32,.18);color:var(--y);border:1px solid rgba(240,190,32,.3)}
-.bd-fx{background:rgba(0,220,212,.1);color:var(--c)}.bd-ix{background:rgba(240,190,32,.1);color:var(--y)}.bd-cm{background:rgba(255,128,32,.1);color:var(--o)}.bd-sk{background:rgba(40,180,240,.1);color:var(--b)}
-.bd-mr{background:rgba(168,120,255,.15);color:var(--p);border:1px solid rgba(168,120,255,.3)}
-/* COLORS */
-.g{color:var(--g)}.r{color:var(--r)}.b{color:var(--b)}.y{color:var(--y)}.p{color:var(--p)}.c{color:var(--c)}.o{color:var(--o)}.d{color:var(--dim)}.fw{font-weight:700}
-/* TYPE BORDER */
-tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-child{border-left:2px solid rgba(0,220,212,.3)}tr.ti td:first-child{border-left:2px solid rgba(240,190,32,.3)}tr.tc td:first-child{border-left:2px solid rgba(255,128,32,.3)}
-/* SL BAR */
-.slbar{display:flex;align-items:center;gap:4px;min-width:66px}
-.slbg{height:4px;flex:1;background:var(--dim2);border-radius:2px;overflow:hidden}
-.slfi{height:100%;border-radius:2px;background:var(--g);transition:width .3s}
-.slfi.w{background:var(--o)}.slfi.d{background:var(--r)}
-/* FILTER BAR */
-.fbar{display:flex;flex-wrap:wrap;align-items:center;gap:5px;padding:7px 10px;border-bottom:1px solid var(--bdr2);background:var(--bg1)}
-.fl{font-size:9px;color:var(--dim);letter-spacing:.4px;margin-right:2px;font-family:var(--fh)}
-.fb{background:none;border:1px solid var(--bdr2);color:var(--dim);padding:2px 7px;border-radius:2px;cursor:pointer;font-family:var(--fn);font-size:9px;transition:all .12s}
-.fb.on{background:rgba(40,180,240,.1);color:var(--b);border-color:var(--b)}
-/* STATS STRIP */
-.strip{display:flex;gap:14px;padding:7px 12px;border-bottom:1px solid var(--bdr2);background:var(--bg2);flex-wrap:wrap}
-.stat{display:flex;flex-direction:column;gap:1px}
-.sl2{font-size:8px;color:var(--dim);letter-spacing:.7px;text-transform:uppercase;font-family:var(--fh)}
-.sv2{font-size:12px;font-weight:700;font-family:var(--fh)}
-/* EV MATRIX */
-.mxg{display:grid;grid-template-columns:1fr 1fr;gap:10px;padding:10px 12px;background:var(--bg2)}
-.mxt{font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.7px;color:var(--dim);padding:0 0 4px;border-bottom:1px solid var(--bdr2);margin-bottom:4px}
-.mx table{font-size:9.5px}.mx th{font-size:8px;padding:3px 5px}.mx td{padding:3px 6px;text-align:center;border-right:1px solid var(--bdr)}
-.mx td:last-child{border-right:none}.mx td.sym{text-align:left;font-weight:700;color:var(--y);font-family:var(--fh);font-size:10px;position:sticky;left:0;background:var(--bg2);z-index:1;border-right:1px solid var(--bdr2)}
-.ep{color:var(--g)}.en{color:var(--r)}.ez{color:var(--dim)}
-/* TABS */
-.tabs{display:flex;gap:0;border-bottom:1px solid var(--bdr2)}
-.tab{padding:7px 14px;cursor:pointer;font-size:10px;font-family:var(--fh);font-weight:600;letter-spacing:.6px;color:var(--dim);border-bottom:2px solid transparent;transition:all .15s}
-.tab:hover{color:var(--b)}.tab.on{color:var(--b);border-bottom-color:var(--b);background:rgba(40,180,240,.04)}
-.tpane{display:none}.tpane.on{display:block}
-/* COMBO FILTER TABLE */
-.cfbox{padding:10px 12px;background:var(--bg2);display:flex;flex-direction:column;gap:10px}
-.cftitle{font-family:var(--fh);font-size:10px;font-weight:700;color:var(--dim);letter-spacing:.6px;padding-bottom:5px;border-bottom:1px solid var(--bdr2)}
-.empty{display:flex;align-items:center;gap:10px;padding:12px 14px;color:var(--dim);font-size:10px}
-.sec-err{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--r);margin-left:6px;vertical-align:middle;animation:pulse 1.5s infinite}
-.sec-ok{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--g);margin-left:6px;vertical-align:middle}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
-.eline{flex:1;height:1px;background:var(--bdr2)}
+*{box-sizing:border-box;margin:0;padding:0;}
+html,body{background:var(--bg);color:var(--txt);font-family:var(--fn);font-size:11px;line-height:1.4;overflow-x:hidden;}
 
-/* TRADE STATS SECTION - improved */
-.stats-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:0;border-bottom:1px solid var(--bdr2)}
-.stats-cell{padding:10px 14px;border-right:1px solid var(--bdr2);background:var(--bg1)}
-.stats-cell:last-child{border-right:none}
-.stats-cell .sc-label{font-size:8px;letter-spacing:1.2px;color:var(--dim);text-transform:uppercase;margin-bottom:4px;font-family:var(--fh)}
-.stats-cell .sc-val{font-size:20px;font-weight:700;font-family:var(--fh);line-height:1}
-.stats-cell .sc-sub{font-size:9px;color:var(--dim);margin-top:2px}
-/* compliance date banner */
-.compliance-banner{display:flex;align-items:center;gap:8px;padding:5px 14px;background:rgba(240,190,32,.06);border-bottom:1px solid rgba(240,190,32,.15);font-size:9px}
-.cb-dot{width:5px;height:5px;border-radius:50%;background:var(--y)}
-/* session breakdown table */
-#st-tbl{font-size:10.5px}
-#st-tbl th{padding:6px 10px;font-size:8.5px}
-#st-tbl td{padding:5px 10px;font-size:10.5px}
-#st-tbl tbody tr{border-bottom:1px solid var(--bdr)}
-#st-tbl tfoot tr td{border-top:2px solid var(--bdr2);font-weight:700;background:var(--bg2)}
+/* ─── BACKGROUND ─────────────────────────────── */
+body::before{
+  content:'';position:fixed;inset:0;pointer-events:none;z-index:0;
+  background:
+    radial-gradient(ellipse 80% 40% at 20% 0%, rgba(24,180,248,.04) 0%, transparent 60%),
+    radial-gradient(ellipse 60% 30% at 80% 100%, rgba(0,232,160,.03) 0%, transparent 60%),
+    linear-gradient(rgba(24,180,248,.02) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(24,180,248,.02) 1px, transparent 1px);
+  background-size:auto,auto,48px 48px,48px 48px;
+}
 
-/* db count badge */
-.db-count-badge{display:inline-flex;align-items:center;gap:5px;padding:2px 8px;background:rgba(0,220,212,.08);border:1px solid rgba(0,220,212,.2);border-radius:2px;font-size:9px;color:var(--c)}
+/* ─── HEADER ─────────────────────────────────── */
+.hdr{
+  position:sticky;top:0;z-index:200;
+  background:rgba(3,5,10,.92);backdrop-filter:blur(16px);
+  border-bottom:1px solid var(--bdr2);
+  display:flex;align-items:center;justify-content:space-between;
+  padding:0 20px;height:52px;gap:16px;
+}
+.logo{font-family:var(--fh);font-size:18px;font-weight:700;letter-spacing:2px;
+  background:linear-gradient(90deg,var(--b),var(--g));-webkit-background-clip:text;-webkit-text-fill-color:transparent;}
+.ver{font-size:8px;color:var(--dim);letter-spacing:.8px;margin-top:1px;}
+.hdr-r{display:flex;align-items:center;gap:10px;}
+.clock{font-family:var(--fh);font-size:16px;font-weight:600;color:var(--c);letter-spacing:2px;min-width:78px;text-align:right;}
+.hdr-sess{padding:3px 9px;border-radius:3px;font-size:9.5px;font-weight:700;letter-spacing:.8px;font-family:var(--fh);}
+.s-asia{background:rgba(0,216,208,.1);color:var(--c);border:1px solid rgba(0,216,208,.3);}
+.s-london{background:rgba(0,232,160,.1);color:var(--g);border:1px solid rgba(0,232,160,.3);}
+.s-ny{background:rgba(168,112,255,.1);color:var(--p);border:1px solid rgba(168,112,255,.3);}
+.s-out{background:rgba(48,72,96,.15);color:var(--dim);border:1px solid var(--bdr2);}
+.hbtn{background:none;border:1px solid var(--bdr2);color:var(--dim);padding:4px 11px;border-radius:3px;cursor:pointer;font-family:var(--fn);font-size:9.5px;transition:all .15s;letter-spacing:.5px;}
+.hbtn:hover{color:var(--b);border-color:var(--b);box-shadow:var(--glow-b);}
+.hbtn.danger{border-color:rgba(255,42,80,.3);color:var(--r);}
+.hbtn.danger:hover{box-shadow:0 0 16px rgba(255,42,80,.15);}
+.live-dot{width:7px;height:7px;border-radius:50%;background:var(--g);display:inline-block;animation:lpulse 2s infinite;}
+@keyframes lpulse{0%,100%{box-shadow:0 0 0 0 rgba(0,232,160,.5);}60%{box-shadow:0 0 0 6px rgba(0,232,160,0);}}
 
-@media(max-width:900px){.kbar{grid-template-columns:repeat(6,1fr)}.mxg{grid-template-columns:1fr}.stats-grid{grid-template-columns:repeat(2,1fr)}}
+/* ─── COMPLIANCE BANNER ──────────────────────── */
+.comp-bar{
+  display:flex;align-items:center;gap:10px;
+  padding:5px 20px;font-size:9px;letter-spacing:.4px;
+  background:rgba(240,190,24,.04);border-bottom:1px solid rgba(240,190,24,.12);
+  position:relative;z-index:1;
+}
+.comp-dot{width:5px;height:5px;border-radius:50%;background:var(--y);flex-shrink:0;}
 
-/* PERFORMANCE SAMENVATTING SECTIE (v12.5) */
-.perf-grid{display:grid;grid-template-columns:repeat(8,1fr);gap:0;border-bottom:1px solid var(--bdr2)}
-.perf-cell{padding:10px 14px;border-right:1px solid var(--bdr2);background:var(--bg1)}
-.perf-cell:last-child{border-right:none}
-.perf-cell .pc-label{font-size:8px;letter-spacing:1.2px;color:var(--dim);text-transform:uppercase;margin-bottom:4px;font-family:var(--fh)}
-.perf-cell .pc-val{font-size:18px;font-weight:700;font-family:var(--fh);line-height:1}
-.perf-cell .pc-sub{font-size:9px;color:var(--dim);margin-top:2px}
-/* P&L Curve mini chart */
-.pnl-chart-wrap{padding:10px 14px;background:var(--bg1)}
-.pnl-chart-title{font-size:8px;letter-spacing:1.2px;color:var(--dim);text-transform:uppercase;margin-bottom:6px;font-family:var(--fh)}
-/* MAE badge kleuren */
-.mae-safe{color:var(--g)}.mae-mild{color:var(--y)}.mae-risk{color:var(--r)}
-/* Ghost grouped view toggle */
-.gh-view-toggle{display:flex;gap:4px;padding:5px 10px;background:var(--bg1);border-bottom:1px solid var(--bdr2)}
-.gh-view-btn{background:none;border:1px solid var(--bdr2);color:var(--dim);padding:2px 8px;border-radius:2px;cursor:pointer;font-family:var(--fn);font-size:9px;transition:all .12s}
-.gh-view-btn.on{background:rgba(40,180,240,.1);color:var(--b);border-color:var(--b)}
-@media(max-width:900px){.perf-grid{grid-template-columns:repeat(4,1fr)}}
+/* ─── KPI BAR ────────────────────────────────── */
+.kbar{
+  display:grid;grid-template-columns:repeat(11,1fr);
+  border-bottom:1px solid var(--bdr2);background:var(--s1);
+  position:relative;z-index:1;
+}
+.kpi{padding:9px 13px;border-right:1px solid var(--bdr);position:relative;overflow:hidden;}
+.kpi:last-child{border-right:none;}
+.kpi::after{content:'';position:absolute;bottom:0;left:0;width:100%;height:2px;}
+.kb::after{background:var(--b);}.kg::after{background:var(--g);}.kp::after{background:var(--p);}
+.ky::after{background:var(--y);}.kc::after{background:var(--c);}.ko::after{background:var(--o);}
+.kr::after{background:var(--r);}
+.kl{font-size:7.5px;letter-spacing:1.2px;color:var(--dim);text-transform:uppercase;margin-bottom:4px;font-family:var(--fh);}
+.kv{font-family:var(--fh);font-size:17px;font-weight:700;line-height:1;letter-spacing:.3px;}
+.ksub{font-size:8px;color:var(--dim);margin-top:2px;}
+
+/* ─── STATUS BAR ─────────────────────────────── */
+.sbar{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:3px 20px;background:var(--s1);border-bottom:1px solid var(--bdr);
+  font-size:8.5px;color:var(--dim);position:relative;z-index:1;
+}
+
+/* ─── MAIN ───────────────────────────────────── */
+.main{padding:12px 16px;display:flex;flex-direction:column;gap:12px;position:relative;z-index:1;}
+
+/* ─── SECTION ────────────────────────────────── */
+.sec{border:1px solid var(--bdr2);border-radius:4px;overflow:hidden;background:var(--s1);}
+.sh{
+  display:flex;align-items:center;justify-content:space-between;gap:8px;
+  padding:8px 13px;background:var(--s2);border-bottom:1px solid var(--bdr2);
+}
+.st{font-family:var(--fh);font-size:11.5px;font-weight:700;letter-spacing:.6px;display:flex;align-items:center;gap:7px;}
+.sdot{width:7px;height:7px;border-radius:50%;flex-shrink:0;}
+.sdot.ok{background:var(--g);box-shadow:0 0 8px rgba(0,232,160,.5);}
+.sdot.err{background:var(--r);animation:lpulse2 1.5s infinite;}
+@keyframes lpulse2{0%,100%{opacity:1;}50%{opacity:.3};}
+.sm{font-size:8.5px;color:var(--dim);letter-spacing:.3px;}
+
+/* ─── FILTER BAR ─────────────────────────────── */
+.fbar{display:flex;flex-wrap:wrap;align-items:center;gap:5px;padding:7px 12px;border-bottom:1px solid var(--bdr2);background:var(--bg);}
+.fl{font-size:8.5px;color:var(--dim);letter-spacing:.4px;margin-right:2px;font-family:var(--fh);}
+.fb{background:none;border:1px solid var(--bdr2);color:var(--dim);padding:2px 8px;border-radius:2px;cursor:pointer;font-family:var(--fn);font-size:9px;transition:all .12s;}
+.fb.on,.fb:hover{background:rgba(24,180,248,.08);color:var(--b);border-color:rgba(24,180,248,.4);}
+
+/* ─── STRIP ──────────────────────────────────── */
+.strip{display:flex;gap:16px;padding:7px 13px;border-bottom:1px solid var(--bdr2);background:var(--s2);flex-wrap:wrap;}
+.stat .sl2{font-size:7.5px;color:var(--dim);letter-spacing:.8px;text-transform:uppercase;font-family:var(--fh);}
+.stat .sv2{font-family:var(--fh);font-size:13px;font-weight:700;}
+
+/* ─── TABLES ─────────────────────────────────── */
+.tw{overflow-x:auto;}
+table{width:100%;border-collapse:collapse;font-size:10.5px;}
+thead tr{background:var(--s2);border-bottom:1px solid var(--bdr2);}
+th{padding:5px 7px;text-align:left;font-size:8px;letter-spacing:.7px;color:var(--dim);
+  text-transform:uppercase;white-space:nowrap;font-family:var(--fh);font-weight:600;user-select:none;}
+th.s{cursor:pointer;}th.s:hover{color:var(--b);}
+th.s.asc::after{content:' ↑';color:var(--b);}th.s.desc::after{content:' ↓';color:var(--b);}
+th.rrh{font-size:7px;padding:5px 4px;color:var(--dim);letter-spacing:0;}
+td{padding:4px 7px;border-bottom:1px solid var(--bdr);white-space:nowrap;vertical-align:middle;}
+tbody tr:hover{background:rgba(24,180,248,.03);}
+tbody tr:last-child td{border-bottom:none;}
+.nodata{text-align:center;padding:14px;color:var(--dim);font-size:9.5px;letter-spacing:.4px;}
+
+/* type borders */
+tr.tf td:first-child{border-left:2px solid rgba(0,216,208,.4);}
+tr.ti td:first-child{border-left:2px solid rgba(240,190,24,.4);}
+tr.tc td:first-child{border-left:2px solid rgba(255,128,24,.4);}
+tr.ts td:first-child{border-left:2px solid rgba(24,180,248,.4);}
+
+/* ─── BADGES ─────────────────────────────────── */
+.bd{display:inline-block;padding:2px 6px;border-radius:2px;font-size:8.5px;font-weight:700;letter-spacing:.3px;font-family:var(--fh);}
+.bd-buy{background:rgba(0,232,160,.1);color:var(--g);border:1px solid rgba(0,232,160,.25);}
+.bd-sell{background:rgba(255,42,80,.1);color:var(--r);border:1px solid rgba(255,42,80,.25);}
+.bd-ab{background:rgba(24,180,248,.1);color:var(--b);border:1px solid rgba(24,180,248,.25);}
+.bd-bw{background:rgba(168,112,255,.1);color:var(--p);border:1px solid rgba(168,112,255,.25);}
+.bd-as{background:rgba(0,216,208,.08);color:var(--c);}
+.bd-lo{background:rgba(0,232,160,.08);color:var(--g);}
+.bd-ny{background:rgba(168,112,255,.08);color:var(--p);}
+.bd-out{background:rgba(48,72,96,.12);color:var(--dim);}
+.bd-tp{background:rgba(0,232,160,.12);color:var(--g);}
+.bd-sl{background:rgba(255,42,80,.12);color:var(--r);}
+.bd-mr{background:rgba(168,112,255,.12);color:var(--p);}
+.bd-mn{background:rgba(240,190,24,.12);color:var(--y);}
+.bd-lck{background:rgba(240,190,24,.15);color:var(--y);border:1px solid rgba(240,190,24,.3);}
+.bd-evp{background:rgba(0,232,160,.15);color:var(--g);border:1px solid rgba(0,232,160,.3);}
+.bd-evn{background:rgba(255,42,80,.12);color:var(--r);border:1px solid rgba(255,42,80,.25);}
+.bd-fx{background:rgba(0,216,208,.08);color:var(--c);}
+.bd-ix{background:rgba(240,190,24,.08);color:var(--y);}
+.bd-cm{background:rgba(255,128,24,.08);color:var(--o);}
+.bd-sk{background:rgba(24,180,248,.08);color:var(--b);}
+
+/* ─── COLORS ─────────────────────────────────── */
+.g{color:var(--g);}.r{color:var(--r);}.b{color:var(--b);}.y{color:var(--y);}
+.p{color:var(--p);}.c{color:var(--c);}.o{color:var(--o);}.d{color:var(--dim);}
+.fw{font-weight:700;}
+
+/* ─── SL BAR ─────────────────────────────────── */
+.slbar{display:flex;align-items:center;gap:4px;min-width:72px;}
+.slbg{height:4px;flex:1;background:var(--dim2);border-radius:2px;overflow:hidden;}
+.slfi{height:100%;border-radius:2px;transition:width .3s;background:var(--g);}
+.slfi.w{background:var(--o);}.slfi.d{background:var(--r);}
+
+/* ─── RR LIVE CELLS ──────────────────────────── */
+.rr-now-cell{font-family:var(--fh);font-weight:700;font-size:12px;}
+.rr-pos{color:var(--g);}.rr-neg{color:var(--r);}.rr-mid{color:var(--y);}
+.rr-zero{color:var(--dim);}
+
+/* ─── TABS ───────────────────────────────────── */
+.tabs{display:flex;border-bottom:1px solid var(--bdr2);}
+.tab{padding:7px 14px;cursor:pointer;font-size:9.5px;font-family:var(--fh);font-weight:600;
+  letter-spacing:.5px;color:var(--dim);border-bottom:2px solid transparent;transition:all .15s;}
+.tab:hover{color:var(--b);}.tab.on{color:var(--b);border-bottom-color:var(--b);background:rgba(24,180,248,.04);}
+.tpane{display:none;}.tpane.on{display:block;}
+
+/* ─── EV MATRIX ──────────────────────────────── */
+.mxg{display:grid;grid-template-columns:1fr 1fr;gap:12px;padding:12px;background:var(--s2);}
+.mxt{font-family:var(--fh);font-size:9.5px;font-weight:700;letter-spacing:.7px;color:var(--dim);
+  padding:0 0 5px;border-bottom:1px solid var(--bdr2);margin-bottom:5px;}
+.mx th{font-size:8px;padding:4px 6px;}.mx td{padding:4px 7px;text-align:center;border-right:1px solid var(--bdr);}
+.mx td:last-child{border-right:none;}
+.mx td.sym{text-align:left;font-weight:700;color:var(--y);font-family:var(--fh);font-size:10px;
+  position:sticky;left:0;background:var(--s2);z-index:1;border-right:1px solid var(--bdr2);}
+.ep{color:var(--g);}.en{color:var(--r);}.ez{color:var(--dim);}
+
+/* ─── STATS GRID ─────────────────────────────── */
+.stats-grid{display:grid;grid-template-columns:repeat(5,1fr);border-bottom:1px solid var(--bdr2);}
+.sc{padding:10px 14px;border-right:1px solid var(--bdr);}
+.sc:last-child{border-right:none;}
+.sc-label{font-size:7.5px;letter-spacing:1.2px;color:var(--dim);text-transform:uppercase;margin-bottom:5px;font-family:var(--fh);}
+.sc-val{font-family:var(--fh);font-size:20px;font-weight:700;line-height:1;}
+.sc-sub{font-size:8px;color:var(--dim);margin-top:3px;}
+
+/* ─── PERF GRID ──────────────────────────────── */
+.perf-grid{display:grid;grid-template-columns:repeat(8,1fr);border-bottom:1px solid var(--bdr2);}
+.pc{padding:9px 13px;border-right:1px solid var(--bdr);}
+.pc:last-child{border-right:none;}
+.pc-label{font-size:7.5px;letter-spacing:1.2px;color:var(--dim);text-transform:uppercase;margin-bottom:4px;font-family:var(--fh);}
+.pc-val{font-family:var(--fh);font-size:17px;font-weight:700;line-height:1;}
+.pc-sub{font-size:8px;color:var(--dim);margin-top:2px;}
+
+/* ─── COMBO FILTER ───────────────────────────── */
+.cfbox{padding:10px 13px;background:var(--s2);display:flex;flex-direction:column;gap:10px;}
+.empty{display:flex;align-items:center;gap:10px;padding:14px;color:var(--dim);font-size:9.5px;}
+.eline{flex:1;height:1px;background:var(--bdr2);}
+
+@media(max-width:1024px){.kbar{grid-template-columns:repeat(6,1fr);}.mxg{grid-template-columns:1fr;}.stats-grid{grid-template-columns:repeat(3,1fr);}.perf-grid{grid-template-columns:repeat(4,1fr);}}
 </style>
 </head>
 <body>
 
+<!-- HEADER -->
 <div class="hdr">
   <div>
-    <div class="logo">PRONTO-AI</div>
-    <div class="ver">v12.5.0 · TradingView → MetaApi → FTMO MT5 · Risk ${(FIXED_RISK_PCT*100).toFixed(4)}% · SL×${SL_BUFFER_MULT} · Stock SL×${STOCK_SL_BUFFER_MULT} · NY Dead Zone 15:30–18:00</div>
+    <div class="logo">PRONTO·AI</div>
+    <div class="ver">v13.0 · TradingView → MetaApi → FTMO MT5 · Risk ${(FIXED_RISK_PCT*100).toFixed(4)}% · SL×${SL_BUFFER_MULT} · Compliance: 3 mei 2026</div>
   </div>
   <div class="hdr-r">
-    <span class="sb s-outside" id="hdr-sess">—</span>
-    <div class="hdr-time-box">
-      <span class="clock" id="clock">--:--:--</span>
-      <span class="upd-freq" id="upd-freq">refresh: 30s</span>
-    </div>
-    <button class="rbtn" onclick="loadAll()">↻ REFRESH</button>
-    <button class="rbtn" id="deploy-btn" onclick="prepareDeploy()" style="border-color:var(--r);color:var(--r)">⚡ PREPARE DEPLOY</button>
-    <span id="deploy-status" style="font-size:9px;color:var(--dim)"></span>
+    <span class="live-dot"></span>
+    <span class="hdr-sess s-out" id="hdr-sess">—</span>
+    <span class="clock" id="clock">--:--:--</span>
+    <button class="hbtn" onclick="loadAll()">↻ REFRESH</button>
+    <button class="hbtn danger" id="deploy-btn" onclick="prepareDeploy()">⚡ DEPLOY</button>
+    <span id="deploy-status" style="font-size:8.5px;color:var(--dim);max-width:160px;overflow:hidden;text-overflow:ellipsis;"></span>
   </div>
 </div>
 
-<div class="kbar">
-  <div class="kpi k0"><div class="kl">Balance MT5</div><div class="kv g">€<span id="k-bal">${balance.toFixed(0)}</span></div><div style="font-size:8px;color:var(--dim);margin-top:2px" id="k-bal-age">laden…</div></div>
-  <div class="kpi k1"><div class="kl">Open Trades</div><div class="kv b" id="k-pos">—</div></div>
-  <div class="kpi k2"><div class="kl">Open P&amp;L</div><div class="kv" id="k-pnl">—</div></div>
-  <div class="kpi k3"><div class="kl">Ghosts Active</div><div class="kv p" id="k-gh">—</div></div>
-  <div class="kpi k4"><div class="kl">TP Locks EV+</div><div class="kv y" id="k-tp">—</div></div>
-  <div class="kpi k5"><div class="kl">SL Optimizer</div><div class="kv c" id="k-sl">—</div></div>
-  <div class="kpi k6"><div class="kl">Session</div><div class="kv o" id="k-sess" style="font-size:13px">—</div></div>
-  <div class="kpi k7"><div class="kl">Base Risk % / Actual</div><div class="kv c" style="font-size:13px">${(FIXED_RISK_PCT*100).toFixed(3)}% <span style="color:var(--o);font-size:10px">~${(FIXED_RISK_PCT*SL_BUFFER_MULT*100).toFixed(3)}%</span></div></div>
-  <div class="kpi k8"><div class="kl">Trades / Sess</div><div class="kv b" id="k-tps">—</div></div>
-  <div class="kpi k9"><div class="kl">Logged Trades</div><div class="kv b" id="k-err">—</div></div>
-  <div class="kpi k10"><div class="kl">DB Trades (totaal)</div><div class="kv y">${dbTradeCount.toLocaleString()}</div></div>
+<!-- COMPLIANCE BANNER -->
+<div class="comp-bar">
+  <div class="comp-dot"></div>
+  <span style="color:var(--y);font-weight:600;">Compliance:</span>
+  <span style="color:var(--txt);">3 mei 2026 00:00 UTC</span>
+  <span style="color:var(--dim);">— alle statistieken, EV-berekeningen en P&amp;L berekend uitsluitend op basis van trades geopend ná deze datum</span>
+  <span style="margin-left:auto;color:var(--c);font-family:Space Grotesk,sans-serif;font-size:9px;">DB totaal: ${dbTradeCount.toLocaleString()} trades</span>
 </div>
 
-<div id="global-status" style="padding:4px 20px;background:var(--bg1);border-bottom:1px solid var(--bdr2);display:flex;align-items:center;justify-content:space-between;font-size:9px;color:var(--dim)">
-  <span id="gs-text">Initializing...</span>
-  <span><span id="gs-err" style="color:var(--r)"></span> <span id="gs-time"></span></span>
+<!-- KPI BAR -->
+<div class="kbar">
+  <div class="kpi kb"><div class="kl">Balance MT5</div><div class="kv b">€<span id="k-bal">${balance.toFixed(0)}</span></div><div class="ksub" id="k-bal-age">live</div></div>
+  <div class="kpi kg"><div class="kl">Open Trades</div><div class="kv g" id="k-pos">—</div></div>
+  <div class="kpi"><div class="kl">Open P&amp;L</div><div class="kv" id="k-pnl">—</div></div>
+  <div class="kpi kp"><div class="kl">Ghosts Actief</div><div class="kv p" id="k-gh">—</div></div>
+  <div class="kpi ky"><div class="kl">TP Locks EV+</div><div class="kv y" id="k-tp">—</div></div>
+  <div class="kpi kc"><div class="kl">SL Optimizer</div><div class="kv c" id="k-sl">—</div></div>
+  <div class="kpi"><div class="kl">Sessie</div><div class="kv" style="font-size:13px" id="k-sess">—</div></div>
+  <div class="kpi kb"><div class="kl">Risk / Actual</div><div class="kv b" style="font-size:13px">${(FIXED_RISK_PCT*100).toFixed(4)}%<span style="color:var(--o);font-size:10px"> ~${(FIXED_RISK_PCT*SL_BUFFER_MULT*100).toFixed(3)}%</span></div></div>
+  <div class="kpi kc"><div class="kl">Signals Placed</div><div class="kv c" id="k-tps">—</div></div>
+  <div class="kpi ko"><div class="kl">Closed Trades</div><div class="kv o" id="k-err">—</div></div>
+  <div class="kpi ky"><div class="kl">DB Trades</div><div class="kv y">${dbTradeCount.toLocaleString()}</div></div>
+</div>
+
+<!-- STATUS BAR -->
+<div class="sbar">
+  <span id="gs-text">Initialiseren...</span>
+  <span><span id="gs-err" style="color:var(--r)"></span> <span id="gs-time"></span> <span id="upd-freq" style="margin-left:8px;color:var(--dim)"></span></span>
 </div>
 
 <div class="main">
 
-<!-- 0. TRADE STATS -->
+<!-- ① TRADE STATS -->
 <div class="sec" id="stats-sec">
   <div class="sh">
-    <span class="st b">▸ TRADE STATS — vanaf compliance datum</span>
+    <span class="st"><div class="sdot err" id="stats-dot"></div><span class="b">TRADE STATS</span></span>
     <span class="sm" id="stats-meta">laden...</span>
-    <span class="db-count-badge" title="Totaal closed_trades in SQL database">🗄 ${dbTradeCount.toLocaleString()} in DB</span>
-  </div>
-  <div class="compliance-banner">
-    <span class="cb-dot"></span>
-    <span style="color:var(--y);font-weight:700">Compliance datum:</span>
-    <span style="color:var(--txt)">27/04/2026 09:00 Brussels</span>
-    <span style="color:var(--dim)">— enkel trades ná deze datum tellen mee voor EV/optimizer statistieken</span>
   </div>
   <div class="stats-grid">
-    <div class="stats-cell"><div class="sc-label">Totaal trades</div><div class="sc-val b" id="st-total">—</div><div class="sc-sub" id="st-total-sub"></div></div>
-    <div class="stats-cell"><div class="sc-label">VWAP Above / Below</div><div class="sc-val" style="font-size:15px"><span class="b" id="st-above">—</span> <span class="d">/</span> <span class="p" id="st-below">—</span></div><div class="sc-sub" id="st-vwap-pct"></div></div>
-    <div class="stats-cell"><div class="sc-label">Sessie verdeling</div><div class="sc-val" style="font-size:12px;display:flex;gap:8px;align-items:baseline"><span class="c" id="st-asia">—</span><span class="d" style="font-size:9px">AS</span><span class="g" id="st-london">—</span><span class="d" style="font-size:9px">LN</span><span class="p" id="st-ny">—</span><span class="d" style="font-size:9px">NY</span></div></div>
-    <div class="stats-cell"><div class="sc-label">Buy / Sell signalen</div><div class="sc-val" style="font-size:15px"><span class="g" id="st-buy">—</span> <span class="d">/</span> <span class="r" id="st-sell">—</span></div><div class="sc-sub" id="st-dir-pct"></div></div>
-    <div class="stats-cell"><div class="sc-label">Compliance datum</div><div class="sc-val y" id="st-comp" style="font-size:11px;line-height:1.3">27/04/2026<br>09:00</div></div>
+    <div class="sc"><div class="sc-label">Totaal trades (3 mei+)</div><div class="sc-val b" id="st-total">—</div><div class="sc-sub" id="st-total-sub"></div></div>
+    <div class="sc"><div class="sc-label">VWAP Above / Below</div><div class="sc-val" style="font-size:14px"><span class="b" id="st-above">—</span> <span class="d">/</span> <span class="p" id="st-below">—</span></div><div class="sc-sub" id="st-vwap-pct"></div></div>
+    <div class="sc"><div class="sc-label">Sessie: Asia / London / NY</div><div class="sc-val" style="font-size:12px;display:flex;gap:8px;align-items:baseline"><span class="c" id="st-asia">—</span><span class="d" style="font-size:8px">AS</span><span class="g" id="st-london">—</span><span class="d" style="font-size:8px">LN</span><span class="p" id="st-ny">—</span><span class="d" style="font-size:8px">NY</span></div></div>
+    <div class="sc"><div class="sc-label">Buy / Sell</div><div class="sc-val" style="font-size:14px"><span class="g" id="st-buy">—</span> <span class="d">/</span> <span class="r" id="st-sell">—</span></div><div class="sc-sub" id="st-dir-pct"></div></div>
+    <div class="sc"><div class="sc-label">Compliance vanaf</div><div class="sc-val y" style="font-size:11px;line-height:1.4">3 mei 2026<br>00:00 UTC</div></div>
   </div>
   <div style="overflow-x:auto">
-  <table id="st-tbl" style="font-size:10.5px">
-    <thead><tr>
-      <th>Sessie</th>
-      <th style="color:var(--g)">Buy Above</th>
-      <th style="color:var(--g);opacity:.7">Buy Below</th>
-      <th style="color:var(--r)">Sell Above</th>
-      <th style="color:var(--r);opacity:.7">Sell Below</th>
-      <th>Totaal</th>
-    </tr></thead>
-    <tbody id="st-body"></tbody>
-    <tfoot><tr>
-      <td class="y">TOTAAL</td>
-      <td id="st-ft-ba" class="g">—</td>
-      <td id="st-ft-bb" class="g">—</td>
-      <td id="st-ft-sa" class="r">—</td>
-      <td id="st-ft-sb" class="r">—</td>
-      <td id="st-ft-t" class="b">—</td>
-    </tr></tfoot>
-  </table>
+    <table id="st-tbl">
+      <thead><tr><th>Sessie</th><th style="color:var(--g)">Buy Above</th><th style="color:var(--g);opacity:.7">Buy Below</th><th style="color:var(--r)">Sell Above</th><th style="color:var(--r);opacity:.7">Sell Below</th><th>Totaal</th></tr></thead>
+      <tbody id="st-body"></tbody>
+      <tfoot><tr style="background:var(--s2);border-top:2px solid var(--bdr2);font-weight:700;">
+        <td class="y">TOTAAL</td><td id="st-ft-ba" class="g">—</td><td id="st-ft-bb" class="g">—</td><td id="st-ft-sa" class="r">—</td><td id="st-ft-sb" class="r">—</td><td id="st-ft-t" class="b">—</td>
+      </tr></tfoot>
+    </table>
   </div>
 </div>
 
-<!-- 1. OPEN POSITIONS -->
+<!-- ② OPEN POSITIONS — full RR timing -->
 <div class="sec">
-  <div class="sh"><span class="st g">▸ OPEN POSITIONS</span><span class="sm" id="pos-meta">loading…</span><span id="pos-dot" class="sec-err" title="Loading..."></span></div>
+  <div class="sh">
+    <span class="st"><div class="sdot err" id="pos-dot"></div><span class="g">OPEN POSITIONS</span></span>
+    <span class="sm" id="pos-meta">laden...</span>
+  </div>
   <div id="pos-empty" class="empty" style="display:none"><div class="eline"></div><span>0 open trades</span><div class="eline"></div></div>
   <div class="tw" id="pos-wrap">
     <table id="pos-tbl">
       <thead><tr>
-        <th class="s" data-col="0">Pair</th><th class="s" data-col="1">Dir</th><th class="s" data-col="2">VWAP</th><th class="s" data-col="3">Session</th>
-        <th class="s" data-col="4">Entry MT5</th><th class="s" data-col="5">SL MT5</th><th class="s" data-col="6">TP MT5</th>
-        <th class="s" data-col="7" title="Current RR: (price-entry)/SL dist">RR Now</th>
-        <th class="s" data-col="8" title="Highest RR reached since open (synced from ghost)">Max RR</th>
-        <th title="% of SL already consumed">SL Used</th>
-        <th class="s" data-col="10" title="TP RR: (TP-entry)/SL dist">Entry→TP RR</th>
+        <th class="s" data-col="0">Pair</th>
+        <th class="s" data-col="1">Dir</th>
+        <th class="s" data-col="2">VWAP</th>
+        <th class="s" data-col="3">Sessie</th>
+        <th class="s" data-col="4">Entry</th>
+        <th class="s" data-col="5">SL</th>
+        <th class="s" data-col="6">TP</th>
+        <th class="s" data-col="7" title="Huidige RR live">RR Nu</th>
+        <th class="s" data-col="8" title="Max RR bereikt (ghost)">Max RR</th>
+        <th title="% SL verbruikt">SL Used</th>
+        <th class="s" data-col="10" title="TP RR: (TP-entry)/SL dist">→TP RR</th>
         <th class="s" data-col="11">P&amp;L €</th>
         <th class="s" data-col="12">Lots</th>
-        <th class="s" data-col="13" title="Actual risk at SL: lots×dist×lotVal as % of balance">Risk %</th>
-        <th class="s" title="T tot -0.25R adverse">T→-¼R</th>
-        <th class="s" title="T tot -0.50R adverse">T→-½R</th>
-        <th class="s" title="T tot -0.75R adverse">T→-¾R</th>
-        <th class="s" title="T tot -1.00R (phantom SL)">T→-1R</th>
-        <th class="s" title="T tot +0.1R">+0.1</th><th class="s" title="T tot +0.2R">+0.2</th><th class="s" title="T tot +0.3R">+0.3</th>
-        <th class="s" title="T tot +0.4R">+0.4</th><th class="s" title="T tot +0.5R">+0.5</th><th class="s" title="T tot +0.6R">+0.6</th>
-        <th class="s" title="T tot +0.7R">+0.7</th><th class="s" title="T tot +0.8R">+0.8</th><th class="s" title="T tot +0.9R">+0.9</th>
-        <th class="s" title="T tot +1.0R">+1R</th><th class="s" title="T tot +1.1R">+1.1</th><th class="s" title="T tot +1.2R">+1.2</th>
-        <th class="s" title="T tot +1.3R">+1.3</th><th class="s" title="T tot +1.4R">+1.4</th><th class="s" title="T tot +1.5R">+1.5</th>
-        <th class="s" title="T tot +1.6R">+1.6</th><th class="s" title="T tot +1.7R">+1.7</th><th class="s" title="T tot +1.8R">+1.8</th>
-        <th class="s" title="T tot +1.9R">+1.9</th><th class="s" title="T tot +2.0R">+2R</th><th class="s" title="T tot +2.5R">+2.5</th>
-        <th class="s" title="T tot +3.0R">+3R</th><th class="s" title="T tot +3.5R">+3.5</th><th class="s" title="T tot +4.0R">+4R</th>
-        <th class="s" title="T tot +4.5R">+4.5</th><th class="s" title="T tot +5.0R">+5R</th><th class="s" title="T tot +6R">+6R</th>
-        <th class="s" title="T tot +7R">+7R</th><th class="s" title="T tot +8R">+8R</th><th class="s" title="T tot +9R">+9R</th>
-        <th class="s" title="T tot +10R">+10R</th><th class="s" title="T tot +11R">+11R</th><th class="s" title="T tot +12R">+12R</th>
-        <th class="s" title="T tot +13R">+13R</th><th class="s" title="T tot +14R">+14R</th><th class="s" title="T tot +15R">+15R</th>
-        <th class="s" data-col="14">Opened</th>
+        <th class="s" data-col="13">Risk %</th>
+        <th class="s" title="T van entry tot -0.25R adverse">T→-¼R</th>
+        <th class="s" title="T van entry tot -0.50R adverse">T→-½R</th>
+        <th class="s" title="T van entry tot -0.75R adverse">T→-¾R</th>
+        <th class="s" title="T van entry tot -1.00R (phantom SL)">T→-1R</th>
+        ${favHeaders}
+        <th class="s" data-col="99">Geopend</th>
       </tr></thead>
       <tbody id="pos-body"></tbody>
     </table>
   </div>
 </div>
 
-<!-- 2. ACTIVE GHOSTS — per trade -->
+<!-- ③ GHOST TRACKER — identical columns to open positions -->
 <div class="sec">
-  <div class="sh"><span class="st p">▸ GHOST TRACKER</span><span id="gh-dot" class="sec-err" title="Loading..."></span><span class="sm" id="gh-meta">active ghosts — tracking until phantom SL hit, max 15R or 2 weeks</span></div>
-  <div id="gh-flat-view" class="tw">
+  <div class="sh">
+    <span class="st"><div class="sdot err" id="gh-dot"></div><span class="p">GHOST TRACKER</span></span>
+    <span class="sm" id="gh-meta">actieve ghosts — tracken tot phantom SL hit, 15R of 15 dagen</span>
+  </div>
+  <div class="tw">
     <table id="gh-tbl">
       <thead><tr>
-      <thead><tr>
-        <th class="s" data-col="0">Symbol</th><th>Type</th><th class="s" data-col="2">Session</th>
-        <th class="s" data-col="3">Dir</th><th class="s" data-col="4">VWAP</th>
-        <th class="s" data-col="5" title="Highest RR reached so far">Max RR</th>
-        <th class="s" title="T tot -0.25R adverse">T→-¼R</th>
-        <th class="s" title="T tot -0.50R adverse">T→-½R</th>
-        <th class="s" title="T tot -0.75R adverse">T→-¾R</th>
-        <th class="s" title="T tot -1.00R (phantom SL)">T→-1R</th>
-        <th class="s" title="T tot +0.1R">+0.1</th>
-        <th class="s" title="T tot +0.2R">+0.2</th>
-        <th class="s" title="T tot +0.3R">+0.3</th>
-        <th class="s" title="T tot +0.4R">+0.4</th>
-        <th class="s" title="T tot +0.5R">+0.5</th>
-        <th class="s" title="T tot +0.6R">+0.6</th>
-        <th class="s" title="T tot +0.7R">+0.7</th>
-        <th class="s" title="T tot +0.8R">+0.8</th>
-        <th class="s" title="T tot +0.9R">+0.9</th>
-        <th class="s" title="T tot +1.0R">+1.0</th>
-        <th class="s" title="T tot +1.1R">+1.1</th>
-        <th class="s" title="T tot +1.2R">+1.2</th>
-        <th class="s" title="T tot +1.3R">+1.3</th>
-        <th class="s" title="T tot +1.4R">+1.4</th>
-        <th class="s" title="T tot +1.5R">+1.5</th>
-        <th class="s" title="T tot +1.6R">+1.6</th>
-        <th class="s" title="T tot +1.7R">+1.7</th>
-        <th class="s" title="T tot +1.8R">+1.8</th>
-        <th class="s" title="T tot +1.9R">+1.9</th>
-        <th class="s" title="T tot +2.0R">+2.0</th>
-        <th class="s" title="T tot +2.5R">+2.5</th>
-        <th class="s" title="T tot +3.0R">+3.0</th>
-        <th class="s" title="T tot +3.5R">+3.5</th>
-        <th class="s" title="T tot +4.0R">+4.0</th>
-        <th class="s" title="T tot +4.5R">+4.5</th>
-        <th class="s" title="T tot +5.0R">+5.0</th>
-        <th class="s" title="T tot +6R">+6R</th>
-        <th class="s" title="T tot +7R">+7R</th>
-        <th class="s" title="T tot +8R">+8R</th>
-        <th class="s" title="T tot +9R">+9R</th>
-        <th class="s" title="T tot +10R">+10R</th>
-        <th class="s" title="T tot +11R">+11R</th>
-        <th class="s" title="T tot +12R">+12R</th>
-        <th class="s" title="T tot +13R">+13R</th>
-        <th class="s" title="T tot +14R">+14R</th>
-        <th class="s" title="T tot +15R">+15R</th>
-        <th class="s" data-col="8">Elapsed</th><th class="s" data-col="9">Opened</th>
+        <th class="s" data-col="0">Symbol</th>
+        <th>Type</th>
+        <th class="s" data-col="2">Sessie</th>
+        <th class="s" data-col="3">Dir</th>
+        <th class="s" data-col="4">VWAP</th>
+        <th class="s" data-col="5" title="Max RR bereikt">Max RR</th>
+        <th class="s" title="T tot -0.25R">T→-¼R</th>
+        <th class="s" title="T tot -0.50R">T→-½R</th>
+        <th class="s" title="T tot -0.75R">T→-¾R</th>
+        <th class="s" title="T tot -1.00R = phantom SL hit">T→-1R</th>
+        ${favHeaders}
+        <th class="s" data-col="98">Elapsed</th>
+        <th class="s" data-col="99">Geopend</th>
       </tr></thead>
+      <tbody id="gh-body"></tbody>
     </table>
   </div>
 </div>
 
-<!-- 3. EV / TP + SL OPTIMISER — ALL combos, 0 trades shown -->
+<!-- ④ GHOST HISTORY — gegroepeerd per optimizer key -->
 <div class="sec">
   <div class="sh">
-    <span class="st y">▸ EV / TP + SL OPTIMISER</span><span id="ev-dot" class="sec-err" title="Loading..."></span>
-    <span class="sm" id="ev-meta">alle combinaties · EV locked bij ≥5</span>
+    <span class="st"><div class="sdot err" id="ghh-dot"></div><span class="c">GHOST HISTORY — gegroepeerd per combo</span></span>
+    <span class="sm" id="ghh-meta">laden...</span>
+  </div>
+  <div style="padding:5px 13px;background:var(--s2);border-bottom:1px solid var(--bdr2);font-size:8.5px;color:var(--dim);">
+    Afgesloten ghosts geaggregeerd per sym+sessie+dir+vwap · gebruikt als input voor EV/optimizer · alleen trades vanaf 3 mei 2026
+  </div>
+  <div class="tw">
+    <table id="ghh-tbl">
+      <thead><tr>
+        <th class="s" data-col="0">Symbol</th><th>Type</th>
+        <th class="s" data-col="2">Sessie</th><th class="s" data-col="3">Dir</th><th class="s" data-col="4">VWAP</th>
+        <th class="s" data-col="5"># Ghosts</th>
+        <th class="s" data-col="6"># EV</th>
+        <th class="s" data-col="7">Best RR</th>
+        <th class="s" data-col="8">Avg RR</th>
+        <th class="s" title="Gem T tot -0.25R adverse">T→-¼R</th>
+        <th class="s" title="Gem T tot -0.50R adverse">T→-½R</th>
+        <th class="s" title="Gem T tot -0.75R adverse">T→-¾R</th>
+        <th class="s" title="Gem T tot -1.00R = SL hit">T→-1R</th>
+        <th class="s" title="Gem T tot +0.5R">+0.5R</th>
+        <th class="s" title="Gem T tot +1R">+1R</th>
+        <th class="s" title="Gem T tot +1.5R">+1.5R</th>
+        <th class="s" title="Gem T tot +2R">+2R</th>
+        <th class="s" title="Gem T tot +3R">+3R</th>
+        <th class="s" title="Gem T tot +5R">+5R</th>
+        <th class="s" title="Gem T tot +10R">+10R</th>
+        <th class="s" title="Gem T tot +15R">+15R</th>
+        <th class="s" data-col="14">Stop reden</th>
+        <th class="s" title="MAE p50 — mediaan adverse excursie survivors">MAE p50</th>
+        <th class="s" title="MAE p75">MAE p75</th>
+        <th class="s" title="MAE p90 — basis SL inkort advies">MAE p90</th>
+        <th title="SL inkort aanbeveling (read-only)">SL Advies</th>
+      </tr></thead>
+      <tbody id="ghh-body"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ⑤ EV OPTIMIZER — TP lock matrix -->
+<div class="sec">
+  <div class="sh">
+    <span class="st"><div class="sdot err" id="ev-dot"></div><span class="y">EV / TP OPTIMISER</span></span>
+    <span class="sm" id="ev-meta">alle combos · EV locked bij ≥5 ghosts</span>
   </div>
   <div class="fbar">
     <span class="fl">Type:</span>
@@ -3395,7 +3467,7 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
     <button class="fb" onclick="setEVF('type','index',this)">Index</button>
     <button class="fb" onclick="setEVF('type','commodity',this)">Commodity</button>
     <button class="fb" onclick="setEVF('type','stock',this)">Stock</button>
-    &nbsp;<span class="fl">Session:</span>
+    &nbsp;<span class="fl">Sessie:</span>
     <button class="fb on" onclick="setEVF('sess','all',this)">All</button>
     <button class="fb" onclick="setEVF('sess','asia',this)">Asia</button>
     <button class="fb" onclick="setEVF('sess','london',this)">London</button>
@@ -3416,27 +3488,26 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
   </div>
   <div class="strip">
     <div class="stat"><span class="sl2">Totaal combos</span><span class="sv2 b" id="ev-count">—</span></div>
-    <div class="stat"><span class="sl2">Met ghost data (≥1 ghost)</span><span class="sv2 c" id="ev-trades">—</span></div>
-    <div class="stat"><span class="sl2">Zonder ghost data</span><span class="sv2 d" id="ev-zero">—</span></div>
+    <div class="stat"><span class="sl2">Met ghost data (≥1)</span><span class="sv2 c" id="ev-trades">—</span></div>
+    <div class="stat"><span class="sl2">Zonder data</span><span class="sv2 d" id="ev-zero">—</span></div>
     <div class="stat"><span class="sl2">Total P&amp;L</span><span class="sv2" id="ev-pnl">—</span></div>
     <div class="stat"><span class="sl2">EV+ locked</span><span class="sv2 y" id="ev-locked">—</span></div>
-    <div class="stat" id="ev-compliance-stat" style="display:none"><span class="sl2" style="color:#f90">⚠ Data na compliance</span><span class="sv2 o" id="ev-compliance-n">—</span></div>
   </div>
   <div class="tw">
     <table id="ev-tbl">
       <thead><tr>
-        <th class="s" data-col="0">Symbol</th><th>Type</th><th class="s" data-col="2">Session</th>
-        <th class="s" data-col="3">Dir</th><th class="s" data-col="4">VWAP</th>
-        <th class="s" data-col="5" title="Closed ghost trades met maxRR>0"># Ghosts</th>
+        <th class="s" data-col="0">Symbol</th><th>Type</th>
+        <th class="s" data-col="2">Sessie</th><th class="s" data-col="3">Dir</th><th class="s" data-col="4">VWAP</th>
+        <th class="s" data-col="5" title="Afgesloten ghosts"># Ghosts</th>
         <th class="s" data-col="6"># Trades</th>
         <th class="s" data-col="7">Best TP RR</th>
         <th class="s" data-col="8">Avg RR</th>
         <th class="s" data-col="9">EV</th>
         <th>EV Status</th>
         <th class="s" data-col="11">TP Lock</th>
-        <th class="s" data-col="12" title="Avg minutes from open to phantom SL hit">Avg T→SL</th>
-        <th class="s" data-col="13" title="Avg max SL% used">Avg SL%</th>
-        <th class="s" data-col="14" title="Best SL% from winning ghost trades">Best SL% (W)</th>
+        <th class="s" data-col="12" title="Gem minuten entry → phantom SL hit">Avg T→SL</th>
+        <th class="s" data-col="13" title="Gem max SL% verbruikt">Avg SL%</th>
+        <th class="s" data-col="14" title="Best SL% winnende ghosts (read-only)">Best SL%(W)</th>
         <th class="s" data-col="15">Total P&amp;L</th>
       </tr></thead>
       <tbody id="ev-body"></tbody>
@@ -3444,48 +3515,87 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
   </div>
 </div>
 
-<!-- 4. GHOST HISTORY — COMBINED aggregated per optimizer_key -->
+<!-- ⑥ EV MATRIX — visuele overview -->
 <div class="sec">
-  <div class="sh"><span class="st c">▸ GHOST HISTORY — CLOSED GHOSTS LOG</span><span id="ghh-dot" class="sec-err" title="Loading..."></span><span class="sm" id="ghh-meta">loading…</span></div>
-  <div style="padding:5px 12px;background:var(--bg2);border-bottom:1px solid var(--bdr2);font-size:9px;color:var(--dim)">
-    Gecombineerde weergave per optimizer-combinatie (sym+sess+dir+vwap) · individuele ghost trades te zien in Ghost Tracker hierboven
+  <div class="sh"><span class="st"><span class="y">EV MATRIX</span></span><span class="sm">bestRR · EV · n · ★ = EV+ locked (n≥5) · grijs = geen data</span></div>
+  <div class="mxg mx" style="overflow-x:auto">
+    <div>
+      <div class="mxt">FOREX</div>
+      <table id="mx-fx"><thead><tr><th>Symbol</th><th>B/Ab</th><th>B/Bw</th><th>S/Ab</th><th>S/Bw</th></tr></thead><tbody id="mxb-fx"></tbody></table>
+    </div>
+    <div>
+      <div class="mxt">INDEXES</div>
+      <table id="mx-ix"><thead><tr><th>Symbol</th><th>B/Ab</th><th>B/Bw</th><th>S/Ab</th><th>S/Bw</th></tr></thead><tbody id="mxb-ix"></tbody></table>
+      <div class="mxt" style="margin-top:12px">COMMODITIES</div>
+      <table id="mx-cm"><thead><tr><th>Symbol</th><th>B/Ab</th><th>B/Bw</th><th>S/Ab</th><th>S/Bw</th></tr></thead><tbody id="mxb-cm"></tbody></table>
+    </div>
+    <div style="grid-column:1/-1">
+      <div class="mxt">STOCKS (NY only)</div>
+      <table id="mx-sk"><thead><tr><th>Symbol</th><th>B/Ab</th><th>B/Bw</th><th>S/Ab</th><th>S/Bw</th></tr></thead><tbody id="mxb-sk"></tbody></table>
+    </div>
+  </div>
+</div>
+
+<!-- ⑦ SL OPTIMIZER — read-only -->
+<div class="sec">
+  <div class="sh"><span class="st"><span class="c">SL OPTIMIZER — READ ONLY</span></span><span class="sm">MAE-gebaseerde SL inkort aanbevelingen · nooit automatisch toegepast</span></div>
+  <div style="padding:6px 13px;background:rgba(0,216,208,.04);border-bottom:1px solid rgba(0,216,208,.12);font-size:8.5px;color:var(--dim);">
+    Gebaseerd op MAE p90 van alle overlevende ghosts (geen SL hit) · aanbeveling = informatief, niet actief
   </div>
   <div class="tw">
-    <table id="ghh-tbl">
+    <table id="sl-opt-tbl">
       <thead><tr>
-        <th class="s" data-col="0">Symbol</th><th>Type</th><th class="s" data-col="2">Session</th>
-        <th class="s" data-col="3">Dir</th><th class="s" data-col="4">VWAP</th>
-        <th class="s" data-col="5" title="Totaal afgesloten ghosts"># Ghosts</th>
-        <th class="s" data-col="6" title="EV-eligible (phantom SL hit of max_rr_15, VWAP known, ≥0.5R)"># EV</th>
-        <th class="s" data-col="7" title="Hoogste RR bereikt">Best RR</th>
-        <th class="s" data-col="8" title="Gemiddelde Max RR">Avg RR</th>
-        <th class="s" title="Avg time to reach -0.25R (25% SL)">T→-¼R</th>
-        <th class="s" title="Avg time to reach -0.50R (50% SL)">T→-½R</th>
-        <th class="s" title="Avg time to reach -0.75R (75% SL)">T→-¾R</th>
-        <th class="s" title="Avg time to reach -1.00R = SL hit">T→-1R</th>
-        <th class="s" title="Avg time to reach +1R favorable">T→+1R</th>
-        <th class="s" title="Avg time to reach +2R favorable">T→+2R</th>
-        <th class="s" title="Avg time to reach +3R favorable">T→+3R</th>
-        <th class="s" title="Avg time to reach +4R favorable">T→+4R</th>
-        <th class="s" title="Avg time to reach +5R favorable">T→+5R</th>
-        <th class="s" title="Avg time to reach +10R favorable">T→+10R</th>
-        <th class="s" title="Avg time to reach +15R (max)">T→+15R</th>
-        <th class="s" data-col="14">Close Reason</th>
-        <th class="s" title="MAE p50: mediaan max adverse excursie van survivors (niet-SL ghosts)">MAE p50</th>
-        <th class="s" title="MAE p75: 75e percentiel adverse excursie van survivors">MAE p75</th>
-        <th class="s" title="MAE p90: 90e percentiel — basis voor SL inkort aanbeveling">MAE p90</th>
-        <th title="SL inkort aanbeveling op basis van MAE p90">SL Inkort?</th>
+        <th class="s" data-col="0">Symbol</th><th>Type</th>
+        <th class="s" data-col="2">Sessie</th><th class="s" data-col="3">Dir</th><th class="s" data-col="4">VWAP</th>
+        <th class="s" data-col="5"># Ghosts</th>
+        <th class="s" data-col="6">Huidig SL%</th>
+        <th class="s" data-col="7">MAE p50</th>
+        <th class="s" data-col="8">MAE p75</th>
+        <th class="s" data-col="9" title="Basis voor aanbeveling">MAE p90</th>
+        <th>Aanbeveling</th>
+        <th class="s" data-col="11">Pot. Besparing</th>
       </tr></thead>
-      <tbody id="ghh-body"></tbody>
+      <tbody id="sl-opt-body"></tbody>
     </table>
   </div>
 </div>
 
-<!-- 5. WEBHOOK ERRORS + VWAP BAND ANALYSIS -->
+<!-- ⑧ COMBO SELECTION -->
 <div class="sec">
-  <div class="sh"><span class="st r">▸ WEBHOOK ERRORS &amp; VWAP BAND ANALYSIS</span><span id="whe-dot" class="sec-err" title="Loading..."></span><span class="sm" id="whe-meta">loading…</span></div>
+  <div class="sh"><span class="st"><span class="p">COMBO SELECTIE — ACTIE TABLE</span></span><span class="sm">alle combos gerankt · beslissing: behouden, snijden of opschalen</span></div>
+  <div class="fbar">
+    <span class="fl">Toon:</span>
+    <button class="fb on" onclick="setCF('show','all',this)">Alle traded</button>
+    <button class="fb" onclick="setCF('show','ev+',this)">EV+ only</button>
+    <button class="fb" onclick="setCF('show','ev-',this)">EV- (snijden?)</button>
+    <button class="fb" onclick="setCF('show','min5',this)">≥5 trades</button>
+    &nbsp;<span class="fl">Sorteren:</span>
+    <button class="fb on" onclick="setCF('sort','ev',this)">Op EV</button>
+    <button class="fb" onclick="setCF('sort','pnl',this)">Op P&amp;L</button>
+    <button class="fb" onclick="setCF('sort','trades',this)">Op # trades</button>
+  </div>
+  <div class="tw">
+    <table id="cf-tbl">
+      <thead><tr>
+        <th>#</th><th class="s" data-col="1">Symbol</th><th>Type</th>
+        <th class="s" data-col="3">Sessie</th><th class="s" data-col="4">Dir</th><th class="s" data-col="5">VWAP</th>
+        <th class="s" data-col="6"># Ghosts</th>
+        <th class="s" data-col="7">Avg RR</th>
+        <th class="s" data-col="8">EV</th>
+        <th class="s" data-col="9">P&amp;L</th>
+        <th>Actie</th>
+      </tr></thead>
+      <tbody id="cf-body"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ⑨ WEBHOOK ERRORS + BAND -->
+<div class="sec">
+  <div class="sh"><span class="st"><div class="sdot err" id="whe-dot"></div><span class="r">SIGNAAL LOG — ERRORS &amp; REJECTS</span></span><span class="sm" id="whe-meta">laden...</span></div>
   <div class="tabs">
-    <div class="tab on" onclick="showTab('wh','errors')">Errors</div>
+    <div class="tab on" onclick="showTab('wh','errors')">Webhook Errors</div>
+    <div class="tab" onclick="showTab('wh','rejects')">Blocked Signals</div>
     <div class="tab" onclick="showTab('wh','band150')">Band 150–250%</div>
     <div class="tab" onclick="showTab('wh','band250')">Band 250–350%</div>
   </div>
@@ -3493,126 +3603,50 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
     <div class="tw">
       <table id="whe-tbl">
         <thead><tr>
-          <th class="s" data-col="0">Time</th><th class="s" data-col="1">Type</th><th class="s" data-col="2">Symbol</th>
-          <th class="s" data-col="3">Dir</th><th class="s" data-col="4">Session</th><th class="s" data-col="5">VWAP</th>
-          <th>Entry</th><th>SL%</th><th>Band%</th><th>Detail / Reason</th>
+          <th class="s" data-col="0">Tijd</th><th class="s" data-col="1">Type</th><th class="s" data-col="2">Symbol</th>
+          <th class="s" data-col="3">Dir</th><th class="s" data-col="4">Sessie</th><th class="s" data-col="5">VWAP</th>
+          <th>Entry</th><th>SL%</th><th>Band%</th><th>Detail</th>
         </tr></thead>
         <tbody id="whe-body"></tbody>
       </table>
     </div>
   </div>
+  <div class="tpane" id="wh-tab-rejects">
+    <div class="strip">
+      <div class="stat"><span class="sl2">Totaal geblokt</span><span class="sv2 r fw" id="blk-total">—</span></div>
+      <div class="stat"><span class="sl2">Duplicate</span><span class="sv2 o" id="blk-dup">—</span></div>
+      <div class="stat"><span class="sl2">VWAP Exhausted</span><span class="sv2 y" id="blk-vwap">—</span></div>
+      <div class="stat"><span class="sl2">Buiten Window</span><span class="sv2 d" id="blk-win">—</span></div>
+      <div class="stat"><span class="sl2">Currency Budget</span><span class="sv2 c" id="blk-cur">—</span></div>
+    </div>
+    <div class="tw">
+      <table id="blk-tbl">
+        <thead><tr><th>Cat.</th><th>Reden</th><th>Symbol</th><th>Dir</th><th>Sessie</th><th style="color:var(--r)">Aantal</th><th>Timestamp</th></tr></thead>
+        <tbody id="blk-body"></tbody>
+      </table>
+    </div>
+  </div>
   <div class="tpane" id="wh-tab-band150">
-    <div style="padding:7px 12px;background:var(--bg2);font-size:9px;color:var(--dim);border-bottom:1px solid var(--bdr2)">
-      <b class="o">Ghost 2.0 — Band 150%–250%.</b> Each rejected signal spawns a ghost tracker that runs until phantom SL / 15RR / 2 weeks.
-      Aggregated stats show what these trades would have earned. Data is read-only — never merged into main EV optimizer.
+    <div style="padding:7px 13px;background:var(--s2);border-bottom:1px solid var(--bdr2);font-size:8.5px;color:var(--dim);">
+      <b class="o">Ghost 2.0 — Band 150%–250%.</b> Read-only — nooit toegevoegd aan EV optimizer.
     </div>
     <div class="strip" id="band150-strip" style="display:none">
       <div class="stat"><span class="sl2">Ghosts</span><span class="sv2 b" id="b150-n">—</span></div>
       <div class="stat"><span class="sl2">Avg Max RR</span><span class="sv2 g" id="b150-rr">—</span></div>
       <div class="stat"><span class="sl2">Avg SL%</span><span class="sv2 o" id="b150-sl">—</span></div>
     </div>
-    <div class="tw">
-      <table id="band150-tbl">
-        <thead><tr>
-          <th>Symbol</th><th>Session</th><th>Dir</th><th>VWAP</th>
-          <th>n Ghosts</th><th>Avg Max RR</th><th>Max RR</th><th>Avg SL%</th><th>Avg T→SL</th>
-        </tr></thead>
-        <tbody id="band150-body"></tbody>
-      </table>
-    </div>
+    <div class="tw"><table id="band150-tbl"><thead><tr><th>Symbol</th><th>Sessie</th><th>Dir</th><th>VWAP</th><th>n</th><th>Avg RR</th><th>Max RR</th><th>Avg SL%</th><th>Avg T→SL</th></tr></thead><tbody id="band150-body"></tbody></table></div>
   </div>
   <div class="tpane" id="wh-tab-band250">
-    <div style="padding:7px 12px;background:var(--bg2);font-size:9px;color:var(--dim);border-bottom:1px solid var(--bdr2)">
-      <b class="r">Ghost 2.0 — Band 250%–350%.</b> Extreme outliers tracked separately. Read-only — never added to main optimizer.
+    <div style="padding:7px 13px;background:var(--s2);border-bottom:1px solid var(--bdr2);font-size:8.5px;color:var(--dim);">
+      <b class="r">Ghost 2.0 — Band 250%–350%.</b> Extreme outliers — read-only.
     </div>
     <div class="strip" id="band250-strip" style="display:none">
       <div class="stat"><span class="sl2">Ghosts</span><span class="sv2 b" id="b250-n">—</span></div>
       <div class="stat"><span class="sl2">Avg Max RR</span><span class="sv2 g" id="b250-rr">—</span></div>
       <div class="stat"><span class="sl2">Avg SL%</span><span class="sv2 o" id="b250-sl">—</span></div>
     </div>
-    <div class="tw">
-      <table id="band250-tbl">
-        <thead><tr>
-          <th>Symbol</th><th>Session</th><th>Dir</th><th>VWAP</th>
-          <th>n Ghosts</th><th>Avg Max RR</th><th>Max RR</th><th>Avg SL%</th><th>Avg T→SL</th>
-        </tr></thead>
-        <tbody id="band250-body"></tbody>
-      </table>
-    </div>
-  </div>
-</div>
-
-<!-- 6. EV MATRIX -->
-<div class="sec">
-  <div class="sh"><span class="st y">▸ EV MATRIX</span><span class="sm">bestRR · EV · n · ★ = EV+ locked (n≥5) &nbsp;|&nbsp; grey = no data</span></div>
-  <div class="mxg mx" style="overflow-x:auto">
-    <div>
-      <div class="mxt">FOREX</div>
-      <table id="mx-fx"><thead><tr><th>Symbol</th><th>B/Above</th><th>B/Below</th><th>S/Above</th><th>S/Below</th></tr></thead><tbody id="mxb-fx"></tbody></table>
-    </div>
-    <div>
-      <div class="mxt">INDEXES</div>
-      <table id="mx-ix"><thead><tr><th>Symbol</th><th>B/Above</th><th>B/Below</th><th>S/Above</th><th>S/Below</th></tr></thead><tbody id="mxb-ix"></tbody></table>
-      <div class="mxt" style="margin-top:10px">COMMODITIES</div>
-      <table id="mx-cm"><thead><tr><th>Symbol</th><th>B/Above</th><th>B/Below</th><th>S/Above</th><th>S/Below</th></tr></thead><tbody id="mxb-cm"></tbody></table>
-    </div>
-    <div style="grid-column:1/-1">
-      <div class="mxt">STOCKS (NY only)</div>
-      <table id="mx-sk"><thead><tr><th>Symbol</th><th>B/Above</th><th>B/Below</th><th>S/Above</th><th>S/Below</th></tr></thead><tbody id="mxb-sk"></tbody></table>
-    </div>
-  </div>
-</div>
-
-<!-- 7. COMBO SELECTION TABLE -->
-<div class="sec">
-  <div class="sh"><span class="st p">▸ COMBO SELECTION — CUT &amp; UPGRADE</span><span class="sm">all traded combos ranked · use to decide what to keep, cut, or focus on</span></div>
-  <div class="fbar">
-    <span class="fl">Show:</span>
-    <button class="fb on" onclick="setCF('show','all',this)">All traded</button>
-    <button class="fb" onclick="setCF('show','ev+',this)">EV+ only</button>
-    <button class="fb" onclick="setCF('show','ev-',this)">EV- (cut?)</button>
-    <button class="fb" onclick="setCF('show','min5',this)">≥5 trades</button>
-    &nbsp;<span class="fl">Sort:</span>
-    <button class="fb on" onclick="setCF('sort','ev',this)">By EV</button>
-    <button class="fb" onclick="setCF('sort','pnl',this)">By P&amp;L</button>
-    <button class="fb" onclick="setCF('sort','winpct',this)">By Win%</button>
-    <button class="fb" onclick="setCF('sort','trades',this)">By # Trades</button>
-  </div>
-  <div class="tw">
-    <table id="cf-tbl">
-      <thead><tr>
-        <th>#</th><th>Symbol</th><th>Type</th><th>Session</th><th>Dir</th><th>VWAP</th>
-        <th># Ghosts</th><th>Avg RR</th><th>EV</th><th>Total P&amp;L</th><th>Action</th>
-      </tr></thead>
-      <tbody id="cf-body"></tbody>
-    </table>
-  </div>
-</div>
-
-<!-- 8. SIGNAAL ANALYSE — geblokkeerd + errors + VWAP band (v12.1.3) -->
-<div class="sec">
-  <div class="sh">
-    <span class="st r">▸ SIGNAAL ANALYSE — geblokkeerd &amp; errors</span>
-    <span class="sm" id="blk-meta">laden...</span>
-    <span id="blk-dot" class="sec-err" title="Loading..."></span>
-  </div>
-  <!-- KPI strip -->
-  <div class="strip" style="margin-bottom:10px">
-    <div class="stat"><span class="sl2">Totaal geblokt</span><span class="sv2 r fw" id="blk-total">—</span></div>
-    <div class="stat"><span class="sl2">Duplicate</span><span class="sv2 o" id="blk-dup">—</span></div>
-    <div class="stat"><span class="sl2">VWAP Exhausted</span><span class="sv2 y" id="blk-vwap">—</span></div>
-    <div class="stat"><span class="sl2">Buiten Window</span><span class="sv2 d" id="blk-win">—</span></div>
-    <div class="stat"><span class="sl2">Currency Budget</span><span class="sv2 c" id="blk-cur">—</span></div>
-    <div class="stat"><span class="sl2">Webhook Errors</span><span class="sv2 r" id="blk-whe">—</span></div>
-    <div class="stat"><span class="sl2">Overige</span><span class="sv2 d" id="blk-oth">—</span></div>
-  </div>
-  <div class="tw">
-    <table id="blk-tbl" style="font-size:10px">
-      <thead><tr>
-        <th>Categorie</th><th>Reden</th><th>Symbol</th><th>Dir</th><th>Sessie</th><th style="color:var(--r)">Aantal</th><th>Timestamp</th>
-      </tr></thead>
-      <tbody id="blk-body"><tr><td colspan="7" style="color:var(--dim);text-align:center">laden...</td></tr></tbody>
-    </table>
+    <div class="tw"><table id="band250-tbl"><thead><tr><th>Symbol</th><th>Sessie</th><th>Dir</th><th>VWAP</th><th>n</th><th>Avg RR</th><th>Max RR</th><th>Avg SL%</th><th>Avg T→SL</th></tr></thead><tbody id="band250-body"></tbody></table></div>
   </div>
 </div>
 
@@ -3623,9 +3657,10 @@ const FOREX  = ${JSON.stringify(FOREX_SYMBOLS)};
 const INDEX  = ${JSON.stringify(INDEX_SYMBOLS)};
 const COMM   = ${JSON.stringify(COMMODITY_SYMBOLS)};
 const STOCKS = ${JSON.stringify(STOCK_SYMBOLS)};
-const TP_OPT_DATE = new Date('2026-05-03T00:00:00.000Z'); // compliance datum: 03/05/2026 00:00 UTC — v12.4
+const COMPLIANCE = new Date('2026-05-03T00:00:00.000Z');
+const FAV_STEPS  = ${JSON.stringify(FAV_DISPLAY)};
 
-let _allTrades=[],_evData=[],_tpMap={},_evMap={};
+let _allTrades=[],_evData=[],_tpMap={},_evMap={},_maeData={};
 let _lastLoadMs=null;
 const evF={type:'all',sess:'all',dir:'all',vwap:'all',min:'0'};
 const cfF={show:'all',sort:'ev'};
@@ -3646,42 +3681,45 @@ function vBadge(v){return v==='above'?'<span class="bd bd-ab">ABOVE</span>':v===
 function sBadge(s){const m={asia:'bd-as',london:'bd-lo',ny:'bd-ny',outside:'bd-out'};const n={asia:'ASIA',london:'LON',ny:'NY',outside:'OUT'};return\`<span class="bd \${m[s]||'bd-out'}">\${n[s]||s||'—'}</span>\`;}
 function tyBadge(t){const m={forex:'bd-fx',index:'bd-ix',commodity:'bd-cm',stock:'bd-sk'};const n={forex:'FX',index:'IDX',commodity:'COM',stock:'STK'};return\`<span class="bd \${m[t]||'bd-sk'}">\${n[t]||t}</span>\`;}
 function cBadge(r){if(r==='tp')return'<span class="bd bd-tp">TP</span>';if(r==='sl')return'<span class="bd bd-sl">SL</span>';if(r==='maxRR')return'<span class="bd bd-mr">MAX-RR</span>';if(r==='timeout')return'<span class="bd bd-mn">TIMEOUT</span>';if(r==='manual')return'<span class="bd bd-mn">MAN</span>';return r?\`<span class="bd d">\${r}</span>\`:'—';}
-function slBar(p){const w=Math.min(100,Math.max(0,p||0));const c=w<50?'':w<80?' w':' d';return\`<div class="slbar"><div class="slbg"><div class="slfi\${c}" style="width:\${w}%"></div></div><span class="\${c.trim()||'g'}">\${f(p,0)}%</span></div>\`;}
+function slBar(p){const w=Math.min(100,Math.max(0,p||0));const c=w<50?'':w<80?' w':' d';return\`<div class="slbar"><div class="slbg"><div class="slfi\${c}" style="width:\${w}%"></div></div><span class="\${c.trim()||'g'}" style="font-size:8.5px">\${f(p,0)}%</span></div>\`;}
+function setDot(id,ok,msg){const el=document.getElementById(id);if(!el)return;el.className='sdot '+(ok?'ok':'err');el.title=msg||'';}
+function emptyRow(cols,msg=''){if(!msg)return\`<tr>\${Array(cols).fill('<td></td>').join('')}</tr>\`;return\`<tr><td colspan="\${cols}" class="nodata">\${msg}</td></tr>\`;}
 
-async function api(path,timeoutMs=12000){
-  const ctrl=new AbortController();
-  const t=setTimeout(()=>ctrl.abort(),timeoutMs);
-  try{
-    const r=await fetch(path,{signal:ctrl.signal});
-    clearTimeout(t);
-    if(!r.ok){console.error('[API] '+path+' → '+r.status);return null;}
-    return r.json();
-  }catch(e){
-    clearTimeout(t);
-    if(e.name==='AbortError')console.error('[API] '+path+' TIMEOUT ('+timeoutMs+'ms)');
-    else console.error('[API] '+path+' failed:',e.message);
-    return null;
-  }
+// Favorite RR timing helper — returns <td> element string
+function favTd(fav, step, openedAt){
+  const v = fav[step] || fav[parseFloat(step)] || fav[step+'.0'] || fav[step+'.00'];
+  if(!v||!openedAt) return '<td class="d" style="font-size:8.5px">—</td>';
+  const mins = Math.round((new Date(v)-new Date(openedAt))/60000);
+  const t = mins<60?mins+'m':Math.floor(mins/60)+'h'+(mins%60?String(mins%60).padStart(2,'0')+'m':'');
+  // Color by speed: <30m = bright green, <2h = green, <8h = yellow, else dim
+  const cls = mins<30?'g fw':mins<120?'g':mins<480?'y':'d';
+  return \`<td class="\${cls}" style="font-size:8.5px">\${t}</td>\`;
 }
-function setDot(id,ok,msg){const el=document.getElementById(id);if(!el)return;el.className=ok?'sec-ok':'sec-err';el.title=msg||'';}
-
-// ── empty table helper (geen LOADING tekst) ───────────────
-function emptyRow(cols,msg=''){
-  if(!msg) return \`<tr>\${Array(cols).fill('<td></td>').join('')}</tr>\`;
-  return \`<tr><td colspan="\${cols}" class="nodata" style="color:var(--dim);opacity:.5">\${msg}</td></tr>\`;
+function advTd(adv, key, openedAt, cls='o'){
+  const v = adv[key];
+  if(!v||!openedAt) return '<td class="d" style="font-size:8.5px">—</td>';
+  const mins = Math.round((new Date(v)-new Date(openedAt))/60000);
+  const t = mins<60?mins+'m':Math.floor(mins/60)+'h'+(mins%60?String(mins%60).padStart(2,'0')+'m':'');
+  return \`<td class="\${cls}" style="font-size:8.5px">\${t}</td>\`;
 }
 
-// ── tab switching ─────────────────────────────────────────
+async function api(path,ms=12000){
+  const ctrl=new AbortController();const t=setTimeout(()=>ctrl.abort(),ms);
+  try{const r=await fetch(path,{signal:ctrl.signal});clearTimeout(t);if(!r.ok)return null;return r.json();}
+  catch(e){clearTimeout(t);return null;}
+}
+
+// ── TABS ─────────────────────────────────────────────────
 function showTab(group,name){
   document.querySelectorAll(\`.tab[onclick*="'\${group}'"]\`).forEach(t=>t.classList.remove('on'));
   document.querySelectorAll(\`[id^="\${group}-tab-"]\`).forEach(p=>p.classList.remove('on'));
   document.querySelector(\`.tab[onclick="showTab('\${group}','\${name}')"]\`).classList.add('on');
   document.getElementById(\`\${group}-tab-\${name}\`).classList.add('on');
-  if(group==='wh'&&name==='band150')loadBandSignals(1.5,2.5,'band150');
-  if(group==='wh'&&name==='band250')loadBandSignals(2.5,3.5,'band250');
+  if(group==='wh'&&name==='band150')loadBandSignals('150_250','band150');
+  if(group==='wh'&&name==='band250')loadBandSignals('250_350','band250');
 }
 
-// ── sort ─────────────────────────────────────────────────
+// ── SORT ─────────────────────────────────────────────────
 const sState={};
 function initSort(id){const t=document.getElementById(id);if(!t)return;t.querySelectorAll('th.s').forEach(th=>th.addEventListener('click',()=>sortBy(id,+th.dataset.col)));}
 function sortBy(id,col){
@@ -3699,12 +3737,11 @@ function sortBy(id,col){
   });
   rows.forEach(r=>tb.appendChild(r));
 }
-function initAll(){['pos-tbl','ev-tbl','gh-tbl','ghh-tbl','whe-tbl','cf-tbl','mx-fx','mx-ix','mx-cm','mx-sk'].forEach(initSort);}
+function initAll(){['pos-tbl','gh-tbl','ev-tbl','ghh-tbl','whe-tbl','cf-tbl','sl-opt-tbl','mx-fx','mx-ix','mx-cm','mx-sk'].forEach(initSort);}
 
-// ── clock + update countdown ─────────────────────────────
-const SESS_LABELS={asia:'ASIA',london:'LONDON',ny:'NY',outside:'OUTSIDE'};
-const SESS_CLS={asia:'s-asia',london:'s-london',ny:'s-ny',outside:'s-outside'};
-let _nextRefreshSec=30;
+// ── CLOCK ─────────────────────────────────────────────────
+const SESS_CLS={asia:'s-asia',london:'s-london',ny:'s-ny',outside:'s-out'};
+const SESS_LBL={asia:'ASIA',london:'LONDON',ny:'NY',outside:'OUTSIDE'};
 function updateClock(){
   const d=new Date();
   const bx=new Intl.DateTimeFormat('en-US',{timeZone:'Europe/Brussels',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}).formatToParts(d);
@@ -3716,347 +3753,280 @@ function updateClock(){
   const day=new Date(d.toLocaleDateString('en-CA',{timeZone:'Europe/Brussels'})).getDay();
   let sess='outside';
   if(day>0&&day<6){if(hhmm>=200&&hhmm<800)sess='asia';else if(hhmm>=800&&hhmm<1530)sess='london';else if(hhmm>=1530&&hhmm<2100)sess='ny';}
-  const hdrEl=document.getElementById('hdr-sess');
-  hdrEl.textContent=SESS_LABELS[sess];hdrEl.className='sb '+SESS_CLS[sess];
-  document.getElementById('k-sess').textContent=SESS_LABELS[sess];
-  // update freq countdown
-  const freqEl=document.getElementById('upd-freq');
-  if(freqEl){
-    if(_lastLoadMs){
-      const elapsed=Math.floor((Date.now()-_lastLoadMs)/1000);
-      const remaining=Math.max(0,30-elapsed%30);
-      freqEl.textContent=\`refresh: 30s · volgende in \${remaining}s\`;
-    }
-  }
-  // balance KPI age
-  const balAgeEl=document.getElementById('k-bal-age');
-  if(balAgeEl&&_lastLoadMs){
-    const secAgo=Math.floor((Date.now()-_lastLoadMs)/1000);
-    balAgeEl.textContent=secAgo<60?secAgo+'s geleden':(Math.floor(secAgo/60))+'m geleden';
+  const el=document.getElementById('hdr-sess');
+  el.textContent=SESS_LBL[sess];el.className='hdr-sess '+SESS_CLS[sess];
+  document.getElementById('k-sess').textContent=SESS_LBL[sess];
+  if(_lastLoadMs){
+    const rem=Math.max(0,30-Math.floor((Date.now()-_lastLoadMs)/1000)%30);
+    document.getElementById('upd-freq').textContent=\`volgende refresh in \${rem}s\`;
+    const balAgeEl=document.getElementById('k-bal-age');
+    if(balAgeEl){const sec=Math.floor((Date.now()-_lastLoadMs)/1000);balAgeEl.textContent=sec<60?sec+'s geleden':Math.floor(sec/60)+'m geleden';}
   }
 }
 setInterval(updateClock,1000);updateClock();
 
-
-// ── 0. TRADE STATS SECTION ───────────────────────────────────────
+// ── ① TRADE STATS ─────────────────────────────────────────
 async function loadTradeStats(){
-  const COMPLIANCE = new Date('2026-05-03T00:00:00.000Z');
-  const d = await api('/trades?limit=10000');
+  const d=await api('/trades?limit=10000');
   if(!d){document.getElementById('stats-meta').textContent='fout bij laden';return;}
-  const trades = (d.trades||[]).filter(t => t.openedAt && new Date(t.openedAt) >= COMPLIANCE);
-  const total = trades.length;
-  document.getElementById('stats-meta').textContent = total + ' trades na compliance datum';
-  document.getElementById('st-total').textContent = total||'0';
-  document.getElementById('st-total-sub').textContent = 'gesloten trades';
+  setDot('stats-dot',true,'OK');
+  const trades=(d.trades||[]).filter(t=>t.openedAt&&new Date(t.openedAt)>=COMPLIANCE);
+  const total=trades.length;
+  document.getElementById('stats-meta').textContent=total+' trades ná compliance datum';
+  document.getElementById('st-total').textContent=total||'0';
+  document.getElementById('st-total-sub').textContent='gesloten trades';
   const abv=trades.filter(t=>t.vwapPosition==='above').length;
   const blw=trades.filter(t=>t.vwapPosition==='below').length;
-  document.getElementById('st-above').textContent = abv;
-  document.getElementById('st-below').textContent = blw;
-  if(total>0) document.getElementById('st-vwap-pct').textContent=\`\${((abv/total)*100).toFixed(0)}% / \${((blw/total)*100).toFixed(0)}%\`;
-  document.getElementById('st-asia').textContent   = trades.filter(t=>t.session==='asia').length;
-  document.getElementById('st-london').textContent = trades.filter(t=>t.session==='london').length;
-  document.getElementById('st-ny').textContent     = trades.filter(t=>t.session==='ny').length;
+  document.getElementById('st-above').textContent=abv;
+  document.getElementById('st-below').textContent=blw;
+  if(total>0)document.getElementById('st-vwap-pct').textContent=\`\${((abv/total)*100).toFixed(0)}% / \${((blw/total)*100).toFixed(0)}%\`;
+  document.getElementById('st-asia').textContent=trades.filter(t=>t.session==='asia').length;
+  document.getElementById('st-london').textContent=trades.filter(t=>t.session==='london').length;
+  document.getElementById('st-ny').textContent=trades.filter(t=>t.session==='ny').length;
   const buys=trades.filter(t=>t.direction==='buy').length;
   const sells=trades.filter(t=>t.direction==='sell').length;
-  document.getElementById('st-buy').textContent    = buys;
-  document.getElementById('st-sell').textContent   = sells;
-  if(total>0) document.getElementById('st-dir-pct').textContent=\`\${((buys/total)*100).toFixed(0)}% / \${((sells/total)*100).toFixed(0)}%\`;
-  // Session breakdown
-  const sessions = ['asia','london','ny'];
-  const tb = document.getElementById('st-body');
+  document.getElementById('st-buy').textContent=buys;
+  document.getElementById('st-sell').textContent=sells;
+  if(total>0)document.getElementById('st-dir-pct').textContent=\`\${((buys/total)*100).toFixed(0)}% / \${((sells/total)*100).toFixed(0)}%\`;
+  const sessions=['asia','london','ny'];
   let ba_t=0,bb_t=0,sa_t=0,sb_t=0;
-  const rows = sessions.map(sess => {
-    const st = trades.filter(t=>t.session===sess);
-    const ba = st.filter(t=>t.direction==='buy'&&t.vwapPosition==='above').length;
-    const bb = st.filter(t=>t.direction==='buy'&&t.vwapPosition==='below').length;
-    const sa = st.filter(t=>t.direction==='sell'&&t.vwapPosition==='above').length;
-    const sb = st.filter(t=>t.direction==='sell'&&t.vwapPosition==='below').length;
-    const tot = st.length;
+  const tb=document.getElementById('st-body');
+  tb.innerHTML=sessions.map(sess=>{
+    const st=trades.filter(t=>t.session===sess);
+    const ba=st.filter(t=>t.direction==='buy'&&t.vwapPosition==='above').length;
+    const bb=st.filter(t=>t.direction==='buy'&&t.vwapPosition==='below').length;
+    const sa=st.filter(t=>t.direction==='sell'&&t.vwapPosition==='above').length;
+    const sb=st.filter(t=>t.direction==='sell'&&t.vwapPosition==='below').length;
     ba_t+=ba;bb_t+=bb;sa_t+=sa;sb_t+=sb;
-    return \`<tr>
-      <td>\${sBadge(sess)}</td>
-      <td class="g fw">\${ba||'0'}</td><td class="g">\${bb||'0'}</td>
-      <td class="r fw">\${sa||'0'}</td><td class="r">\${sb||'0'}</td>
-      <td class="b fw">\${tot||'0'}</td>
-    </tr>\`;
-  });
-  tb.innerHTML = rows.join('');
-  // footer totals
-  document.getElementById('st-ft-ba').textContent=ba_t;
-  document.getElementById('st-ft-bb').textContent=bb_t;
-  document.getElementById('st-ft-sa').textContent=sa_t;
-  document.getElementById('st-ft-sb').textContent=sb_t;
-  document.getElementById('st-ft-t').textContent=total;
-}
-
-// ── 0b. BLOCKED SIGNALS ── v12.1.3 ───────────────────────────────
-async function loadBlockedSignals(){
-  const COMPLIANCE = new Date('2026-05-03T00:00:00.000Z');
-
-  // Fetch rejects (compliance-gefilterd via since param) + webhook errors history
-  const [rejectD, histD] = await Promise.all([
-    api('/signal-stats/rejects?since=2026-05-03T00:00:00.000Z'),
-    api('/history'),
-  ]);
-
-  setDot('blk-dot', !!(rejectD||histD), rejectD ? 'OK' : 'Fout bij laden');
-  if(!rejectD && !histD){
-    document.getElementById('blk-meta').textContent='fout bij laden';
-    return;
-  }
-
-  // ── Rejects van signals_log (al compliance-gefilterd via ?since) ──
-  const allPairs = (rejectD?.topPairs||[]);
-  const byO = {};
-  (rejectD?.byOutcome||[]).forEach(r => {
-    byO[r.outcome] = r.pairs?.reduce((s,p)=>s+p.count,0) ?? 0;
-  });
-  const dupCount  = (byO['DUPLICATE_OPEN']??0)+(byO['DUPLICATE_BLOCKED']??0)+(byO['DUPLICATE']??0);
-  const vwapCount = (byO['VWAP_BAND_EXHAUSTED']??0)+(byO['VWAP_EXHAUSTED']??0);
-  const winCount  = (byO['OUTSIDE_WINDOW']??0)+(byO['OUTSIDE_HOURS']??0);
-  const curCount  = (byO['CURRENCY_BUDGET']??0)+(byO['BUDGET_EXHAUSTED']??0);
-  const rejectTotal = rejectD?.total ?? 0;
-
-  // ── Webhook errors uit /history (compliance-gefilterd client-side) ──
-  const ERROR_TYPES = ['REJECTED','SL_TP_SET_FAILED','LOT_CALC_FAILED','ORDER_NOT_CONFIRMED',
-    'VWAP_BAND_EXHAUSTED','SPREAD_GUARD_CLOSE','RR_VERIFY_FAILED',
-    'CURRENCY_BUDGET_EXHAUSTED','OUTSIDE_WINDOW'];
-  const allHist = Array.isArray(histD) ? histD : [];
-  const errRows = allHist.filter(e =>
-    ERROR_TYPES.includes(e.type) &&
-    e.ts && new Date(e.ts) >= COMPLIANCE
-  );
-  const wheCount = errRows.length;
-  const othCount = Math.max(0, rejectTotal - dupCount - vwapCount - winCount - curCount);
-  const grandTotal = rejectTotal + wheCount;
-
-  document.getElementById('blk-meta').textContent =
-    \`\${grandTotal} geblokkeerde signalen + errors · ná compliance datum\`;
-  document.getElementById('blk-total').textContent = grandTotal || '0';
-  document.getElementById('blk-dup').textContent   = dupCount   || '0';
-  document.getElementById('blk-vwap').textContent  = vwapCount  || '0';
-  document.getElementById('blk-win').textContent   = winCount   || '0';
-  document.getElementById('blk-cur').textContent   = curCount   || '0';
-  document.getElementById('blk-whe').textContent   = wheCount   || '0';
-  document.getElementById('blk-oth').textContent   = othCount   || '0';
-
-  // ── Gecombineerde tabel ──
-  const tb = document.getElementById('blk-body');
-
-  // Reject rows
-  const rejectRows = allPairs.slice(0,25).map(p => ({
-    cat: 'BLOCKED', reason: p.outcome, symbol: p.symbol||'?',
-    dir: p.direction||null, session: p.session||null,
-    count: p.count, ts: null,
-  }));
-
-  // Webhook error rows (max 25, meest recent eerst)
-  const errTableRows = errRows.slice(0,25).map(e => ({
-    cat: 'ERROR', reason: e.type, symbol: e.symbol||e.payload?.symbol||'?',
-    dir: e.direction||e.payload?.direction||null,
-    session: e.session||e.payload?.session||null,
-    count: null, ts: e.ts||null,
-  }));
-
-  const combined = [...rejectRows, ...errTableRows]
-    .sort((a,b) => (b.count||1) - (a.count||1));
-
-  if(!combined.length){
-    tb.innerHTML=\`<tr><td colspan="7" style="color:var(--dim);text-align:center">geen geblokkeerde signalen ná compliance datum</td></tr>\`;
-    return;
-  }
-
-  tb.innerHTML = combined.map(r => {
-    const catCls = r.cat === 'ERROR' ? 'r' : 'o';
-    return \`<tr>
-      <td><span class="bd bd-sl" style="font-size:8px">\${r.cat}</span></td>
-      <td style="color:var(--\${catCls});font-size:9px;max-width:200px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="\${r.reason}">\${r.reason}</td>
-      <td class="b fw">\${r.symbol}</td>
-      <td>\${r.dir ? dBadge(r.dir) : '—'}</td>
-      <td>\${r.session ? sBadge(r.session) : '—'}</td>
-      <td class="r fw">\${r.count != null ? r.count : '1'}</td>
-      <td class="d" style="font-size:9px">\${r.ts ? dtTs(r.ts) : '—'}</td>
-    </tr>\`;
+    return\`<tr><td>\${sBadge(sess)}</td><td class="g fw">\${ba||0}</td><td class="g">\${bb||0}</td><td class="r fw">\${sa||0}</td><td class="r">\${sb||0}</td><td class="b fw">\${st.length}</td></tr>\`;
   }).join('');
+  ['ba','bb','sa','sb','t'].forEach((k,i)=>document.getElementById('st-ft-'+k).textContent=[ba_t,bb_t,sa_t,sb_t,total][i]);
 }
 
-// ── 1. OPEN POSITIONS ────────────────────────────────────
+// ── ② OPEN POSITIONS — full RR timing 0.1→15R ────────────
 async function loadPositions(){
   const d=await api('/live/positions');
   const tb=document.getElementById('pos-body');
   const em=document.getElementById('pos-empty');
   const pw=document.getElementById('pos-wrap');
-  if(!d){
-    setDot('pos-dot',false,'Failed — server error or timeout');
-    document.getElementById('pos-meta').textContent='error — will retry';
-    if(tb)tb.innerHTML=emptyRow(15,'⚠ Verbindingsfout — auto-retry in 10s');
-    setTimeout(loadPositions,10000);return;
-  }
-  document.getElementById('pos-meta').textContent=d.count+' open';
+  if(!d){setDot('pos-dot',false,'Error');document.getElementById('pos-meta').textContent='error — retry in 10s';if(tb)tb.innerHTML=emptyRow(22+FAV_STEPS.length,'⚠ Verbindingsfout');setTimeout(loadPositions,10000);return;}
   setDot('pos-dot',true,'OK');
+  document.getElementById('pos-meta').textContent=d.count+' open';
   document.getElementById('k-pos').textContent=d?.count??'?';
   const pnlTotal=d?.positions?.reduce((s,p)=>s+(p.currentPnL??0),0)??null;
   const pnlEl=document.getElementById('k-pnl');
   if(pnlTotal!=null){pnlEl.textContent=(pnlTotal>=0?'+':'')+'€'+pnlTotal.toFixed(0);pnlEl.className='kv '+pC(pnlTotal);}
-  if(!d||!d.positions?.length){em.style.display='flex';pw.style.display='none';return;}
+  if(!d?.positions?.length){em.style.display='flex';pw.style.display='none';return;}
   em.style.display='none';pw.style.display='';
-  const bal=d.balance||1;
   tb.innerHTML=d.positions.map(p=>{
     const slU=p.slPctUsed||0;
     const slDist=p.sl&&p.entry?Math.abs(p.entry-p.sl):0;
-    const priceDist=p.currentPrice&&p.entry?
-      (p.direction==='buy'?(p.currentPrice-p.entry):(p.entry-p.currentPrice)):null;
+    const priceDist=p.currentPrice&&p.entry?(p.direction==='buy'?(p.currentPrice-p.entry):(p.entry-p.currentPrice)):null;
     const rrNow=slDist>0&&priceDist!=null?parseFloat((priceDist/slDist).toFixed(2)):null;
-    const rrNowCls=rrNow==null?'d':rrNow>=1?'g':rrNow>=0?'y':'r';
+    const rrNowCls=rrNow==null?'d rr-now-cell':rrNow>=1?'rr-now-cell rr-pos fw':rrNow>=0?'rr-now-cell rr-mid':rrNow>=-0.5?'rr-now-cell rr-neg':'rr-now-cell rr-neg fw';
     const tpRR=p.tpRRActual??p.tpRR;
     const riskPctShow=p.actualRiskPct??p.riskPct;
-    const riskPctCls=riskPctShow==null?'d':riskPctShow>0.35?'r':riskPctShow>0.25?'o':'g';
+    const riskPctCls=riskPctShow==null?'d':riskPctShow>0.35?'r fw':riskPctShow>0.25?'o':'g';
     const isFx=FOREX.includes(p.symbol);const isIdx=INDEX.includes(p.symbol);
     const dec=isFx?5:isIdx?2:2;
-    // SL milestone timing: tijd van entry tot elke adverse drempel
+    // adverse milestones (from slMilestones legacy + rrMilestones.adverse)
     const ms=p.slMilestones??{};
     const rrMs=p.rrMilestones??{};
-    const advMs=rrMs.adverse??{};
-    const favMs=rrMs.favorable??{};
-    // Adverse timing helper (from slMilestones legacy keys)
-    function advTime(key,cls){
-      const v=advMs[key]??ms[{'0.25':'25','0.50':'50','0.75':'75','1.00':'100'}[key]];
-      if(!v||!p.openedAt)return'<td class="d" style="font-size:9px">—</td>';
-      const mins=Math.round((new Date(v)-new Date(p.openedAt))/60000);
-      const t=mins<60?mins+'m':Math.floor(mins/60)+'h'+(mins%60?String(mins%60).padStart(2,'0')+'m':'');
-      return\`<td class="\${cls}" style="font-size:9px">\${t}</td>\`;
-    }
-    // Favorable timing helper (from rrMilestones.favorable)
-    function favTime(key){
-      const v=favMs[key];
-      if(!v||!p.openedAt)return'<td class="d" style="font-size:9px">—</td>';
-      const mins=Math.round((new Date(v)-new Date(p.openedAt))/60000);
-      const t=mins<60?mins+'m':Math.floor(mins/60)+'h'+(mins%60?String(mins%60).padStart(2,'0')+'m':'');
-      return\`<td class="g" style="font-size:9px">\${t}</td>\`;
-    }
+    const adv=rrMs.adverse??{};
+    if(!adv[0.25]&&ms['25'])adv[0.25]=ms['25'];
+    if(!adv[0.50]&&ms['50'])adv[0.50]=ms['50'];
+    if(!adv[0.75]&&ms['75'])adv[0.75]=ms['75'];
+    if(!adv[1.00]&&(ms['100']||ms['99']))adv[1.00]=ms['100']||ms['99'];
+    const fav=rrMs.favorable??{};
+    const maxRR=p.maxRR??0;
+    const maxRRCls=maxRR>=1.5?'g fw':maxRR>=0.5?'g':maxRR>0?'y':'d';
     return\`<tr class="\${tClass(p.symbol)}">
       <td data-val="\${p.symbol}" class="b fw">\${p.symbol}</td>
       <td>\${dBadge(p.direction)}</td><td>\${vBadge(p.vwapPosition)}</td><td>\${sBadge(p.session)}</td>
-      <td data-val="\${p.entry}" class="d">\${f(p.entry,dec)}</td>
-      <td data-val="\${p.sl}" class="r">\${f(p.sl,dec)}</td>
-      <td data-val="\${p.tp}" class="g">\${f(p.tp,dec)}</td>
-      <td data-val="\${rrNow??-99}" class="\${rrNowCls} fw">\${rrNow!=null?rrNow+'R':'—'}</td>
-      <td data-val="\${p.maxRR??-99}" class="\${(p.maxRR??0)>0?'g':'d'} fw">\${f(p.maxRR,2)}R</td>
+      <td data-val="\${p.entry}" class="d" style="font-size:9.5px">\${f(p.entry,dec)}</td>
+      <td data-val="\${p.sl}" class="r" style="font-size:9.5px">\${f(p.sl,dec)}</td>
+      <td data-val="\${p.tp}" class="g" style="font-size:9.5px">\${f(p.tp,dec)}</td>
+      <td data-val="\${rrNow??-99}" class="\${rrNowCls}">\${rrNow!=null?rrNow+'R':'—'}</td>
+      <td data-val="\${maxRR??-99}" class="\${maxRRCls}">\${f(maxRR,2)}R</td>
       <td>\${slBar(slU)}</td>
       <td data-val="\${tpRR??-99}" class="y">\${tpRR!=null?f(tpRR,2)+'R':'—'}</td>
       <td data-val="\${p.currentPnL??-99999}" class="\${pC(p.currentPnL)} fw">\${eu(p.currentPnL)}</td>
       <td data-val="\${p.lots}" class="c">\${f(p.lots,2)}</td>
-      <td data-val="\${riskPctShow??-1}" class="\${riskPctCls} fw">\${riskPctShow!=null?f(riskPctShow,3)+'%':'—'}</td>
-      \${advTime('0.25','o')}\${advTime('0.50','o')}\${advTime('0.75','r')}\${advTime('1.00','r fw')}
-      \${favTime(0.1)}\${favTime(0.2)}\${favTime(0.3)}\${favTime(0.4)}\${favTime(0.5)}
-      \${favTime(0.6)}\${favTime(0.7)}\${favTime(0.8)}\${favTime(0.9)}\${favTime(1.0)}
-      \${favTime(1.1)}\${favTime(1.2)}\${favTime(1.3)}\${favTime(1.4)}\${favTime(1.5)}
-      \${favTime(1.6)}\${favTime(1.7)}\${favTime(1.8)}\${favTime(1.9)}\${favTime(2.0)}
-      \${favTime(2.5)}\${favTime(3.0)}\${favTime(3.5)}\${favTime(4.0)}\${favTime(4.5)}
-      \${favTime(5.0)}\${favTime(6.0)}\${favTime(7.0)}\${favTime(8.0)}\${favTime(9.0)}
-      \${favTime(10.0)}\${favTime(11.0)}\${favTime(12.0)}\${favTime(13.0)}\${favTime(14.0)}\${favTime(15.0)}
+      <td data-val="\${riskPctShow??-1}" class="\${riskPctCls}">\${riskPctShow!=null?f(riskPctShow,3)+'%':'—'}</td>
+      \${advTd(adv,0.25,p.openedAt,'o')}
+      \${advTd(adv,0.50,p.openedAt,'o')}
+      \${advTd(adv,0.75,p.openedAt,'r')}
+      \${advTd(adv,1.00,p.openedAt,'r fw')}
+      \${FAV_STEPS.map(s=>favTd(fav,s,p.openedAt)).join('')}
       <td data-val="\${p.openedAt}" class="d" style="font-size:9px">\${dtTs(p.openedAt)}</td>
     </tr>\`;
   }).join('');
 }
 
-// ── 2. ACTIVE GHOSTS — per trade ─────────────────────────
+// ── ③ GHOST TRACKER — identical structure ─────────────────
 async function loadGhosts(){
   const d=await api('/live/ghosts');
-  if(!d){
-    setDot('gh-dot',false,'Failed — retrying in 10s');
-    document.getElementById('gh-meta').textContent='error — retrying';
-    setTimeout(loadGhosts,10000);return;
-  }
-  document.getElementById('gh-meta').textContent=d.count+' active';
+  if(!d){setDot('gh-dot',false,'Failed');document.getElementById('gh-meta').textContent='error — retry in 10s';setTimeout(loadGhosts,10000);return;}
   setDot('gh-dot',true,'OK');
+  document.getElementById('gh-meta').textContent=d.count+' active — tracken tot phantom SL / 15R / 15 dagen';
   document.getElementById('k-gh').textContent=d?.count??'?';
   const tb=document.getElementById('gh-body');
-  if(!d||!d.ghosts?.length){tb.innerHTML=emptyRow(19);return;}
+  if(!d?.ghosts?.length){tb.innerHTML=emptyRow(10+FAV_STEPS.length,'Geen actieve ghosts');return;}
   tb.innerHTML=d.ghosts.map(g=>{
     const type=sTypeName(g.symbol);
-    // Formatteer minuten vanaf entry naar milestone
-    function msFmt(isoTs){
-      if(!isoTs||!g.openedAt)return'—';
-      const mins=Math.round((new Date(isoTs)-new Date(g.openedAt))/60000);
-      if(mins<60)return mins+'m';
-      return Math.floor(mins/60)+'h'+(mins%60?String(mins%60).padStart(2,'0')+'m':'');
-    }
-    // Adverse milestones: keys 0.25 / 0.50 / 0.75 / 1.00 in rrMilestones.adverse
     const adv=g.rrMilestones?.adverse||{};
-    // Backward compat: slMilestones keys 25/50/75/100
-    if(!adv[0.25]&&g.slMilestones){
-      adv[0.25]=g.slMilestones['25'];
-      adv[0.50]=g.slMilestones['50'];
-      adv[0.75]=g.slMilestones['75'];
-      adv[1.00]=g.slMilestones['100'];
-    }
-    // Favorable milestones: keys 1/2/3/4/5/10/15 in rrMilestones.favorable
+    const sl=g.slMilestones||{};
+    if(!adv[0.25]&&sl['25'])adv[0.25]=sl['25'];
+    if(!adv[0.50]&&sl['50'])adv[0.50]=sl['50'];
+    if(!adv[0.75]&&sl['75'])adv[0.75]=sl['75'];
+    if(!adv[1.00]&&sl['100'])adv[1.00]=sl['100'];
     const fav=g.rrMilestones?.favorable||{};
-    // Helper cell: adverse = oranje/rood, favorable = groen
-    function advCell(key,cls='o'){
-      const t=msFmt(adv[key]);
-      return\`<td class="\${adv[key]?cls:'d'}" style="font-size:9px">\${t}</td>\`;
-    }
-    function favCell(key){
-      const t=msFmt(fav[key]);
-      return\`<td class="\${fav[key]?'g':'d'}" style="font-size:9px">\${t}</td>\`;
-    }
+    const maxRR=g.maxRR??0;
+    const maxRRCls=maxRR>=2?'g fw':maxRR>=1?'g':maxRR>=0.5?'y':'d';
     return\`<tr class="\${tClass(g.symbol)}">
       <td data-val="\${g.symbol}" class="b fw">\${g.symbol}</td>
       <td>\${tyBadge(type)}</td>
       <td>\${sBadge(g.session)}</td>
       <td>\${dBadge(g.direction)}</td>
       <td>\${vBadge(g.vwapPosition)}</td>
-      <td data-val="\${g.maxRR??-99}" class="\${(g.maxRR??0)>=1?'g fw':(g.maxRR??0)>0?'y':'d'}">\${f(g.maxRR,2)}R</td>
-      \${advCell(0.25,'o')}
-      \${advCell(0.50,'o')}
-      \${advCell(0.75,'r')}
-      \${advCell(1.00,'r fw')}
-      \${favCell(0.1)}\${favCell(0.2)}\${favCell(0.3)}\${favCell(0.4)}\${favCell(0.5)}
-      \${favCell(0.6)}\${favCell(0.7)}\${favCell(0.8)}\${favCell(0.9)}\${favCell(1.0)}
-      \${favCell(1.1)}\${favCell(1.2)}\${favCell(1.3)}\${favCell(1.4)}\${favCell(1.5)}
-      \${favCell(1.6)}\${favCell(1.7)}\${favCell(1.8)}\${favCell(1.9)}\${favCell(2.0)}
-      \${favCell(2.5)}\${favCell(3.0)}\${favCell(3.5)}\${favCell(4.0)}\${favCell(4.5)}
-      \${favCell(5.0)}\${favCell(6.0)}\${favCell(7.0)}\${favCell(8.0)}\${favCell(9.0)}
-      \${favCell(10.0)}\${favCell(11.0)}\${favCell(12.0)}\${favCell(13.0)}\${favCell(14.0)}\${favCell(15.0)}
-
+      <td data-val="\${maxRR}" class="\${maxRRCls}" style="font-size:13px;font-family:'Space Grotesk',sans-serif;">\${f(maxRR,2)}R</td>
+      \${advTd(adv,0.25,g.openedAt,'o')}
+      \${advTd(adv,0.50,g.openedAt,'o')}
+      \${advTd(adv,0.75,g.openedAt,'r')}
+      \${advTd(adv,1.00,g.openedAt,'r fw')}
+      \${FAV_STEPS.map(s=>favTd(fav,s,g.openedAt)).join('')}
       <td data-val="\${g.elapsedMin}" class="d">\${g.elapsedMin}min</td>
       <td data-val="\${g.openedAt}" class="d" style="font-size:9px">\${dtTs(g.openedAt)}</td>
     </tr>\`;
   }).join('');
 }
 
-// ── 3. EV / TP + SL OPTIMISER — ALL combos ───────────────
+// ── ④ GHOST HISTORY ──────────────────────────────────────
+async function loadGhostHistory(){
+  const d=await api('/ghosts/history?limit=5000');
+  if(!d){setDot('ghh-dot',false,'Failed');setTimeout(loadGhostHistory,10000);return;}
+  const rows=d?.rows||d||[];
+  setDot('ghh-dot',true,'OK — '+rows.length+' records');
+  // Filter: alleen trades ná compliance datum
+  const compRows=rows.filter(g=>g.openedAt&&new Date(g.openedAt)>=COMPLIANCE);
+  function elMin(openedAt,isoTs){if(!isoTs||!openedAt)return null;return Math.round((new Date(isoTs)-new Date(openedAt))/60000);}
+  function fmtMin(m){if(m==null)return'—';if(m<60)return m+'m';return Math.floor(m/60)+'h'+(m%60?String(m%60).padStart(2,'0'):'');}
+  const byKey={};
+  for(const g of compRows){
+    const key=g.optimizerKey||(g.symbol+'_'+g.session+'_'+g.direction+'_'+(g.vwapPosition||'unknown'));
+    if(!byKey[key])byKey[key]={sym:g.symbol,sess:g.session,dir:g.direction,vwap:g.vwapPosition,key,
+      count:0,evCount:0,bestMaxRR:0,sumRR:0,sumSLPct:0,nSL:0,
+      advSum:{0.25:0,0.50:0,0.75:0,1.00:0},advN:{0.25:0,0.50:0,0.75:0,1.00:0},
+      favSum:{0.5:0,1:0,1.5:0,2:0,3:0,5:0,10:0,15:0},favN:{0.5:0,1:0,1.5:0,2:0,3:0,5:0,10:0,15:0},
+      reasons:{}};
+    const b=byKey[key];
+    b.count++;
+    const maxRR=g.maxRRBeforeSL??g.maxRR??0;
+    b.bestMaxRR=Math.max(b.bestMaxRR,maxRR);b.sumRR+=maxRR;
+    const slPct=g.maxSlPctUsed??g.slPctUsed;
+    if(slPct!=null){b.sumSLPct+=slPct;b.nSL++;}
+    const adv=g.rrMilestones?.adverse||{};const fav=g.rrMilestones?.favorable||{};
+    const sl=g.slMilestones||{};
+    const aFb={0.25:sl['25'],0.50:sl['50'],0.75:sl['75'],1.00:sl['100']};
+    for(const step of[0.25,0.50,0.75,1.00]){const ts2=adv[step]||aFb[step];const m=elMin(g.openedAt,ts2);if(m!=null){b.advSum[step]+=m;b.advN[step]++;}}
+    for(const step of[0.5,1,1.5,2,3,5,10,15]){const ts2=fav[step]||fav[parseFloat(step+'.00')]||fav[step+'.00']||null;const m=elMin(g.openedAt,ts2);if(m!=null){b.favSum[step]+=m;b.favN[step]++;}}
+    let cr=g.stopReason||g.closeReason||'sl';
+    if(maxRR>=15)cr='maxRR';else if(cr==='phantom_sl'||cr==='sl')cr='sl';else if(cr.includes('timeout'))cr='timeout';else if(cr.includes('manual'))cr='manual';
+    b.reasons[cr]=(b.reasons[cr]||0)+1;
+    const evOk=(g.phantomSLHit||g.stopReason==='max_rr_15')&&(g.vwapPosition==='above'||g.vwapPosition==='below')&&maxRR>=0.5;
+    if(evOk)b.evCount++;
+  }
+  const combined=Object.values(byKey).filter(b=>b.sym&&b.vwap&&b.vwap!=='unknown');
+  document.getElementById('ghh-meta').textContent=combined.length+' combos · '+compRows.length+' ghosts (3 mei+)';
+  const tb=document.getElementById('ghh-body');
+  if(!combined.length){tb.innerHTML=emptyRow(26,'Geen ghost history ná compliance datum');return;}
+  combined.sort((a,b)=>b.count-a.count);
+  tb.innerHTML=combined.map(g=>{
+    const type=sTypeName(g.sym||'');
+    const avgRR=g.count>0?(g.sumRR/g.count):0;
+    const avgSL=g.nSL>0?(g.sumSLPct/g.nSL):null;
+    const topReason=Object.entries(g.reasons).sort((a,b)=>b[1]-a[1])[0]?.[0]||'sl';
+    function aAvg(s){const n=g.advN[s];return n>0?Math.round(g.advSum[s]/n):null;}
+    function fAvg(s){const n=g.favN[s];return n>0?Math.round(g.favSum[s]/n):null;}
+    function tCell(m,cls='d'){return\`<td class="\${m!=null?cls:'d'}" style="font-size:8.5px">\${m!=null?fmtMin(m):'—'}</td>\`;}
+    const mae=_maeData[g.key]??null;
+    const maeP50=mae?.maeP50;const maeP75=mae?.maeP75;const maeP90=mae?.maeP90;
+    const slRec=mae?.slReduction;
+    function maePct(v,t1,t2){if(v==null)return'<td class="d">—</td>';const c=v<t1?'g':v<t2?'y':'r';return\`<td class="\${c}" style="font-size:8.5px">\${f(v,1)}%</td>\`;}
+    const slRecCell=slRec==null?'<td class="d">—</td>':\`<td class="\${slRec.color==='g'?'g':slRec.color==='y'?'y':'r'}" style="font-size:8.5px;white-space:nowrap">\${slRec.label}</td>\`;
+    return\`<tr class="\${tClass(g.sym||'')}">
+      <td data-val="\${g.sym}" class="b fw">\${g.sym||'—'}</td>
+      <td>\${tyBadge(type)}</td>
+      <td>\${sBadge(g.sess)}</td><td>\${dBadge(g.dir)}</td><td>\${vBadge(g.vwap)}</td>
+      <td data-val="\${g.count}" class="\${g.count>=5?'y fw':'c'}">\${g.count}</td>
+      <td data-val="\${g.evCount}" class="\${g.evCount>=5?'y fw':g.evCount>=1?'c':'d'}">\${g.evCount}</td>
+      <td data-val="\${g.bestMaxRR}" class="\${g.bestMaxRR>0?'g fw':'d'}">\${f(g.bestMaxRR,2)}R</td>
+      <td data-val="\${avgRR}" class="\${avgRR>=1?'g':avgRR>0?'y':'d'}">\${f(avgRR,2)}R</td>
+      \${tCell(aAvg(0.25),'o')}\${tCell(aAvg(0.50),'o')}\${tCell(aAvg(0.75),'r')}\${tCell(aAvg(1.00),'r')}
+      \${tCell(fAvg(0.5),'g')}\${tCell(fAvg(1),'g')}\${tCell(fAvg(1.5),'g')}\${tCell(fAvg(2),'g')}\${tCell(fAvg(3),'g')}\${tCell(fAvg(5),'g')}\${tCell(fAvg(10),'g')}\${tCell(fAvg(15),'g')}
+      <td>\${cBadge(topReason)}</td>
+      \${maePct(maeP50,40,65)}\${maePct(maeP75,50,75)}\${maePct(maeP90,50,80)}\${slRecCell}
+    </tr>\`;
+  }).join('');
+  // Also feed SL optimizer
+  renderSLOptimizer(combined);
+}
+
+// ── ⑦ SL OPTIMIZER — read only ───────────────────────────
+function renderSLOptimizer(combined){
+  const tb=document.getElementById('sl-opt-body');
+  const hasMae=combined.filter(g=>{const m=_maeData[g.key];return m?.maeP90!=null;});
+  if(!hasMae.length){tb.innerHTML=emptyRow(12,'Geen MAE data beschikbaar — wacht op ghost history');return;}
+  hasMae.sort((a,b)=>{
+    const ma=_maeData[a.key];const mb=_maeData[b.key];
+    const sa=(ma?.slReduction?.pct??100);const sb=(mb?.slReduction?.pct??100);
+    return sa-sb;
+  });
+  tb.innerHTML=hasMae.map(g=>{
+    const type=sTypeName(g.sym||'');
+    const mae=_maeData[g.key]??null;
+    const p50=mae?.maeP50;const p75=mae?.maeP75;const p90=mae?.maeP90;
+    const slRec=mae?.slReduction;
+    function maePct(v,t1,t2){if(v==null)return'<td class="d">—</td>';const c=v<t1?'g':v<t2?'y':'r';return\`<td class="\${c}">\${f(v,1)}%</td>\`;}
+    const savings=slRec?.pct?(\`\${(100-slRec.pct).toFixed(0)}% smaller SL\`):'—';
+    return\`<tr class="\${tClass(g.sym||'')}">
+      <td class="b fw">\${g.sym||'—'}</td>
+      <td>\${tyBadge(type)}</td>
+      <td>\${sBadge(g.sess)}</td><td>\${dBadge(g.dir)}</td><td>\${vBadge(g.vwap)}</td>
+      <td class="\${g.count>=5?'y fw':'c'}">\${g.count}</td>
+      <td class="d">huidig</td>
+      \${maePct(p50,40,65)}\${maePct(p75,50,75)}\${maePct(p90,50,80)}
+      <td class="\${slRec?.color==='g'?'g':slRec?.color==='y'?'y':'r'}">\${slRec?.label||'—'}</td>
+      <td class="c">\${savings}</td>
+    </tr>\`;
+  }).join('');
+}
+
+// ── ⑤ EV OPTIMIZER ───────────────────────────────────────
 async function loadEV(){
   const countD=await api('/trades?limit=1');
   const realLimit=countD?.count??5000;
   const [trD,tpD]=await Promise.all([api('/trades?limit='+Math.max(realLimit,5000)),api('/tp-locks')]);
-  if(!trD){setDot('ev-dot',false,'Failed to load trades');return;}
+  if(!trD){setDot('ev-dot',false,'Failed');return;}
   _allTrades=trD.trades||[];
   _tpMap={};if(tpD)tpD.forEach(t=>{_tpMap[t.key]=t;});
   document.getElementById('k-tp').textContent=Object.values(_tpMap).filter(t=>(t.evAtLock??0)>0).length;
   _buildCombos();
-  setDot('ev-dot',true,'Trades geladen · EV data wordt opgehaald...');
-  _loadEVWithRetry().catch(()=>{});
+  setDot('ev-dot',true,'EV data opbouwen...');
+  _loadEVWithRetry();
 }
 
 async function _loadEVWithRetry(attempt=0){
-  const MAX=12, INTERVAL=5000;
+  const MAX=12,INTERVAL=5000;
   const evD=await api('/ev');
   _evMap={};
   if(evD&&evD.length>0){
     evD.forEach(e=>{_evMap[e.key]=e;});
     setDot('ev-dot',true,'EV: '+evD.filter(e=>e.count>0).length+' combos met data');
-    _buildCombos();
-    return;
+    _buildCombos();return;
   }
-  if(attempt<MAX){
-    setDot('ev-dot',false,'EV cache opbouwen... ('+(attempt+1)+'/'+MAX+')');
-    setTimeout(()=>_loadEVWithRetry(attempt+1),INTERVAL);
-  } else {
-    setDot('ev-dot',false,'EV cache niet beschikbaar — klik REFRESH');
-  }
+  if(attempt<MAX){setDot('ev-dot',false,'EV cache opbouwen... ('+(attempt+1)+'/'+MAX+')');setTimeout(()=>_loadEVWithRetry(attempt+1),INTERVAL);}
+  else setDot('ev-dot',false,'EV cache niet beschikbaar — klik REFRESH');
 }
 
 function _buildCombos(){
@@ -4066,27 +4036,14 @@ function _buildCombos(){
   for(const sym of allSyms){
     const type=sTypeName(sym);
     const sessions=type==='stock'?['ny']:['asia','london','ny'];
-    for(const sess of sessions){
-      for(const dir of['buy','sell']){
-        for(const vwap of['above','below']){
-          const key=sym+'_'+sess+'_'+dir+'_'+vwap;
-          const trades=_allTrades.filter(t=>
-            t.symbol===sym&&t.session===sess&&t.direction===dir&&
-            t.vwapPosition===vwap&&t.closedAt!=null&&
-            t.openedAt&&new Date(t.openedAt)>=TP_OPT_DATE
-          );
-          const totalPnl=trades.reduce((s,t)=>s+(t.realizedPnlEUR??t.currentPnL??0),0);
-          const ev=_evMap[key]??null;
-          const tp=_tpMap[key]??null;
-          combos.push({sym,sess,dir,vwap,key,trades,totalPnl,type,ev,tp});
-        }
-      }
+    for(const sess of sessions)for(const dir of['buy','sell'])for(const vwap of['above','below']){
+      const key=sym+'_'+sess+'_'+dir+'_'+vwap;
+      const trades=_allTrades.filter(t=>t.symbol===sym&&t.session===sess&&t.direction===dir&&t.vwapPosition===vwap&&t.closedAt!=null&&t.openedAt&&new Date(t.openedAt)>=COMPLIANCE);
+      const totalPnl=trades.reduce((s,t)=>s+(t.realizedPnlEUR??t.currentPnL??0),0);
+      combos.push({sym,sess,dir,vwap,key,trades,totalPnl,type,ev:_evMap[key]??null,tp:_tpMap[key]??null});
     }
   }
-  _evData=combos;renderEV();
-  loadGhostHistory();
-  buildMatrix(combos);
-  renderComboFilter(combos);
+  _evData=combos;renderEV();loadGhostHistory();buildMatrix(combos);renderComboFilter(combos);
 }
 
 function renderEV(){
@@ -4095,75 +4052,39 @@ function renderEV(){
   if(evF.sess!=='all')d=d.filter(c=>c.sess===evF.sess);
   if(evF.dir!=='all')d=d.filter(c=>c.dir===evF.dir);
   if(evF.vwap!=='all')d=d.filter(c=>c.vwap===evF.vwap);
-  // Standaard: enkel combos tonen met minstens 1 afgewerkte ghost
-  // (phantom SL hit, 15R bereikt of 15 dagen timeout — NIET actieve lege ghosts)
-  if(evF.min==='0'){
-    // "Alle" filter: toon enkel combos met ghost data (>=1 afgewerkte ghost)
-    // 0-ghost combos zijn nutteloos — geen data = geen beslissing mogelijk
-    d=d.filter(c=>(c.ev?.count??0)>=1);
-  } else if(evF.min==='5'){
-    d=d.filter(c=>(c.ev?.count??0)>=5);
-  } else if(evF.min==='10'){
-    d=d.filter(c=>(c.ev?.count??0)>=10);
-  } else if(evF.min==='1'){
-    d=d.filter(c=>(c.ev?.count??0)>=1);
-  }
-  d.sort((a,b)=>{
-    // First: combos with ghost data, then without
-    const ha=(a.ev?.count??0)>0, hb=(b.ev?.count??0)>0;
-    if(ha!==hb)return ha?-1:1;
-    const ea=a.ev?.bestEV??-999,eb=b.ev?.bestEV??-999;
-    if(eb!==ea)return eb-ea;
-    return (b.ev?.count??0)-(a.ev?.count??0);
-  });
+  if(evF.min==='0')d=d.filter(c=>(c.ev?.count??0)>=1);
+  else if(evF.min==='5')d=d.filter(c=>(c.ev?.count??0)>=5);
+  else if(evF.min==='10')d=d.filter(c=>(c.ev?.count??0)>=10);
+  else if(evF.min==='1')d=d.filter(c=>(c.ev?.count??0)>=1);
+  d.sort((a,b)=>{const ha=(a.ev?.count??0)>0,hb=(b.ev?.count??0)>0;if(ha!==hb)return ha?-1:1;return (b.ev?.bestEV??-999)-(a.ev?.bestEV??-999);});
   const withData=d.filter(c=>c.ev&&c.ev.count>0);
-  const withZero=d.filter(c=>!c.ev||c.ev.count===0);
   const pnl=d.reduce((s,c)=>s+c.totalPnl,0);
-  const totalCombos=d.length;
-  const totalGhosts=d.reduce((s,c)=>s+(c.ev?.count??0),0);
-  const metaNote=withData.length===0?' · ⚠ Nog geen ghost data — ghost lopen pas na phantom SL hit':' · '+totalGhosts+' ghosts over '+withData.length+' combos';
-  document.getElementById('ev-meta').textContent=totalCombos+' combos'+metaNote+(_evMap&&Object.keys(_evMap).length===0?' · ⏳ laden...':'');
-  document.getElementById('ev-count').textContent=totalCombos;
-  document.getElementById('ev-trades').textContent=withData.length===0?'0 (ghosts actief, nog geen SL hit)':withData.length;
-  document.getElementById('ev-zero').textContent=withZero.length;
-  const cEl=document.getElementById('ev-compliance-stat');
-  const cNEl=document.getElementById('ev-compliance-n');
-  if(cEl&&cNEl){cEl.style.display='';cNEl.textContent=totalGhosts+' phantom SL hits (data na 27/04/2026)';}
+  document.getElementById('ev-meta').textContent=d.length+' combos · '+withData.length+' met ghost data';
+  document.getElementById('ev-count').textContent=d.length;
+  document.getElementById('ev-trades').textContent=withData.length;
+  document.getElementById('ev-zero').textContent=d.filter(c=>!c.ev||c.ev.count===0).length;
   const pEl=document.getElementById('ev-pnl');pEl.textContent=(pnl>=0?'+':'')+'€'+pnl.toFixed(0);pEl.className='sv2 '+pC(pnl);
   document.getElementById('ev-locked').textContent=d.filter(c=>c.tp&&(c.ev?.bestEV??0)>0).length;
   const tb=document.getElementById('ev-body');
-  if(!d.length){
-    tb.innerHTML=emptyRow(16,'Geen combos met huidige filters');
-    return;
-  }
+  if(!d.length){tb.innerHTML=emptyRow(16,'Geen combos met huidige filters');return;}
   tb.innerHTML=d.map(c=>{
     const ev=c.ev;const tp=c.tp;
-    const evV=ev?.bestEV??null;
-    const ghostN=ev?.count??0;
-    const tradeN=c.trades?.length??0;
-    const ready=ghostN>=5;
-    const bestTP=tp?tp.lockedRR:(ev?.bestRR??null);
-    const avgTimeMin=ev?.avgTimeToSLMin??null;
-    const avgSlPct=ev?.avgMaxSlPct??null;
-    const bestSlW=ev?.bestWinnerSlPct??null;
-    // row opacity: lighter if no data at all
-    const rowStyle=ghostN===0&&tradeN===0?' style="opacity:.45"':'';
+    const evV=ev?.bestEV??null;const ghostN=ev?.count??0;const tradeN=c.trades?.length??0;
+    const ready=ghostN>=5;const bestTP=tp?tp.lockedRR:(ev?.bestRR??null);
+    const rowStyle=ghostN===0&&tradeN===0?' style="opacity:.4"':'';
     return\`<tr class="\${tClass(c.sym)}"\${rowStyle}>
       <td data-val="\${c.sym}" class="b fw">\${c.sym}</td>
-      <td>\${tyBadge(c.type)}</td>
-      <td>\${sBadge(c.sess)}</td>
-      <td>\${dBadge(c.dir)}</td>
-      <td>\${vBadge(c.vwap)}</td>
+      <td>\${tyBadge(c.type)}</td><td>\${sBadge(c.sess)}</td><td>\${dBadge(c.dir)}</td><td>\${vBadge(c.vwap)}</td>
       <td data-val="\${ghostN}" class="\${ready?'y fw':ghostN>0?'c':'d'}">\${ghostN===0?'<span class="d">0</span>':ghostN+(ready?'':' <span class="d" style="font-size:8px">('+(5-ghostN)+'→5)</span>')}</td>
       <td data-val="\${tradeN}" class="\${tradeN>0?'b':'d'}">\${tradeN}</td>
       <td data-val="\${bestTP??-99}" class="\${bestTP?'g fw':'d'}">\${bestTP!=null?f(bestTP,1)+'R':'—'}</td>
       <td data-val="\${ev?.avgRR??-99}" class="\${(ev?.avgRR??0)>=1?'g':'d'}">\${ev?.avgRR!=null?f(ev.avgRR,2)+'R':'—'}</td>
       <td data-val="\${evV??-999}" class="\${evC(evV)} fw">\${evV!=null?evV.toFixed(3):'—'}</td>
-      <td>\${ready?(evV!=null?(evV>0?'<span class="bd bd-evp">EV+ ✓</span>':'<span class="bd bd-evn">EV-</span>'):'<span class="bd d">pending</span>'):('<span class="d" style="font-size:9px">'+(ghostN>0?'need '+(5-ghostN)+' more':'geen data')+'</span>')}</td>
+      <td>\${ready?(evV!=null?(evV>0?'<span class="bd bd-evp">EV+ ✓</span>':'<span class="bd bd-evn">EV-</span>'):'<span class="bd d">pending</span>'):('<span class="d" style="font-size:8.5px">'+(ghostN>0?'need '+(5-ghostN)+' more':'geen data')+'</span>')}</td>
       <td>\${tp?\`<span class="bd bd-lck">★ \${tp.lockedRR.toFixed(1)}R</span>\`:'<span class="d">—</span>'}</td>
-      <td data-val="\${avgTimeMin??9999}" class="d">\${avgTimeMin!=null?avgTimeMin+'min':'—'}</td>
-      <td data-val="\${avgSlPct??-1}" class="\${avgSlPct!=null?(avgSlPct<50?'g':avgSlPct<80?'y':'o'):'d'}" title="Avg max SL% used — lower = can tighten">\${avgSlPct!=null?f(avgSlPct,1)+'%':'—'}</td>
-      <td data-val="\${bestSlW??-1}" class="g" title="Best SL% from winning ghosts (read only)">\${bestSlW!=null?f(bestSlW,1)+'%':'—'}</td>
+      <td data-val="\${ev?.avgTimeToSLMin??9999}" class="d">\${ev?.avgTimeToSLMin!=null?ev.avgTimeToSLMin+'min':'—'}</td>
+      <td data-val="\${ev?.avgMaxSlPct??-1}" class="\${ev?.avgMaxSlPct!=null?(ev.avgMaxSlPct<50?'g':ev.avgMaxSlPct<80?'y':'o'):'d'}">\${ev?.avgMaxSlPct!=null?f(ev.avgMaxSlPct,1)+'%':'—'}</td>
+      <td data-val="\${ev?.bestWinnerSlPct??-1}" class="g">\${ev?.bestWinnerSlPct!=null?f(ev.bestWinnerSlPct,1)+'%':'—'}</td>
       <td data-val="\${c.totalPnl}" class="\${pC(c.totalPnl)} fw">\${eu(c.totalPnl)}</td>
     </tr>\`;
   }).join('');
@@ -4171,263 +4092,52 @@ function renderEV(){
 
 function setEVF(k,v,btn){evF[k]=v;btn.closest('.fbar').querySelectorAll('.fb').forEach(b=>{if(b.getAttribute('onclick')?.includes("'"+k+"'"))b.classList.remove('on');});btn.classList.add('on');renderEV();}
 
-
-// ── 4. GHOST HISTORY — COMBINED per optimizer_key ────────
-async function loadGhostHistory(){
-  const d=await api('/ghosts/history?limit=5000');
-  if(!d){setDot('ghh-dot',false,'Failed — retry in 10s');setTimeout(loadGhostHistory,10000);return;}
-  const rows=d?.rows||d||[];
-  setDot('ghh-dot',true,'OK — '+rows.length+' records');
-
-  // Helper: elapsed minutes from openedAt to a milestone ISO timestamp
-  function elMin(openedAt, isoTs){
-    if(!isoTs||!openedAt)return null;
-    return Math.round((new Date(isoTs)-new Date(openedAt))/60000);
-  }
-  function fmtMin(m){
-    if(m==null)return'—';
-    if(m<60)return m+'m';
-    return Math.floor(m/60)+'h'+(m%60?String(m%60).padStart(2,'0'):'');
-  }
-
-  // Aggregate by optimizer key
-  const byKey={};
-  for(const g of rows){
-    const key=g.optimizerKey||(g.symbol+'_'+g.session+'_'+g.direction+'_'+(g.vwapPosition||'unknown'));
-    if(!byKey[key]) byKey[key]={
-      sym:g.symbol,sess:g.session,dir:g.direction,vwap:g.vwapPosition,
-      count:0,evCount:0,bestMaxRR:0,sumRR:0,sumSLPct:0,nSL:0,
-      // RR adverse milestone sums: time from open to -0.25/-0.50/-0.75/-1.00R
-      advSum:{0.25:0,0.50:0,0.75:0,1.00:0},advN:{0.25:0,0.50:0,0.75:0,1.00:0},
-      // RR favorable milestone sums: 1/2/3/4/5/10/15R
-      favSum:{1:0,2:0,3:0,4:0,5:0,10:0,15:0},favN:{1:0,2:0,3:0,4:0,5:0,10:0,15:0},
-      lastOpenedAt:g.openedAt,reasons:{}
-    };
-    const b=byKey[key];
-    b.count++;
-    const maxRR=g.maxRRBeforeSL??g.maxRR??0;
-    b.bestMaxRR=Math.max(b.bestMaxRR,maxRR);
-    b.sumRR+=maxRR;
-    const slPct=g.maxSlPctUsed??g.slPctUsed;
-    if(slPct!=null){b.sumSLPct+=slPct;b.nSL++;}
-
-    // RR milestones — support both new rrMilestones and legacy slMilestones
-    const adv=g.rrMilestones?.adverse||{};
-    const fav=g.rrMilestones?.favorable||{};
-    // Legacy fallback
-    const sl=g.slMilestones||{};
-    const advFallback={0.25:sl['25'],0.50:sl['50'],0.75:sl['75'],1.00:sl['100']};
-    for(const step of [0.25,0.50,0.75,1.00]){
-      const ts=adv[step]||advFallback[step];
-      const m=elMin(g.openedAt,ts);
-      if(m!=null){b.advSum[step]+=m;b.advN[step]++;}
-    }
-    // Favorable: probeer exact key, dan ook 1.00/2.00/3.00/4.00/5.00/10.00/15.00
-    for(const step of [1,2,3,4,5,10,15]){
-      const ts=fav[step]||fav[parseFloat(step+'.00')]||fav[step+'.00']||null;
-      const m=elMin(g.openedAt,ts);
-      if(m!=null){b.favSum[step]+=m;b.favN[step]++;}
-    }
-
-    let cr=g.stopReason||g.closeReason||'sl';
-    if(maxRR>=15)cr='maxRR';
-    else if(cr==='phantom_sl'||cr==='sl')cr='sl';
-    else if(cr==='timeout_72h'||cr==='timeout_2w')cr='timeout';
-    else if(cr==='manual_deploy')cr='manual';
-    b.reasons[cr]=(b.reasons[cr]||0)+1;
-    const evOk=(g.phantomSLHit||g.stopReason==='max_rr_15')&&(g.vwapPosition==='above'||g.vwapPosition==='below')&&maxRR>=0.5;
-    if(evOk) b.evCount++;
-    if(!b.lastOpenedAt||g.openedAt>b.lastOpenedAt)b.lastOpenedAt=g.openedAt;
-  }
-  const combined=Object.values(byKey).filter(b=>b.sym&&b.vwap&&b.vwap!=='unknown');
-  const totalGhosts=rows.length;
-  const totalEV=combined.reduce((s,b)=>s+b.evCount,0);
-  document.getElementById('ghh-meta').textContent=
-    combined.length+' combinaties · '+totalGhosts+' ghosts · '+totalEV+' EV-eligible';
-  const tb=document.getElementById('ghh-body');
-  if(!combined.length){tb.innerHTML=emptyRow(19,'Geen ghost history — wacht op eerste phantom SL hit');return;}
-  combined.sort((a,b)=>b.count-a.count);
-  tb.innerHTML=combined.map(g=>{
-    const type=sTypeName(g.sym||'');
-    const avgRR=g.count>0?(g.sumRR/g.count):0;
-    const avgSL=g.nSL>0?(g.sumSLPct/g.nSL):null;
-    const topReason=Object.entries(g.reasons).sort((a,b)=>b[1]-a[1])[0]?.[0]||'sl';
-    const evCls=g.evCount>=5?'y fw':g.evCount>=1?'c':'d';
-    // Avg time per adverse/favorable step
-    function avgAdv(step){const n=g.advN[step];return n>0?Math.round(g.advSum[step]/n):null;}
-    function avgFav(step){const n=g.favN[step];return n>0?Math.round(g.favSum[step]/n):null;}
-    function tCell(m,cls='d'){return\`<td class="\${m!=null?cls:'d'}" style="font-size:9px">\${m!=null?fmtMin(m):'—'}</td>\`;}
-    // MAE data voor deze combo key
-    const mae=_maeData[g.key]??null;
-    const maeP50=mae?.maeP50;const maeP75=mae?.maeP75;const maeP90=mae?.maeP90;
-    const slRec=mae?.slReduction;
-    const maePctCell=(v,threshG,threshY)=>{
-      if(v==null)return'<td class="d">—</td>';
-      const cls=v<threshG?'g':v<threshY?'y':'r';
-      return\`<td class="\${cls}" style="font-size:9px">\${f(v,1)}%</td>\`;
-    };
-    const slRecCell=slRec==null?'<td class="d">—</td>':
-      \`<td class="\${slRec.color==='g'?'g':slRec.color==='y'?'y':'r'}" style="font-size:9px;white-space:nowrap" title="Gebaseerd op MAE p90=\${maeP90??'—'}%">\${slRec.label}</td>\`;
-    return\`<tr class="\${tClass(g.sym||'')}">
-      <td data-val="\${g.sym}" class="b fw">\${g.sym||'—'}</td>
-      <td>\${tyBadge(type)}</td>
-      <td>\${sBadge(g.sess)}</td>
-      <td>\${dBadge(g.dir)}</td>
-      <td>\${vBadge(g.vwap)}</td>
-      <td data-val="\${g.count}" class="\${g.count>=5?'y fw':'c'}">\${g.count}</td>
-      <td data-val="\${g.evCount}" class="\${evCls}" title="EV-eligible ghosts">\${g.evCount}</td>
-      <td data-val="\${g.bestMaxRR}" class="\${g.bestMaxRR>0?'g':'d'} fw">\${f(g.bestMaxRR,2)}R</td>
-      <td data-val="\${avgRR}" class="\${avgRR>=1?'g':avgRR>0?'y':'d'}">\${f(avgRR,2)}R</td>
-      \${tCell(avgAdv(0.25),'o')}
-      \${tCell(avgAdv(0.50),'o')}
-      \${tCell(avgAdv(0.75),'r')}
-      \${tCell(avgAdv(1.00),'r')}
-      \${tCell(avgFav(1),'g')}
-      \${tCell(avgFav(2),'g')}
-      \${tCell(avgFav(3),'g')}
-      \${tCell(avgFav(4),'g')}
-      \${tCell(avgFav(5),'g')}
-      \${tCell(avgFav(10),'g')}
-      \${tCell(avgFav(15),'g')}
-      <td>\${cBadge(topReason)}</td>
-      \${maePctCell(maeP50,40,65)}
-      \${maePctCell(maeP75,50,75)}
-      \${maePctCell(maeP90,50,80)}
-      \${slRecCell}
-    </tr>\`;
-  }).join('');
-}
-
-// ── 5. WEBHOOK ERRORS ────────────────────────────────────
-async function loadErrors(){
-  const d=await api('/history');
-  if(d===null){
-    setDot('whe-dot',false,'Failed — retrying in 10s');
-    document.getElementById('whe-meta').textContent='error — retrying';
-    setTimeout(loadErrors,10000);return;
-  }
-  const all=Array.isArray(d)?d:[];
-  const errs=all.filter(e=>['REJECTED','SL_TP_SET_FAILED','LOT_CALC_FAILED','ORDER_NOT_CONFIRMED','VWAP_BAND_EXHAUSTED','SPREAD_GUARD_CLOSE','RR_VERIFY_FAILED','CURRENCY_BUDGET_EXHAUSTED','OUTSIDE_WINDOW'].includes(e.type));
-  document.getElementById('whe-meta').textContent=errs.length+' errors';
-  setDot('whe-dot',true,'OK — '+errs.length+' errors');
-  document.getElementById('k-err').textContent=errs.length;
-  const tb=document.getElementById('whe-body');
-  if(!errs.length){tb.innerHTML='<tr><td colspan="10" class="nodata g">✓ No errors</td></tr>';return;}
-  tb.innerHTML=errs.slice(0,80).map(e=>{
-    const p=e.payload||{};
-    const bandPct=p.vwapBandPct||e.vwapBandPct;
-    const bandStr=bandPct!=null?((+bandPct)*100).toFixed(0)+'%':'—';
-    return\`<tr>
-      <td class="d" style="font-size:9px">\${ts(e.ts)}</td>
-      <td><span class="r" style="font-size:9px;font-weight:700">\${e.type}</span></td>
-      <td class="b">\${e.symbol||p.symbol||'—'}</td>
-      <td>\${dBadge(e.direction||p.direction)}</td>
-      <td>\${sBadge(e.session||p.session)}</td>
-      <td>\${vBadge(e.vwapPos||p.vwapPosition)}</td>
-      <td class="d">\${e.entry?f(e.entry,5):'—'}</td>
-      <td class="o">\${p.slPctHuman||p.derivedSlPct||'—'}</td>
-      <td class="\${bandPct&&(+bandPct)>1.5?'r':'d'}">\${bandStr}</td>
-      <td class="d" style="max-width:220px;overflow:hidden;text-overflow:ellipsis;font-size:9px">\${e.reason||p.reason||''}</td>
-    </tr>\`;
-  }).join('');
-}
-
-async function loadBandSignals(minPct,maxPct,prefix){
-  const tier=prefix==='band150'?'150_250':'250_350';
-  const d=await api(\`/band-ghost-stats?tier=\${tier}\`);
-  const rows=d?.rows||[];
-  const tb=document.getElementById(prefix+'-body');
-  const strip=document.getElementById(prefix+'-strip');
-  if(!rows.length){
-    tb.innerHTML=emptyRow(9,\`Geen ghost data voor \${tier.replace('_','%–')}%\`);
-    if(strip)strip.style.display='none';return;
-  }
-  const totalN=rows.reduce((s,r)=>s+(+r.n||0),0);
-  const rrRows=rows.filter(r=>r.avgMaxRR!=null);
-  const avgRR=rrRows.length?rrRows.reduce((s,r)=>s+(+r.avgMaxRR),0)/rrRows.length:0;
-  const slRows=rows.filter(r=>r.avgSlPct!=null);
-  const avgSL=slRows.length?slRows.reduce((s,r)=>s+(+r.avgSlPct),0)/slRows.length:0;
-  if(strip)strip.style.display='flex';
-  const pfx=prefix==='band150'?'b150':'b250';
-  const nEl=document.getElementById(pfx+'-n');const rrEl=document.getElementById(pfx+'-rr');const slEl=document.getElementById(pfx+'-sl');
-  if(nEl)nEl.textContent=totalN;
-  if(rrEl)rrEl.textContent=avgRR?f(avgRR,2)+'R':'—';
-  if(slEl)slEl.textContent=avgSL?f(avgSL,1)+'%':'—';
-  tb.innerHTML=rows.map(r=>\`<tr class="\${tClass(r.symbol||'')}">
-    <td class="b fw">\${r.symbol||'—'}</td>
-    <td>\${sBadge(r.session)}</td>
-    <td>\${dBadge(r.direction)}</td>
-    <td>\${vBadge(r.vwapPosition)}</td>
-    <td class="\${(+r.n||0)>=5?'y fw':'c'}">\${r.n||0}</td>
-    <td class="\${(+r.avgMaxRR||0)>=2?'g fw':(+r.avgMaxRR||0)>=1?'y fw':'d'}">\${r.avgMaxRR!=null?f(r.avgMaxRR,2)+'R':'—'}</td>
-    <td class="g">\${r.maxMaxRR!=null?f(r.maxMaxRR,2)+'R':'—'}</td>
-    <td class="\${(+r.avgSlPct||0)<50?'g':(+r.avgSlPct||0)<80?'y':'o'}">\${r.avgSlPct!=null?f(r.avgSlPct,1)+'%':'—'}</td>
-    <td class="d">\${r.avgTimeMin!=null?r.avgTimeMin+'min':'—'}</td>
-  </tr>\`).join('');
-}
-
-// ── 6. EV MATRIX ─────────────────────────────────────────
+// ── ⑥ EV MATRIX ──────────────────────────────────────────
 function buildMatrix(combos){
+  const byKey={};combos.forEach(c=>{byKey[c.key]=c;});
   const make=(syms,tid)=>{
-    const byKey={};combos.forEach(c=>{byKey[c.key]=c;});
-    const body=document.getElementById('mxb-'+tid);
-    if(!body)return;
+    const body=document.getElementById('mxb-'+tid);if(!body)return;
     body.innerHTML=syms.map(sym=>{
-      return'<tr>'+[
-        \`<td class="sym">\${sym}</td>\`,
-        ...[['buy','above'],['buy','below'],['sell','above'],['sell','below']].map(([dir,vwap])=>{
-          const sess=STOCKS.includes(sym)?'ny':null;
-          const keys=sess?[sym+'_'+sess+'_'+dir+'_'+vwap]:
-            ['asia','london','ny'].map(s=>sym+'_'+s+'_'+dir+'_'+vwap);
-          const cs=keys.map(k=>byKey[k]).filter(Boolean);
-          const n=cs.reduce((s,c)=>s+c.trades.length,0);
-          if(!n)return\`<td class="ez">—</td>\`;
-          const allEV=cs.map(c=>c.ev?.bestEV).filter(v=>v!=null);
-          const evV=allEV.length?allEV.reduce((s,v)=>s+v,0)/allEV.length:null;
-          const allTPs=cs.map(c=>c.tp?.lockedRR).filter(v=>v!=null);
-          const tpV=allTPs.length?Math.max(...allTPs):null;
-          const cls=evV==null?'ez':evV>0?'ep':'en';
-          const star=tpV?'★':'';
-          return\`<td class="\${cls}" title="n=\${n} EV=\${evV!=null?evV.toFixed(3):'?'}">\${star}\${evV!=null?evV.toFixed(2):'?'}<br><span style="font-size:8px;color:var(--dim)">n=\${n}</span></td>\`;
-        })
-      ].join('')+'</tr>';
+      const isSK=STOCKS.includes(sym);
+      return'<tr>'+[\`<td class="sym">\${sym}</td>\`,...[['buy','above'],['buy','below'],['sell','above'],['sell','below']].map(([dir,vwap])=>{
+        const keys=isSK?[sym+'_ny_'+dir+'_'+vwap]:['asia','london','ny'].map(s=>sym+'_'+s+'_'+dir+'_'+vwap);
+        const cs=keys.map(k=>byKey[k]).filter(Boolean);
+        const n=cs.reduce((s,c)=>s+c.trades.length,0);
+        if(!n)return'<td class="ez">—</td>';
+        const allEV=cs.map(c=>c.ev?.bestEV).filter(v=>v!=null);
+        const evV=allEV.length?allEV.reduce((s,v)=>s+v,0)/allEV.length:null;
+        const allTPs=cs.map(c=>c.tp?.lockedRR).filter(v=>v!=null);
+        const tpV=allTPs.length?Math.max(...allTPs):null;
+        const cls=evV==null?'ez':evV>0?'ep':'en';
+        return\`<td class="\${cls}" title="n=\${n} EV=\${evV!=null?evV.toFixed(3):'?'}">\${tpV?'★':''}\${evV!=null?evV.toFixed(2):'?'}<br><span style="font-size:7.5px;color:var(--dim)">n=\${n}</span></td>\`;
+      })].join('')+'</tr>';
     }).join('');
   };
   make(FOREX,'fx');make(INDEX,'ix');make(COMM,'cm');make(STOCKS,'sk');
 }
 
-// ── 7. COMBO SELECTION ────────────────────────────────────
+// ── ⑧ COMBO SELECTION ────────────────────────────────────
 function renderComboFilter(combos){
   let d=[...combos];
-  if(cfF.show==='all')d=d.filter(c=>(c.ev?.count??0)>0||c.trades?.length>0||c.totalPnl!==0);
+  if(cfF.show==='all')d=d.filter(c=>(c.ev?.count??0)>0||c.trades?.length>0);
   else if(cfF.show==='ev+')d=d.filter(c=>(c.ev?.bestEV??0)>0);
   else if(cfF.show==='ev-')d=d.filter(c=>c.ev?.bestEV!=null&&c.ev.bestEV<0);
   else if(cfF.show==='min5')d=d.filter(c=>(c.ev?.count??0)>=5);
   if(cfF.sort==='ev')d.sort((a,b)=>(b.ev?.bestEV??-999)-(a.ev?.bestEV??-999));
   else if(cfF.sort==='pnl')d.sort((a,b)=>b.totalPnl-a.totalPnl);
-  else if(cfF.sort==='winpct')d.sort((a,b)=>(b.ev?.bestEV??-999)-(a.ev?.bestEV??-999));
   else if(cfF.sort==='trades')d.sort((a,b)=>(b.ev?.count??0)-(a.ev?.count??0));
   const tb=document.getElementById('cf-body');
-  if(!d.length){tb.innerHTML=emptyRow(11,'No traded combos yet');return;}
+  if(!d.length){tb.innerHTML=emptyRow(11,'Geen traded combos');return;}
   tb.innerHTML=d.map((c,i)=>{
-    const evV=c.ev?.bestEV??null;
-    const ghostN=c.ev?.count??0;
-    const ready=ghostN>=5;
+    const evV=c.ev?.bestEV??null;const ghostN=c.ev?.count??0;const ready=ghostN>=5;
     let action='—',aCls='d';
-    if(ready){
-      if(evV!=null&&evV>0.05){action='⬆ KEEP / SCALE';aCls='g';}
-      else if(evV!=null&&evV<-0.05){action='⬇ CONSIDER CUT';aCls='r';}
-      else{action='↔ NEUTRAL';aCls='y';}
-    } else if(ghostN>0){action=\`need \${5-ghostN} more ghosts\`;aCls='d';}
-    else{action='no data yet';aCls='d';}
+    if(ready){if(evV!=null&&evV>0.05){action='⬆ BEHOUDEN / SCHALEN';aCls='g';}else if(evV!=null&&evV<-0.05){action='⬇ OVERWEGEN SNIJDEN';aCls='r';}else{action='↔ NEUTRAAL';aCls='y';}}
+    else if(ghostN>0){action=\`wacht op \${5-ghostN} ghosts\`;aCls='d';}
+    else{action='geen data';aCls='d';}
     return\`<tr class="\${tClass(c.sym)}">
-      <td class="d">\${i+1}</td>
-      <td class="b fw">\${c.sym}</td>
-      <td>\${tyBadge(c.type)}</td>
-      <td>\${sBadge(c.sess)}</td>
-      <td>\${dBadge(c.dir)}</td>
-      <td>\${vBadge(c.vwap)}</td>
-      <td class="\${ready?'y fw':ghostN>0?'c':'d'}">\${ghostN||'0'}</td>
+      <td class="d">\${i+1}</td><td class="b fw">\${c.sym}</td><td>\${tyBadge(c.type)}</td>
+      <td>\${sBadge(c.sess)}</td><td>\${dBadge(c.dir)}</td><td>\${vBadge(c.vwap)}</td>
+      <td class="\${ready?'y fw':ghostN>0?'c':'d'}">\${ghostN||0}</td>
       <td class="\${(c.ev?.avgRR??0)>=1?'g':c.ev?.avgRR!=null?'r':'d'}">\${c.ev?.avgRR!=null?f(c.ev.avgRR,2)+'R':'—'}</td>
       <td class="\${evC(evV)} fw">\${evV!=null?evV.toFixed(3):'—'}</td>
       <td class="\${pC(c.totalPnl)}">\${eu(c.totalPnl)}</td>
@@ -4435,84 +4145,144 @@ function renderComboFilter(combos){
     </tr>\`;
   }).join('');
 }
-
 function setCF(k,v,btn){cfF[k]=v;btn.closest('.fbar').querySelectorAll('.fb').forEach(b=>{if(b.getAttribute('onclick')?.includes("'"+k+"'"))b.classList.remove('on');});btn.classList.add('on');renderComboFilter(_evData);}
 
-// ── SIGNAL STATS for session trades KPI ──────────────────
+// ── WEBHOOK ERRORS ────────────────────────────────────────
+async function loadErrors(){
+  const d=await api('/history');
+  if(!d){setDot('whe-dot',false,'Failed');document.getElementById('whe-meta').textContent='error';setTimeout(loadErrors,10000);return;}
+  const all=Array.isArray(d)?d:[];
+  const errs=all.filter(e=>['REJECTED','SL_TP_SET_FAILED','LOT_CALC_FAILED','ORDER_NOT_CONFIRMED','VWAP_BAND_EXHAUSTED','SPREAD_GUARD_CLOSE','RR_VERIFY_FAILED','CURRENCY_BUDGET_EXHAUSTED','OUTSIDE_WINDOW'].includes(e.type));
+  setDot('whe-dot',true,'OK — '+errs.length+' errors');
+  document.getElementById('whe-meta').textContent=errs.length+' errors';
+  document.getElementById('k-err').textContent=errs.length;
+  const tb=document.getElementById('whe-body');
+  if(!errs.length){tb.innerHTML='<tr><td colspan="10" class="nodata g">✓ Geen errors</td></tr>';return;}
+  tb.innerHTML=errs.slice(0,80).map(e=>{
+    const p=e.payload||{};const bandPct=p.vwapBandPct||e.vwapBandPct;
+    return\`<tr>
+      <td class="d" style="font-size:9px">\${ts(e.ts)}</td>
+      <td><span class="r fw" style="font-size:9px">\${e.type}</span></td>
+      <td class="b">\${e.symbol||p.symbol||'—'}</td>
+      <td>\${dBadge(e.direction||p.direction)}</td>
+      <td>\${sBadge(e.session||p.session)}</td>
+      <td>\${vBadge(e.vwapPos||p.vwapPosition)}</td>
+      <td class="d">\${e.entry?f(e.entry,5):'—'}</td>
+      <td class="o">\${p.slPctHuman||p.derivedSlPct||'—'}</td>
+      <td class="\${bandPct&&(+bandPct)>1.5?'r':'d'}">\${bandPct!=null?((+bandPct)*100).toFixed(0)+'%':'—'}</td>
+      <td class="d" style="max-width:200px;overflow:hidden;text-overflow:ellipsis;font-size:8.5px">\${e.reason||p.reason||''}</td>
+    </tr>\`;
+  }).join('');
+}
+
+// BLOCKED SIGNALS
+async function loadBlockedSignals(){
+  const [rejectD,histD]=await Promise.all([api('/signal-stats/rejects?since=2026-05-03T00:00:00.000Z'),api('/history')]);
+  if(!rejectD&&!histD)return;
+  const COMPLIANCE2=new Date('2026-05-03T00:00:00.000Z');
+  const byO={};(rejectD?.byOutcome||[]).forEach(r=>{byO[r.outcome]=r.pairs?.reduce((s,p)=>s+p.count,0)??0;});
+  document.getElementById('blk-total').textContent=(rejectD?.total||0)+'';
+  document.getElementById('blk-dup').textContent=((byO['DUPLICATE_OPEN']??0)+(byO['DUPLICATE_BLOCKED']??0)+(byO['DUPLICATE']??0))+'';
+  document.getElementById('blk-vwap').textContent=((byO['VWAP_BAND_EXHAUSTED']??0)+(byO['VWAP_EXHAUSTED']??0))+'';
+  document.getElementById('blk-win').textContent=((byO['OUTSIDE_WINDOW']??0)+(byO['OUTSIDE_HOURS']??0))+'';
+  document.getElementById('blk-cur').textContent=((byO['CURRENCY_BUDGET']??0)+(byO['BUDGET_EXHAUSTED']??0))+'';
+  const tb=document.getElementById('blk-body');
+  const allPairs=rejectD?.topPairs||[];
+  if(!allPairs.length){tb.innerHTML=emptyRow(7,'Geen geblokkeerde signalen ná 3 mei 2026');return;}
+  tb.innerHTML=allPairs.slice(0,30).map(p=>\`<tr>
+    <td><span class="bd bd-mn" style="font-size:7.5px">BLOCKED</span></td>
+    <td style="color:var(--o);font-size:9px">\${p.outcome}</td>
+    <td class="b fw">\${p.symbol||'?'}</td>
+    <td>\${p.direction?dBadge(p.direction):'—'}</td>
+    <td>\${p.session?sBadge(p.session):'—'}</td>
+    <td class="r fw">\${p.count}</td>
+    <td class="d">—</td>
+  </tr>\`).join('');
+}
+
+// BAND SIGNALS
+async function loadBandSignals(tier,prefix){
+  const d=await api(\`/band-ghost-stats?tier=\${tier}\`);
+  const rows=d?.rows||[];
+  const tb=document.getElementById(prefix+'-body');
+  const strip=document.getElementById(prefix+'-strip');
+  if(!rows.length){tb.innerHTML=emptyRow(9,\`Geen ghost data voor \${tier.replace('_','%–')}%\`);if(strip)strip.style.display='none';return;}
+  const totalN=rows.reduce((s,r)=>s+(+r.n||0),0);
+  const avgRR=rows.filter(r=>r.avgMaxRR!=null).reduce((s,r,_,a)=>s+(+r.avgMaxRR)/a.length,0);
+  const avgSL=rows.filter(r=>r.avgSlPct!=null).reduce((s,r,_,a)=>s+(+r.avgSlPct)/a.length,0);
+  if(strip)strip.style.display='flex';
+  const pfx=prefix==='band150'?'b150':'b250';
+  const nEl=document.getElementById(pfx+'-n');const rrEl=document.getElementById(pfx+'-rr');const slEl=document.getElementById(pfx+'-sl');
+  if(nEl)nEl.textContent=totalN;if(rrEl)rrEl.textContent=avgRR?f(avgRR,2)+'R':'—';if(slEl)slEl.textContent=avgSL?f(avgSL,1)+'%':'—';
+  tb.innerHTML=rows.map(r=>\`<tr class="\${tClass(r.symbol||'')}">
+    <td class="b fw">\${r.symbol||'—'}</td><td>\${sBadge(r.session)}</td><td>\${dBadge(r.direction)}</td><td>\${vBadge(r.vwapPosition)}</td>
+    <td class="\${(+r.n||0)>=5?'y fw':'c'}">\${r.n||0}</td>
+    <td class="\${(+r.avgMaxRR||0)>=2?'g fw':(+r.avgMaxRR||0)>=1?'y':'d'}">\${r.avgMaxRR!=null?f(r.avgMaxRR,2)+'R':'—'}</td>
+    <td class="g">\${r.maxMaxRR!=null?f(r.maxMaxRR,2)+'R':'—'}</td>
+    <td class="\${(+r.avgSlPct||0)<50?'g':(+r.avgSlPct||0)<80?'y':'o'}">\${r.avgSlPct!=null?f(r.avgSlPct,1)+'%':'—'}</td>
+    <td class="d">\${r.avgTimeMin!=null?r.avgTimeMin+'min':'—'}</td>
+  </tr>\`).join('');
+}
+
+// SIGNAL STATS
 async function loadSignalStats(){
   const [sigD,statsD]=await Promise.all([api('/signal-stats'),api('/stats')]);
-  if(sigD){
-    const total=sigD.total||0;const placed=sigD.placed||0;
-    const pct=total>0?((placed/total)*100).toFixed(0):'?';
-    document.getElementById('k-tps').textContent=placed+' ('+pct+'%)';
-  }
-  if(statsD){
-    document.getElementById('k-err').textContent=statsD.totalClosedTrades??'?';
-  }
+  if(sigD){const total=sigD.total||0;const placed=sigD.placed||0;const pct=total>0?((placed/total)*100).toFixed(0):'?';document.getElementById('k-tps').textContent=placed+' ('+pct+'%)';}
+  if(statsD){document.getElementById('k-err').textContent=statsD.totalClosedTrades??'?';}
 }
 
-// ── SHADOW SL key count for KPI ──────────────────────────
-async function prepareDeploy(){
-  const statusEl=document.getElementById('deploy-status');
-  const btn=document.getElementById('deploy-btn');
-  const st=await api('/admin/deploy-status');
-  if(!st){statusEl.textContent='Error checking status';return;}
-  if(st.safeToDeployNow){statusEl.textContent='✓ Already safe to deploy — 0 positions, 0 ghosts';return;}
-  const msg='PREPARE DEPLOY\\n\\n'+(st.recommendation||'')+'\\n\\nThis will:\\n1. Close '+st.openPositions+' open MT5 position(s)\\n2. Finalize '+st.activeGhosts+' active ghost(s) to DB\\n\\nContinue?'
-  if(!confirm(msg))return;
-  btn.disabled=true;statusEl.textContent='Closing positions...';
-  const secret=prompt('Enter WEBHOOK_SECRET:');
-  if(!secret){btn.disabled=false;return;}
-  const r1=await fetch(\`/admin/close-all-positions?secret=\${encodeURIComponent(secret)}\`,{method:'POST'});
-  const d1=await r1.json().catch(()=>({}));
-  if(d1.status!=='OK'){statusEl.textContent='Error closing positions: '+(d1.error||'unknown');btn.disabled=false;return;}
-  statusEl.textContent=\`Closed \${d1.closed} position(s). Finalizing ghosts...\`;
-  const r2=await fetch(\`/admin/finalize-all-ghosts?secret=\${encodeURIComponent(secret)}\`,{method:'POST'});
-  const d2=await r2.json().catch(()=>({}));
-  if(d2.status!=='OK'){statusEl.textContent='Error finalizing ghosts: '+(d2.error||'unknown');btn.disabled=false;return;}
-  statusEl.textContent=\`✓ SAFE TO DEPLOY — Closed \${d1.closed} position(s), finalized \${d2.finalized} ghost(s). Push now.\`;
-  btn.style.borderColor='var(--g)';btn.style.color='var(--g)';btn.textContent='✓ READY TO DEPLOY';
-  await loadAll();
-}
-
+// SHADOW SL
 async function loadShadowCount(){
   const d=await api('/shadow');
-  // Toon alleen analyses die 'ready' zijn (≥30 ghosts na compliance)
   const ready=(d?.results||[]).filter(r=>r.ready===true).length;
   document.getElementById('k-sl').textContent=ready;
 }
 
-let _loadErrors=0;
-// ── MAE stats laden en in ghh-tbl mergen (v12.5) ──────────
+// MAE
 let _maeData={};
 async function loadMAE(){
   const d=await api('/mae-stats');
   if(!d?.rows)return;
-  _maeData={};
-  for(const r of d.rows)_maeData[r.optimizerKey]=r;
+  _maeData={};for(const r of d.rows)_maeData[r.optimizerKey]=r;
 }
 
+// DEPLOY
+async function prepareDeploy(){
+  const statusEl=document.getElementById('deploy-status');const btn=document.getElementById('deploy-btn');
+  const st=await api('/admin/deploy-status');
+  if(!st){statusEl.textContent='Error checking status';return;}
+  if(st.safeToDeployNow){statusEl.textContent='✓ Safe to deploy — 0 posities, 0 ghosts';return;}
+  if(!confirm('PREPARE DEPLOY\\n\\n'+(st.recommendation||'')+'\\n\\nFortgaan?'))return;
+  btn.disabled=true;statusEl.textContent='Sluiten posities...';
+  const secret=prompt('WEBHOOK_SECRET:');if(!secret){btn.disabled=false;return;}
+  const r1=await fetch(\`/admin/close-all-positions?secret=\${encodeURIComponent(secret)}\`,{method:'POST'});
+  const d1=await r1.json().catch(()=>({}));
+  if(d1.status!=='OK'){statusEl.textContent='Error: '+(d1.error||'unknown');btn.disabled=false;return;}
+  statusEl.textContent=\`Gesloten \${d1.closed}. Ghosts finaliseren...\`;
+  const r2=await fetch(\`/admin/finalize-all-ghosts?secret=\${encodeURIComponent(secret)}\`,{method:'POST'});
+  const d2=await r2.json().catch(()=>({}));
+  if(d2.status!=='OK'){statusEl.textContent='Error: '+(d2.error||'unknown');btn.disabled=false;return;}
+  statusEl.textContent=\`✓ KLAAR VOOR DEPLOY — \${d1.closed} posities, \${d2.finalized} ghosts.\`;
+  btn.style.borderColor='var(--g)';btn.style.color='var(--g)';btn.textContent='✓ READY';
+  await loadAll();
+}
+
+let _lastLoadMs=null;
 async function loadAll(){
-  const t0=Date.now();
-  _lastLoadMs=t0;
-  const gsText=document.getElementById('gs-text');
-  const gsTime=document.getElementById('gs-time');
+  const t0=Date.now();_lastLoadMs=t0;
+  const gsText=document.getElementById('gs-text');const gsTime=document.getElementById('gs-time');
   if(gsText)gsText.textContent='Laden...';
-
-  const timeout=new Promise(res=>setTimeout(()=>res('timeout'),15000));
-  const work=Promise.allSettled([
-    loadTradeStats().catch(e=>{console.error('[stats]',e?.message);return null;}),
-    loadBlockedSignals().catch(e=>{console.error('[blocked]',e?.message);return null;}),
-    loadPositions().catch(e=>{console.error('[pos]',e?.message);return null;}),
-    loadGhosts().catch(e=>{console.error('[ghost]',e?.message);return null;}),
-    loadEV().catch(e=>{console.error('[ev]',e?.message);return null;}),
-    loadErrors().catch(e=>{console.error('[errors]',e?.message);return null;}),
-    loadSignalStats().catch(e=>{console.error('[stats]',e?.message);return null;}),
-    loadShadowCount().catch(e=>{console.error('[shadow]',e?.message);return null;}),
-    loadMAE().catch(e=>{console.error('[mae]',e?.message);return null;}),
+  await Promise.allSettled([
+    loadTradeStats().catch(e=>console.error('[stats]',e?.message)),
+    loadPositions().catch(e=>console.error('[pos]',e?.message)),
+    loadGhosts().catch(e=>console.error('[ghost]',e?.message)),
+    loadEV().catch(e=>console.error('[ev]',e?.message)),
+    loadErrors().catch(e=>console.error('[errors]',e?.message)),
+    loadBlockedSignals().catch(e=>console.error('[blocked]',e?.message)),
+    loadSignalStats().catch(e=>console.error('[sigsig]',e?.message)),
+    loadShadowCount().catch(e=>console.error('[shadow]',e?.message)),
+    loadMAE().catch(e=>console.error('[mae]',e?.message)),
   ]);
-
-  await Promise.race([work,timeout]);
   const elapsed=Date.now()-t0;
   if(gsText)gsText.textContent='Geladen';
   if(gsTime)gsTime.textContent='Refresh: '+new Date().toLocaleTimeString('nl-BE',{hour:'2-digit',minute:'2-digit',second:'2-digit'})+' ('+elapsed+'ms)';
@@ -4525,8 +4295,9 @@ document.addEventListener('DOMContentLoaded',()=>{
 });
 </script>
 </body>
-</html>`);
+</html>\`);
 });
+
 
 
 
