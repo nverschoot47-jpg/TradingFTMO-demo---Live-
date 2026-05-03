@@ -1,3 +1,4 @@
+
 // ===============================================================
 // session.js  v12.5  |  PRONTO-AI
 //
@@ -351,7 +352,7 @@ const SESSION_LABELS = {
 };
 
 // ── Data quality compliance date (FIX 8: single source of truth) ────
-const COMPLIANCE_DATE    = '2026-05-03 00:00:00';  // 00:00 UTC 3 mei 2026 — v12.4
+const COMPLIANCE_DATE    = '2026-05-03 00:00:00';  // 00:00 UTC 3 mei 2026 — v13.0
 const COMPLIANCE_DATE_MS = new Date('2026-05-03T00:00:00.000Z').getTime();
 
 module.exports = {
