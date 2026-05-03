@@ -2505,6 +2505,9 @@ app.get("/live/positions", (req, res) => {
       isEvPlus: p.isEvPlus ?? false,
       scaleFactor: p.scaleFactor ?? 1.0,
       slMilestones: p.slMilestones ?? null,
+      rrMilestones: ghostTrackers[p.positionId]?.rrMilestones ?? null,
+      maxRR: ghostTrackers[p.positionId]?.maxRR ?? p.maxRR ?? 0,
+      type,
     };
   });
   res.json({ count: positions.length, balance, positions });
@@ -3832,12 +3835,13 @@ async function loadPositions(){
     // adverse milestones (from slMilestones legacy + rrMilestones.adverse)
     const ms=p.slMilestones??{};
     const rrMs=p.rrMilestones??{};
-    const adv=rrMs.adverse??{};
-    if(!adv[0.25]&&ms['25'])adv[0.25]=ms['25'];
-    if(!adv[0.50]&&ms['50'])adv[0.50]=ms['50'];
-    if(!adv[0.75]&&ms['75'])adv[0.75]=ms['75'];
-    if(!adv[1.00]&&(ms['100']||ms['99']))adv[1.00]=ms['100']||ms['99'];
-    const fav=rrMs.favorable??{};
+    const adv={...(rrMs.adverse??{})};
+    // Fallback: slMilestones keys are strings '25','50','75','100'
+    if(!adv[0.25]&&(ms['25']||ms[0.25]))adv[0.25]=ms['25']||ms[0.25];
+    if(!adv[0.50]&&(ms['50']||ms[0.50]))adv[0.50]=ms['50']||ms[0.50];
+    if(!adv[0.75]&&(ms['75']||ms[0.75]))adv[0.75]=ms['75']||ms[0.75];
+    if(!adv[1.00]&&(ms['100']||ms['99']||ms[1.00]))adv[1.00]=ms['100']||ms['99']||ms[1.00];
+    const fav={...(rrMs.favorable??{})};
     const maxRR=p.maxRR??0;
     const maxRRCls=maxRR>=1.5?'g fw':maxRR>=0.5?'g':maxRR>0?'y':'d';
     return\`<tr class="\${tClass(p.symbol)}">
@@ -3874,13 +3878,14 @@ async function loadGhosts(){
   if(!d?.ghosts?.length){tb.innerHTML=emptyRow(10+FAV_STEPS.length,'Geen actieve ghosts');return;}
   tb.innerHTML=d.ghosts.map(g=>{
     const type=sTypeName(g.symbol);
-    const adv=g.rrMilestones?.adverse||{};
+    const _rrMs=g.rrMilestones||{};
+    const adv={...(_rrMs.adverse||{})};
     const sl=g.slMilestones||{};
-    if(!adv[0.25]&&sl['25'])adv[0.25]=sl['25'];
-    if(!adv[0.50]&&sl['50'])adv[0.50]=sl['50'];
-    if(!adv[0.75]&&sl['75'])adv[0.75]=sl['75'];
-    if(!adv[1.00]&&sl['100'])adv[1.00]=sl['100'];
-    const fav=g.rrMilestones?.favorable||{};
+    if(!adv[0.25]&&(sl['25']||sl[0.25]))adv[0.25]=sl['25']||sl[0.25];
+    if(!adv[0.50]&&(sl['50']||sl[0.50]))adv[0.50]=sl['50']||sl[0.50];
+    if(!adv[0.75]&&(sl['75']||sl[0.75]))adv[0.75]=sl['75']||sl[0.75];
+    if(!adv[1.00]&&(sl['100']||sl[1.00]))adv[1.00]=sl['100']||sl[1.00];
+    const fav={...(_rrMs.favorable||{})};
     const maxRR=g.maxRR??0;
     const maxRRCls=maxRR>=2?'g fw':maxRR>=1?'g':maxRR>=0.5?'y':'d';
     return\`<tr class="\${tClass(g.symbol)}">
@@ -4267,7 +4272,6 @@ async function prepareDeploy(){
   await loadAll();
 }
 
-let _lastLoadMs=null;
 async function loadAll(){
   const t0=Date.now();_lastLoadMs=t0;
   const gsText=document.getElementById('gs-text');const gsTime=document.getElementById('gs-time');
