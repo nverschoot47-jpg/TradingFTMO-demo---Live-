@@ -3056,7 +3056,7 @@ app.get(["/", "/dashboard"], async (req, res) => {
   // Generate favorable RR steps: 0.1 to 15.0 per 0.1 = 150 steps
   // But for display we show selective columns in the header
   const FAV_DISPLAY = [0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0,1.1,1.2,1.3,1.4,1.5,1.6,1.7,1.8,1.9,2.0,2.5,3.0,3.5,4.0,4.5,5.0,6.0,7.0,8.0,9.0,10.0,11.0,12.0,13.0,14.0,15.0];
-  const favHeaders = FAV_DISPLAY.map(v => `<th class="s rrh" title="T to +${v}R">${v<1?'+'+v:v>=10?'+'+v+'R':'+'+v}</th>`).join('');
+  const favHeaders = FAV_DISPLAY.map(v => '<th class="s rrh" title="T to +'+v+'R">'+(v<1?'+'+v:v>=10?'+'+v+'R':'+'+v)+'</th>').join('');
   const favColCount = FAV_DISPLAY.length;
 
   res.end(`<!DOCTYPE html>
@@ -4295,7 +4295,7 @@ document.addEventListener('DOMContentLoaded',()=>{
 });
 </script>
 </body>
-</html>\`);
+</html>`);
 });
 
 
