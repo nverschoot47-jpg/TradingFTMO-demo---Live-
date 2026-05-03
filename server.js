@@ -1079,10 +1079,6 @@ function startGhostTracker(pos, restoreData = null) {
           maxPrice = price;
           g.maxPrice = price;
           g.maxRR = calcMaxRR(direction, entry, phantomSL, price);
-          // FIX v12.6: sync maxRR terug naar openPositions zodat /live/positions
-          // dezelfde waarde toont als de ghost tracker (was: TSLA pos 0.62R ghost 1.86R)
-          const lp = openPositions[positionId];
-          if (lp) { lp.maxPrice = maxPrice; lp.maxRR = g.maxRR; }
         }
 
         const slDist = Math.abs(entry - phantomSL);
@@ -1108,9 +1104,6 @@ function startGhostTracker(pos, restoreData = null) {
               slMilestones[pct] = nowIso;
               g.rrMilestones = rrMilestones;
               g.slMilestones = { ...slMilestones };
-              // FIX v12.6: ook openPositions bijwerken zodat /live/positions de milestone toont
-              const lp = openPositions[positionId];
-              if (lp) lp.slMilestones = { ...slMilestones };
               const elMin = Math.round(elapsed / 60000);
               console.log(`[Ghost] ${positionId} adverse -${step}R (${pct}% SL) @ +${elMin}min | maxRR so far: ${g.maxRR}R`);
             }
@@ -1416,13 +1409,12 @@ async function syncOpenPositions() {
           const adverseRR   = Math.max(0, adverseMove) / slDist;
           if (!local.slMilestones) local.slMilestones = {};
           const nowIso = new Date().toISOString();
-          // Drempels: 25% = -0.25R, 50% = -0.50R, 75% = -0.75R, 100% = -1.00R (phantom SL)
-          // FIX v12.6: was '99'/0.99R — nu '100'/1.00R consistent met ghost tracker slMilestones
+          // Drempels: 25% = -0.25R, 50% = -0.50R, 75% = -0.75R, 99% = -0.99R
           const OPEN_POS_MILESTONES = [
             { key: '25',  rr: 0.25 },
             { key: '50',  rr: 0.50 },
             { key: '75',  rr: 0.75 },
-            { key: '100', rr: 1.00 },
+            { key: '99',  rr: 0.99 },
           ];
           for (const ms of OPEN_POS_MILESTONES) {
             if (!local.slMilestones[ms.key] && adverseRR >= ms.rr) {
@@ -2029,10 +2021,8 @@ app.post("/webhook", async (req, res) => {
     return res.status(200).json({ status: "OUTSIDE_TRADE_WINDOW", reason: tradeWindow.reason, assetType });
   }
 
-  // Duplicate guard — FIX v12.6: sessie meenemen zodat EURUSD_BUY_LON en EURUSD_BUY_NY
-  // onafhankelijk zijn (verschillende optimizer combos met eigen EV). Zonder sessie blokkeerde
-  // een LONDON signaal het NY signaal 2 minuten later terwijl dat 2 aparte kansen zijn.
-  const dupKey  = `${symKey}_${direction}_${session}`;
+  // Duplicate guard
+  const dupKey  = `${symKey}_${direction}`;
   const dupLast = global._dupGuard?.[dupKey];
   if (dupLast && (Date.now() - dupLast) < DUP_GUARD_TTL_MS) {
     const _dupAge = Math.round((Date.now() - dupLast) / 1000);
@@ -3309,7 +3299,7 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
         <th class="s" title="Tijd vanaf entry tot -0.25R adverse bereikt (25% SL gebruikt)">T→-¼R</th>
         <th class="s" title="Tijd vanaf entry tot -0.50R adverse bereikt (50% SL gebruikt)">T→-½R</th>
         <th class="s" title="Tijd vanaf entry tot -0.75R adverse bereikt (75% SL gebruikt)">T→-¾R</th>
-        <th class="s" title="Tijd vanaf entry tot -1.00R adverse bereikt (phantom SL = 100% SL gebruikt)">T→-1R</th>
+        <th class="s" title="Tijd vanaf entry tot -0.99R adverse bereikt (bijna-SL)">T→-1R</th>
         <th class="s" data-col="14">Opened</th>
       </tr></thead>
       <tbody id="pos-body"></tbody>
@@ -3394,7 +3384,6 @@ tr.ts td:first-child{border-left:2px solid rgba(40,180,240,.3)}tr.tf td:first-ch
         <th class="s" data-col="7">Best TP RR</th>
         <th class="s" data-col="8">Avg RR</th>
         <th class="s" data-col="9">EV</th>
-        <th class="s" title="EV na gemiddelde slippage van 0.3–0.8 pips (forex) — negatief = combo verliest netto">EV Netto</th>
         <th>EV Status</th>
         <th class="s" data-col="11">TP Lock</th>
         <th class="s" data-col="12" title="Avg minutes from open to phantom SL hit">Avg T→SL</th>
@@ -3881,7 +3870,7 @@ async function loadPositions(){
     function msTime(key){
       if(!ms[key]||!p.openedAt)return'<span class="d">—</span>';
       const mins=Math.round((new Date(ms[key])-new Date(p.openedAt))/60000);
-      const cls=key==='100'?'r fw':key==='75'?'r':'o';
+      const cls=key==='99'?'r fw':key==='75'?'r':'o';
       if(mins<60)return\`<span class="\${cls}">\${mins}m</span>\`;
       return\`<span class="\${cls}">\${Math.floor(mins/60)}h\${String(mins%60).padStart(2,'0')}m</span>\`;
     }
@@ -3901,7 +3890,7 @@ async function loadPositions(){
       <td style="font-size:9px">\${msTime('25')}</td>
       <td style="font-size:9px">\${msTime('50')}</td>
       <td style="font-size:9px">\${msTime('75')}</td>
-      <td style="font-size:9px">\${msTime('100')}</td>
+      <td style="font-size:9px">\${msTime('99')}</td>
       <td data-val="\${p.openedAt}" class="d" style="font-size:9px">\${dtTs(p.openedAt)}</td>
     </tr>\`;
   }).join('');
@@ -4009,14 +3998,6 @@ function _buildCombos(){
   document.getElementById('k-tp').textContent=Object.values(_tpMap).filter(t=>(t.evAtLock??0)>0).length;
   const combos=[];
   const allSyms=[...FOREX,...INDEX,...COMM,...STOCKS];
-  // FIX v12.6: build tradesByKey index O(n) eenmalig ipv O(n) per combo = was 424×10000=4.2M ops
-  const tradesByKey={};
-  for(const t of _allTrades){
-    if(!t.closedAt||!t.openedAt||new Date(t.openedAt)<TP_OPT_DATE)continue;
-    const k=t.symbol+'_'+t.session+'_'+t.direction+'_'+t.vwapPosition;
-    if(!tradesByKey[k])tradesByKey[k]=[];
-    tradesByKey[k].push(t);
-  }
   for(const sym of allSyms){
     const type=sTypeName(sym);
     const sessions=type==='stock'?['ny']:['asia','london','ny'];
@@ -4024,7 +4005,11 @@ function _buildCombos(){
       for(const dir of['buy','sell']){
         for(const vwap of['above','below']){
           const key=sym+'_'+sess+'_'+dir+'_'+vwap;
-          const trades=tradesByKey[key]??[];
+          const trades=_allTrades.filter(t=>
+            t.symbol===sym&&t.session===sess&&t.direction===dir&&
+            t.vwapPosition===vwap&&t.closedAt!=null&&
+            t.openedAt&&new Date(t.openedAt)>=TP_OPT_DATE
+          );
           const totalPnl=trades.reduce((s,t)=>s+(t.realizedPnlEUR??t.currentPnL??0),0);
           const ev=_evMap[key]??null;
           const tp=_tpMap[key]??null;
@@ -4096,13 +4081,6 @@ function renderEV(){
     const avgTimeMin=ev?.avgTimeToSLMin??null;
     const avgSlPct=ev?.avgMaxSlPct??null;
     const bestSlW=ev?.bestWinnerSlPct??null;
-    // FIX v12.6: netEV na gemiddelde slippage. Slippage was gemeten maar NIET gebruikt in EV.
-    // Gemiddelde slippage forex: 0.5 pips. Per pip: riskEUR * 0.0001 / SL_dist.
-    // Vereenvoudigd: netEV = grossEV - (avgSlippagePips × pipValue / riskEUR)
-    // Hier: ruwweg 0.5 pips kosten = ~0.05R nadeel (konservatieve estimate).
-    // Toont het potentieel verborgen verlies voor combos met kleine EV marges.
-    const AVG_SLIPPAGE_EV_IMPACT = c.type === 'forex' ? 0.05 : c.type === 'stock' ? 0.02 : 0.03;
-    const netEV = evV != null ? parseFloat((evV - AVG_SLIPPAGE_EV_IMPACT).toFixed(3)) : null;
     // row opacity: lighter if no data at all
     const rowStyle=ghostN===0&&tradeN===0?' style="opacity:.45"':'';
     return\`<tr class="\${tClass(c.sym)}"\${rowStyle}>
@@ -4116,7 +4094,6 @@ function renderEV(){
       <td data-val="\${bestTP??-99}" class="\${bestTP?'g fw':'d'}">\${bestTP!=null?f(bestTP,1)+'R':'—'}</td>
       <td data-val="\${ev?.avgRR??-99}" class="\${(ev?.avgRR??0)>=1?'g':'d'}">\${ev?.avgRR!=null?f(ev.avgRR,2)+'R':'—'}</td>
       <td data-val="\${evV??-999}" class="\${evC(evV)} fw">\${evV!=null?evV.toFixed(3):'—'}</td>
-      <td data-val="\${netEV??-999}" class="\${evC(netEV)}" title="EV na slippage estimate (\${c.type})">\${netEV!=null?netEV.toFixed(3):'—'}</td>
       <td>\${ready?(evV!=null?(evV>0?'<span class="bd bd-evp">EV+ ✓</span>':'<span class="bd bd-evn">EV-</span>'):'<span class="bd d">pending</span>'):('<span class="d" style="font-size:9px">'+(ghostN>0?'need '+(5-ghostN)+' more':'geen data')+'</span>')}</td>
       <td>\${tp?\`<span class="bd bd-lck">★ \${tp.lockedRR.toFixed(1)}R</span>\`:'<span class="d">—</span>'}</td>
       <td data-val="\${avgTimeMin??9999}" class="d">\${avgTimeMin!=null?avgTimeMin+'min':'—'}</td>
@@ -4487,6 +4464,132 @@ document.addEventListener('DOMContentLoaded',()=>{
 });
 
 
+
+// ── /api/summary — volledig leesbare snapshot voor Claude/AI ────
+// Geeft ALLES: balance, open trades, ghosts, closed trades,
+// EV/optimizer data, tpLocks, keyRiskMult, signaallog, config.
+app.get("/api/summary", async (req, res) => {
+  try {
+    // ── Open posities ────────────────────────────────────────────
+    const positions = Object.values(openPositions).map(p => {
+      const info    = getSymbolInfo(p.symbol);
+      const type    = info?.type || "stock";
+      const mt5Sym  = info?.mt5 || p.mt5Symbol || p.symbol;
+      const cached  = symbolSpecCache[mt5Sym];
+      const lotVal  = cached?.lotVal ?? LOT_VALUE[type] ?? 1;
+      const slDist  = p.sl > 0 ? Math.abs(p.entry - p.sl) : 0;
+      const actualRiskEUR = slDist > 0 ? parseFloat((p.lots * slDist * lotVal).toFixed(2)) : null;
+      const actualRiskPct = actualRiskEUR && liveBalance > 0
+        ? parseFloat((actualRiskEUR / liveBalance * 100).toFixed(4)) : null;
+      const slDistPct = p.sl && p.entry
+        ? parseFloat((Math.abs(p.entry - p.sl) / p.entry * 100).toFixed(3)) : null;
+      const tpRRActual = p.tp && p.sl && p.entry && slDist > 0
+        ? parseFloat((Math.abs(p.tp - p.entry) / slDist).toFixed(3)) : null;
+      return {
+        positionId: p.positionId, symbol: p.symbol, type,
+        direction: p.direction, session: p.session,
+        vwapPosition: p.vwapPosition, optimizerKey: p.optimizerKey,
+        entry: p.entry, sl: p.sl, tp: p.tp, lots: p.lots,
+        riskPct: p.riskPct, riskEUR: p.riskEUR,
+        actualRiskEUR, actualRiskPct, slDistPct, tpRRActual,
+        evMult: p.evMult ?? 1.0, dayMult: p.dayMult ?? 1.0,
+        currentPrice: p.currentPrice, currentPnL: p.currentPnL,
+        maxRR: p.maxRR, tpRR: p.tpRRUsed, isEvPlus: p.isEvPlus ?? false,
+        spread: p.spread ?? 0, scaleFactor: p.scaleFactor ?? 1.0,
+        slMilestones: p.slMilestones ?? null,
+        isGhosted: !!ghostTrackers[p.positionId],
+        openedAt: p.openedAt, balance: p.balance,
+      };
+    });
+
+    // ── Actieve ghosts ───────────────────────────────────────────
+    const ghosts = Object.values(ghostTrackers).map(g => ({
+      positionId: g.positionId, symbol: g.symbol,
+      direction: g.direction, session: g.session,
+      vwapPosition: g.vwapPosition, optimizerKey: g.optimizerKey,
+      entry: g.entry, sl: g.sl, tp: g.tp,
+      maxRR: g.maxRR, currentPrice: g.currentPrice,
+      slMilestones: g.slMilestones ?? null,
+      openedAt: g.openedAt,
+    }));
+
+    // ── Closed trades (laatste 200) ──────────────────────────────
+    const recentClosed = closedTrades.slice(-200).reverse().map(t => ({
+      positionId: t.positionId, symbol: t.symbol,
+      direction: t.direction, session: t.session,
+      vwapPosition: t.vwapPosition, optimizerKey: t.optimizerKey,
+      entry: t.entry, sl: t.sl, tp: t.tp, lots: t.lots,
+      closeReason: t.closeReason, closedAt: t.closedAt,
+      openedAt: t.openedAt, realizedPnL: t.realizedPnL,
+      riskPct: t.riskPct, riskEUR: t.riskEUR,
+      maxRR: t.maxRR, tpRR: t.tpRRUsed,
+      isEvPlus: t.isEvPlus ?? false,
+    }));
+
+    // ── TP Locks ─────────────────────────────────────────────────
+    const tpLocksData = Object.entries(tpLocks).map(([key, v]) => ({
+      optimizerKey: key, ...v
+    }));
+
+    // ── Key Risk Multipliers ──────────────────────────────────────
+    const riskMultData = Object.entries(keyRiskMult).map(([key, v]) => ({
+      optimizerKey: key, ...v
+    })).sort((a, b) => (b.evMult ?? 1) - (a.evMult ?? 1));
+
+    // ── Currency exposure ─────────────────────────────────────────
+    const exposureData = Object.entries(currencyExposure).map(([cur, v]) => ({
+      currency: cur, ...v
+    }));
+
+    // ── EV optimizer data (cached) ────────────────────────────────
+    const evData = evCache.data ?? [];
+
+    // ── Webhook log (laatste 50) ──────────────────────────────────
+    const recentWebhooks = webhookLog.slice(0, 50);
+
+    // ── Band ghosts ───────────────────────────────────────────────
+    const bandGhosts = Object.values(bandGhostTrackers ?? {}).map(g => ({
+      symbol: g.symbol, direction: g.direction, session: g.session,
+      vwapPosition: g.vwapPosition, bandPct: g.bandPct,
+      maxRR: g.maxRR, openedAt: g.openedAt,
+    }));
+
+    // ── Config snapshot ───────────────────────────────────────────
+    const config = {
+      fixedRiskPct:      FIXED_RISK_PCT,
+      currencyBudgetPct: CURRENCY_BUDGET_PCT,
+      minTpRrFloor:      MIN_TP_RR_FLOOR,
+      slBufferMult:      SL_BUFFER_MULT,
+      ghostPollMs:       GHOST_POLL_MS,
+      ghostMaxMs:        GHOST_MAX_MS,
+      ghostMaxRR:        GHOST_MAX_RR,
+      ghostMinTradesForTp: GHOST_MIN_TRADES_FOR_TP,
+      maxClosedTrades:   MAX_CLOSED_TRADES,
+    };
+
+    res.json({
+      timestamp:          new Date().toISOString(),
+      balance:            liveBalance,
+      openTradesCount:    positions.length,
+      activeGhostsCount:  ghosts.length,
+      bandGhostsCount:    bandGhosts.length,
+      totalClosedTrades:  closedTrades.length,
+      tpLocksCount:       tpLocksData.length,
+      config,
+      positions,
+      ghosts,
+      bandGhosts,
+      tpLocks:            tpLocksData,
+      keyRiskMultipliers: riskMultData,
+      currencyExposure:   exposureData,
+      recentClosed,
+      evOptimizer:        evData,
+      recentWebhooks,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message, stack: err.stack });
+  }
+});
 
 // 404
 app.use((req, res) => res.status(404).json({ error: "Route not found", route: `${req.method} ${req.originalUrl}` }));
