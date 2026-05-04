@@ -360,6 +360,9 @@ const {
   loadPerformanceSummary,
   loadMAEStats,
   loadGhostGrouped,
+  loadDailyBreakdown,
+  loadGhostHistoryByPair,
+  loadBlockedRaw,
   setComplianceDateLive,
   saveComplianceDate,
   loadComplianceDate,
@@ -2579,6 +2582,7 @@ app.get("/live/positions", (req, res) => {
       isEvPlus: p.isEvPlus ?? false,
       scaleFactor: p.scaleFactor ?? 1.0,
       slMilestones: p.slMilestones ?? null,
+      rrMilestones: p.rrMilestones ?? null,   // v12.6: favorable milestones voor open pos tabel
       tradeNumber: p.tradeNumber ?? null,
       peakRRPos: p.peakRRPos ?? p.maxRR ?? 0,
       peakRRNeg: p.peakRRNeg ?? 0,
@@ -2616,6 +2620,9 @@ app.get("/live/ghosts", (req, res) => {
         ? calcPctSlUsed(g.direction, g.entry, liveSL, livePrice) : 0,
       slMilestones: g.slMilestones ?? null,
       rrMilestones: g.rrMilestones ?? null,
+      // v12.6: peak RR pos (best ever) en peak RR neg (worst adverse ever, als % SL)
+      peakRRPos: g.peakRRPos ?? calcMaxRR(g.direction, g.entry, liveSL, bestMaxPrice) ?? 0,
+      peakRRNeg: g.peakRRNeg ?? g.maxSlPctUsed ?? 0,
     };
   });
   res.json({ count: ghosts.length, ghosts });
@@ -3076,6 +3083,53 @@ app.get("/ghosts/grouped", async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// ── GET /api/daily-breakdown (v12.6) ─────────────────────────────
+app.get('/api/daily-breakdown', async (req, res) => {
+  try {
+    const data = await loadDailyBreakdown();
+    res.json(data ?? { days: [], maxWinStreak: 0, maxLossStreak: 0, maxDrawdownDay: 0, bestTrades: [], worstTrades: [] });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── GET /api/ghost-history-by-pair (v12.6) ────────────────────────
+app.get('/api/ghost-history-by-pair', async (req, res) => {
+  try {
+    const since = req.query.since ?? currentComplianceDate;
+    const data  = await loadGhostHistoryByPair(since);
+    res.json(data);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── GET /api/blocked-raw (v12.6) ─────────────────────────────────
+// Ruwe geblokkeerde signalen gegroepeerd per symbol+direction+vwap+session+reason
+app.get('/api/blocked-raw', async (req, res) => {
+  try {
+    const data = await loadBlockedRaw(currentComplianceDate);
+    res.json(data);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── GET /api/ev-sl-optimizer (v12.6) ─────────────────────────────
+// EV SL optimizer data: MAE stats + shadow + combo analyse
+app.get('/api/ev-sl-optimizer', async (req, res) => {
+  try {
+    const [mae, shadow, combo] = await Promise.all([
+      loadMAEStats(currentComplianceDate),
+      loadAllShadowAnalysis(),
+      loadGhostComboAnalysis(),
+    ]);
+    const maeMap    = Object.fromEntries((mae || []).map(m => [m.optimizerKey, m]));
+    const shadowMap = Object.fromEntries((shadow || []).map(s => [s.optimizerKey, s]));
+    const merged = (combo || []).map(c => ({
+      ...c,
+      mae:    maeMap[c.optimizerKey]    ?? null,
+      shadow: shadowMap[c.optimizerKey] ?? null,
+    }));
+    merged.sort((a, b) => (b.sampleCount ?? 0) - (a.sampleCount ?? 0));
+    res.json(merged);
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ── TEST endpoint — gebruik dit om Railway connectie te verifiëren ──
@@ -3691,11 +3745,17 @@ td.mx-sym { text-align: left !important; font-weight: 600; color: var(--y); font
     Ghost History
   </div>
   <div class="ntab" onclick="showPage('ev')">
-    EV Optimizer
+    EV TP Optimizer
+  </div>
+  <div class="ntab" onclick="showPage('ev-sl')">
+    EV SL Optimizer
   </div>
   <div class="ntab" onclick="showPage('signals')">
     Signals
     <span class="ntab-badge err" id="nb-sig">—</span>
+  </div>
+  <div class="ntab" onclick="showPage('blocked-raw')">
+    Blocked Raw
   </div>
   <div id="nav-right" id="nav-status">—</div>
 </nav>
@@ -3867,6 +3927,66 @@ td.mx-sym { text-align: left !important; font-weight: 600; color: var(--y); font
         </table>
       </div>
     </div>
+
+    <!-- ── Daily Breakdown (v12.6) ─────────────────────────────────── -->
+    <div class="card" id="card-daily">
+      <div class="card-hdr">
+        <div class="card-title">
+          <div class="status-dot sd-wait" id="daily-dot"></div>
+          Daily Breakdown — Per Dag Performance (compliance+)
+        </div>
+        <div class="card-meta" id="daily-meta">loading...</div>
+      </div>
+      <!-- Streak + Drawdown KPI strip -->
+      <div class="sstrip" id="daily-kpi">
+        <div class="ss"><div class="ss-lbl">Max Win Streak</div><div class="ss-val cg" id="d-wstrk">—</div></div>
+        <div class="ss"><div class="ss-lbl">Max Loss Streak</div><div class="ss-val cr" id="d-lstrk">—</div></div>
+        <div class="ss"><div class="ss-lbl">Max Drawdown (dag-gebaseerd)</div><div class="ss-val cy" id="d-dd">—</div></div>
+      </div>
+      <div class="tw">
+        <table id="daily-tbl">
+          <thead><tr>
+            <th data-col="0">Datum</th>
+            <th data-col="1"># Trades</th>
+            <th data-col="2">Wins</th>
+            <th data-col="3">Losses</th>
+            <th data-col="4">Win%</th>
+            <th data-col="5">Dag P&amp;L €</th>
+            <th data-col="6">Cum P&amp;L €</th>
+            <th data-col="7">Avg Lots</th>
+            <th data-col="8">Best RR</th>
+            <th data-col="9">Avg RR</th>
+          </tr></thead>
+          <tbody id="daily-body"></tbody>
+        </table>
+      </div>
+      <!-- Best / Worst setups -->
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:10px 14px;border-top:1px solid var(--bdr2)">
+        <div>
+          <div style="font-size:10px;color:var(--g);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;font-family:var(--fi)">🏆 Best 5 Setups</div>
+          <table id="best-tbl" style="font-size:10px;width:100%;border-collapse:collapse">
+            <thead><tr>
+              <th style="text-align:left;padding:3px 4px;color:var(--ink3)">Symbol</th>
+              <th>Dir</th><th>Session</th><th>VWAP</th>
+              <th>RR</th><th>P&amp;L €</th>
+            </tr></thead>
+            <tbody id="best-body"></tbody>
+          </table>
+        </div>
+        <div>
+          <div style="font-size:10px;color:var(--r);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;font-family:var(--fi)">💀 Worst 5 Setups</div>
+          <table id="worst-tbl" style="font-size:10px;width:100%;border-collapse:collapse">
+            <thead><tr>
+              <th style="text-align:left;padding:3px 4px;color:var(--ink3)">Symbol</th>
+              <th>Dir</th><th>Session</th><th>VWAP</th>
+              <th>RR</th><th>P&amp;L €</th>
+            </tr></thead>
+            <tbody id="worst-body"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
   </div>
 </div>
 
@@ -3906,12 +4026,13 @@ td.mx-sym { text-align: left !important; font-weight: 600; color: var(--y); font
             <th data-col="6">SL</th>
             <th data-col="7">TP</th>
             <th data-col="8" title="Live RR based on current price">RR Now</th>
-            <th data-col="9" title="Best RR achieved so far">Peak +RR</th>
-            <th title="SL distance consumed">SL Used</th>
-            <th data-col="10" title="TP target RR">→TP</th>
-            <th data-col="11">P&L €</th>
-            <th data-col="12">Lots</th>
-            <th data-col="13" title="Actual risk% at SL hit">Risk %</th>
+            <th data-col="9" title="Best favorable RR ever reached">Peak +RR</th>
+            <th data-col="10" title="Worst adverse RR ever reached (% of SL dist)">Peak −RR</th>
+            <th title="SL distance consumed now">SL Used</th>
+            <th data-col="11" title="TP target RR">→TP</th>
+            <th data-col="12">P&L €</th>
+            <th data-col="13">Lots</th>
+            <th data-col="14" title="Actual risk% at SL hit">Risk %</th>
             <!-- Adverse milestones -0.1 to -1.0 per 0.1 -->
             ${ADV_STEPS.map(v=>`<th class="adv-th" title="Time to reach -${v}R">-${v}</th>`).join('')}
             <!-- Favorable milestones +0.1 to +15 -->
@@ -3956,9 +4077,9 @@ td.mx-sym { text-align: left !important; font-weight: 600; color: var(--y); font
             <th data-col="2">Session</th>
             <th data-col="3">Dir</th>
             <th data-col="4">VWAP</th>
-            <th data-col="5" title="Best RR ever achieved">Peak +RR</th>
-            <th data-col="6" title="Worst RR (adverse)">Peak -RR</th>
-            <th title="SL distance consumed">SL Used%</th>
+            <th data-col="5" title="Best favorable RR ever reached (peak positive)">Peak +RR</th>
+            <th data-col="6" title="Worst adverse RR ever reached (% of SL distance, peak)">Peak −RR%</th>
+            <th title="SL distance consumed right now">SL Now</th>
             <!-- Adverse -0.1 to -1.0 -->
             ${ADV_STEPS.map(v=>`<th class="adv-th" title="T to -${v}R">-${v}</th>`).join('')}
             <!-- Favorable +0.1 to +15 -->
@@ -3981,12 +4102,55 @@ td.mx-sym { text-align: left !important; font-weight: 600; color: var(--y); font
 <div class="npage" id="page-history">
   <div class="page">
 
-    <!-- Ghost History Grouped -->
+    <!-- Ghost History Grouped (v12.6: per-pair individuele lijnen + expand) -->
+    <div class="card">
+      <div class="card-hdr">
+        <div class="card-title">
+          <div class="status-dot sd-wait" id="ghh2-dot"></div>
+          Ghost History — Grouped per Pair · Klik rij voor detail
+        </div>
+        <div class="card-meta" id="ghh2-meta">loading...</div>
+      </div>
+      <div class="fbar">
+        <span class="fl">Session:</span>
+        <button class="fb on" onclick="setGHHF('sess','all',this)">All</button>
+        <button class="fb" onclick="setGHHF('sess','asia',this)">Asia</button>
+        <button class="fb" onclick="setGHHF('sess','london',this)">London</button>
+        <button class="fb" onclick="setGHHF('sess','ny',this)">NY</button>
+        &nbsp;<span class="fl">Dir:</span>
+        <button class="fb on" onclick="setGHHF('dir','all',this)">All</button>
+        <button class="fb" onclick="setGHHF('dir','buy',this)">Buy</button>
+        <button class="fb" onclick="setGHHF('dir','sell',this)">Sell</button>
+      </div>
+      <div class="tw">
+        <table id="ghh2-tbl">
+          <thead><tr>
+            <th>▶</th>
+            <th data-col="1">Symbol</th>
+            <th data-col="2">Session</th>
+            <th data-col="3">Dir</th>
+            <th data-col="4">VWAP</th>
+            <th data-col="5"># Ghosts</th>
+            <th>SL Hits</th>
+            <th>Max RR15</th>
+            <th>Timeout</th>
+            <th data-col="9">Avg Peak+RR</th>
+            <th data-col="10">Avg Peak−RR%</th>
+            <th>Max Peak+RR</th>
+            <th>Best TP (last 5)</th>
+            <th>Best SL% (last 5)</th>
+          </tr></thead>
+          <tbody id="ghh2-body"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Ghost History — klassiek gegroepeerd (bestaand) -->
     <div class="card">
       <div class="card-hdr">
         <div class="card-title">
           <div class="status-dot sd-wait" id="ghh-dot"></div>
-          Ghost History — Grouped by Signal Combo
+          Ghost History — Klassiek Grouped by Signal Combo
         </div>
         <div class="card-meta" id="ghh-meta">Peak RR negative &amp; positive per combo · 3 mei 2026+</div>
       </div>
@@ -4057,6 +4221,76 @@ td.mx-sym { text-align: left !important; font-weight: 600; color: var(--y); font
       </div>
     </div>
 
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════════
+     PAGE: EV SL OPTIMIZER (v12.6)
+═══════════════════════════════════════════════════════════════ -->
+<div class="npage" id="page-ev-sl">
+  <div class="page">
+    <div class="card">
+      <div class="card-hdr">
+        <div class="card-title">
+          <div class="status-dot sd-wait" id="evsl-dot"></div>
+          EV SL Optimizer — MAE-based SL Reduction Recommendations
+        </div>
+        <div class="card-meta">READ ONLY · MAE p90 per combo · min 5 ghost trades vereist</div>
+      </div>
+      <div style="padding:7px 14px;background:rgba(6,182,212,.04);border-bottom:1px solid rgba(6,182,212,.1);font-size:10px;color:var(--ink3);font-family:var(--fi)">
+        ℹ Gebaseerd op MAE (Max Adverse Excursion) van ghost trades. Hoe kleiner MAE p90 t.o.v. 100%, hoe meer de SL kan worden ingekort.
+      </div>
+      <div class="tw">
+        <table id="evsl-tbl">
+          <thead><tr>
+            <th data-col="0">Symbol</th>
+            <th>Type</th>
+            <th data-col="2">Session</th>
+            <th data-col="3">Dir</th>
+            <th data-col="4">VWAP</th>
+            <th data-col="5"># Ghosts</th>
+            <th>MAE p50</th>
+            <th>MAE p75</th>
+            <th data-col="8">MAE p90</th>
+            <th data-col="9">EV SL Advies (READ ONLY)</th>
+            <th data-col="10">Best SL%</th>
+            <th>Potentiële Reductie</th>
+            <th>Shadow p50</th>
+            <th>Shadow p90</th>
+          </tr></thead>
+          <tbody id="evsl-body"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════════
+     PAGE: BLOCKED RAW (v12.6)
+═══════════════════════════════════════════════════════════════ -->
+<div class="npage" id="page-blocked-raw">
+  <div class="page">
+    <div class="card">
+      <div class="card-hdr">
+        <div class="card-title">Blocked Signals — Raw Grouped View</div>
+        <div class="card-meta" id="blkraw-meta">Compliance+ · gegroepeerd per symbol / dir / vwap / session / reason</div>
+      </div>
+      <div class="tw">
+        <table id="blkraw-tbl">
+          <thead><tr>
+            <th data-col="0">Symbol</th>
+            <th data-col="1">Dir</th>
+            <th data-col="2">VWAP</th>
+            <th data-col="3">Session</th>
+            <th data-col="4">Outcome</th>
+            <th data-col="5">Reject Reason</th>
+            <th data-col="6"># Geblokkeerd</th>
+            <th>Laatste Keer</th>
+          </tr></thead>
+          <tbody id="blkraw-body"></tbody>
+        </table>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -4414,9 +4648,11 @@ function showPage(name) {
   });
   _page = name;
   // Lazy load on first visit
-  if(name==='history' && !_histLoaded) loadGhostHistory();
+  if(name==='history'     && !_histLoaded)    { _histLoaded=true;    loadGhostHistory(); loadGhostHistoryGrouped(); }
+  if(name==='ev-sl'       && !_evslLoaded)    { _evslLoaded=true;    loadEVSL(); }
+  if(name==='blocked-raw' && !_blkRawLoaded)  { _blkRawLoaded=true;  loadBlockedRaw(); }
 }
-let _histLoaded = false;
+let _histLoaded=false, _evslLoaded=false, _blkRawLoaded=false;
 
 function showItab(group, name) {
   const pre = group+'-tab-';
@@ -4452,7 +4688,7 @@ function initSort(id) {
   }));
 }
 function initAll() {
-  ['pos-tbl','gh-tbl','ghh-tbl','ev-tbl','whe-tbl','blk-tbl','sl-tbl','placed-tbl','wr-body']
+  ['pos-tbl','gh-tbl','ghh-tbl','ghh2-tbl','daily-tbl','ev-tbl','evsl-tbl','whe-tbl','blk-tbl','blkraw-tbl','sl-tbl','placed-tbl','wr-body']
     .forEach(initSort);
 }
 
@@ -4671,21 +4907,17 @@ async function loadPositions() {
     const rPct   = p.actualRiskPct??p.riskPct;
     const dec    = isFx(p.symbol)?5:2;
 
-    // Milestone data
-    const ms  = p.slMilestones??{};
-    const rrMs= {};  // will be populated if server sends rrMilestones
-    const adv = {};
-    if(ms['25']||ms[0.25]) adv[0.25]=ms['25']||ms[0.25];
-    if(ms['50']||ms[0.50]) adv[0.50]=ms['50']||ms[0.50];
-    if(ms['75']||ms[0.75]) adv[0.75]=ms['75']||ms[0.75];
-    if(ms['100']||ms[1.0]) adv[1.0]=ms['100']||ms[1.0];
-    const fav = {};
-    // ADV_STEPS adverse milestones: map 25/50/75/100 to 0.25/0.5/0.75/1.0
+    // Milestone data — adverse uit slMilestones (pct keys 10-100), favorable uit rrMilestones.favorable
+    const ms     = p.slMilestones ?? {};
+    const favMs  = p.rrMilestones?.favorable ?? {};
     const advFull = {};
-    ADV_STEPS.forEach(s=>{
-      const pctKey = Math.round(s*100)+'';
-      advFull[s] = ms[pctKey]||ms[s]||null;
+    ADV_STEPS.forEach(s => {
+      const pctKey = Math.round(s * 100) + '';   // "10","20",...,"100"
+      advFull[s] = ms[pctKey] || ms[s] || ms[String(parseFloat(s))] || null;
     });
+
+    const peakPos = p.peakRRPos ?? p.maxRR ?? 0;
+    const peakNeg = p.peakRRNeg ?? 0;   // stored as % of SL distance (0–100)
 
     return \`<tr class="\${tCls(p.symbol)}">
       <td data-val="\${p.symbol}" class="cb fw fm" style="font-size:11px">\${p.symbol}</td>
@@ -4697,14 +4929,15 @@ async function loadPositions() {
       <td data-val="\${p.sl}"    class="cr fm" style="font-size:10px">\${f(p.sl,dec)}</td>
       <td data-val="\${p.tp}"    class="cg fm" style="font-size:10px">\${f(p.tp,dec)}</td>
       <td data-val="\${rrNow??-99}" class="\${rrCls} fm" style="font-size:13px">\${rrNow!=null?rrNow+'R':'—'}</td>
-      <td data-val="\${maxRR??-99}" class="\${maxRR>=2?'cg fw':maxRR>=1?'cg':maxRR>0?'cy':'cd'} fm">\${f(maxRR,2)}R</td>
+      <td data-val="\${peakPos}" class="\${peakPos>=2?'cg fw':peakPos>=1?'cg':peakPos>0?'cy':'cd'} fm">\${f(peakPos,2)}R</td>
+      <td data-val="\${peakNeg}" class="\${peakNeg>80?'cr fw':peakNeg>50?'cr':peakNeg>25?'co':'cd'} fm">\${peakNeg>0?'-'+f(peakNeg,0)+'%':'—'}</td>
       <td>\${slBar(p.slPctUsed)}</td>
       <td data-val="\${tpRR??-99}" class="cy fm">\${tpRR!=null?f(tpRR,2)+'R':'—'}</td>
       <td data-val="\${p.currentPnL??-99999}" class="\${pC(p.currentPnL)} fw fm">\${eu(p.currentPnL)}</td>
       <td data-val="\${p.lots}" class="cd fm">\${f(p.lots,2)}</td>
       <td data-val="\${rPct??-1}" class="\${rPct&&rPct>0.04?'cr fw':rPct&&rPct>0.025?'co':'cg'} fm">\${rPct!=null?f(rPct,3)+'%':'—'}</td>
       \${ADV_STEPS.map(s=>msT(advFull[s],p.openedAt,false)).join('')}
-      \${FAV_STEPS.map(s=>msT(null,p.openedAt,true)).join('')}
+      \${FAV_STEPS.map(s=>msT(getMilestone(favMs,s),p.openedAt,true)).join('')}
       <td data-val="\${p.openedAt}" class="cd" style="font-size:9px">\${dtTs(p.openedAt)}</td>
     </tr>\`;
   }).join('');
@@ -4725,8 +4958,11 @@ async function loadGhosts() {
     const strip = document.getElementById('gh-strip');
     if(strip) strip.style.display='flex';
     document.getElementById('gh-cnt').textContent=cnt;
-    const best = Math.max(...(d.ghosts||[]).map(g=>g.maxRR??0));
+    const best = Math.max(...(d.ghosts||[]).map(g=>g.peakRRPos??g.maxRR??0));
     document.getElementById('gh-bestRR').textContent = best>0?f(best,2)+'R':'—';
+    const worst = Math.max(...(d.ghosts||[]).map(g=>g.peakRRNeg??g.slPctUsed??0));
+    const worstEl = document.getElementById('gh-worstRR');
+    if(worstEl) { worstEl.textContent = worst>0?'-'+f(worst,0)+'%':'—'; }
     const elapsed = d.ghosts?.map(g=>g.elapsedMin||0);
     const avgElap = elapsed?.length>0?Math.round(elapsed.reduce((s,v)=>s+v,0)/elapsed.length):0;
     document.getElementById('gh-elapsed').textContent = msFmt(avgElap);
@@ -4737,7 +4973,6 @@ async function loadGhosts() {
   const isFx=s=>FOREX.includes(s)||INDEX.includes(s);
 
   tb.innerHTML=d.ghosts.map(g=>{
-    const slDist = g.sl&&g.entry ? Math.abs(g.entry-g.sl) : 0;
     const advMs  = {};
     const ms     = g.slMilestones||{};
     ADV_STEPS.forEach(s=>{
@@ -4746,8 +4981,9 @@ async function loadGhosts() {
     });
     const favMs = g.rrMilestones?.favorable||{};
 
-    // Compute adverseRR from slPctUsed
-    const adverseRR = g.slPctUsed ? -(g.slPctUsed/100).toFixed(2) : null;
+    // v12.6: gebruik echte peak waarden uit API (niet current slPctUsed)
+    const peakPos = g.peakRRPos ?? g.maxRR ?? 0;
+    const peakNeg = g.peakRRNeg ?? g.slPctUsed ?? 0;  // % van SL afstand
 
     return \`<tr class="\${tCls(g.symbol)}">
       <td data-val="\${g.symbol}" class="cb fw fm" style="font-size:11px">\${g.symbol}</td>
@@ -4755,8 +4991,8 @@ async function loadGhosts() {
       <td>\${sBadge(g.session)}</td>
       <td>\${dBadge(g.direction)}</td>
       <td>\${vBadge(g.vwapPosition)}</td>
-      <td data-val="\${g.maxRR??-99}" class="\${(g.maxRR||0)>=2?'cg fw':(g.maxRR||0)>=1?'cg':(g.maxRR||0)>0?'cy':'cd'} fm">\${f(g.maxRR,2)}R</td>
-      <td data-val="\${adverseRR??0}" class="\${(g.slPctUsed||0)>80?'cr fw':(g.slPctUsed||0)>50?'cr':'cd'} fm">\${g.slPctUsed?'-'+f(g.slPctUsed,0)+'%':'—'}</td>
+      <td data-val="\${peakPos}" class="\${peakPos>=2?'cg fw':peakPos>=1?'cg':peakPos>0?'cy':'cd'} fm">\${f(peakPos,2)}R</td>
+      <td data-val="\${peakNeg}" class="\${peakNeg>80?'cr fw':peakNeg>50?'cr':peakNeg>25?'co':'cd'} fm">\${peakNeg>0?'-'+f(peakNeg,0)+'%':'—'}</td>
       <td>\${slBar(g.slPctUsed)}</td>
       \${ADV_STEPS.map(s=>msT(advMs[s],g.openedAt,false)).join('')}
       \${FAV_STEPS.map(s=>msT(getMilestone(favMs,s),g.openedAt,true)).join('')}
@@ -4764,6 +5000,178 @@ async function loadGhosts() {
       <td data-val="\${g.openedAt}" class="cd" style="font-size:9px">\${dtTs(g.openedAt)}</td>
     </tr>\`;
   }).join('');
+}
+
+/* ══ DAILY BREAKDOWN (v12.6) ════════════════════════════════════ */
+async function loadDailyBreakdown() {
+  const d = await api('/api/daily-breakdown');
+  if(!d){ setDot('daily-dot',false); return; }
+  setDot('daily-dot',true);
+  document.getElementById('d-wstrk').textContent = (d.maxWinStreak??0)+' days';
+  document.getElementById('d-lstrk').textContent = (d.maxLossStreak??0)+' days';
+  document.getElementById('d-dd').textContent    = '€'+f(d.maxDrawdownDay??0,2);
+  document.getElementById('daily-meta').textContent = (d.days?.length??0)+' trading days · compliance+';
+
+  const tb = document.getElementById('daily-body');
+  tb.innerHTML = (d.days||[]).map(row=>{
+    const wins   = parseInt(row.wins??0);
+    const losses = parseInt(row.losses??0);
+    const trades = parseInt(row.trades??0);
+    const wr     = trades>0?(wins/trades*100).toFixed(0):'0';
+    const pnl    = parseFloat(row.day_pnl??0);
+    const cum    = parseFloat(row.cum_pnl??0);
+    return \`<tr>
+      <td class="cd fm" style="font-size:10px">\${row.trade_date}</td>
+      <td data-val="\${trades}" class="cb fm">\${trades}</td>
+      <td class="cg fm">\${wins}</td>
+      <td class="cr fm">\${losses}</td>
+      <td data-val="\${wr}" class="\${wr>=60?'cg':wr>=45?'cy':'cr'} fm">\${wr}%</td>
+      <td data-val="\${pnl}" class="\${pnl>=0?'cg':'cr'} fw fm">\${eu(pnl)}</td>
+      <td class="\${cum>=0?'cg':'cr'} fm">\${eu(cum)}</td>
+      <td class="cd fm">\${f(parseFloat(row.avg_lots??0),2)}</td>
+      <td class="cg fm">\${f(parseFloat(row.best_rr??0),2)}R</td>
+      <td class="cy fm">\${f(parseFloat(row.avg_rr??0),2)}R</td>
+    </tr>\`;
+  }).join('')||emptyRow(10,'Geen data');
+
+  const setupRow = t => \`<tr style="border-bottom:1px solid var(--bdr)">
+    <td class="cb fm" style="padding:2px 4px;font-size:9px">\${t.symbol}</td>
+    <td>\${dBadge(t.direction)}</td>
+    <td>\${sBadge(t.session)}</td>
+    <td>\${vBadge(t.vwapPosition)}</td>
+    <td class="cy fm" style="font-size:9px">\${f(parseFloat(t.maxRR??0),2)}R</td>
+    <td class="\${(t.pnl??0)>=0?'cg':'cr'} fw fm" style="font-size:9px">\${eu(parseFloat(t.pnl??0))}</td>
+  </tr>\`;
+  document.getElementById('best-body').innerHTML  = (d.bestTrades||[]).map(setupRow).join('')||emptyRow(6,'—');
+  document.getElementById('worst-body').innerHTML = (d.worstTrades||[]).map(setupRow).join('')||emptyRow(6,'—');
+}
+
+/* ══ GHOST HISTORY GROUPED (v12.6) ════════════════════════════ */
+let _ghhData2=[], _ghhF2={sess:'all',dir:'all'};
+function setGHHF(k,v,btn){
+  _ghhF2[k]=v;
+  document.querySelectorAll(\`.fb[onclick*="setGHHF('\${k}'"]\`).forEach(b=>b.classList.remove('on'));
+  btn.classList.add('on');
+  renderGhostHistoryGrouped();
+}
+
+async function loadGhostHistoryGrouped() {
+  const d = await api('/api/ghost-history-by-pair');
+  if(!d) return;
+  _ghhData2=d;
+  renderGhostHistoryGrouped();
+}
+
+function renderGhostHistoryGrouped() {
+  const data = _ghhData2.filter(g=>{
+    if(_ghhF2.sess!=='all'&&g.session!==_ghhF2.sess) return false;
+    if(_ghhF2.dir !=='all'&&g.direction!==_ghhF2.dir)  return false;
+    return true;
+  });
+  const meta = document.getElementById('ghh2-meta');
+  if(meta) meta.textContent = data.length+' combos · compliance+';
+
+  const tb = document.getElementById('ghh2-body');
+  if(!tb) return;
+  tb.innerHTML = data.map(g=>{
+    const tpRRs  = (g.trades||[]).filter(t=>parseFloat(t.peakRRPos??0)>0).map(t=>parseFloat(t.peakRRPos));
+    const last5TP = tpRRs.slice(0,5);
+    const bestTP = last5TP.length>0?'avg '+f(last5TP.reduce((s,v)=>s+v,0)/last5TP.length,2)+'R':'—';
+    const slPcts = (g.trades||[]).filter(t=>parseFloat(t.maxSlPct??0)>0).map(t=>parseFloat(t.maxSlPct)).sort((a,b)=>a-b);
+    const last5SL = slPcts.slice(0,5);
+    const bestSL  = last5SL.length>0?'p90: '+(last5SL[Math.min(last5SL.length-1,Math.floor(last5SL.length*.9))]??'—')+'%':'—';
+    const safeKey = g.optimizerKey.replace(/[^a-zA-Z0-9_]/g,'_');
+    return \`<tr style="cursor:pointer" onclick="toggleGHH2('\${safeKey}')">
+      <td style="color:var(--ink3);font-size:9px">▶</td>
+      <td data-val="\${g.symbol}" class="cb fw fm" style="font-size:11px">\${g.symbol}</td>
+      <td>\${sBadge(g.session)}</td>
+      <td>\${dBadge(g.direction)}</td>
+      <td>\${vBadge(g.vwapPosition)}</td>
+      <td data-val="\${g.n}" class="\${g.n>=5?'cy fw':'cc'} fm">\${g.n}</td>
+      <td class="cr fm">\${g.nSLHit}</td>
+      <td class="cg fm">\${g.nMaxRR15}</td>
+      <td class="cy fm">\${g.nMaxDays}</td>
+      <td data-val="\${g.avgPeakPos}" class="cg fm">\${f(g.avgPeakPos,2)}R</td>
+      <td data-val="\${g.avgPeakNeg}" class="cr fm">\${f(g.avgPeakNeg,1)}%</td>
+      <td class="cg fw fm">\${f(g.maxPeakPos,2)}R</td>
+      <td class="cy fm" style="font-size:9px">\${bestTP}</td>
+      <td class="cd fm" style="font-size:9px">\${bestSL}</td>
+    </tr>
+    <tr class="ghh2-detail" id="ghh2-detail-\${safeKey}" style="display:none">
+      <td colspan="14" style="padding:0;background:var(--bg3)">
+        <table style="width:100%;font-size:9px;border-collapse:collapse">
+          <thead><tr style="background:var(--bg4)">
+            <th style="padding:4px 6px">#</th>
+            <th>Opened</th><th>Close Reason</th>
+            <th>TP RR</th><th>Max RR</th>
+            <th>Peak+RR</th><th>Peak−RR%</th><th>MAE%</th>
+          </tr></thead>
+          <tbody>\${(g.trades||[]).map((t,i)=>{
+            const sr = t.stopReason==='phantom_sl'?'cr':t.stopReason==='max_rr_15'?'cg':'cy';
+            return \`<tr style="border-bottom:1px solid var(--bdr)">
+              <td style="padding:3px 6px;color:var(--ink3)">\${i+1}</td>
+              <td class="cd" style="font-size:8px">\${t.openedAt?new Date(t.openedAt).toLocaleDateString('nl-BE'):'—'}</td>
+              <td class="\${sr}" style="font-size:8px">\${t.stopReason??'—'}</td>
+              <td class="cy fm">\${t.tpRRUsed??'—'}</td>
+              <td class="cy fm">\${f(parseFloat(t.maxRR??0),2)}R</td>
+              <td class="cg fm">\${f(parseFloat(t.peakRRPos??0),2)}R</td>
+              <td class="cr fm">\${f(parseFloat(t.peakRRNeg??0),1)}%</td>
+              <td class="cd fm">\${f(parseFloat(t.maxSlPct??0),1)}%</td>
+            </tr>\`;
+          }).join('')}</tbody>
+        </table>
+      </td>
+    </tr>\`;
+  }).join('')||emptyRow(14,'Geen ghost history');
+}
+function toggleGHH2(key){
+  const el=document.getElementById('ghh2-detail-'+key);
+  if(el) el.style.display=el.style.display==='none'?'':'none';
+}
+
+/* ══ EV SL OPTIMIZER (v12.6) ═══════════════════════════════════ */
+async function loadEVSL() {
+  const d = await api('/api/ev-sl-optimizer');
+  if(!d){ setDot('evsl-dot',false); return; }
+  setDot('evsl-dot',true);
+  function maePct(v,t1,t2){if(v==null)return'<td class="cd">—</td>';const c=v<t1?'cg':v<t2?'cy':'cr';return\`<td class="\${c} fm">\${f(v,1)}%</td>\`;}
+  const tb = document.getElementById('evsl-body');
+  tb.innerHTML = d.filter(c=>(c.sampleCount??0)>=5).map(c=>{
+    const mae=c.mae, shad=c.shadow, slRec=mae?.slReduction;
+    return \`<tr class="\${tCls(c.symbol||'')}">
+      <td data-val="\${c.symbol}" class="cb fw fm" style="font-size:11px">\${c.symbol||'—'}</td>
+      <td>\${tyBadge(sTypeName(c.symbol||''))}</td>
+      <td>\${sBadge(c.session)}</td>
+      <td>\${dBadge(c.direction)}</td>
+      <td>\${vBadge(c.vwapPosition)}</td>
+      <td data-val="\${c.sampleCount}" class="\${(c.sampleCount??0)>=5?'cy fw':'cc'} fm">\${c.sampleCount??0}</td>
+      \${maePct(mae?.maeP50,40,65)}\${maePct(mae?.maeP75,50,75)}\${maePct(mae?.maeP90,50,80)}
+      <td class="\${slRec?.color==='g'?'cg fw':slRec?.color==='y'?'cy':'cr'} fm" style="font-size:9px">\${slRec?.label||'—'}</td>
+      <td data-val="\${c.bestSlPct??0}" class="cy fm">\${c.bestSlPct!=null?c.bestSlPct+'%':'—'}</td>
+      <td class="cc fm">\${c.bestSlPct!=null?((100-c.bestSlPct).toFixed(0))+'% kleiner':'—'}</td>
+      <td class="cd fm">\${shad?.p50!=null?f(shad.p50,1)+'%':'—'}</td>
+      <td class="cd fm">\${shad?.p90!=null?f(shad.p90,1)+'%':'—'}</td>
+    </tr>\`;
+  }).join('')||emptyRow(14,'Min 5 ghost trades vereist per combo');
+}
+
+/* ══ BLOCKED RAW (v12.6) ════════════════════════════════════════ */
+async function loadBlockedRaw() {
+  const d = await api('/api/blocked-raw');
+  if(!d) return;
+  const meta = document.getElementById('blkraw-meta');
+  if(meta) meta.textContent = d.length+' groepen · compliance+';
+  const tb = document.getElementById('blkraw-body');
+  tb.innerHTML = d.map(row=>\`<tr>
+    <td data-val="\${row.symbol||''}" class="cb fw fm" style="font-size:11px">\${row.symbol||'—'}</td>
+    <td>\${dBadge(row.direction)}</td>
+    <td>\${vBadge(row.vwapPosition)}</td>
+    <td>\${sBadge(row.session)}</td>
+    <td data-val="\${row.outcome||''}" class="cd fm" style="font-size:10px">\${row.outcome||'—'}</td>
+    <td class="cr fm" style="font-size:10px">\${row.rejectReason||'—'}</td>
+    <td data-val="\${row.count}" class="cy fw fm">\${row.count}</td>
+    <td class="cd" style="font-size:9px">\${row.lastSeen?new Date(row.lastSeen).toLocaleDateString('nl-BE'):'—'}</td>
+  </tr>\`).join('')||emptyRow(8,'Geen geblokkeerde signalen');
 }
 
 /* ══ GHOST HISTORY ══════════════════════════════════════════════ */
@@ -5095,7 +5503,11 @@ async function loadAll(){
     loadErrors().catch(()=>{}),
     loadBlockedSignals().catch(()=>{}),
     loadMAE().catch(()=>{}),
+    loadDailyBreakdown().catch(()=>{}),
     (_histLoaded?loadGhostHistory():Promise.resolve()).catch(()=>{}),
+    (_histLoaded?loadGhostHistoryGrouped():Promise.resolve()).catch(()=>{}),
+    (_evslLoaded?loadEVSL():Promise.resolve()).catch(()=>{}),
+    (_blkRawLoaded?loadBlockedRaw():Promise.resolve()).catch(()=>{}),
   ]);
   const ms=Date.now()-t0;
   if(ns)ns.textContent='Updated: '+new Date().toLocaleTimeString('nl-BE',{hour:'2-digit',minute:'2-digit',second:'2-digit'})+' ('+ms+'ms)';
