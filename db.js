@@ -446,6 +446,53 @@ async function initDB() {
       ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS exclude_from_ev BOOLEAN DEFAULT FALSE;
     `);
 
+    // ── v12.5.1: trade_number — doorlopend nummer per positie ────────
+    // Elke nieuwe trade krijgt een uniek oplopend nummer (globaal).
+    // Wordt gebruikt in open positions, ghost tracker en ghost history
+    // zodat je altijd weet welke trade #N je volgt.
+    await client.query(`
+      ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS trade_number INTEGER;
+      CREATE SEQUENCE IF NOT EXISTS trade_number_seq START 1;
+    `);
+    // ghost_trades krijgt ook trade_number mee
+    await client.query(`
+      ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS trade_number    INTEGER;
+      ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS peak_rr_pos     NUMERIC DEFAULT 0;
+      ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS peak_rr_neg     NUMERIC DEFAULT 0;
+    `);
+    // ghost_state krijgt trade_number + peak RR kolommen
+    await client.query(`
+      ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS trade_number     INTEGER;
+      ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS peak_rr_pos      NUMERIC DEFAULT 0;
+      ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS peak_rr_neg      NUMERIC DEFAULT 0;
+      ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS rr_milestones    JSONB DEFAULT '{}'::jsonb;
+    `);
+
+    // ── ghost_combo_analysis — gecombineerde analyse per optimizer_key ──
+    // Wordt herberekend telkens een ghost trade afgewerkt wordt voor die combo.
+    // Bevat: best_sl_pct, best_tp_rr, win_rate, ev_score, sample_count, ...
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS ghost_combo_analysis (
+        optimizer_key     TEXT        PRIMARY KEY,
+        symbol            TEXT        NOT NULL,
+        session           TEXT        NOT NULL,
+        direction         TEXT        NOT NULL,
+        vwap_position     TEXT        NOT NULL DEFAULT 'unknown',
+        sample_count      INTEGER     DEFAULT 0,
+        ev_count          INTEGER     DEFAULT 0,
+        best_sl_pct       NUMERIC,
+        best_tp_rr        NUMERIC,
+        win_rate          NUMERIC,
+        ev_score          NUMERIC,
+        avg_peak_rr_pos   NUMERIC,
+        avg_peak_rr_neg   NUMERIC,
+        max_peak_rr_pos   NUMERIC,
+        max_peak_rr_neg   NUMERIC,
+        avg_time_to_sl    NUMERIC,
+        computed_at       TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+
     // ── currency_exposure (Fix C: per-currency budget tracking) ─────
     await client.query(`
       CREATE TABLE IF NOT EXISTS currency_exposure (
@@ -631,8 +678,10 @@ async function saveGhostTrade(g) {
         (position_id, symbol, session, direction, vwap_position, optimizer_key,
          entry, sl, sl_pct, phantom_sl, tp_rr_used,
          max_price, max_rr_before_sl, phantom_sl_hit, stop_reason,
-         time_to_sl_min, max_sl_pct_used, sl_milestones, rr_milestones, opened_at, closed_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+         time_to_sl_min, max_sl_pct_used, sl_milestones, rr_milestones,
+         trade_number, peak_rr_pos, peak_rr_neg,
+         opened_at, closed_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
       ON CONFLICT DO NOTHING
     `, [
       g.positionId      ?? null,
@@ -651,6 +700,9 @@ async function saveGhostTrade(g) {
       g.maxSlPctUsed    ?? 0,
       g.slMilestones    ? JSON.stringify(g.slMilestones) : null,
       g.rrMilestones    ? JSON.stringify(g.rrMilestones) : null,
+      g.tradeNumber     ?? null,
+      g.peakRRPos       ?? g.maxRRBeforeSL ?? 0,
+      g.peakRRNeg       ?? g.maxSlPctUsed  ?? 0,
       g.openedAt        ?? null,
       g.closedAt        ?? null,
     ]);
@@ -684,6 +736,9 @@ async function loadGhostTrades(optimizerKey = null, limitRows = 200) {
         CAST(max_sl_pct_used AS FLOAT) AS "maxSlPctUsed",
         sl_milestones        AS "slMilestones",
         rr_milestones        AS "rrMilestones",
+        trade_number         AS "tradeNumber",
+        CAST(peak_rr_pos     AS FLOAT) AS "peakRRPos",
+        CAST(peak_rr_neg     AS FLOAT) AS "peakRRNeg",
         opened_at            AS "openedAt",
         closed_at            AS "closedAt"
       FROM ghost_trades
@@ -1548,18 +1603,24 @@ async function saveGhostState(g) {
         (position_id, optimizer_key, symbol, mt5_symbol, session, direction,
          vwap_position, entry, sl, sl_pct, tp_rr_used,
          max_price, max_rr, max_sl_pct_used, opened_at,
-         risk_pct, risk_eur, ev_mult, day_mult, sl_milestones,
+         risk_pct, risk_eur, ev_mult, day_mult,
+         sl_milestones, rr_milestones,
+         trade_number, peak_rr_pos, peak_rr_neg,
          updated_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,NOW())
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,NOW())
       ON CONFLICT (position_id) DO UPDATE SET
         max_price       = EXCLUDED.max_price,
         max_rr          = EXCLUDED.max_rr,
         max_sl_pct_used = EXCLUDED.max_sl_pct_used,
-        risk_pct        = COALESCE(EXCLUDED.risk_pct, ghost_state.risk_pct),
-        risk_eur        = COALESCE(EXCLUDED.risk_eur, ghost_state.risk_eur),
-        ev_mult         = COALESCE(EXCLUDED.ev_mult,  ghost_state.ev_mult),
-        day_mult        = COALESCE(EXCLUDED.day_mult, ghost_state.day_mult),
-        sl_milestones   = COALESCE(EXCLUDED.sl_milestones, ghost_state.sl_milestones),
+        risk_pct        = COALESCE(EXCLUDED.risk_pct,  ghost_state.risk_pct),
+        risk_eur        = COALESCE(EXCLUDED.risk_eur,  ghost_state.risk_eur),
+        ev_mult         = COALESCE(EXCLUDED.ev_mult,   ghost_state.ev_mult),
+        day_mult        = COALESCE(EXCLUDED.day_mult,  ghost_state.day_mult),
+        sl_milestones   = COALESCE(EXCLUDED.sl_milestones,  ghost_state.sl_milestones),
+        rr_milestones   = COALESCE(EXCLUDED.rr_milestones,  ghost_state.rr_milestones),
+        peak_rr_pos     = GREATEST(EXCLUDED.peak_rr_pos, ghost_state.peak_rr_pos),
+        peak_rr_neg     = GREATEST(EXCLUDED.peak_rr_neg, ghost_state.peak_rr_neg),
+        trade_number    = COALESCE(ghost_state.trade_number, EXCLUDED.trade_number),
         updated_at      = NOW()
     `, [
       g.positionId, g.optimizerKey, g.symbol, g.mt5Symbol ?? g.symbol,
@@ -1570,8 +1631,12 @@ async function saveGhostState(g) {
       g.riskPct ?? null, g.riskEUR ?? null,
       g.evMult ?? 1.0, g.dayMult ?? 1.0,
       g.slMilestones && Object.keys(g.slMilestones).length > 0
-        ? JSON.stringify(g.slMilestones)
-        : null,
+        ? JSON.stringify(g.slMilestones) : null,
+      g.rrMilestones && Object.keys(g.rrMilestones).length > 0
+        ? JSON.stringify(g.rrMilestones) : null,
+      g.tradeNumber ?? null,
+      g.peakRRPos ?? g.maxRR ?? 0,
+      g.peakRRNeg ?? g.maxSlPctUsed ?? 0,
     ]);
   } catch (e) { console.warn('[!] saveGhostState:', e.message); }
 }
@@ -1597,7 +1662,11 @@ async function loadAllGhostStates() {
         CAST(risk_eur         AS FLOAT) AS "riskEUR",
         CAST(ev_mult          AS FLOAT) AS "evMult",
         CAST(day_mult         AS FLOAT) AS "dayMult",
-        sl_milestones         AS "slMilestones"
+        sl_milestones         AS "slMilestones",
+        rr_milestones         AS "rrMilestones",
+        trade_number          AS "tradeNumber",
+        CAST(peak_rr_pos      AS FLOAT) AS "peakRRPos",
+        CAST(peak_rr_neg      AS FLOAT) AS "peakRRNeg"
       FROM ghost_state
     `);
     return r.rows;
@@ -1735,6 +1804,172 @@ async function loadSignalRejects({ since } = {}) {
   } catch (e) { console.warn('[!] loadSignalRejects:', e.message); return []; }
 }
 
+// ── Trade number — volgende beschikbare nummer ────────────────
+// Geeft het volgende globale trade nummer terug (atomisch via sequence).
+async function getNextTradeNumber() {
+  try {
+    const r = await pool.query(`SELECT nextval('trade_number_seq') AS num`);
+    return parseInt(r.rows[0]?.num ?? 1, 10);
+  } catch (e) {
+    // Fallback: tel huidige closed_trades + open_positions
+    try {
+      const r2 = await pool.query(`SELECT COALESCE(MAX(trade_number),0)+1 AS num FROM closed_trades WHERE trade_number IS NOT NULL`);
+      return parseInt(r2.rows[0]?.num ?? 1, 10);
+    } catch { return Date.now() % 100000; }
+  }
+}
+
+// Herlaad trade_number sequence zodat die na een deploy synchroon loopt
+async function syncTradeNumberSequence() {
+  try {
+    await pool.query(`
+      SELECT setval('trade_number_seq',
+        COALESCE((SELECT MAX(trade_number) FROM closed_trades WHERE trade_number IS NOT NULL), 0) + 1,
+        false)
+    `);
+  } catch (e) { console.warn('[TradeNum] sequence sync failed:', e.message); }
+}
+
+// ── Ghost Combo Analysis ──────────────────────────────────────
+// Herbereken de gecombineerde analyse voor een optimizer_key
+// op basis van ALLE afgewerkte ghost trades voor die combo.
+// Wordt aangeroepen telkens een ghost finalizeert.
+async function computeAndSaveGhostComboAnalysis(optimizerKey) {
+  try {
+    const r = await pool.query(`
+      SELECT
+        optimizer_key, symbol, session, direction, vwap_position,
+        CAST(max_rr_before_sl  AS FLOAT) AS "maxRR",
+        CAST(max_sl_pct_used   AS FLOAT) AS "maxSlPct",
+        CAST(peak_rr_pos       AS FLOAT) AS "peakPos",
+        CAST(peak_rr_neg       AS FLOAT) AS "peakNeg",
+        CAST(tp_rr_used        AS FLOAT) AS "tpRR",
+        phantom_sl_hit   AS "phantomSLHit",
+        stop_reason      AS "stopReason",
+        time_to_sl_min   AS "timeToSL",
+        opened_at        AS "openedAt"
+      FROM ghost_trades
+      WHERE optimizer_key = $1
+        AND closed_at IS NOT NULL
+        AND opened_at >= $2
+        AND vwap_position IN ('above','below')
+      ORDER BY opened_at ASC
+    `, [optimizerKey, COMPLIANCE_DATE]);
+
+    const rows = r.rows;
+    if (!rows.length) return null;
+
+    const n = rows.length;
+    const sym   = rows[0].optimizer_key?.split('_')[0] ?? '';
+    const sess  = rows[0].session;
+    const dir   = rows[0].direction;
+    const vwap  = rows[0].vwap_position;
+
+    // EV-eligible: phantom SL hit OR max_rr_15, AND maxRR >= 0.5
+    const evRows = rows.filter(g => (g.phantomSLHit || g.stopReason === 'max_rr_15') && (g.maxRR ?? 0) >= 0.5);
+    const evCount = evRows.length;
+
+    const avgPeakPos = rows.reduce((s,g) => s+(g.peakPos??g.maxRR??0), 0) / n;
+    const avgPeakNeg = rows.reduce((s,g) => s+(g.peakNeg??0), 0) / n;
+    const maxPeakPos = Math.max(...rows.map(g => g.peakPos ?? g.maxRR ?? 0));
+    const maxPeakNeg = Math.max(...rows.map(g => g.peakNeg ?? 0));
+
+    const tSLRows = rows.filter(g => g.timeToSL != null);
+    const avgTimeToSL = tSLRows.length > 0 ? tSLRows.reduce((s,g) => s+g.timeToSL, 0) / tSLRows.length : null;
+
+    // Sweep TP RR levels from 0.5 to 15 to find best EV
+    let bestTPRR = null, bestWR = 0, bestEV = -Infinity;
+    for (let tp = 0.5; tp <= 15; tp += 0.5) {
+      const wins = evRows.filter(g => (g.maxRR ?? 0) >= tp).length;
+      const wr   = evCount > 0 ? wins / evCount : 0;
+      const ev   = wr * tp - (1 - wr);
+      if (ev > bestEV) { bestEV = ev; bestWR = wr; bestTPRR = tp; }
+    }
+
+    // Best SL: sweep maxSlPct percentiles
+    const slPcts = evRows.map(g => g.maxSlPct ?? 100).sort((a,b) => a-b);
+    const p90SL  = slPcts.length > 0 ? slPcts[Math.min(slPcts.length-1, Math.floor(0.9*slPcts.length))] : null;
+
+    const analysis = {
+      optimizerKey, symbol: sym, session: sess, direction: dir, vwapPosition: vwap,
+      sampleCount: n, evCount,
+      bestSlPct: p90SL, bestTpRr: bestTPRR,
+      winRate: parseFloat((bestWR * 100).toFixed(2)),
+      evScore: parseFloat(bestEV.toFixed(4)),
+      avgPeakRrPos: parseFloat(avgPeakPos.toFixed(3)),
+      avgPeakRrNeg: parseFloat(avgPeakNeg.toFixed(3)),
+      maxPeakRrPos: parseFloat(maxPeakPos.toFixed(3)),
+      maxPeakRrNeg: parseFloat(maxPeakNeg.toFixed(3)),
+      avgTimeToSl: avgTimeToSL != null ? Math.round(avgTimeToSL) : null,
+    };
+
+    await pool.query(`
+      INSERT INTO ghost_combo_analysis
+        (optimizer_key, symbol, session, direction, vwap_position,
+         sample_count, ev_count, best_sl_pct, best_tp_rr, win_rate, ev_score,
+         avg_peak_rr_pos, avg_peak_rr_neg, max_peak_rr_pos, max_peak_rr_neg,
+         avg_time_to_sl, computed_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,NOW())
+      ON CONFLICT (optimizer_key) DO UPDATE SET
+        sample_count    = EXCLUDED.sample_count,
+        ev_count        = EXCLUDED.ev_count,
+        best_sl_pct     = EXCLUDED.best_sl_pct,
+        best_tp_rr      = EXCLUDED.best_tp_rr,
+        win_rate        = EXCLUDED.win_rate,
+        ev_score        = EXCLUDED.ev_score,
+        avg_peak_rr_pos = EXCLUDED.avg_peak_rr_pos,
+        avg_peak_rr_neg = EXCLUDED.avg_peak_rr_neg,
+        max_peak_rr_pos = EXCLUDED.max_peak_rr_pos,
+        max_peak_rr_neg = EXCLUDED.max_peak_rr_neg,
+        avg_time_to_sl  = EXCLUDED.avg_time_to_sl,
+        computed_at     = NOW()
+    `, [
+      analysis.optimizerKey, analysis.symbol, analysis.session,
+      analysis.direction, analysis.vwapPosition,
+      analysis.sampleCount, analysis.evCount,
+      analysis.bestSlPct, analysis.bestTpRr,
+      analysis.winRate, analysis.evScore,
+      analysis.avgPeakRrPos, analysis.avgPeakRrNeg,
+      analysis.maxPeakRrPos, analysis.maxPeakRrNeg,
+      analysis.avgTimeToSl,
+    ]);
+
+    return analysis;
+  } catch (e) {
+    console.warn('[GhostCombo] computeAndSave:', e.message);
+    return null;
+  }
+}
+
+async function loadGhostComboAnalysis(optimizerKey = null) {
+  try {
+    const vals = [];
+    let where = '';
+    if (optimizerKey) { vals.push(optimizerKey); where = 'WHERE optimizer_key=$1'; }
+    const r = await pool.query(`
+      SELECT
+        optimizer_key AS "optimizerKey", symbol, session, direction,
+        vwap_position AS "vwapPosition",
+        sample_count  AS "sampleCount",
+        ev_count      AS "evCount",
+        CAST(best_sl_pct     AS FLOAT) AS "bestSlPct",
+        CAST(best_tp_rr      AS FLOAT) AS "bestTpRr",
+        CAST(win_rate        AS FLOAT) AS "winRate",
+        CAST(ev_score        AS FLOAT) AS "evScore",
+        CAST(avg_peak_rr_pos AS FLOAT) AS "avgPeakRrPos",
+        CAST(avg_peak_rr_neg AS FLOAT) AS "avgPeakRrNeg",
+        CAST(max_peak_rr_pos AS FLOAT) AS "maxPeakRrPos",
+        CAST(max_peak_rr_neg AS FLOAT) AS "maxPeakRrNeg",
+        avg_time_to_sl AS "avgTimeToSl",
+        computed_at    AS "computedAt"
+      FROM ghost_combo_analysis
+      ${where}
+      ORDER BY sample_count DESC
+    `, vals);
+    return r.rows;
+  } catch (e) { return []; }
+}
+
 // ── Compliance date persistence ───────────────────────────────
 async function saveComplianceDate(isoStr) {
   try {
@@ -1811,6 +2046,11 @@ module.exports = {
   computeEVStats,
   // Shadow winners
   loadShadowWinners,
+  // v12.5.1: trade numbering + ghost combo analysis
+  getNextTradeNumber,
+  syncTradeNumberSequence,
+  computeAndSaveGhostComboAnalysis,
+  loadGhostComboAnalysis,
   // v12.5: compliance date management
   setComplianceDateLive,
   saveComplianceDate,
