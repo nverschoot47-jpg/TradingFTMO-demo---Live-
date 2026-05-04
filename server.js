@@ -4240,10 +4240,6 @@ document.addEventListener('DOMContentLoaded',()=>{initAll();loadAll();setInterva
 </html>`);
 });
 
-</script>
-</body>
-</html>`);
-});
 
 
 
