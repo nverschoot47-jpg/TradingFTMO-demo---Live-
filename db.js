@@ -34,14 +34,21 @@
 //    loadAllShadowAnalysis (FIX 12), loadAllTrades LIMIT 10000.
 // ===============================================================
 
-// FIX 8: COMPLIANCE_DATE from single source of truth
-const { COMPLIANCE_DATE, COMPLIANCE_DATE_MS } = require('./session');
+// FIX 8: COMPLIANCE_DATE from single source of truth (startup default)
+const { COMPLIANCE_DATE: COMPLIANCE_DATE_DEFAULT, COMPLIANCE_DATE_MS } = require('./session');
 
-// FIX v12.2: EV_DATA_CUTOFF — earliest date for valid ghost EV data.
-// Aligned with COMPLIANCE_DATE: 28/04/2026 14:00 Brussels (12:00 UTC).
-// All ghost data before this timestamp is excluded from EV calculations.
-// FIX v12.6: env var override — set EV_DATA_CUTOFF in Railway env to change without redeploy.
-const EV_DATA_CUTOFF = process.env.EV_DATA_CUTOFF || '2026-04-28 12:00:00';
+// Live mutable compliance date — updated at startup from DB and via POST /compliance-date.
+// One date controls everything: open trades, ghost, history, EV, signals.
+// Default: session.js hardcoded value (2026-05-03). Override via DB or endpoint.
+let COMPLIANCE_DATE = COMPLIANCE_DATE_DEFAULT;
+let EV_DATA_CUTOFF  = COMPLIANCE_DATE_DEFAULT;  // unified — same date for all filters
+
+// Update both live vars at once. Called by server.js on startup + via /compliance-date POST.
+function setComplianceDateLive(isoStr) {
+  COMPLIANCE_DATE = isoStr;
+  EV_DATA_CUTOFF  = isoStr;
+  console.log(`[ComplianceDate] Live updated → ${isoStr}`);
+}
 //  - DATE GATE: computeEVStats(), countGhostsByKey() now filter
 //    ghost_trades to opened_at >= '2026-04-18' only.
 //    Pre-compliance trades had missing execution_price / vwap_band_pct
@@ -90,6 +97,15 @@ async function initDB() {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
+
+    // ── system_config ───────────────────────────────────────────
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS system_config (
+        key        TEXT        PRIMARY KEY,
+        value      TEXT        NOT NULL,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
 
     // ── symbol_risk_config ──────────────────────────────────────
     await client.query(`
@@ -1719,6 +1735,24 @@ async function loadSignalRejects({ since } = {}) {
   } catch (e) { console.warn('[!] loadSignalRejects:', e.message); return []; }
 }
 
+// ── Compliance date persistence ───────────────────────────────
+async function saveComplianceDate(isoStr) {
+  try {
+    await pool.query(`
+      INSERT INTO system_config (key, value, updated_at)
+      VALUES ('compliance_date', $1, NOW())
+      ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()
+    `, [isoStr]);
+  } catch (e) { console.warn('[!] saveComplianceDate:', e.message); }
+}
+
+async function loadComplianceDate() {
+  try {
+    const r = await pool.query(`SELECT value FROM system_config WHERE key = 'compliance_date'`);
+    return r.rows[0]?.value ?? null;
+  } catch (e) { return null; }
+}
+
 module.exports = {
   pool,
   initDB,
@@ -1777,6 +1811,10 @@ module.exports = {
   computeEVStats,
   // Shadow winners
   loadShadowWinners,
+  // v12.5: compliance date management
+  setComplianceDateLive,
+  saveComplianceDate,
+  loadComplianceDate,
   // v12.5: nieuwe functies
   loadPerformanceSummary,
   loadMAEStats,
