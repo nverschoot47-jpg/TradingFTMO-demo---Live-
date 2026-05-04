@@ -360,6 +360,9 @@ const {
   loadPerformanceSummary,
   loadMAEStats,
   loadGhostGrouped,
+  setComplianceDateLive,
+  saveComplianceDate,
+  loadComplianceDate,
   pool,
 } = require("./db");
 
@@ -373,6 +376,11 @@ const {
   SL_BUFFER_MULT: SESSION_SL_BUFFER_MULT,
   STOCK_SL_BUFFER_MULT,
 } = require("./session");
+
+// Live compliance date — geladen uit DB bij startup, aanpasbaar via POST /compliance-date.
+// Beheert de datumgrens voor ghost EV, shadow, signals, history, trade stats.
+// Default: hardcoded session.js waarde (2026-05-03). DB overschrijft bij startup.
+let currentComplianceDate = COMPLIANCE_DATE;
 
 // ── Config ───────────────────────────────────────────────────────
 const META_API_TOKEN  = process.env.META_API_TOKEN;
@@ -556,7 +564,6 @@ const shadowResults  = {};
 const webhookLog     = [];
 const symbolRiskMap  = {};
 const keyRiskMult    = {};   // { [optimizerKey]: { streak, evMult, dayMult } }
-const lotOverrides   = {};   // { [symbol]: baseLots }
 
 // FIX C: currency exposure tracking { [currency]: currentEURExposure }
 // Bijgewerkt bij elke nieuwe EV-neutraal trade open/close.
@@ -1729,14 +1736,14 @@ async function evaluateDailyRisk() {
         console.warn('[DailyRisk] DB fallback mislukt:', e.message);
       }
     }
-    // FIX 7: use realizedPnlEUR
-    const totalPnl = todayT.reduce((s, t) => s + (t.realizedPnlEUR ?? t.currentPnL ?? 0), 0);
+    // FIX 7: use realizedPnlEUR (in-memory) or pnl (DB-fallback rows)
+    const totalPnl = todayT.reduce((s, t) => s + (t.realizedPnlEUR ?? t.pnl ?? t.currentPnL ?? 0), 0);
 
     const keyGroups = {};
     for (const t of todayT) {
       const k = t.optimizerKey ?? buildOptimizerKey(t.symbol, t.session, t.direction, t.vwapPosition ?? "unknown");
       if (!keyGroups[k]) keyGroups[k] = { pnl: 0, count: 0 };
-      keyGroups[k].pnl   += t.realizedPnlEUR ?? t.currentPnL ?? 0;
+      keyGroups[k].pnl   += t.realizedPnlEUR ?? t.pnl ?? t.currentPnL ?? 0;
       keyGroups[k].count += 1;
     }
 
@@ -1994,7 +2001,7 @@ app.post("/webhook", async (req, res) => {
         ? (pct >= 3.5 ? "350_500" : "250_350")
         : (pct >= 2.5 ? "250_350" : "150_250");
       if (pct < 5.0) {
-        const tempSLForBand   = calcSLFromDerivedPct(direction, closePrice, derivedSlPct);
+        const tempSLForBand   = calcSLFromDerivedPct(direction, closePrice, derivedSlPct, assetType);
         const enforcedSLBand  = enforceMinStop(mt5Symbol, direction, closePrice, tempSLForBand);
         startBandGhostTracker({
           signalId:      signalLogRow?.id ?? null,
@@ -2303,9 +2310,9 @@ app.post("/webhook", async (req, res) => {
     console.log(`[SL-CHAIN] ${symKey} ${direction}: TV entry=${closePrice} TV SL=${tvSL ?? "n/a"} → slPct=${(derivedSlPct*100).toFixed(4)}% → MT5 exec=${executionPrice} → MT5 SL=${mt5SL} (dist=${slDist.toFixed(5)} = ${slPctActual}%)`);
   }
 
-  // Step C2: Recalculate lots op executionPrice (als geen override) — nu met live lotVal
+  // Step C2: Recalculate lots op executionPrice — nu met live lotVal
   // FIX R5 (v11.0): lotDivisor verwijderd — uniform risk per trade.
-  if (!lotOverrides[symKey]) {
+  {
     const calcResult2 = await calcLots(symKey, mt5Symbol, assetType, executionPrice, mt5SL, riskEUR, evMult, dayMult);
     lots   = calcResult2.lots;
     lotVal = calcResult2.lotVal; // live lotVal na executie (spec al gecached)
@@ -2819,7 +2826,7 @@ app.get("/risk-config", async (req, res) => {
     riskPct: getSymbolRiskPct(sym),
     riskEUR: parseFloat((getSymbolRiskPct(sym) * balance).toFixed(2)),
     evMult:  getKeyEvMult(sym), dayMult: getKeyDayMult(sym),
-    envVar:  `RISK_${sym}`, lotOverride: lotOverrides[sym] ?? null,
+    envVar:  `RISK_${sym}`, lotOverride: null,
   }));
   res.json({ balance, fixedRiskPct: FIXED_RISK_PCT, config });
 });
@@ -3025,15 +3032,16 @@ app.get("/health", async (req, res) => {
   const tradeWindowForex = canOpenNewTrade("EURUSD");
   const tradeWindowStock = canOpenNewTrade("AAPL");
   res.json({
-    status: "ok", version: "12.3.0", time: getBrusselsDateStr(),
+    status: "ok", version: "12.5.0", time: getBrusselsDateStr(),
     openPos: Object.keys(openPositions).length, ghosts: Object.keys(ghostTrackers).length,
     tpLocks: Object.keys(tpLocks).length, closedT: closedTrades.length, balance,
     fixedRiskPct: FIXED_RISK_PCT, marketOpen: isMarketOpen(), session: getSession(),
     tradeWindowForex: tradeWindowForex.allowed, tradeWindowStocks: tradeWindowStock.allowed,
-    lotOverrides: Object.keys(lotOverrides).length, evKeyMults: Object.keys(keyRiskMult).length,
+    lotOverrides: 0, evKeyMults: Object.keys(keyRiskMult).length,
     multMinSample: MULT_MIN_SAMPLE, slBufferMult: SL_BUFFER_MULT,
     stockSlBufferMult: STOCK_SL_BUFFER_MULT,
     nyDeadZone: "1530-1800 Brussels (forex/commodity/stock geblokkeerd)",
+    complianceDate: currentComplianceDate,
   });
 });
 
@@ -4369,6 +4377,37 @@ app.get("/api/summary", async (req, res) => {
   }
 });
 
+// ── Compliance date endpoint ──────────────────────────────────────
+// GET  /compliance-date  → huidige datum + default
+// POST /compliance-date  → { date: "2026-05-03" } of ISO string
+// Geldt direct voor: EV stats, ghost data, shadow snapshots, signals, history
+app.get("/compliance-date", async (req, res) => {
+  res.json({
+    complianceDate: currentComplianceDate,
+    default:        COMPLIANCE_DATE,
+    note:           "Trades/ghosts/EV/signals vóór deze datum worden genegeerd in alle stats",
+  });
+});
+
+app.post("/compliance-date", async (req, res) => {
+  try {
+    const raw = req.body?.date;
+    if (!raw) return res.status(400).json({ error: "Geef { date: 'YYYY-MM-DD' } of ISO string mee" });
+    const parsed = new Date(raw);
+    if (isNaN(parsed.getTime())) return res.status(400).json({ error: `Ongeldige datum: ${raw}` });
+    // Sla op als "YYYY-MM-DD HH:MM:SS" formaat (consistent met bestaande queries)
+    const isoStr = parsed.toISOString().slice(0, 19).replace("T", " ");
+    setComplianceDateLive(isoStr);
+    currentComplianceDate = isoStr;
+    await saveComplianceDate(isoStr);
+    console.log(`[ComplianceDate] Bijgewerkt via API → ${isoStr}`);
+    logEvent({ type: "COMPLIANCE_DATE_UPDATED", date: isoStr });
+    res.json({ ok: true, complianceDate: isoStr, message: `Alle stats gefilterd vanaf ${isoStr}` });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // 404
 app.use((req, res) => res.status(404).json({ error: "Route not found", route: `${req.method} ${req.originalUrl}` }));
 
@@ -4379,6 +4418,16 @@ async function start() {
 
   console.log("🚀 PRONTO-AI v12.5.0 starting...");
   await initDB();
+
+  // Laad compliance date uit DB — overschrijft hardcoded default als eerder ingesteld via /compliance-date
+  const savedComplianceDate = await loadComplianceDate();
+  if (savedComplianceDate) {
+    currentComplianceDate = savedComplianceDate;
+    setComplianceDateLive(savedComplianceDate);
+    console.log(`📅 Compliance date (DB): ${savedComplianceDate}`);
+  } else {
+    console.log(`📅 Compliance date (default): ${COMPLIANCE_DATE}`);
+  }
 
   // Load closed trades
   const trades = await loadAllTrades();
@@ -4451,7 +4500,7 @@ async function start() {
   rebuildEVCache().catch(() => {});
 
   app.listen(PORT, () => {
-    console.log(`[✓] PRONTO-AI v12.4.0 on port ${PORT}`);
+    console.log(`[✓] PRONTO-AI v12.5.0 on port ${PORT}`);
     console.log(`   🔹 Dashboard:      /`);
     console.log(`   🔹 Health:         /health`);
     console.log(`   🔹 EV Table:       /ev`);
@@ -4463,12 +4512,14 @@ async function start() {
     console.log(`   🔹 Rejects:        /signal-stats/rejects`);
     console.log(`   🔹 Spread Stats:   /spread-stats?symbol=EURUSD&session=london`);
     console.log(`   🔹 Spread Log:     /spread-log?symbol=EURUSD&limit=200`);
+    console.log(`   🔹 Compliance:     GET/POST /compliance-date`);
     console.log(`   🔹 Webhook:        POST /webhook?secret=<secret>`);
     console.log(`   💵 Fixed risk:     ${(FIXED_RISK_PCT*100).toFixed(3)}% | Balance: €${liveBalance.toFixed(2)}`);
     console.log(`   🌍 MetaApi regio:  ${META_REGION} (wijzig via META_API_REGION env als 504 errors)`);
     console.log(`   💰 Curr budget:    ${(CURRENCY_BUDGET_PCT*100).toFixed(1)}% per valuta | TP floor: ${MIN_TP_RR_FLOOR}R`);
-    console.log(`   🕐 Ghost max:      72h | SL buffer: ×${SL_BUFFER_MULT} | Stock SL buffer: ×${STOCK_SL_BUFFER_MULT}`);
+    console.log(`   🕐 Ghost max:      ${GHOST_MAX_MS / (24*3600*1000)}d | SL buffer: ×${SL_BUFFER_MULT} | Stock SL buffer: ×${STOCK_SL_BUFFER_MULT}`);
     console.log(`   📊 Mult threshold: ${MULT_MIN_SAMPLE} ghost samples`);
+    console.log(`   📅 Compliance:     ${currentComplianceDate} (POST /compliance-date om te wijzigen)`);
   });
 }
 
