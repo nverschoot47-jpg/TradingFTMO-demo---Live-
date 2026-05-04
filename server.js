@@ -2505,9 +2505,6 @@ app.get("/live/positions", (req, res) => {
       isEvPlus: p.isEvPlus ?? false,
       scaleFactor: p.scaleFactor ?? 1.0,
       slMilestones: p.slMilestones ?? null,
-      rrMilestones: ghostTrackers[p.positionId]?.rrMilestones ?? null,
-      maxRR: ghostTrackers[p.positionId]?.maxRR ?? p.maxRR ?? 0,
-      type,
     };
   });
   res.json({ count: positions.length, balance, positions });
@@ -3051,750 +3048,787 @@ app.get(["/", "/dashboard"], async (req, res) => {
   const STOCK_SYMBOLS     = ["AAPL","AMD","AMZN","ARM","ASML","AVGO","AZN","BA","BABA","BAC","BRKB","CSCO","CVX","DIS","FDX","GE","GM","GME","GOOGL","IBM","INTC","JNJ","JPM","KO","LMT","MCD","META","MSFT","MSTR","NFLX","NKE","NVDA","PFE","PLTR","QCOM","SBUX","SNOW","T","TSLA","V","WMT","XOM","ZM"];
 
   let dbTradeCount = 0;
-  try {
-    const r = await pool.query("SELECT COUNT(*) AS cnt FROM closed_trades");
-    dbTradeCount = parseInt(r.rows[0]?.cnt ?? 0, 10);
-  } catch(e) {}
+  try { const r = await pool.query("SELECT COUNT(*) AS cnt FROM closed_trades"); dbTradeCount = parseInt(r.rows[0]?.cnt ?? 0, 10); } catch(e) {}
 
-  // Generate favorable RR steps: 0.1 to 15.0 per 0.1 = 150 steps
-  // But for display we show selective columns in the header
-  const FAV_DISPLAY = [0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0,1.1,1.2,1.3,1.4,1.5,1.6,1.7,1.8,1.9,2.0,2.5,3.0,3.5,4.0,4.5,5.0,6.0,7.0,8.0,9.0,10.0,11.0,12.0,13.0,14.0,15.0];
-  const favHeaders = FAV_DISPLAY.map(v => '<th class="s rrh" title="T to +'+v+'R">'+(v<1?'+'+v:v>=10?'+'+v+'R':'+'+v)+'</th>').join('');
-  const favColCount = FAV_DISPLAY.length;
+  const FAV_STEPS = [0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0,1.2,1.4,1.5,1.6,1.8,2.0,2.5,3.0,3.5,4.0,4.5,5.0,6.0,7.0,8.0,9.0,10.0,12.0,15.0];
 
   res.end(`<!DOCTYPE html>
 <html lang="nl">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PRONTO·AI — v13.0</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=JetBrains+Mono:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<title>PRONTO·AI — Live Trading</title>
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@300;400;500;600;700;800&family=Barlow:wght@300;400;500;600&family=Barlow+Semi+Condensed:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-:root {
-  --bg:#03050a; --s1:#060a12; --s2:#090e18; --s3:#0c1220;
-  --bdr:#111b2e; --bdr2:#192840; --bdr3:#1f3050;
-  --txt:#b8d0e8; --dim:#304860; --dim2:#0a1020;
-  --g:#00e8a0; --r:#ff2a50; --b:#18b4f8; --y:#f0be18;
-  --p:#a870ff; --c:#00d8d0; --o:#ff8018;
-  --fn:'JetBrains Mono',monospace; --fh:'Space Grotesk',sans-serif;
-  --glow-b:0 0 20px rgba(24,180,248,.15);
-  --glow-g:0 0 20px rgba(0,232,160,.15);
+:root{
+  --ink:#e8f0f8; --ink2:#8aa4c0; --ink3:#4a6480;
+  --bg:#080c14; --bg1:#0c1220; --bg2:#101828; --bg3:#141e2e;
+  --bdr:#1a2840; --bdr2:#243650;
+  --g:#00e5a0; --g2:rgba(0,229,160,.12); --g3:rgba(0,229,160,.06);
+  --r:#ff3355; --r2:rgba(255,51,85,.12); --r3:rgba(255,51,85,.06);
+  --b:#18aaee; --b2:rgba(24,170,238,.12); --b3:rgba(24,170,238,.06);
+  --y:#f0c020; --y2:rgba(240,192,32,.12);
+  --p:#aa70ff; --p2:rgba(170,112,255,.12);
+  --o:#ff8c30; --o2:rgba(255,140,48,.12);
+  --c:#00ccd4; --c2:rgba(0,204,212,.12);
+  --fn:'Barlow',sans-serif; --fc:'Barlow Condensed',sans-serif; --fs:'Barlow Semi Condensed',sans-serif;
 }
 *{box-sizing:border-box;margin:0;padding:0;}
-html,body{background:var(--bg);color:var(--txt);font-family:var(--fn);font-size:11px;line-height:1.4;overflow-x:hidden;}
+html,body{background:var(--bg);color:var(--ink);font-family:var(--fn);font-size:12px;line-height:1.4;overflow-x:hidden;}
+::selection{background:rgba(24,170,238,.3);}
+::-webkit-scrollbar{width:3px;height:3px;} ::-webkit-scrollbar-track{background:transparent;} ::-webkit-scrollbar-thumb{background:var(--bdr2);border-radius:2px;}
 
-/* ─── BACKGROUND ─────────────────────────────── */
-body::before{
-  content:'';position:fixed;inset:0;pointer-events:none;z-index:0;
-  background:
-    radial-gradient(ellipse 80% 40% at 20% 0%, rgba(24,180,248,.04) 0%, transparent 60%),
-    radial-gradient(ellipse 60% 30% at 80% 100%, rgba(0,232,160,.03) 0%, transparent 60%),
-    linear-gradient(rgba(24,180,248,.02) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(24,180,248,.02) 1px, transparent 1px);
-  background-size:auto,auto,48px 48px,48px 48px;
-}
-
-/* ─── HEADER ─────────────────────────────────── */
-.hdr{
-  position:sticky;top:0;z-index:200;
-  background:rgba(3,5,10,.92);backdrop-filter:blur(16px);
+/* ═══ HEADER ═══════════════════════════════════════════════════ */
+#hdr{
+  position:sticky;top:0;z-index:300;
+  background:rgba(8,12,20,.95);backdrop-filter:blur(20px);
   border-bottom:1px solid var(--bdr2);
-  display:flex;align-items:center;justify-content:space-between;
-  padding:0 20px;height:52px;gap:16px;
+  display:flex;align-items:center;height:48px;padding:0 16px;gap:0;
 }
-.logo{font-family:var(--fh);font-size:18px;font-weight:700;letter-spacing:2px;
-  background:linear-gradient(90deg,var(--b),var(--g));-webkit-background-clip:text;-webkit-text-fill-color:transparent;}
-.ver{font-size:8px;color:var(--dim);letter-spacing:.8px;margin-top:1px;}
-.hdr-r{display:flex;align-items:center;gap:10px;}
-.clock{font-family:var(--fh);font-size:16px;font-weight:600;color:var(--c);letter-spacing:2px;min-width:78px;text-align:right;}
-.hdr-sess{padding:3px 9px;border-radius:3px;font-size:9.5px;font-weight:700;letter-spacing:.8px;font-family:var(--fh);}
-.s-asia{background:rgba(0,216,208,.1);color:var(--c);border:1px solid rgba(0,216,208,.3);}
-.s-london{background:rgba(0,232,160,.1);color:var(--g);border:1px solid rgba(0,232,160,.3);}
-.s-ny{background:rgba(168,112,255,.1);color:var(--p);border:1px solid rgba(168,112,255,.3);}
-.s-out{background:rgba(48,72,96,.15);color:var(--dim);border:1px solid var(--bdr2);}
-.hbtn{background:none;border:1px solid var(--bdr2);color:var(--dim);padding:4px 11px;border-radius:3px;cursor:pointer;font-family:var(--fn);font-size:9.5px;transition:all .15s;letter-spacing:.5px;}
-.hbtn:hover{color:var(--b);border-color:var(--b);box-shadow:var(--glow-b);}
-.hbtn.danger{border-color:rgba(255,42,80,.3);color:var(--r);}
-.hbtn.danger:hover{box-shadow:0 0 16px rgba(255,42,80,.15);}
-.live-dot{width:7px;height:7px;border-radius:50%;background:var(--g);display:inline-block;animation:lpulse 2s infinite;}
-@keyframes lpulse{0%,100%{box-shadow:0 0 0 0 rgba(0,232,160,.5);}60%{box-shadow:0 0 0 6px rgba(0,232,160,0);}}
+.hdr-logo{
+  font-family:var(--fc);font-size:22px;font-weight:800;letter-spacing:3px;
+  color:var(--b);text-shadow:0 0 24px rgba(24,170,238,.4);
+  padding-right:20px;border-right:1px solid var(--bdr2);margin-right:16px;
+  flex-shrink:0;
+}
+.hdr-kpis{display:flex;align-items:center;gap:0;flex:1;overflow:hidden;}
+.hdr-kpi{
+  display:flex;flex-direction:column;padding:0 14px;border-right:1px solid var(--bdr);
+  min-width:0;
+}
+.hdr-kpi:first-child{padding-left:0;}
+.hk-lbl{font-family:var(--fc);font-size:8px;letter-spacing:1.2px;text-transform:uppercase;color:var(--ink3);margin-bottom:1px;}
+.hk-val{font-family:var(--fc);font-size:16px;font-weight:700;line-height:1;white-space:nowrap;}
+.hdr-right{display:flex;align-items:center;gap:8px;margin-left:auto;flex-shrink:0;}
+.hdr-clock{font-family:var(--fc);font-size:18px;font-weight:600;color:var(--c);letter-spacing:2px;min-width:72px;text-align:right;}
+.hdr-sess{font-family:var(--fc);font-size:10px;font-weight:700;letter-spacing:1px;padding:3px 8px;border-radius:2px;}
+.sa{background:var(--c2);color:var(--c);border:1px solid var(--c);}
+.sl{background:var(--g2);color:var(--g);border:1px solid var(--g);}
+.sn{background:var(--p2);color:var(--p);border:1px solid var(--p);}
+.so{background:rgba(30,48,70,.5);color:var(--ink3);border:1px solid var(--bdr2);}
+.hbtn{
+  background:transparent;border:1px solid var(--bdr2);color:var(--ink3);
+  padding:4px 10px;font-family:var(--fc);font-size:10px;letter-spacing:.5px;
+  cursor:pointer;border-radius:2px;transition:all .12s;
+}
+.hbtn:hover{color:var(--b);border-color:var(--b);}
+.hbtn.red{border-color:rgba(255,51,85,.4);color:var(--r);}
+.live-dot{width:6px;height:6px;border-radius:50%;background:var(--g);animation:ldot 2s infinite;flex-shrink:0;}
+@keyframes ldot{0%,100%{box-shadow:0 0 0 0 rgba(0,229,160,.5);}60%{box-shadow:0 0 0 5px rgba(0,229,160,0);}}
 
-/* ─── COMPLIANCE BANNER ──────────────────────── */
+/* ═══ NAV TABS ══════════════════════════════════════════════════ */
+#nav{
+  display:flex;align-items:center;
+  background:var(--bg1);border-bottom:1px solid var(--bdr2);
+  padding:0 16px;position:sticky;top:48px;z-index:200;
+}
+.ntab{
+  font-family:var(--fc);font-size:11px;font-weight:600;letter-spacing:.8px;
+  text-transform:uppercase;padding:10px 14px;cursor:pointer;
+  color:var(--ink3);border-bottom:2px solid transparent;
+  transition:all .12s;white-space:nowrap;
+}
+.ntab:hover{color:var(--ink);}
+.ntab.on{color:var(--b);border-bottom-color:var(--b);}
+.ntab .badge{
+  display:inline-block;background:var(--b2);color:var(--b);
+  font-size:8px;padding:1px 5px;border-radius:10px;margin-left:4px;
+  font-weight:700;vertical-align:middle;
+}
+.ntab.on .badge{background:var(--b2);color:var(--b);}
+.ntab-err .badge{background:var(--r2);color:var(--r);}
+.npage{display:none;}.npage.on{display:block;}
+#nav-status{margin-left:auto;font-size:9px;color:var(--ink3);}
+
+/* ═══ COMPLIANCE BAR ════════════════════════════════════════════ */
 .comp-bar{
-  display:flex;align-items:center;gap:10px;
-  padding:5px 20px;font-size:9px;letter-spacing:.4px;
-  background:rgba(240,190,24,.04);border-bottom:1px solid rgba(240,190,24,.12);
-  position:relative;z-index:1;
+  display:flex;align-items:center;gap:8px;padding:4px 16px;
+  background:rgba(240,192,32,.04);border-bottom:1px solid rgba(240,192,32,.1);
+  font-size:9px;color:var(--ink3);
 }
 .comp-dot{width:5px;height:5px;border-radius:50%;background:var(--y);flex-shrink:0;}
 
-/* ─── KPI BAR ────────────────────────────────── */
-.kbar{
-  display:grid;grid-template-columns:repeat(11,1fr);
-  border-bottom:1px solid var(--bdr2);background:var(--s1);
-  position:relative;z-index:1;
-}
-.kpi{padding:9px 13px;border-right:1px solid var(--bdr);position:relative;overflow:hidden;}
-.kpi:last-child{border-right:none;}
-.kpi::after{content:'';position:absolute;bottom:0;left:0;width:100%;height:2px;}
-.kb::after{background:var(--b);}.kg::after{background:var(--g);}.kp::after{background:var(--p);}
-.ky::after{background:var(--y);}.kc::after{background:var(--c);}.ko::after{background:var(--o);}
-.kr::after{background:var(--r);}
-.kl{font-size:7.5px;letter-spacing:1.2px;color:var(--dim);text-transform:uppercase;margin-bottom:4px;font-family:var(--fh);}
-.kv{font-family:var(--fh);font-size:17px;font-weight:700;line-height:1;letter-spacing:.3px;}
-.ksub{font-size:8px;color:var(--dim);margin-top:2px;}
+/* ═══ PAGE LAYOUT ═══════════════════════════════════════════════ */
+.page{padding:12px 16px;display:flex;flex-direction:column;gap:10px;}
 
-/* ─── STATUS BAR ─────────────────────────────── */
-.sbar{
+/* ═══ CARDS / SECTIONS ══════════════════════════════════════════ */
+.card{background:var(--bg1);border:1px solid var(--bdr2);border-radius:3px;overflow:hidden;}
+.card-hdr{
   display:flex;align-items:center;justify-content:space-between;
-  padding:3px 20px;background:var(--s1);border-bottom:1px solid var(--bdr);
-  font-size:8.5px;color:var(--dim);position:relative;z-index:1;
+  padding:7px 12px;background:var(--bg2);border-bottom:1px solid var(--bdr2);
 }
-
-/* ─── MAIN ───────────────────────────────────── */
-.main{padding:12px 16px;display:flex;flex-direction:column;gap:12px;position:relative;z-index:1;}
-
-/* ─── SECTION ────────────────────────────────── */
-.sec{border:1px solid var(--bdr2);border-radius:4px;overflow:hidden;background:var(--s1);}
-.sh{
-  display:flex;align-items:center;justify-content:space-between;gap:8px;
-  padding:8px 13px;background:var(--s2);border-bottom:1px solid var(--bdr2);
-}
-.st{font-family:var(--fh);font-size:11.5px;font-weight:700;letter-spacing:.6px;display:flex;align-items:center;gap:7px;}
+.card-title{font-family:var(--fc);font-size:11px;font-weight:700;letter-spacing:.8px;display:flex;align-items:center;gap:7px;}
+.card-meta{font-size:9px;color:var(--ink3);}
 .sdot{width:7px;height:7px;border-radius:50%;flex-shrink:0;}
-.sdot.ok{background:var(--g);box-shadow:0 0 8px rgba(0,232,160,.5);}
-.sdot.err{background:var(--r);animation:lpulse2 1.5s infinite;}
-@keyframes lpulse2{0%,100%{opacity:1;}50%{opacity:.3};}
-.sm{font-size:8.5px;color:var(--dim);letter-spacing:.3px;}
+.sdot.ok{background:var(--g);box-shadow:0 0 6px rgba(0,229,160,.5);}
+.sdot.err{background:var(--r);animation:ldot 1.5s infinite;}
+.sdot.wait{background:var(--y);}
 
-/* ─── FILTER BAR ─────────────────────────────── */
-.fbar{display:flex;flex-wrap:wrap;align-items:center;gap:5px;padding:7px 12px;border-bottom:1px solid var(--bdr2);background:var(--bg);}
-.fl{font-size:8.5px;color:var(--dim);letter-spacing:.4px;margin-right:2px;font-family:var(--fh);}
-.fb{background:none;border:1px solid var(--bdr2);color:var(--dim);padding:2px 8px;border-radius:2px;cursor:pointer;font-family:var(--fn);font-size:9px;transition:all .12s;}
-.fb.on,.fb:hover{background:rgba(24,180,248,.08);color:var(--b);border-color:rgba(24,180,248,.4);}
+/* ═══ FILTER BAR ════════════════════════════════════════════════ */
+.fbar{display:flex;flex-wrap:wrap;align-items:center;gap:4px;padding:6px 12px;border-bottom:1px solid var(--bdr2);background:var(--bg);}
+.fl{font-family:var(--fc);font-size:9px;color:var(--ink3);margin-right:2px;letter-spacing:.4px;}
+.fb{
+  background:none;border:1px solid var(--bdr);color:var(--ink3);
+  padding:2px 8px;border-radius:2px;cursor:pointer;
+  font-family:var(--fc);font-size:9.5px;transition:all .1s;letter-spacing:.3px;
+}
+.fb.on,.fb:hover{background:var(--b2);color:var(--b);border-color:rgba(24,170,238,.4);}
 
-/* ─── STRIP ──────────────────────────────────── */
-.strip{display:flex;gap:16px;padding:7px 13px;border-bottom:1px solid var(--bdr2);background:var(--s2);flex-wrap:wrap;}
-.stat .sl2{font-size:7.5px;color:var(--dim);letter-spacing:.8px;text-transform:uppercase;font-family:var(--fh);}
-.stat .sv2{font-family:var(--fh);font-size:13px;font-weight:700;}
+/* ═══ STAT STRIP ════════════════════════════════════════════════ */
+.sstrip{display:flex;gap:0;border-bottom:1px solid var(--bdr2);}
+.ss{padding:8px 14px;border-right:1px solid var(--bdr);flex:1;}
+.ss:last-child{border-right:none;}
+.ss-lbl{font-family:var(--fc);font-size:8px;letter-spacing:1px;text-transform:uppercase;color:var(--ink3);margin-bottom:3px;}
+.ss-val{font-family:var(--fc);font-size:17px;font-weight:700;line-height:1;}
+.ss-sub{font-size:8px;color:var(--ink3);margin-top:2px;}
 
-/* ─── TABLES ─────────────────────────────────── */
+/* ═══ TABLES ════════════════════════════════════════════════════ */
 .tw{overflow-x:auto;}
 table{width:100%;border-collapse:collapse;font-size:10.5px;}
-thead tr{background:var(--s2);border-bottom:1px solid var(--bdr2);}
-th{padding:5px 7px;text-align:left;font-size:8px;letter-spacing:.7px;color:var(--dim);
-  text-transform:uppercase;white-space:nowrap;font-family:var(--fh);font-weight:600;user-select:none;}
-th.s{cursor:pointer;}th.s:hover{color:var(--b);}
-th.s.asc::after{content:' ↑';color:var(--b);}th.s.desc::after{content:' ↓';color:var(--b);}
-th.rrh{font-size:7px;padding:5px 4px;color:var(--dim);letter-spacing:0;}
-td{padding:4px 7px;border-bottom:1px solid var(--bdr);white-space:nowrap;vertical-align:middle;}
-tbody tr:hover{background:rgba(24,180,248,.03);}
+thead th{
+  background:var(--bg2);border-bottom:1px solid var(--bdr2);
+  padding:5px 8px;text-align:left;white-space:nowrap;
+  font-family:var(--fc);font-size:8.5px;font-weight:600;
+  letter-spacing:.6px;text-transform:uppercase;color:var(--ink3);
+  cursor:pointer;user-select:none;
+}
+thead th:hover{color:var(--b);}
+thead th.asc::after{content:' ↑';color:var(--b);}
+thead th.desc::after{content:' ↓';color:var(--b);}
+thead th.rrh{font-size:7.5px;padding:5px 3px;color:var(--ink3);letter-spacing:0;}
+td{padding:4px 8px;border-bottom:1px solid var(--bdr);white-space:nowrap;vertical-align:middle;}
+tbody tr:hover{background:rgba(24,170,238,.025);}
 tbody tr:last-child td{border-bottom:none;}
-.nodata{text-align:center;padding:14px;color:var(--dim);font-size:9.5px;letter-spacing:.4px;}
+.nd{text-align:center;padding:16px;color:var(--ink3);font-size:9.5px;}
 
-/* type borders */
-tr.tf td:first-child{border-left:2px solid rgba(0,216,208,.4);}
-tr.ti td:first-child{border-left:2px solid rgba(240,190,24,.4);}
-tr.tc td:first-child{border-left:2px solid rgba(255,128,24,.4);}
-tr.ts td:first-child{border-left:2px solid rgba(24,180,248,.4);}
+/* type row indicators */
+tr.tf td:first-child{border-left:2px solid rgba(0,204,212,.5);}
+tr.ti td:first-child{border-left:2px solid rgba(240,192,32,.5);}
+tr.tc td:first-child{border-left:2px solid rgba(255,140,48,.5);}
+tr.ts td:first-child{border-left:2px solid rgba(24,170,238,.5);}
 
-/* ─── BADGES ─────────────────────────────────── */
-.bd{display:inline-block;padding:2px 6px;border-radius:2px;font-size:8.5px;font-weight:700;letter-spacing:.3px;font-family:var(--fh);}
-.bd-buy{background:rgba(0,232,160,.1);color:var(--g);border:1px solid rgba(0,232,160,.25);}
-.bd-sell{background:rgba(255,42,80,.1);color:var(--r);border:1px solid rgba(255,42,80,.25);}
-.bd-ab{background:rgba(24,180,248,.1);color:var(--b);border:1px solid rgba(24,180,248,.25);}
-.bd-bw{background:rgba(168,112,255,.1);color:var(--p);border:1px solid rgba(168,112,255,.25);}
-.bd-as{background:rgba(0,216,208,.08);color:var(--c);}
-.bd-lo{background:rgba(0,232,160,.08);color:var(--g);}
-.bd-ny{background:rgba(168,112,255,.08);color:var(--p);}
-.bd-out{background:rgba(48,72,96,.12);color:var(--dim);}
-.bd-tp{background:rgba(0,232,160,.12);color:var(--g);}
-.bd-sl{background:rgba(255,42,80,.12);color:var(--r);}
-.bd-mr{background:rgba(168,112,255,.12);color:var(--p);}
-.bd-mn{background:rgba(240,190,24,.12);color:var(--y);}
-.bd-lck{background:rgba(240,190,24,.15);color:var(--y);border:1px solid rgba(240,190,24,.3);}
-.bd-evp{background:rgba(0,232,160,.15);color:var(--g);border:1px solid rgba(0,232,160,.3);}
-.bd-evn{background:rgba(255,42,80,.12);color:var(--r);border:1px solid rgba(255,42,80,.25);}
-.bd-fx{background:rgba(0,216,208,.08);color:var(--c);}
-.bd-ix{background:rgba(240,190,24,.08);color:var(--y);}
-.bd-cm{background:rgba(255,128,24,.08);color:var(--o);}
-.bd-sk{background:rgba(24,180,248,.08);color:var(--b);}
+/* ═══ BADGES ════════════════════════════════════════════════════ */
+.bd{display:inline-flex;align-items:center;padding:1px 6px;border-radius:2px;font-family:var(--fc);font-size:8.5px;font-weight:700;letter-spacing:.4px;}
+.b-buy{background:var(--g2);color:var(--g);border:1px solid rgba(0,229,160,.3);}
+.b-sell{background:var(--r2);color:var(--r);border:1px solid rgba(255,51,85,.3);}
+.b-ab{background:var(--b2);color:var(--b);border:1px solid rgba(24,170,238,.3);}
+.b-bw{background:var(--p2);color:var(--p);border:1px solid rgba(170,112,255,.3);}
+.b-as{background:var(--c2);color:var(--c);}
+.b-lo{background:var(--g2);color:var(--g);}
+.b-ny{background:var(--p2);color:var(--p);}
+.b-out{background:rgba(30,48,70,.5);color:var(--ink3);}
+.b-tp{background:var(--g2);color:var(--g);}
+.b-sl{background:var(--r2);color:var(--r);}
+.b-mr{background:var(--p2);color:var(--p);}
+.b-mn{background:var(--y2);color:var(--y);}
+.b-lk{background:var(--y2);color:var(--y);border:1px solid rgba(240,192,32,.3);}
+.b-ev+{background:var(--g2);color:var(--g);border:1px solid rgba(0,229,160,.3);}
+.b-evn{background:var(--r2);color:var(--r);border:1px solid rgba(255,51,85,.3);}
+.b-fx{background:var(--c2);color:var(--c);}
+.b-ix{background:var(--y2);color:var(--y);}
+.b-cm{background:var(--o2);color:var(--o);}
+.b-sk{background:var(--b2);color:var(--b);}
 
-/* ─── COLORS ─────────────────────────────────── */
-.g{color:var(--g);}.r{color:var(--r);}.b{color:var(--b);}.y{color:var(--y);}
-.p{color:var(--p);}.c{color:var(--c);}.o{color:var(--o);}.d{color:var(--dim);}
-.fw{font-weight:700;}
+/* ═══ COLORS ════════════════════════════════════════════════════ */
+.g{color:var(--g);}.r{color:var(--r);}.b{color:var(--b);}
+.y{color:var(--y);}.p{color:var(--p);}.c{color:var(--c);}
+.o{color:var(--o);}.d{color:var(--ink3);}.fw{font-weight:700;}
 
-/* ─── SL BAR ─────────────────────────────────── */
-.slbar{display:flex;align-items:center;gap:4px;min-width:72px;}
-.slbg{height:4px;flex:1;background:var(--dim2);border-radius:2px;overflow:hidden;}
-.slfi{height:100%;border-radius:2px;transition:width .3s;background:var(--g);}
-.slfi.w{background:var(--o);}.slfi.d{background:var(--r);}
+/* ═══ SL PROGRESS BAR ═══════════════════════════════════════════ */
+.slbar{display:flex;align-items:center;gap:4px;min-width:80px;}
+.slbg{height:3px;flex:1;background:var(--bdr);border-radius:2px;overflow:hidden;}
+.slfi{height:100%;border-radius:2px;background:var(--g);transition:width .3s;}
+.slfi.w{background:var(--y);}.slfi.d{background:var(--r);}
 
-/* ─── RR LIVE CELLS ──────────────────────────── */
-.rr-now-cell{font-family:var(--fh);font-weight:700;font-size:12px;}
-.rr-pos{color:var(--g);}.rr-neg{color:var(--r);}.rr-mid{color:var(--y);}
-.rr-zero{color:var(--dim);}
+/* ═══ RR JOURNEY BAR ════════════════════════════════════════════ */
+.rrbar{display:flex;align-items:center;gap:3px;}
+.rrtrack{height:4px;width:80px;background:var(--bdr);border-radius:2px;position:relative;overflow:visible;}
+.rrfill{height:100%;border-radius:2px;position:absolute;left:0;top:0;transition:width .3s;}
+.rrnow{width:2px;height:8px;border-radius:1px;position:absolute;top:-2px;background:white;transition:left .3s;}
 
-/* ─── TABS ───────────────────────────────────── */
-.tabs{display:flex;border-bottom:1px solid var(--bdr2);}
-.tab{padding:7px 14px;cursor:pointer;font-size:9.5px;font-family:var(--fh);font-weight:600;
-  letter-spacing:.5px;color:var(--dim);border-bottom:2px solid transparent;transition:all .15s;}
-.tab:hover{color:var(--b);}.tab.on{color:var(--b);border-bottom-color:var(--b);background:rgba(24,180,248,.04);}
-.tpane{display:none;}.tpane.on{display:block;}
+/* ═══ SECTION GRID - OVERVIEW PAGE ══════════════════════════════ */
+.overview-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;padding:12px 16px;}
+.overview-card{background:var(--bg1);border:1px solid var(--bdr2);border-radius:3px;padding:14px;}
+.ov-lbl{font-family:var(--fc);font-size:8.5px;letter-spacing:1.2px;text-transform:uppercase;color:var(--ink3);margin-bottom:8px;}
+.ov-val{font-family:var(--fc);font-size:28px;font-weight:800;line-height:1;letter-spacing:.5px;}
+.ov-sub{font-size:9px;color:var(--ink3);margin-top:4px;}
+.ov-bar{margin-top:8px;height:2px;background:var(--bdr);border-radius:1px;overflow:hidden;}
+.ov-bar-fill{height:100%;border-radius:1px;}
+.ov-accent{position:relative;}
+.ov-accent::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;border-radius:3px 3px 0 0;}
+.ov-accent.blue::before{background:var(--b);}
+.ov-accent.green::before{background:var(--g);}
+.ov-accent.purple::before{background:var(--p);}
+.ov-accent.yellow::before{background:var(--y);}
+.ov-accent.cyan::before{background:var(--c);}
+.ov-accent.red::before{background:var(--r);}
 
-/* ─── EV MATRIX ──────────────────────────────── */
-.mxg{display:grid;grid-template-columns:1fr 1fr;gap:12px;padding:12px;background:var(--s2);}
-.mxt{font-family:var(--fh);font-size:9.5px;font-weight:700;letter-spacing:.7px;color:var(--dim);
-  padding:0 0 5px;border-bottom:1px solid var(--bdr2);margin-bottom:5px;}
-.mx th{font-size:8px;padding:4px 6px;}.mx td{padding:4px 7px;text-align:center;border-right:1px solid var(--bdr);}
-.mx td:last-child{border-right:none;}
-.mx td.sym{text-align:left;font-weight:700;color:var(--y);font-family:var(--fh);font-size:10px;
-  position:sticky;left:0;background:var(--s2);z-index:1;border-right:1px solid var(--bdr2);}
-.ep{color:var(--g);}.en{color:var(--r);}.ez{color:var(--dim);}
+/* ═══ EV MATRIX ═════════════════════════════════════════════════ */
+.mx-wrap{display:grid;grid-template-columns:1fr 1fr;gap:0;}
+.mx-section{border-right:1px solid var(--bdr);}
+.mx-section:last-child{border-right:none;}
+.mx-hdr{font-family:var(--fc);font-size:8px;letter-spacing:1px;color:var(--ink3);text-transform:uppercase;padding:5px 10px;border-bottom:1px solid var(--bdr2);background:var(--bg2);}
+table.mx-tbl th{font-size:7.5px;padding:4px 6px;}
+table.mx-tbl td{padding:3px 7px;text-align:center;font-size:9.5px;border-right:1px solid var(--bdr);}
+table.mx-tbl td:last-child{border-right:none;}
+table.mx-tbl td.sym-cell{text-align:left;font-family:var(--fc);font-weight:700;color:var(--y);font-size:10px;position:sticky;left:0;background:var(--bg1);z-index:1;border-right:1px solid var(--bdr2);}
 
-/* ─── STATS GRID ─────────────────────────────── */
-.stats-grid{display:grid;grid-template-columns:repeat(5,1fr);border-bottom:1px solid var(--bdr2);}
-.sc{padding:10px 14px;border-right:1px solid var(--bdr);}
-.sc:last-child{border-right:none;}
-.sc-label{font-size:7.5px;letter-spacing:1.2px;color:var(--dim);text-transform:uppercase;margin-bottom:5px;font-family:var(--fh);}
-.sc-val{font-family:var(--fh);font-size:20px;font-weight:700;line-height:1;}
-.sc-sub{font-size:8px;color:var(--dim);margin-top:3px;}
+/* ═══ EMPTY STATE ═══════════════════════════════════════════════ */
+.empty-state{display:flex;align-items:center;gap:10px;padding:16px 14px;color:var(--ink3);font-size:9.5px;}
+.es-line{flex:1;height:1px;background:var(--bdr);}
 
-/* ─── PERF GRID ──────────────────────────────── */
-.perf-grid{display:grid;grid-template-columns:repeat(8,1fr);border-bottom:1px solid var(--bdr2);}
-.pc{padding:9px 13px;border-right:1px solid var(--bdr);}
-.pc:last-child{border-right:none;}
-.pc-label{font-size:7.5px;letter-spacing:1.2px;color:var(--dim);text-transform:uppercase;margin-bottom:4px;font-family:var(--fh);}
-.pc-val{font-family:var(--fh);font-size:17px;font-weight:700;line-height:1;}
-.pc-sub{font-size:8px;color:var(--dim);margin-top:2px;}
+/* ═══ RR HEATMAP CELLS ══════════════════════════════════════════ */
+td.rr-hit{background:rgba(0,229,160,.08);color:var(--g);}
+td.rr-mid{background:rgba(240,192,32,.06);color:var(--y);}
+td.rr-soon{color:var(--ink2);}
+td.rr-no{color:var(--ink3);}
 
-/* ─── COMBO FILTER ───────────────────────────── */
-.cfbox{padding:10px 13px;background:var(--s2);display:flex;flex-direction:column;gap:10px;}
-.empty{display:flex;align-items:center;gap:10px;padding:14px;color:var(--dim);font-size:9.5px;}
-.eline{flex:1;height:1px;background:var(--bdr2);}
+/* ═══ TABS (inner) ══════════════════════════════════════════════ */
+.itabs{display:flex;border-bottom:1px solid var(--bdr2);}
+.itab{font-family:var(--fc);font-size:10px;font-weight:600;letter-spacing:.5px;padding:6px 12px;cursor:pointer;color:var(--ink3);border-bottom:2px solid transparent;transition:all .12s;}
+.itab:hover{color:var(--ink);}
+.itab.on{color:var(--b);border-bottom-color:var(--b);}
+.ipane{display:none;}.ipane.on{display:block;}
 
-@media(max-width:1024px){.kbar{grid-template-columns:repeat(6,1fr);}.mxg{grid-template-columns:1fr;}.stats-grid{grid-template-columns:repeat(3,1fr);}.perf-grid{grid-template-columns:repeat(4,1fr);}}
+@media(max-width:900px){.overview-grid{grid-template-columns:1fr 1fr;}.mx-wrap{grid-template-columns:1fr;}}
 </style>
 </head>
 <body>
 
-<!-- HEADER -->
-<div class="hdr">
-  <div>
-    <div class="logo">PRONTO·AI</div>
-    <div class="ver">v13.0 · TradingView → MetaApi → FTMO MT5 · Risk ${(FIXED_RISK_PCT*100).toFixed(4)}% · SL×${SL_BUFFER_MULT} · Compliance: 3 mei 2026</div>
+<!-- ═══ HEADER ═══════════════════════════════════════════════════ -->
+<div id="hdr">
+  <div class="hdr-logo">PRONTO·AI</div>
+  <div class="hdr-kpis">
+    <div class="hdr-kpi"><div class="hk-lbl">Balance MT5</div><div class="hk-val b">€<span id="k-bal">${balance.toFixed(0)}</span></div></div>
+    <div class="hdr-kpi"><div class="hk-lbl">Open Trades</div><div class="hk-val g" id="k-pos">—</div></div>
+    <div class="hdr-kpi"><div class="hk-lbl">Open P&L</div><div class="hk-val" id="k-pnl">—</div></div>
+    <div class="hdr-kpi"><div class="hk-lbl">Ghosts</div><div class="hk-val p" id="k-gh">—</div></div>
+    <div class="hdr-kpi"><div class="hk-lbl">Risk/trade</div><div class="hk-val c">${(FIXED_RISK_PCT*100).toFixed(4)}%</div></div>
+    <div class="hdr-kpi"><div class="hk-lbl">DB Trades</div><div class="hk-val y">${dbTradeCount.toLocaleString()}</div></div>
+    <div class="hdr-kpi"><div class="hk-lbl">TP Locked</div><div class="hk-val y" id="k-tp">—</div></div>
   </div>
-  <div class="hdr-r">
+  <div class="hdr-right">
     <span class="live-dot"></span>
-    <span class="hdr-sess s-out" id="hdr-sess">—</span>
-    <span class="clock" id="clock">--:--:--</span>
-    <button class="hbtn" onclick="loadAll()">↻ REFRESH</button>
-    <button class="hbtn danger" id="deploy-btn" onclick="prepareDeploy()">⚡ DEPLOY</button>
-    <span id="deploy-status" style="font-size:8.5px;color:var(--dim);max-width:160px;overflow:hidden;text-overflow:ellipsis;"></span>
+    <span class="hdr-sess so" id="hdr-sess">—</span>
+    <span class="hdr-clock" id="clock">--:--:--</span>
+    <button class="hbtn" onclick="loadAll()">↻</button>
+    <button class="hbtn red" id="dbtn" onclick="prepareDeploy()">⚡ DEPLOY</button>
   </div>
 </div>
 
-<!-- COMPLIANCE BANNER -->
+<!-- ═══ NAV TABS ══════════════════════════════════════════════════ -->
+<div id="nav">
+  <div class="ntab on" onclick="showPage('overview')">📊 Overview</div>
+  <div class="ntab" onclick="showPage('positions')">📈 Open Positions <span class="badge" id="nb-pos">—</span></div>
+  <div class="ntab" onclick="showPage('ghosts')">👻 Ghost Tracker <span class="badge" id="nb-gh">—</span></div>
+  <div class="ntab" onclick="showPage('history')">📚 Ghost History</div>
+  <div class="ntab" onclick="showPage('ev')">🎯 EV Optimizer</div>
+  <div class="ntab" onclick="showPage('signals')">⚡ Signals <span class="badge ntab-err" id="nb-sig">—</span></div>
+  <span id="nav-status" style="font-size:9px;color:var(--ink3)"></span>
+</div>
+
+<!-- ═══ COMPLIANCE BAR ═══════════════════════════════════════════ -->
 <div class="comp-bar">
   <div class="comp-dot"></div>
-  <span style="color:var(--y);font-weight:600;">Compliance:</span>
-  <span style="color:var(--txt);">3 mei 2026 00:00 UTC</span>
-  <span style="color:var(--dim);">— alle statistieken, EV-berekeningen en P&amp;L berekend uitsluitend op basis van trades geopend ná deze datum</span>
-  <span style="margin-left:auto;color:var(--c);font-family:Space Grotesk,sans-serif;font-size:9px;">DB totaal: ${dbTradeCount.toLocaleString()} trades</span>
+  <strong style="color:var(--y)">Compliance: 3 mei 2026 00:00 UTC</strong>
+  <span style="color:var(--ink3)">— EV, statistics & P&L calculated only on trades opened after this date</span>
+  <span style="margin-left:auto;color:var(--c);font-family:var(--fc);font-size:9px;">${dbTradeCount.toLocaleString()} trades in DB</span>
 </div>
 
-<!-- KPI BAR -->
-<div class="kbar">
-  <div class="kpi kb"><div class="kl">Balance MT5</div><div class="kv b">€<span id="k-bal">${balance.toFixed(0)}</span></div><div class="ksub" id="k-bal-age">live</div></div>
-  <div class="kpi kg"><div class="kl">Open Trades</div><div class="kv g" id="k-pos">—</div></div>
-  <div class="kpi"><div class="kl">Open P&amp;L</div><div class="kv" id="k-pnl">—</div></div>
-  <div class="kpi kp"><div class="kl">Ghosts Actief</div><div class="kv p" id="k-gh">—</div></div>
-  <div class="kpi ky"><div class="kl">TP Locks EV+</div><div class="kv y" id="k-tp">—</div></div>
-  <div class="kpi kc"><div class="kl">SL Optimizer</div><div class="kv c" id="k-sl">—</div></div>
-  <div class="kpi"><div class="kl">Sessie</div><div class="kv" style="font-size:13px" id="k-sess">—</div></div>
-  <div class="kpi kb"><div class="kl">Risk / Actual</div><div class="kv b" style="font-size:13px">${(FIXED_RISK_PCT*100).toFixed(4)}%<span style="color:var(--o);font-size:10px"> ~${(FIXED_RISK_PCT*SL_BUFFER_MULT*100).toFixed(3)}%</span></div></div>
-  <div class="kpi kc"><div class="kl">Signals Placed</div><div class="kv c" id="k-tps">—</div></div>
-  <div class="kpi ko"><div class="kl">Closed Trades</div><div class="kv o" id="k-err">—</div></div>
-  <div class="kpi ky"><div class="kl">DB Trades</div><div class="kv y">${dbTradeCount.toLocaleString()}</div></div>
-</div>
+<!-- ═══ PAGE: OVERVIEW ═══════════════════════════════════════════ -->
+<div class="npage on" id="page-overview">
 
-<!-- STATUS BAR -->
-<div class="sbar">
-  <span id="gs-text">Initialiseren...</span>
-  <span><span id="gs-err" style="color:var(--r)"></span> <span id="gs-time"></span> <span id="upd-freq" style="margin-left:8px;color:var(--dim)"></span></span>
-</div>
-
-<div class="main">
-
-<!-- ① TRADE STATS -->
-<div class="sec" id="stats-sec">
-  <div class="sh">
-    <span class="st"><div class="sdot err" id="stats-dot"></div><span class="b">TRADE STATS</span></span>
-    <span class="sm" id="stats-meta">laden...</span>
-  </div>
-  <div class="stats-grid">
-    <div class="sc"><div class="sc-label">Totaal trades (3 mei+)</div><div class="sc-val b" id="st-total">—</div><div class="sc-sub" id="st-total-sub"></div></div>
-    <div class="sc"><div class="sc-label">VWAP Above / Below</div><div class="sc-val" style="font-size:14px"><span class="b" id="st-above">—</span> <span class="d">/</span> <span class="p" id="st-below">—</span></div><div class="sc-sub" id="st-vwap-pct"></div></div>
-    <div class="sc"><div class="sc-label">Sessie: Asia / London / NY</div><div class="sc-val" style="font-size:12px;display:flex;gap:8px;align-items:baseline"><span class="c" id="st-asia">—</span><span class="d" style="font-size:8px">AS</span><span class="g" id="st-london">—</span><span class="d" style="font-size:8px">LN</span><span class="p" id="st-ny">—</span><span class="d" style="font-size:8px">NY</span></div></div>
-    <div class="sc"><div class="sc-label">Buy / Sell</div><div class="sc-val" style="font-size:14px"><span class="g" id="st-buy">—</span> <span class="d">/</span> <span class="r" id="st-sell">—</span></div><div class="sc-sub" id="st-dir-pct"></div></div>
-    <div class="sc"><div class="sc-label">Compliance vanaf</div><div class="sc-val y" style="font-size:11px;line-height:1.4">3 mei 2026<br>00:00 UTC</div></div>
-  </div>
-  <div style="overflow-x:auto">
-    <table id="st-tbl">
-      <thead><tr><th>Sessie</th><th style="color:var(--g)">Buy Above</th><th style="color:var(--g);opacity:.7">Buy Below</th><th style="color:var(--r)">Sell Above</th><th style="color:var(--r);opacity:.7">Sell Below</th><th>Totaal</th></tr></thead>
-      <tbody id="st-body"></tbody>
-      <tfoot><tr style="background:var(--s2);border-top:2px solid var(--bdr2);font-weight:700;">
-        <td class="y">TOTAAL</td><td id="st-ft-ba" class="g">—</td><td id="st-ft-bb" class="g">—</td><td id="st-ft-sa" class="r">—</td><td id="st-ft-sb" class="r">—</td><td id="st-ft-t" class="b">—</td>
-      </tr></tfoot>
-    </table>
-  </div>
-</div>
-
-<!-- ② OPEN POSITIONS — full RR timing -->
-<div class="sec">
-  <div class="sh">
-    <span class="st"><div class="sdot err" id="pos-dot"></div><span class="g">OPEN POSITIONS</span></span>
-    <span class="sm" id="pos-meta">laden...</span>
-  </div>
-  <div id="pos-empty" class="empty" style="display:none"><div class="eline"></div><span>0 open trades</span><div class="eline"></div></div>
-  <div class="tw" id="pos-wrap">
-    <table id="pos-tbl">
-      <thead><tr>
-        <th class="s" data-col="0">Pair</th>
-        <th class="s" data-col="1">Dir</th>
-        <th class="s" data-col="2">VWAP</th>
-        <th class="s" data-col="3">Sessie</th>
-        <th class="s" data-col="4">Entry</th>
-        <th class="s" data-col="5">SL</th>
-        <th class="s" data-col="6">TP</th>
-        <th class="s" data-col="7" title="Huidige RR live">RR Nu</th>
-        <th class="s" data-col="8" title="Max RR bereikt (ghost)">Max RR</th>
-        <th title="% SL verbruikt">SL Used</th>
-        <th class="s" data-col="10" title="TP RR: (TP-entry)/SL dist">→TP RR</th>
-        <th class="s" data-col="11">P&amp;L €</th>
-        <th class="s" data-col="12">Lots</th>
-        <th class="s" data-col="13">Risk %</th>
-        <th class="s" title="T van entry tot -0.25R adverse">T→-¼R</th>
-        <th class="s" title="T van entry tot -0.50R adverse">T→-½R</th>
-        <th class="s" title="T van entry tot -0.75R adverse">T→-¾R</th>
-        <th class="s" title="T van entry tot -1.00R (phantom SL)">T→-1R</th>
-        ${favHeaders}
-        <th class="s" data-col="99">Geopend</th>
-      </tr></thead>
-      <tbody id="pos-body"></tbody>
-    </table>
-  </div>
-</div>
-
-<!-- ③ GHOST TRACKER — identical columns to open positions -->
-<div class="sec">
-  <div class="sh">
-    <span class="st"><div class="sdot err" id="gh-dot"></div><span class="p">GHOST TRACKER</span></span>
-    <span class="sm" id="gh-meta">actieve ghosts — tracken tot phantom SL hit, 15R of 15 dagen</span>
-  </div>
-  <div class="tw">
-    <table id="gh-tbl">
-      <thead><tr>
-        <th class="s" data-col="0">Symbol</th>
-        <th>Type</th>
-        <th class="s" data-col="2">Sessie</th>
-        <th class="s" data-col="3">Dir</th>
-        <th class="s" data-col="4">VWAP</th>
-        <th class="s" data-col="5" title="Max RR bereikt">Max RR</th>
-        <th class="s" title="T tot -0.25R">T→-¼R</th>
-        <th class="s" title="T tot -0.50R">T→-½R</th>
-        <th class="s" title="T tot -0.75R">T→-¾R</th>
-        <th class="s" title="T tot -1.00R = phantom SL hit">T→-1R</th>
-        ${favHeaders}
-        <th class="s" data-col="98">Elapsed</th>
-        <th class="s" data-col="99">Geopend</th>
-      </tr></thead>
-      <tbody id="gh-body"></tbody>
-    </table>
-  </div>
-</div>
-
-<!-- ④ GHOST HISTORY — gegroepeerd per optimizer key -->
-<div class="sec">
-  <div class="sh">
-    <span class="st"><div class="sdot err" id="ghh-dot"></div><span class="c">GHOST HISTORY — gegroepeerd per combo</span></span>
-    <span class="sm" id="ghh-meta">laden...</span>
-  </div>
-  <div style="padding:5px 13px;background:var(--s2);border-bottom:1px solid var(--bdr2);font-size:8.5px;color:var(--dim);">
-    Afgesloten ghosts geaggregeerd per sym+sessie+dir+vwap · gebruikt als input voor EV/optimizer · alleen trades vanaf 3 mei 2026
-  </div>
-  <div class="tw">
-    <table id="ghh-tbl">
-      <thead><tr>
-        <th class="s" data-col="0">Symbol</th><th>Type</th>
-        <th class="s" data-col="2">Sessie</th><th class="s" data-col="3">Dir</th><th class="s" data-col="4">VWAP</th>
-        <th class="s" data-col="5"># Ghosts</th>
-        <th class="s" data-col="6"># EV</th>
-        <th class="s" data-col="7">Best RR</th>
-        <th class="s" data-col="8">Avg RR</th>
-        <th class="s" title="Gem T tot -0.25R adverse">T→-¼R</th>
-        <th class="s" title="Gem T tot -0.50R adverse">T→-½R</th>
-        <th class="s" title="Gem T tot -0.75R adverse">T→-¾R</th>
-        <th class="s" title="Gem T tot -1.00R = SL hit">T→-1R</th>
-        <th class="s" title="Gem T tot +0.5R">+0.5R</th>
-        <th class="s" title="Gem T tot +1R">+1R</th>
-        <th class="s" title="Gem T tot +1.5R">+1.5R</th>
-        <th class="s" title="Gem T tot +2R">+2R</th>
-        <th class="s" title="Gem T tot +3R">+3R</th>
-        <th class="s" title="Gem T tot +5R">+5R</th>
-        <th class="s" title="Gem T tot +10R">+10R</th>
-        <th class="s" title="Gem T tot +15R">+15R</th>
-        <th class="s" data-col="14">Stop reden</th>
-        <th class="s" title="MAE p50 — mediaan adverse excursie survivors">MAE p50</th>
-        <th class="s" title="MAE p75">MAE p75</th>
-        <th class="s" title="MAE p90 — basis SL inkort advies">MAE p90</th>
-        <th title="SL inkort aanbeveling (read-only)">SL Advies</th>
-      </tr></thead>
-      <tbody id="ghh-body"></tbody>
-    </table>
-  </div>
-</div>
-
-<!-- ⑤ EV OPTIMIZER — TP lock matrix -->
-<div class="sec">
-  <div class="sh">
-    <span class="st"><div class="sdot err" id="ev-dot"></div><span class="y">EV / TP OPTIMISER</span></span>
-    <span class="sm" id="ev-meta">alle combos · EV locked bij ≥5 ghosts</span>
-  </div>
-  <div class="fbar">
-    <span class="fl">Type:</span>
-    <button class="fb on" onclick="setEVF('type','all',this)">All</button>
-    <button class="fb" onclick="setEVF('type','forex',this)">Forex</button>
-    <button class="fb" onclick="setEVF('type','index',this)">Index</button>
-    <button class="fb" onclick="setEVF('type','commodity',this)">Commodity</button>
-    <button class="fb" onclick="setEVF('type','stock',this)">Stock</button>
-    &nbsp;<span class="fl">Sessie:</span>
-    <button class="fb on" onclick="setEVF('sess','all',this)">All</button>
-    <button class="fb" onclick="setEVF('sess','asia',this)">Asia</button>
-    <button class="fb" onclick="setEVF('sess','london',this)">London</button>
-    <button class="fb" onclick="setEVF('sess','ny',this)">NY</button>
-    &nbsp;<span class="fl">Dir:</span>
-    <button class="fb on" onclick="setEVF('dir','all',this)">All</button>
-    <button class="fb" onclick="setEVF('dir','buy',this)">Buy</button>
-    <button class="fb" onclick="setEVF('dir','sell',this)">Sell</button>
-    &nbsp;<span class="fl">VWAP:</span>
-    <button class="fb on" onclick="setEVF('vwap','all',this)">All</button>
-    <button class="fb" onclick="setEVF('vwap','above',this)">Above</button>
-    <button class="fb" onclick="setEVF('vwap','below',this)">Below</button>
-    &nbsp;<span class="fl">Min ghosts:</span>
-    <button class="fb on" onclick="setEVF('min','0',this)">Alle</button>
-    <button class="fb" onclick="setEVF('min','1',this)">1+</button>
-    <button class="fb" onclick="setEVF('min','5',this)">5+ (EV ready)</button>
-    <button class="fb" onclick="setEVF('min','10',this)">10+</button>
-  </div>
-  <div class="strip">
-    <div class="stat"><span class="sl2">Totaal combos</span><span class="sv2 b" id="ev-count">—</span></div>
-    <div class="stat"><span class="sl2">Met ghost data (≥1)</span><span class="sv2 c" id="ev-trades">—</span></div>
-    <div class="stat"><span class="sl2">Zonder data</span><span class="sv2 d" id="ev-zero">—</span></div>
-    <div class="stat"><span class="sl2">Total P&amp;L</span><span class="sv2" id="ev-pnl">—</span></div>
-    <div class="stat"><span class="sl2">EV+ locked</span><span class="sv2 y" id="ev-locked">—</span></div>
-  </div>
-  <div class="tw">
-    <table id="ev-tbl">
-      <thead><tr>
-        <th class="s" data-col="0">Symbol</th><th>Type</th>
-        <th class="s" data-col="2">Sessie</th><th class="s" data-col="3">Dir</th><th class="s" data-col="4">VWAP</th>
-        <th class="s" data-col="5" title="Afgesloten ghosts"># Ghosts</th>
-        <th class="s" data-col="6"># Trades</th>
-        <th class="s" data-col="7">Best TP RR</th>
-        <th class="s" data-col="8">Avg RR</th>
-        <th class="s" data-col="9">EV</th>
-        <th>EV Status</th>
-        <th class="s" data-col="11">TP Lock</th>
-        <th class="s" data-col="12" title="Gem minuten entry → phantom SL hit">Avg T→SL</th>
-        <th class="s" data-col="13" title="Gem max SL% verbruikt">Avg SL%</th>
-        <th class="s" data-col="14" title="Best SL% winnende ghosts (read-only)">Best SL%(W)</th>
-        <th class="s" data-col="15">Total P&amp;L</th>
-      </tr></thead>
-      <tbody id="ev-body"></tbody>
-    </table>
-  </div>
-</div>
-
-<!-- ⑥ EV MATRIX — visuele overview -->
-<div class="sec">
-  <div class="sh"><span class="st"><span class="y">EV MATRIX</span></span><span class="sm">bestRR · EV · n · ★ = EV+ locked (n≥5) · grijs = geen data</span></div>
-  <div class="mxg mx" style="overflow-x:auto">
-    <div>
-      <div class="mxt">FOREX</div>
-      <table id="mx-fx"><thead><tr><th>Symbol</th><th>B/Ab</th><th>B/Bw</th><th>S/Ab</th><th>S/Bw</th></tr></thead><tbody id="mxb-fx"></tbody></table>
+  <div class="overview-grid">
+    <div class="overview-card ov-accent blue">
+      <div class="ov-lbl">MT5 Account Balance</div>
+      <div class="ov-val b">€<span id="ov-bal">${balance.toLocaleString('nl-BE',{minimumFractionDigits:2})}</span></div>
+      <div class="ov-sub">Live · FTMO Demo Account</div>
     </div>
-    <div>
-      <div class="mxt">INDEXES</div>
-      <table id="mx-ix"><thead><tr><th>Symbol</th><th>B/Ab</th><th>B/Bw</th><th>S/Ab</th><th>S/Bw</th></tr></thead><tbody id="mxb-ix"></tbody></table>
-      <div class="mxt" style="margin-top:12px">COMMODITIES</div>
-      <table id="mx-cm"><thead><tr><th>Symbol</th><th>B/Ab</th><th>B/Bw</th><th>S/Ab</th><th>S/Bw</th></tr></thead><tbody id="mxb-cm"></tbody></table>
+    <div class="overview-card ov-accent green">
+      <div class="ov-lbl">Open P&L (live)</div>
+      <div class="ov-val" id="ov-pnl">—</div>
+      <div class="ov-sub" id="ov-pnl-sub">—</div>
     </div>
-    <div style="grid-column:1/-1">
-      <div class="mxt">STOCKS (NY only)</div>
-      <table id="mx-sk"><thead><tr><th>Symbol</th><th>B/Ab</th><th>B/Bw</th><th>S/Ab</th><th>S/Bw</th></tr></thead><tbody id="mxb-sk"></tbody></table>
+    <div class="overview-card ov-accent purple">
+      <div class="ov-lbl">Active Positions / Ghosts</div>
+      <div class="ov-val" style="display:flex;align-items:baseline;gap:8px"><span class="g" id="ov-pos">—</span><span style="color:var(--ink3);font-size:16px">/</span><span class="p" id="ov-gh">—</span></div>
+      <div class="ov-sub">Open trades / Phantom SL trackers</div>
+    </div>
+    <div class="overview-card ov-accent yellow">
+      <div class="ov-lbl">EV+ TP Locks</div>
+      <div class="ov-val y" id="ov-tp">—</div>
+      <div class="ov-sub">Combos with locked TP RR (≥5 ghosts)</div>
+    </div>
+    <div class="overview-card ov-accent cyan">
+      <div class="ov-lbl">Risk per Trade</div>
+      <div class="ov-val c">${(FIXED_RISK_PCT*100).toFixed(4)}%</div>
+      <div class="ov-sub">~${(FIXED_RISK_PCT*SL_BUFFER_MULT*100).toFixed(3)}% actual at SL · SL buffer ×${SL_BUFFER_MULT}</div>
+    </div>
+    <div class="overview-card ov-accent red">
+      <div class="ov-lbl">Compliance Trades (3 mei+)</div>
+      <div class="ov-val r" id="ov-comp">—</div>
+      <div class="ov-sub" id="ov-comp-sub">Closed trades ná compliance datum</div>
+    </div>
+  </div>
+
+  <!-- Trade Stats -->
+  <div style="padding:0 16px 12px">
+    <div class="card">
+      <div class="card-hdr">
+        <div class="card-title"><div class="sdot wait" id="st-dot"></div><span class="b">Trade Distribution — 3 mei 2026+</span></div>
+        <div class="card-meta" id="st-meta">laden...</div>
+      </div>
+      <div class="sstrip" id="st-strip">
+        <div class="ss"><div class="ss-lbl">Total</div><div class="ss-val b" id="ss-tot">—</div></div>
+        <div class="ss"><div class="ss-lbl">Buy</div><div class="ss-val g" id="ss-buy">—</div></div>
+        <div class="ss"><div class="ss-lbl">Sell</div><div class="ss-val r" id="ss-sell">—</div></div>
+        <div class="ss"><div class="ss-lbl">VWAP Above</div><div class="ss-val b" id="ss-ab">—</div></div>
+        <div class="ss"><div class="ss-lbl">VWAP Below</div><div class="ss-val p" id="ss-bw">—</div></div>
+        <div class="ss"><div class="ss-lbl">Asia</div><div class="ss-val c" id="ss-as">—</div></div>
+        <div class="ss"><div class="ss-lbl">London</div><div class="ss-val g" id="ss-lo">—</div></div>
+        <div class="ss"><div class="ss-lbl">New York</div><div class="ss-val p" id="ss-ny">—</div></div>
+      </div>
+      <div class="tw">
+        <table>
+          <thead><tr><th>Session</th><th style="color:var(--g)">Buy Above</th><th style="color:var(--g)">Buy Below</th><th style="color:var(--r)">Sell Above</th><th style="color:var(--r)">Sell Below</th><th>Total</th></tr></thead>
+          <tbody id="st-body"></tbody>
+          <tfoot><tr style="background:var(--bg2);font-weight:700;border-top:2px solid var(--bdr2)"><td class="y" style="font-family:var(--fc);font-size:10px">TOTAL</td><td id="ft-ba" class="g">—</td><td id="ft-bb" class="g">—</td><td id="ft-sa" class="r">—</td><td id="ft-sb" class="r">—</td><td id="ft-t" class="b">—</td></tr></tfoot>
+        </table>
+      </div>
     </div>
   </div>
 </div>
 
-<!-- ⑦ SL OPTIMIZER — read-only -->
-<div class="sec">
-  <div class="sh"><span class="st"><span class="c">SL OPTIMIZER — READ ONLY</span></span><span class="sm">MAE-gebaseerde SL inkort aanbevelingen · nooit automatisch toegepast</span></div>
-  <div style="padding:6px 13px;background:rgba(0,216,208,.04);border-bottom:1px solid rgba(0,216,208,.12);font-size:8.5px;color:var(--dim);">
-    Gebaseerd op MAE p90 van alle overlevende ghosts (geen SL hit) · aanbeveling = informatief, niet actief
-  </div>
-  <div class="tw">
-    <table id="sl-opt-tbl">
-      <thead><tr>
-        <th class="s" data-col="0">Symbol</th><th>Type</th>
-        <th class="s" data-col="2">Sessie</th><th class="s" data-col="3">Dir</th><th class="s" data-col="4">VWAP</th>
-        <th class="s" data-col="5"># Ghosts</th>
-        <th class="s" data-col="6">Huidig SL%</th>
-        <th class="s" data-col="7">MAE p50</th>
-        <th class="s" data-col="8">MAE p75</th>
-        <th class="s" data-col="9" title="Basis voor aanbeveling">MAE p90</th>
-        <th>Aanbeveling</th>
-        <th class="s" data-col="11">Pot. Besparing</th>
-      </tr></thead>
-      <tbody id="sl-opt-body"></tbody>
-    </table>
+<!-- ═══ PAGE: OPEN POSITIONS ═════════════════════════════════════ -->
+<div class="npage" id="page-positions">
+  <div class="page">
+    <div class="card">
+      <div class="card-hdr">
+        <div class="card-title"><div class="sdot err" id="pos-dot"></div><span class="g">Open Positions — Live</span></div>
+        <div class="card-meta" id="pos-meta">laden...</div>
+      </div>
+      <div class="tw">
+        <table id="pos-tbl">
+          <thead><tr>
+            <th data-col="0">Symbol</th>
+            <th data-col="1">Dir</th>
+            <th data-col="2">VWAP</th>
+            <th data-col="3">Session</th>
+            <th data-col="4">Entry</th>
+            <th data-col="5">SL</th>
+            <th data-col="6">TP</th>
+            <th data-col="7" title="Live RR based on current price">RR Now</th>
+            <th data-col="8" title="Peak RR since open (from ghost)">Peak RR</th>
+            <th title="SL distance consumed">SL Used</th>
+            <th data-col="9" title="TP target in RR">→TP</th>
+            <th data-col="10">P&L €</th>
+            <th data-col="11">Lots</th>
+            <th data-col="12" title="Actual risk at SL as % of balance">Risk%</th>
+            <th title="Time to reach -¼R">T-¼R</th>
+            <th title="Time to reach -½R">T-½R</th>
+            <th title="Time to reach -¾R">T-¾R</th>
+            <th title="Time to reach -1R (phantom SL)">T-1R</th>
+            ${FAV_STEPS.map(v=>'<th class="rrh" title="T to reach +'+v+'R">+'+v+'</th>').join('')}
+            <th data-col="99">Opened</th>
+          </tr></thead>
+          <tbody id="pos-body"></tbody>
+        </table>
+      </div>
+    </div>
   </div>
 </div>
 
-<!-- ⑧ COMBO SELECTION -->
-<div class="sec">
-  <div class="sh"><span class="st"><span class="p">COMBO SELECTIE — ACTIE TABLE</span></span><span class="sm">alle combos gerankt · beslissing: behouden, snijden of opschalen</span></div>
-  <div class="fbar">
-    <span class="fl">Toon:</span>
-    <button class="fb on" onclick="setCF('show','all',this)">Alle traded</button>
-    <button class="fb" onclick="setCF('show','ev+',this)">EV+ only</button>
-    <button class="fb" onclick="setCF('show','ev-',this)">EV- (snijden?)</button>
-    <button class="fb" onclick="setCF('show','min5',this)">≥5 trades</button>
-    &nbsp;<span class="fl">Sorteren:</span>
-    <button class="fb on" onclick="setCF('sort','ev',this)">Op EV</button>
-    <button class="fb" onclick="setCF('sort','pnl',this)">Op P&amp;L</button>
-    <button class="fb" onclick="setCF('sort','trades',this)">Op # trades</button>
-  </div>
-  <div class="tw">
-    <table id="cf-tbl">
-      <thead><tr>
-        <th>#</th><th class="s" data-col="1">Symbol</th><th>Type</th>
-        <th class="s" data-col="3">Sessie</th><th class="s" data-col="4">Dir</th><th class="s" data-col="5">VWAP</th>
-        <th class="s" data-col="6"># Ghosts</th>
-        <th class="s" data-col="7">Avg RR</th>
-        <th class="s" data-col="8">EV</th>
-        <th class="s" data-col="9">P&amp;L</th>
-        <th>Actie</th>
-      </tr></thead>
-      <tbody id="cf-body"></tbody>
-    </table>
+<!-- ═══ PAGE: GHOST TRACKER ══════════════════════════════════════ -->
+<div class="npage" id="page-ghosts">
+  <div class="page">
+    <div class="card">
+      <div class="card-hdr">
+        <div class="card-title"><div class="sdot err" id="gh-dot"></div><span class="p">Ghost Tracker — Active</span></div>
+        <div class="card-meta" id="gh-meta">Tracking until phantom SL / 15R / 15 days</div>
+      </div>
+      <div class="tw">
+        <table id="gh-tbl">
+          <thead><tr>
+            <th data-col="0">Symbol</th>
+            <th>Type</th>
+            <th data-col="2">Session</th>
+            <th data-col="3">Dir</th>
+            <th data-col="4">VWAP</th>
+            <th data-col="5" title="Highest RR reached so far">Peak RR</th>
+            <th title="T to -¼R">T-¼R</th>
+            <th title="T to -½R">T-½R</th>
+            <th title="T to -¾R">T-¾R</th>
+            <th title="T to -1R = phantom SL">T-1R</th>
+            ${FAV_STEPS.map(v=>'<th class="rrh" title="T to +'+v+'R">+'+v+'</th>').join('')}
+            <th data-col="98">Elapsed</th>
+            <th data-col="99">Opened</th>
+          </tr></thead>
+          <tbody id="gh-body"></tbody>
+        </table>
+      </div>
+    </div>
   </div>
 </div>
 
-<!-- ⑨ WEBHOOK ERRORS + BAND -->
-<div class="sec">
-  <div class="sh"><span class="st"><div class="sdot err" id="whe-dot"></div><span class="r">SIGNAAL LOG — ERRORS &amp; REJECTS</span></span><span class="sm" id="whe-meta">laden...</span></div>
-  <div class="tabs">
-    <div class="tab on" onclick="showTab('wh','errors')">Webhook Errors</div>
-    <div class="tab" onclick="showTab('wh','rejects')">Blocked Signals</div>
-    <div class="tab" onclick="showTab('wh','band150')">Band 150–250%</div>
-    <div class="tab" onclick="showTab('wh','band250')">Band 250–350%</div>
-  </div>
-  <div class="tpane on" id="wh-tab-errors">
-    <div class="tw">
-      <table id="whe-tbl">
-        <thead><tr>
-          <th class="s" data-col="0">Tijd</th><th class="s" data-col="1">Type</th><th class="s" data-col="2">Symbol</th>
-          <th class="s" data-col="3">Dir</th><th class="s" data-col="4">Sessie</th><th class="s" data-col="5">VWAP</th>
-          <th>Entry</th><th>SL%</th><th>Band%</th><th>Detail</th>
-        </tr></thead>
-        <tbody id="whe-body"></tbody>
-      </table>
+<!-- ═══ PAGE: GHOST HISTORY ══════════════════════════════════════ -->
+<div class="npage" id="page-history">
+  <div class="page">
+    <div class="card">
+      <div class="card-hdr">
+        <div class="card-title"><div class="sdot err" id="ghh-dot"></div><span class="c">Ghost History — Grouped by Signal Combo</span></div>
+        <div class="card-meta" id="ghh-meta">Closed ghosts aggregated by sym+session+dir+vwap · 3 mei 2026+</div>
+      </div>
+      <div class="tw">
+        <table id="ghh-tbl">
+          <thead><tr>
+            <th data-col="0">Symbol</th><th>Type</th>
+            <th data-col="2">Session</th><th data-col="3">Dir</th><th data-col="4">VWAP</th>
+            <th data-col="5"># Ghosts</th>
+            <th data-col="6" title="EV-eligible (SL hit, VWAP known, ≥0.5R)"># EV</th>
+            <th data-col="7">Best RR</th>
+            <th data-col="8">Avg RR</th>
+            <th title="Avg T to -¼R">T-¼R</th><th title="Avg T to -½R">T-½R</th>
+            <th title="Avg T to -¾R">T-¾R</th><th title="Avg T to -1R">T-1R</th>
+            <th title="Avg T to +0.5R">+0.5R</th><th title="Avg T to +1R">+1R</th>
+            <th title="Avg T to +1.5R">+1.5R</th><th title="Avg T to +2R">+2R</th>
+            <th title="Avg T to +3R">+3R</th><th title="Avg T to +5R">+5R</th>
+            <th title="Avg T to +10R">+10R</th><th title="Avg T to +15R">+15R</th>
+            <th data-col="14">Stop</th>
+            <th title="MAE p50">MAE50</th><th title="MAE p75">MAE75</th>
+            <th title="MAE p90 — SL advice basis">MAE90</th>
+            <th title="SL reduction advice (read-only)">SL Advice</th>
+          </tr></thead>
+          <tbody id="ghh-body"></tbody>
+        </table>
+      </div>
     </div>
-  </div>
-  <div class="tpane" id="wh-tab-rejects">
-    <div class="strip">
-      <div class="stat"><span class="sl2">Totaal geblokt</span><span class="sv2 r fw" id="blk-total">—</span></div>
-      <div class="stat"><span class="sl2">Duplicate</span><span class="sv2 o" id="blk-dup">—</span></div>
-      <div class="stat"><span class="sl2">VWAP Exhausted</span><span class="sv2 y" id="blk-vwap">—</span></div>
-      <div class="stat"><span class="sl2">Buiten Window</span><span class="sv2 d" id="blk-win">—</span></div>
-      <div class="stat"><span class="sl2">Currency Budget</span><span class="sv2 c" id="blk-cur">—</span></div>
-    </div>
-    <div class="tw">
-      <table id="blk-tbl">
-        <thead><tr><th>Cat.</th><th>Reden</th><th>Symbol</th><th>Dir</th><th>Sessie</th><th style="color:var(--r)">Aantal</th><th>Timestamp</th></tr></thead>
-        <tbody id="blk-body"></tbody>
-      </table>
-    </div>
-  </div>
-  <div class="tpane" id="wh-tab-band150">
-    <div style="padding:7px 13px;background:var(--s2);border-bottom:1px solid var(--bdr2);font-size:8.5px;color:var(--dim);">
-      <b class="o">Ghost 2.0 — Band 150%–250%.</b> Read-only — nooit toegevoegd aan EV optimizer.
-    </div>
-    <div class="strip" id="band150-strip" style="display:none">
-      <div class="stat"><span class="sl2">Ghosts</span><span class="sv2 b" id="b150-n">—</span></div>
-      <div class="stat"><span class="sl2">Avg Max RR</span><span class="sv2 g" id="b150-rr">—</span></div>
-      <div class="stat"><span class="sl2">Avg SL%</span><span class="sv2 o" id="b150-sl">—</span></div>
-    </div>
-    <div class="tw"><table id="band150-tbl"><thead><tr><th>Symbol</th><th>Sessie</th><th>Dir</th><th>VWAP</th><th>n</th><th>Avg RR</th><th>Max RR</th><th>Avg SL%</th><th>Avg T→SL</th></tr></thead><tbody id="band150-body"></tbody></table></div>
-  </div>
-  <div class="tpane" id="wh-tab-band250">
-    <div style="padding:7px 13px;background:var(--s2);border-bottom:1px solid var(--bdr2);font-size:8.5px;color:var(--dim);">
-      <b class="r">Ghost 2.0 — Band 250%–350%.</b> Extreme outliers — read-only.
-    </div>
-    <div class="strip" id="band250-strip" style="display:none">
-      <div class="stat"><span class="sl2">Ghosts</span><span class="sv2 b" id="b250-n">—</span></div>
-      <div class="stat"><span class="sl2">Avg Max RR</span><span class="sv2 g" id="b250-rr">—</span></div>
-      <div class="stat"><span class="sl2">Avg SL%</span><span class="sv2 o" id="b250-sl">—</span></div>
-    </div>
-    <div class="tw"><table id="band250-tbl"><thead><tr><th>Symbol</th><th>Sessie</th><th>Dir</th><th>VWAP</th><th>n</th><th>Avg RR</th><th>Max RR</th><th>Avg SL%</th><th>Avg T→SL</th></tr></thead><tbody id="band250-body"></tbody></table></div>
   </div>
 </div>
 
-</div><!-- /main -->
+<!-- ═══ PAGE: EV OPTIMIZER ════════════════════════════════════════ -->
+<div class="npage" id="page-ev">
+  <div class="page">
+
+    <!-- EV TP Optimizer -->
+    <div class="card">
+      <div class="card-hdr">
+        <div class="card-title"><div class="sdot err" id="ev-dot"></div><span class="y">EV / TP Optimizer — All Signal Combos</span></div>
+        <div class="card-meta" id="ev-meta">EV locked at ≥5 ghosts</div>
+      </div>
+      <div class="fbar">
+        <span class="fl">Type:</span>
+        <button class="fb on" onclick="setEVF('type','all',this)">All</button>
+        <button class="fb" onclick="setEVF('type','forex',this)">Forex</button>
+        <button class="fb" onclick="setEVF('type','index',this)">Index</button>
+        <button class="fb" onclick="setEVF('type','stock',this)">Stock</button>
+        &nbsp;<span class="fl">Session:</span>
+        <button class="fb on" onclick="setEVF('sess','all',this)">All</button>
+        <button class="fb" onclick="setEVF('sess','asia',this)">Asia</button>
+        <button class="fb" onclick="setEVF('sess','london',this)">London</button>
+        <button class="fb" onclick="setEVF('sess','ny',this)">NY</button>
+        &nbsp;<span class="fl">Dir:</span>
+        <button class="fb on" onclick="setEVF('dir','all',this)">All</button>
+        <button class="fb" onclick="setEVF('dir','buy',this)">Buy</button>
+        <button class="fb" onclick="setEVF('dir','sell',this)">Sell</button>
+        &nbsp;<span class="fl">Min ghosts:</span>
+        <button class="fb on" onclick="setEVF('min','1',this)">≥1</button>
+        <button class="fb" onclick="setEVF('min','5',this)">≥5 (EV ready)</button>
+        <button class="fb" onclick="setEVF('min','0',this)">All (incl. empty)</button>
+      </div>
+      <div class="sstrip">
+        <div class="ss"><div class="ss-lbl">Combos shown</div><div class="ss-val b" id="ev-cnt">—</div></div>
+        <div class="ss"><div class="ss-lbl">With ghost data</div><div class="ss-val c" id="ev-data">—</div></div>
+        <div class="ss"><div class="ss-lbl">EV+ locked</div><div class="ss-val y" id="ev-lck">—</div></div>
+        <div class="ss"><div class="ss-lbl">Total P&L (3 mei+)</div><div class="ss-val" id="ev-pnl">—</div></div>
+      </div>
+      <div class="tw">
+        <table id="ev-tbl">
+          <thead><tr>
+            <th data-col="0">Symbol</th><th>Type</th>
+            <th data-col="2">Session</th><th data-col="3">Dir</th><th data-col="4">VWAP</th>
+            <th data-col="5"># Ghosts</th>
+            <th data-col="6"># Trades</th>
+            <th data-col="7">Best TP RR</th>
+            <th data-col="8">Avg RR</th>
+            <th data-col="9">EV Score</th>
+            <th>Status</th>
+            <th data-col="11">TP Lock</th>
+            <th data-col="12">Avg T→SL</th>
+            <th data-col="13">Avg SL%</th>
+            <th data-col="14">P&L</th>
+          </tr></thead>
+          <tbody id="ev-body"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- EV Matrix -->
+    <div class="card">
+      <div class="card-hdr"><div class="card-title"><span class="y">EV Matrix — Quick View</span></div><div class="card-meta">EV score · n · ★ = TP locked · grey = no data</div></div>
+      <div style="overflow-x:auto">
+        <div style="display:grid;grid-template-columns:1fr 1fr;border-bottom:1px solid var(--bdr2)">
+          <div style="border-right:1px solid var(--bdr2)">
+            <div class="mx-hdr">FOREX</div>
+            <table class="mx-tbl" id="mx-fx"><thead><tr><th>Symbol</th><th>B/Ab</th><th>B/Bw</th><th>S/Ab</th><th>S/Bw</th></tr></thead><tbody id="mxb-fx"></tbody></table>
+          </div>
+          <div>
+            <div class="mx-hdr">INDEXES + COMMODITIES</div>
+            <table class="mx-tbl" id="mx-ix"><thead><tr><th>Symbol</th><th>B/Ab</th><th>B/Bw</th><th>S/Ab</th><th>S/Bw</th></tr></thead><tbody id="mxb-ix"></tbody></table>
+          </div>
+        </div>
+        <div class="mx-hdr">STOCKS (NY only)</div>
+        <table class="mx-tbl" id="mx-sk"><thead><tr><th>Symbol</th><th>B/Ab</th><th>B/Bw</th><th>S/Ab</th><th>S/Bw</th></tr></thead><tbody id="mxb-sk"></tbody></table>
+      </div>
+    </div>
+
+    <!-- SL Optimizer (read-only) -->
+    <div class="card">
+      <div class="card-hdr">
+        <div class="card-title"><span class="c">SL Optimizer — READ ONLY · MAE-based recommendations</span></div>
+        <div class="card-meta">Never auto-applied · informational only · based on MAE p90 of surviving ghosts</div>
+      </div>
+      <div style="padding:5px 12px;background:rgba(0,204,212,.04);border-bottom:1px solid rgba(0,204,212,.1);font-size:8.5px;color:var(--ink3)">
+        These recommendations show how much the SL could theoretically be tightened based on historical ghost data. Applied manually only.
+      </div>
+      <div class="tw">
+        <table id="sl-tbl">
+          <thead><tr>
+            <th data-col="0">Symbol</th><th>Type</th>
+            <th data-col="2">Session</th><th data-col="3">Dir</th><th data-col="4">VWAP</th>
+            <th data-col="5"># Ghosts</th>
+            <th data-col="6">MAE p50</th><th data-col="7">MAE p75</th>
+            <th data-col="8" title="Basis for recommendation">MAE p90</th>
+            <th>Advice</th>
+            <th data-col="10">Potential Saving</th>
+          </tr></thead>
+          <tbody id="sl-body"></tbody>
+        </table>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- ═══ PAGE: SIGNALS ════════════════════════════════════════════ -->
+<div class="npage" id="page-signals">
+  <div class="page">
+    <div class="card">
+      <div class="card-hdr">
+        <div class="card-title"><div class="sdot err" id="sig-dot"></div><span class="r">Signal Log — Errors &amp; Blocked</span></div>
+        <div class="card-meta" id="sig-meta">laden...</div>
+      </div>
+      <div class="itabs">
+        <div class="itab on" onclick="showItab('sig','errors')">Webhook Errors</div>
+        <div class="itab" onclick="showItab('sig','rejects')">Blocked Signals</div>
+        <div class="itab" onclick="showItab('sig','band150')">Band 150–250%</div>
+        <div class="itab" onclick="showItab('sig','band250')">Band 250–350%</div>
+      </div>
+      <div class="ipane on" id="sig-tab-errors">
+        <div class="tw">
+          <table id="whe-tbl">
+            <thead><tr>
+              <th data-col="0">Time</th><th data-col="1">Type</th>
+              <th data-col="2">Symbol</th><th data-col="3">Dir</th>
+              <th data-col="4">Session</th><th data-col="5">VWAP</th>
+              <th>Entry</th><th>SL%</th><th>Band%</th><th>Reason</th>
+            </tr></thead>
+            <tbody id="whe-body"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="ipane" id="sig-tab-rejects">
+        <div class="sstrip">
+          <div class="ss"><div class="ss-lbl">Total blocked</div><div class="ss-val r" id="blk-tot">—</div></div>
+          <div class="ss"><div class="ss-lbl">Duplicate</div><div class="ss-val o" id="blk-dup">—</div></div>
+          <div class="ss"><div class="ss-lbl">VWAP Exhausted</div><div class="ss-val y" id="blk-vw">—</div></div>
+          <div class="ss"><div class="ss-lbl">Outside Window</div><div class="ss-val d" id="blk-win">—</div></div>
+          <div class="ss"><div class="ss-lbl">Currency Budget</div><div class="ss-val c" id="blk-cur">—</div></div>
+        </div>
+        <div class="tw">
+          <table id="blk-tbl">
+            <thead><tr><th>Cat.</th><th>Reason</th><th>Symbol</th><th>Dir</th><th>Session</th><th class="r">Count</th><th>Time</th></tr></thead>
+            <tbody id="blk-body"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="ipane" id="sig-tab-band150">
+        <div style="padding:7px 12px;background:var(--bg2);border-bottom:1px solid var(--bdr2);font-size:8.5px;color:var(--ink3)"><b class="o">Band 150–250%</b> — rejected signals that spawned ghost trackers. Read-only, never merged into EV optimizer.</div>
+        <div class="sstrip" id="b150-strip" style="display:none">
+          <div class="ss"><div class="ss-lbl">Ghosts</div><div class="ss-val b" id="b150-n">—</div></div>
+          <div class="ss"><div class="ss-lbl">Avg Max RR</div><div class="ss-val g" id="b150-rr">—</div></div>
+          <div class="ss"><div class="ss-lbl">Avg SL%</div><div class="ss-val o" id="b150-sl">—</div></div>
+        </div>
+        <div class="tw"><table id="b150-tbl"><thead><tr><th>Symbol</th><th>Session</th><th>Dir</th><th>VWAP</th><th>n</th><th>Avg RR</th><th>Max RR</th><th>Avg SL%</th><th>Avg T→SL</th></tr></thead><tbody id="b150-body"></tbody></table></div>
+      </div>
+      <div class="ipane" id="sig-tab-band250">
+        <div style="padding:7px 12px;background:var(--bg2);border-bottom:1px solid var(--bdr2);font-size:8.5px;color:var(--ink3)"><b class="r">Band 250–350%</b> — extreme outliers. Read-only.</div>
+        <div class="sstrip" id="b250-strip" style="display:none">
+          <div class="ss"><div class="ss-lbl">Ghosts</div><div class="ss-val b" id="b250-n">—</div></div>
+          <div class="ss"><div class="ss-lbl">Avg Max RR</div><div class="ss-val g" id="b250-rr">—</div></div>
+          <div class="ss"><div class="ss-lbl">Avg SL%</div><div class="ss-val o" id="b250-sl">—</div></div>
+        </div>
+        <div class="tw"><table id="b250-tbl"><thead><tr><th>Symbol</th><th>Session</th><th>Dir</th><th>VWAP</th><th>n</th><th>Avg RR</th><th>Max RR</th><th>Avg SL%</th><th>Avg T→SL</th></tr></thead><tbody id="b250-body"></tbody></table></div>
+      </div>
+    </div>
+  </div>
+</div>
 
 <script>
-const FOREX  = ${JSON.stringify(FOREX_SYMBOLS)};
-const INDEX  = ${JSON.stringify(INDEX_SYMBOLS)};
-const COMM   = ${JSON.stringify(COMMODITY_SYMBOLS)};
-const STOCKS = ${JSON.stringify(STOCK_SYMBOLS)};
-const COMPLIANCE = new Date('2026-05-03T00:00:00.000Z');
-const FAV_STEPS  = ${JSON.stringify(FAV_DISPLAY)};
+/* ═══════════════════════════════════════════════════════════════
+   PRONTO·AI Dashboard v14.0 — Complete Rewrite
+   ═══════════════════════════════════════════════════════════════ */
+const FOREX=${JSON.stringify(FOREX_SYMBOLS)};
+const INDEX=${JSON.stringify(INDEX_SYMBOLS)};
+const COMM=${JSON.stringify(COMMODITY_SYMBOLS)};
+const STOCKS=${JSON.stringify(STOCK_SYMBOLS)};
+const FAV_STEPS=${JSON.stringify(FAV_STEPS)};
+const COMPLIANCE=new Date('2026-05-03T00:00:00.000Z');
 
 let _allTrades=[],_evData=[],_tpMap={},_evMap={},_maeData={};
-let _lastLoadMs=null;
-const evF={type:'all',sess:'all',dir:'all',vwap:'all',min:'0'};
+let _lastLoad=null;
+const evF={type:'all',sess:'all',dir:'all',min:'1'};
 const cfF={show:'all',sort:'ev'};
 
-// ── helpers ──────────────────────────────────────────────
+/* ── Helpers ─────────────────────────────────────────────────── */
 const f=(v,d=2)=>v==null?'—':(+v).toFixed(d);
-const eu=v=>v==null?'—':(v>=0?'+':'')+\`€\${(+v).toFixed(2)}\`;
-const pC=v=>v>0?'g':v<0?'r':'d';
-const ts=s=>s?new Date(s).toLocaleTimeString('nl-BE',{timeZone:'Europe/Brussels',hour:'2-digit',minute:'2-digit'}):'—';
-const dt=s=>s?new Date(s).toLocaleDateString('nl-BE',{timeZone:'Europe/Brussels',month:'2-digit',day:'2-digit'}):'—';
-const dtTs=s=>s?dt(s)+' '+ts(s):'—';
+const eu=v=>v==null?'—':(v>=0?'+':'')+'€'+Math.abs(+v).toFixed(2);
+const pC=v=>v==null?'d':v>0?'g':v<0?'r':'d';
+const ts=s=>!s?'—':new Date(s).toLocaleTimeString('nl-BE',{timeZone:'Europe/Brussels',hour:'2-digit',minute:'2-digit'});
+const dt=s=>!s?'—':new Date(s).toLocaleDateString('nl-BE',{timeZone:'Europe/Brussels',month:'2-digit',day:'2-digit'});
+const dtTs=s=>!s?'—':dt(s)+' '+ts(s);
+const msFmt=m=>{if(m==null)return'—';if(m<60)return m+'m';return Math.floor(m/60)+'h'+(m%60?String(m%60).padStart(2,'0')+'m':'');};
 function sType(s){if(FOREX.includes(s))return'f';if(INDEX.includes(s))return'i';if(COMM.includes(s))return'c';return's';}
 function sTypeName(s){if(FOREX.includes(s))return'forex';if(INDEX.includes(s))return'index';if(COMM.includes(s))return'commodity';return'stock';}
 function tClass(s){return{f:'tf',i:'ti',c:'tc'}[sType(s)]||'ts';}
-function evC(v){return v>0?'ep':v<0?'en':'ez';}
-function dBadge(d){return d==='buy'?'<span class="bd bd-buy">BUY</span>':d==='sell'?'<span class="bd bd-sell">SELL</span>':'—';}
-function vBadge(v){return v==='above'?'<span class="bd bd-ab">ABOVE</span>':v==='below'?'<span class="bd bd-bw">BELOW</span>':'<span class="bd d">?</span>';}
-function sBadge(s){const m={asia:'bd-as',london:'bd-lo',ny:'bd-ny',outside:'bd-out'};const n={asia:'ASIA',london:'LON',ny:'NY',outside:'OUT'};return\`<span class="bd \${m[s]||'bd-out'}">\${n[s]||s||'—'}</span>\`;}
-function tyBadge(t){const m={forex:'bd-fx',index:'bd-ix',commodity:'bd-cm',stock:'bd-sk'};const n={forex:'FX',index:'IDX',commodity:'COM',stock:'STK'};return\`<span class="bd \${m[t]||'bd-sk'}">\${n[t]||t}</span>\`;}
-function cBadge(r){if(r==='tp')return'<span class="bd bd-tp">TP</span>';if(r==='sl')return'<span class="bd bd-sl">SL</span>';if(r==='maxRR')return'<span class="bd bd-mr">MAX-RR</span>';if(r==='timeout')return'<span class="bd bd-mn">TIMEOUT</span>';if(r==='manual')return'<span class="bd bd-mn">MAN</span>';return r?\`<span class="bd d">\${r}</span>\`:'—';}
-function slBar(p){const w=Math.min(100,Math.max(0,p||0));const c=w<50?'':w<80?' w':' d';return\`<div class="slbar"><div class="slbg"><div class="slfi\${c}" style="width:\${w}%"></div></div><span class="\${c.trim()||'g'}" style="font-size:8.5px">\${f(p,0)}%</span></div>\`;}
-function setDot(id,ok,msg){const el=document.getElementById(id);if(!el)return;el.className='sdot '+(ok?'ok':'err');el.title=msg||'';}
-function emptyRow(cols,msg=''){if(!msg)return\`<tr>\${Array(cols).fill('<td></td>').join('')}</tr>\`;return\`<tr><td colspan="\${cols}" class="nodata">\${msg}</td></tr>\`;}
+function dBadge(d){return d==='buy'?'<span class="bd b-buy">BUY</span>':d==='sell'?'<span class="bd b-sell">SELL</span>':'—';}
+function vBadge(v){return v==='above'?'<span class="bd b-ab">ABOVE</span>':v==='below'?'<span class="bd b-bw">BELOW</span>':'<span class="bd" style="color:var(--ink3)">?</span>';}
+function sBadge(s){const m={asia:'b-as',london:'b-lo',ny:'b-ny',outside:'b-out'};const n={asia:'ASIA',london:'LON',ny:'NY',outside:'OUT'};return\`<span class="bd \${m[s]||'b-out'}">\${n[s]||s||'—'}</span>\`;}
+function tyBadge(t){const m={forex:'b-fx',index:'b-ix',commodity:'b-cm',stock:'b-sk'};const n={forex:'FX',index:'IDX',commodity:'COM',stock:'STK'};return\`<span class="bd \${m[t]||'b-sk'}">\${n[t]||t}</span>\`;}
+function slBar(p){const w=Math.min(100,Math.max(0,p||0));const c=w<50?'':w<80?' w':' d';return\`<div class="slbar"><div class="slbg"><div class="slfi\${c}" style="width:\${w}%"></div></div><span class="\${c.trim()||'g'}" style="font-size:8px">\${f(p,0)}%</span></div>\`;}
+function setDot(id,ok){const e=document.getElementById(id);if(e){e.className='sdot '+(ok?'ok':'err');}}
+function emptyRow(n,msg=''){return\`<tr><td colspan="\${n}" class="nd">\${msg}</td></tr>\`;}
 
-// Favorite RR timing helper — returns <td> element string
-function favTd(fav, step, openedAt){
-  const v = fav[step] || fav[parseFloat(step)] || fav[step+'.0'] || fav[step+'.00'];
-  if(!v||!openedAt) return '<td class="d" style="font-size:8.5px">—</td>';
-  const mins = Math.round((new Date(v)-new Date(openedAt))/60000);
-  const t = mins<60?mins+'m':Math.floor(mins/60)+'h'+(mins%60?String(mins%60).padStart(2,'0')+'m':'');
-  // Color by speed: <30m = bright green, <2h = green, <8h = yellow, else dim
-  const cls = mins<30?'g fw':mins<120?'g':mins<480?'y':'d';
-  return \`<td class="\${cls}" style="font-size:8.5px">\${t}</td>\`;
+/* milestone timing helper */
+function msT(ts,openedAt,cls='d'){
+  if(!ts||!openedAt)return\`<td class="\${cls}" style="font-size:8.5px">—</td>\`;
+  const m=Math.round((new Date(ts)-new Date(openedAt))/60000);
+  return\`<td class="\${m<60?cls:cls}" style="font-size:8.5px">\${msFmt(m)}</td>\`;
 }
-function advTd(adv, key, openedAt, cls='o'){
-  const v = adv[key];
-  if(!v||!openedAt) return '<td class="d" style="font-size:8.5px">—</td>';
-  const mins = Math.round((new Date(v)-new Date(openedAt))/60000);
-  const t = mins<60?mins+'m':Math.floor(mins/60)+'h'+(mins%60?String(mins%60).padStart(2,'0')+'m':'');
-  return \`<td class="\${cls}" style="font-size:8.5px">\${t}</td>\`;
+function favTd(fav,step,openedAt){
+  const v=fav[step]||fav[parseFloat(step)]||fav[step+'.0']||fav[step+'.00'];
+  if(!v||!openedAt)return'<td class="d" style="font-size:8px">—</td>';
+  const m=Math.round((new Date(v)-new Date(openedAt))/60000);
+  const cls=m<30?'g fw':m<120?'g':m<480?'y':'d';
+  return\`<td class="\${cls}" style="font-size:8px">\${msFmt(m)}</td>\`;
+}
+function advTd(adv,key,openedAt,cls='o'){
+  const v=adv[key];
+  if(!v||!openedAt)return'<td class="d" style="font-size:8px">—</td>';
+  const m=Math.round((new Date(v)-new Date(openedAt))/60000);
+  return\`<td class="\${cls}" style="font-size:8px">\${msFmt(m)}</td>\`;
 }
 
 async function api(path,ms=12000){
-  const ctrl=new AbortController();const t=setTimeout(()=>ctrl.abort(),ms);
-  try{const r=await fetch(path,{signal:ctrl.signal});clearTimeout(t);if(!r.ok)return null;return r.json();}
+  const c=new AbortController();const t=setTimeout(()=>c.abort(),ms);
+  try{const r=await fetch(path,{signal:c.signal});clearTimeout(t);if(!r.ok)return null;return r.json();}
   catch(e){clearTimeout(t);return null;}
 }
 
-// ── TABS ─────────────────────────────────────────────────
-function showTab(group,name){
-  document.querySelectorAll(\`.tab[onclick*="'\${group}'"]\`).forEach(t=>t.classList.remove('on'));
-  document.querySelectorAll(\`[id^="\${group}-tab-"]\`).forEach(p=>p.classList.remove('on'));
-  document.querySelector(\`.tab[onclick="showTab('\${group}','\${name}')"]\`).classList.add('on');
-  document.getElementById(\`\${group}-tab-\${name}\`).classList.add('on');
-  if(group==='wh'&&name==='band150')loadBandSignals('150_250','band150');
-  if(group==='wh'&&name==='band250')loadBandSignals('250_350','band250');
+/* ── Navigation ──────────────────────────────────────────────── */
+let _page='overview';
+function showPage(name){
+  document.querySelectorAll('.npage').forEach(p=>p.classList.remove('on'));
+  document.querySelectorAll('.ntab').forEach(t=>t.classList.remove('on'));
+  document.getElementById('page-'+name).classList.add('on');
+  document.querySelectorAll('.ntab').forEach(t=>{if(t.getAttribute('onclick')?.includes("'"+name+"'"))t.classList.add('on');});
+  _page=name;
+}
+function showItab(group,name){
+  const prefix=group+'-tab-';
+  document.querySelectorAll(\`[id^="\${prefix}"]\`).forEach(p=>p.classList.remove('on'));
+  document.querySelectorAll(\`.itab[onclick*="'\${group}'"]\`).forEach(t=>t.classList.remove('on'));
+  document.getElementById(prefix+name)?.classList.add('on');
+  document.querySelector(\`.itab[onclick="showItab('\${group}','\${name}')"]\`)?.classList.add('on');
+  if(group==='sig'&&name==='band150')loadBand('150_250','b150');
+  if(group==='sig'&&name==='band250')loadBand('250_350','b250');
 }
 
-// ── SORT ─────────────────────────────────────────────────
-const sState={};
-function initSort(id){const t=document.getElementById(id);if(!t)return;t.querySelectorAll('th.s').forEach(th=>th.addEventListener('click',()=>sortBy(id,+th.dataset.col)));}
-function sortBy(id,col){
+/* ── Sort ────────────────────────────────────────────────────── */
+const _sortState={};
+function initSort(id){
   const t=document.getElementById(id);if(!t)return;
-  const k=id+'_'+col;const asc=sState[k]!=='asc';sState[k]=asc?'asc':'desc';
-  t.querySelectorAll('th.s').forEach(th=>th.classList.remove('asc','desc'));
-  const th=t.querySelector(\`th.s[data-col="\${col}"]\`);if(th)th.classList.add(asc?'asc':'desc');
-  const tb=t.querySelector('tbody');const rows=Array.from(tb.rows);
-  rows.sort((a,b)=>{
-    const av=a.cells[col]?.dataset.val??a.cells[col]?.textContent??'';
-    const bv=b.cells[col]?.dataset.val??b.cells[col]?.textContent??'';
-    const an=parseFloat(av),bn=parseFloat(bv);
-    const cmp=!isNaN(an)&&!isNaN(bn)?an-bn:av.localeCompare(bv);
-    return asc?cmp:-cmp;
-  });
-  rows.forEach(r=>tb.appendChild(r));
+  t.querySelectorAll('th[data-col]').forEach(th=>th.addEventListener('click',()=>{
+    const col=+th.dataset.col;
+    const k=id+'_'+col;const asc=_sortState[k]!=='asc';_sortState[k]=asc?'asc':'desc';
+    t.querySelectorAll('th[data-col]').forEach(h=>{h.classList.remove('asc','desc');});
+    th.classList.add(asc?'asc':'desc');
+    const tb=t.querySelector('tbody');const rows=Array.from(tb.rows);
+    rows.sort((a,b)=>{
+      const av=a.cells[col]?.dataset?.val??a.cells[col]?.textContent??'';
+      const bv=b.cells[col]?.dataset?.val??b.cells[col]?.textContent??'';
+      const an=parseFloat(av),bn=parseFloat(bv);
+      return (asc?1:-1)*(!isNaN(an)&&!isNaN(bn)?an-bn:av.localeCompare(bv));
+    });
+    rows.forEach(r=>tb.appendChild(r));
+  }));
 }
-function initAll(){['pos-tbl','gh-tbl','ev-tbl','ghh-tbl','whe-tbl','cf-tbl','sl-opt-tbl','mx-fx','mx-ix','mx-cm','mx-sk'].forEach(initSort);}
+function initAll(){['pos-tbl','gh-tbl','ghh-tbl','ev-tbl','whe-tbl','sl-tbl','mx-fx','mx-ix','mx-sk'].forEach(initSort);}
 
-// ── CLOCK ─────────────────────────────────────────────────
-const SESS_CLS={asia:'s-asia',london:'s-london',ny:'s-ny',outside:'s-out'};
-const SESS_LBL={asia:'ASIA',london:'LONDON',ny:'NY',outside:'OUTSIDE'};
+/* ── Clock ───────────────────────────────────────────────────── */
+const SESS_META={asia:{cls:'sa',lbl:'ASIA'},london:{cls:'sl',lbl:'LONDON'},ny:{cls:'sn',lbl:'NEW YORK'},outside:{cls:'so',lbl:'OUTSIDE'}};
 function updateClock(){
   const d=new Date();
-  const bx=new Intl.DateTimeFormat('en-US',{timeZone:'Europe/Brussels',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}).formatToParts(d);
-  const get=t=>bx.find(p=>p.type===t)?.value??'00';
-  let h=parseInt(get('hour'));const mi=parseInt(get('minute'));
+  const bf=new Intl.DateTimeFormat('en-US',{timeZone:'Europe/Brussels',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}).formatToParts(d);
+  const gp=t=>bf.find(p=>p.type===t)?.value??'00';
+  let h=parseInt(gp('hour'));const mi=parseInt(gp('minute'));
   if(h===24)h=0;
-  document.getElementById('clock').textContent=\`\${String(h).padStart(2,'0')}:\${get('minute')}:\${get('second')}\`;
+  document.getElementById('clock').textContent=\`\${String(h).padStart(2,'0')}:\${gp('minute')}:\${gp('second')}\`;
   const hhmm=h*100+mi;
   const day=new Date(d.toLocaleDateString('en-CA',{timeZone:'Europe/Brussels'})).getDay();
   let sess='outside';
   if(day>0&&day<6){if(hhmm>=200&&hhmm<800)sess='asia';else if(hhmm>=800&&hhmm<1530)sess='london';else if(hhmm>=1530&&hhmm<2100)sess='ny';}
+  const sm=SESS_META[sess];
   const el=document.getElementById('hdr-sess');
-  el.textContent=SESS_LBL[sess];el.className='hdr-sess '+SESS_CLS[sess];
-  document.getElementById('k-sess').textContent=SESS_LBL[sess];
-  if(_lastLoadMs){
-    const rem=Math.max(0,30-Math.floor((Date.now()-_lastLoadMs)/1000)%30);
-    document.getElementById('upd-freq').textContent=\`volgende refresh in \${rem}s\`;
-    const balAgeEl=document.getElementById('k-bal-age');
-    if(balAgeEl){const sec=Math.floor((Date.now()-_lastLoadMs)/1000);balAgeEl.textContent=sec<60?sec+'s geleden':Math.floor(sec/60)+'m geleden';}
+  el.textContent=sm.lbl;el.className='hdr-sess '+sm.cls;
+  document.getElementById('k-sess')?.setAttribute('data-sess',sess);
+  if(_lastLoad){
+    const rem=Math.max(0,30-Math.floor((Date.now()-_lastLoad)/1000)%30);
+    document.getElementById('nav-status').textContent='Next refresh in '+rem+'s';
   }
 }
 setInterval(updateClock,1000);updateClock();
 
-// ── ① TRADE STATS ─────────────────────────────────────────
+/* ══════════════════════════════════════════════════════════════
+   DATA LOADERS
+   ══════════════════════════════════════════════════════════════ */
+
+/* ── Trade Stats ─────────────────────────────────────────────── */
 async function loadTradeStats(){
   const d=await api('/trades?limit=10000');
-  if(!d){document.getElementById('stats-meta').textContent='fout bij laden';return;}
-  setDot('stats-dot',true,'OK');
+  if(!d){setDot('st-dot',false);return;}
+  setDot('st-dot',true);
   const trades=(d.trades||[]).filter(t=>t.openedAt&&new Date(t.openedAt)>=COMPLIANCE);
   const total=trades.length;
-  document.getElementById('stats-meta').textContent=total+' trades ná compliance datum';
-  document.getElementById('st-total').textContent=total||'0';
-  document.getElementById('st-total-sub').textContent='gesloten trades';
-  const abv=trades.filter(t=>t.vwapPosition==='above').length;
-  const blw=trades.filter(t=>t.vwapPosition==='below').length;
-  document.getElementById('st-above').textContent=abv;
-  document.getElementById('st-below').textContent=blw;
-  if(total>0)document.getElementById('st-vwap-pct').textContent=\`\${((abv/total)*100).toFixed(0)}% / \${((blw/total)*100).toFixed(0)}%\`;
-  document.getElementById('st-asia').textContent=trades.filter(t=>t.session==='asia').length;
-  document.getElementById('st-london').textContent=trades.filter(t=>t.session==='london').length;
-  document.getElementById('st-ny').textContent=trades.filter(t=>t.session==='ny').length;
-  const buys=trades.filter(t=>t.direction==='buy').length;
-  const sells=trades.filter(t=>t.direction==='sell').length;
-  document.getElementById('st-buy').textContent=buys;
-  document.getElementById('st-sell').textContent=sells;
-  if(total>0)document.getElementById('st-dir-pct').textContent=\`\${((buys/total)*100).toFixed(0)}% / \${((sells/total)*100).toFixed(0)}%\`;
-  const sessions=['asia','london','ny'];
+  document.getElementById('st-meta').textContent=total+' closed trades after compliance date';
+  document.getElementById('ov-comp').textContent=total||'0';
+  document.getElementById('ss-tot').textContent=total;
+  const buy=trades.filter(t=>t.direction==='buy').length;
+  const sell=trades.filter(t=>t.direction==='sell').length;
+  const ab=trades.filter(t=>t.vwapPosition==='above').length;
+  const bw=trades.filter(t=>t.vwapPosition==='below').length;
+  const as=trades.filter(t=>t.session==='asia').length;
+  const lo=trades.filter(t=>t.session==='london').length;
+  const ny=trades.filter(t=>t.session==='ny').length;
+  document.getElementById('ss-buy').textContent=buy;
+  document.getElementById('ss-sell').textContent=sell;
+  document.getElementById('ss-ab').textContent=ab;
+  document.getElementById('ss-bw').textContent=bw;
+  document.getElementById('ss-as').textContent=as;
+  document.getElementById('ss-lo').textContent=lo;
+  document.getElementById('ss-ny').textContent=ny;
   let ba_t=0,bb_t=0,sa_t=0,sb_t=0;
   const tb=document.getElementById('st-body');
-  tb.innerHTML=sessions.map(sess=>{
+  tb.innerHTML=['asia','london','ny'].map(sess=>{
     const st=trades.filter(t=>t.session===sess);
     const ba=st.filter(t=>t.direction==='buy'&&t.vwapPosition==='above').length;
     const bb=st.filter(t=>t.direction==='buy'&&t.vwapPosition==='below').length;
@@ -3803,60 +3837,61 @@ async function loadTradeStats(){
     ba_t+=ba;bb_t+=bb;sa_t+=sa;sb_t+=sb;
     return\`<tr><td>\${sBadge(sess)}</td><td class="g fw">\${ba||0}</td><td class="g">\${bb||0}</td><td class="r fw">\${sa||0}</td><td class="r">\${sb||0}</td><td class="b fw">\${st.length}</td></tr>\`;
   }).join('');
-  ['ba','bb','sa','sb','t'].forEach((k,i)=>document.getElementById('st-ft-'+k).textContent=[ba_t,bb_t,sa_t,sb_t,total][i]);
+  ['ba','bb','sa','sb','t'].forEach((k,i)=>document.getElementById('ft-'+k).textContent=[ba_t,bb_t,sa_t,sb_t,total][i]);
 }
 
-// ── ② OPEN POSITIONS — full RR timing 0.1→15R ────────────
+/* ── Open Positions ──────────────────────────────────────────── */
 async function loadPositions(){
   const d=await api('/live/positions');
-  const tb=document.getElementById('pos-body');
-  const em=document.getElementById('pos-empty');
-  const pw=document.getElementById('pos-wrap');
-  if(!d){setDot('pos-dot',false,'Error');document.getElementById('pos-meta').textContent='error — retry in 10s';if(tb)tb.innerHTML=emptyRow(22+FAV_STEPS.length,'⚠ Verbindingsfout');setTimeout(loadPositions,10000);return;}
-  setDot('pos-dot',true,'OK');
-  document.getElementById('pos-meta').textContent=d.count+' open';
-  document.getElementById('k-pos').textContent=d?.count??'?';
-  const pnlTotal=d?.positions?.reduce((s,p)=>s+(p.currentPnL??0),0)??null;
+  if(!d){setDot('pos-dot',false);document.getElementById('pos-meta').textContent='error';setTimeout(loadPositions,10000);return;}
+  setDot('pos-dot',true);
+  const cnt=d.count||0;
+  document.getElementById('pos-meta').textContent=cnt+' open trades';
+  document.getElementById('k-pos').textContent=cnt;
+  document.getElementById('nb-pos').textContent=cnt;
+  document.getElementById('ov-pos').textContent=cnt;
+  const pnl=d.positions?.reduce((s,p)=>s+(p.currentPnL||0),0)??0;
   const pnlEl=document.getElementById('k-pnl');
-  if(pnlTotal!=null){pnlEl.textContent=(pnlTotal>=0?'+':'')+'€'+pnlTotal.toFixed(0);pnlEl.className='kv '+pC(pnlTotal);}
-  if(!d?.positions?.length){em.style.display='flex';pw.style.display='none';return;}
-  em.style.display='none';pw.style.display='';
+  pnlEl.textContent=eu(pnl);pnlEl.className='hk-val '+pC(pnl);
+  const ovPnl=document.getElementById('ov-pnl');
+  ovPnl.textContent=eu(pnl);ovPnl.className='ov-val '+(pnl>=0?'g':'r');
+  const wins=d.positions?.filter(p=>(p.currentPnL||0)>0).length||0;
+  document.getElementById('ov-pnl-sub').textContent=wins+'/'+cnt+' trades in profit';
+  const tb=document.getElementById('pos-body');
+  if(!d.positions?.length){tb.innerHTML=emptyRow(18+FAV_STEPS.length,'No open trades');return;}
+  const isFx=s=>FOREX.includes(s)||INDEX.includes(s);
   tb.innerHTML=d.positions.map(p=>{
-    const slU=p.slPctUsed||0;
     const slDist=p.sl&&p.entry?Math.abs(p.entry-p.sl):0;
     const priceDist=p.currentPrice&&p.entry?(p.direction==='buy'?(p.currentPrice-p.entry):(p.entry-p.currentPrice)):null;
-    const rrNow=slDist>0&&priceDist!=null?parseFloat((priceDist/slDist).toFixed(2)):null;
-    const rrNowCls=rrNow==null?'d rr-now-cell':rrNow>=1?'rr-now-cell rr-pos fw':rrNow>=0?'rr-now-cell rr-mid':rrNow>=-0.5?'rr-now-cell rr-neg':'rr-now-cell rr-neg fw';
+    const rrNow=slDist>0&&priceDist!=null?+(priceDist/slDist).toFixed(2):null;
+    const rrCls=rrNow==null?'d':rrNow>=1?'g fw':rrNow>=0?'y':rrNow>=-0.5?'r':'r fw';
+    const maxRR=p.maxRR??0;
     const tpRR=p.tpRRActual??p.tpRR;
-    const riskPctShow=p.actualRiskPct??p.riskPct;
-    const riskPctCls=riskPctShow==null?'d':riskPctShow>0.35?'r fw':riskPctShow>0.25?'o':'g';
-    const isFx=FOREX.includes(p.symbol);const isIdx=INDEX.includes(p.symbol);
-    const dec=isFx?5:isIdx?2:2;
-    // adverse milestones (from slMilestones legacy + rrMilestones.adverse)
+    const rPct=p.actualRiskPct??p.riskPct;
+    const dec=isFx(p.symbol)?5:2;
     const ms=p.slMilestones??{};
     const rrMs=p.rrMilestones??{};
     const adv={...(rrMs.adverse??{})};
-    // Fallback: slMilestones keys are strings '25','50','75','100'
     if(!adv[0.25]&&(ms['25']||ms[0.25]))adv[0.25]=ms['25']||ms[0.25];
     if(!adv[0.50]&&(ms['50']||ms[0.50]))adv[0.50]=ms['50']||ms[0.50];
     if(!adv[0.75]&&(ms['75']||ms[0.75]))adv[0.75]=ms['75']||ms[0.75];
     if(!adv[1.00]&&(ms['100']||ms['99']||ms[1.00]))adv[1.00]=ms['100']||ms['99']||ms[1.00];
     const fav={...(rrMs.favorable??{})};
-    const maxRR=p.maxRR??0;
-    const maxRRCls=maxRR>=1.5?'g fw':maxRR>=0.5?'g':maxRR>0?'y':'d';
     return\`<tr class="\${tClass(p.symbol)}">
-      <td data-val="\${p.symbol}" class="b fw">\${p.symbol}</td>
-      <td>\${dBadge(p.direction)}</td><td>\${vBadge(p.vwapPosition)}</td><td>\${sBadge(p.session)}</td>
-      <td data-val="\${p.entry}" class="d" style="font-size:9.5px">\${f(p.entry,dec)}</td>
-      <td data-val="\${p.sl}" class="r" style="font-size:9.5px">\${f(p.sl,dec)}</td>
-      <td data-val="\${p.tp}" class="g" style="font-size:9.5px">\${f(p.tp,dec)}</td>
-      <td data-val="\${rrNow??-99}" class="\${rrNowCls}">\${rrNow!=null?rrNow+'R':'—'}</td>
-      <td data-val="\${maxRR??-99}" class="\${maxRRCls}">\${f(maxRR,2)}R</td>
-      <td>\${slBar(slU)}</td>
+      <td data-val="\${p.symbol}" class="b fw" style="font-family:var(--fc);font-size:11px">\${p.symbol}</td>
+      <td>\${dBadge(p.direction)}</td>
+      <td>\${vBadge(p.vwapPosition)}</td>
+      <td>\${sBadge(p.session)}</td>
+      <td data-val="\${p.entry}" class="d" style="font-size:10px">\${f(p.entry,dec)}</td>
+      <td data-val="\${p.sl}" class="r" style="font-size:10px">\${f(p.sl,dec)}</td>
+      <td data-val="\${p.tp}" class="g" style="font-size:10px">\${f(p.tp,dec)}</td>
+      <td data-val="\${rrNow??-99}" class="\${rrCls}" style="font-family:var(--fc);font-size:13px">\${rrNow!=null?rrNow+'R':'—'}</td>
+      <td data-val="\${maxRR??-99}" class="\${maxRR>=1.5?'g fw':maxRR>=0.5?'g':maxRR>0?'y':'d'}" style="font-family:var(--fc)">\${f(maxRR,2)}R</td>
+      <td>\${slBar(p.slPctUsed)}</td>
       <td data-val="\${tpRR??-99}" class="y">\${tpRR!=null?f(tpRR,2)+'R':'—'}</td>
       <td data-val="\${p.currentPnL??-99999}" class="\${pC(p.currentPnL)} fw">\${eu(p.currentPnL)}</td>
-      <td data-val="\${p.lots}" class="c">\${f(p.lots,2)}</td>
-      <td data-val="\${riskPctShow??-1}" class="\${riskPctCls}">\${riskPctShow!=null?f(riskPctShow,3)+'%':'—'}</td>
+      <td data-val="\${p.lots}" class="d">\${f(p.lots,2)}</td>
+      <td data-val="\${rPct??-1}" class="\${rPct&&rPct>0.04?'r fw':rPct&&rPct>0.025?'o':'g'}">\${rPct!=null?f(rPct,3)+'%':'—'}</td>
       \${advTd(adv,0.25,p.openedAt,'o')}
       \${advTd(adv,0.50,p.openedAt,'o')}
       \${advTd(adv,0.75,p.openedAt,'r')}
@@ -3867,335 +3902,260 @@ async function loadPositions(){
   }).join('');
 }
 
-// ── ③ GHOST TRACKER — identical structure ─────────────────
+/* ── Ghost Tracker ───────────────────────────────────────────── */
 async function loadGhosts(){
   const d=await api('/live/ghosts');
-  if(!d){setDot('gh-dot',false,'Failed');document.getElementById('gh-meta').textContent='error — retry in 10s';setTimeout(loadGhosts,10000);return;}
-  setDot('gh-dot',true,'OK');
-  document.getElementById('gh-meta').textContent=d.count+' active — tracken tot phantom SL / 15R / 15 dagen';
-  document.getElementById('k-gh').textContent=d?.count??'?';
+  if(!d){setDot('gh-dot',false);document.getElementById('gh-meta').textContent='error';setTimeout(loadGhosts,10000);return;}
+  setDot('gh-dot',true);
+  document.getElementById('gh-meta').textContent=d.count+' active · until phantom SL / 15R / 15 days';
+  document.getElementById('k-gh').textContent=d.count||0;
+  document.getElementById('nb-gh').textContent=d.count||0;
+  document.getElementById('ov-gh').textContent=d.count||0;
   const tb=document.getElementById('gh-body');
-  if(!d?.ghosts?.length){tb.innerHTML=emptyRow(10+FAV_STEPS.length,'Geen actieve ghosts');return;}
+  if(!d.ghosts?.length){tb.innerHTML=emptyRow(10+FAV_STEPS.length,'No active ghost trackers');return;}
   tb.innerHTML=d.ghosts.map(g=>{
-    const type=sTypeName(g.symbol);
-    const _rrMs=g.rrMilestones||{};
-    const adv={...(_rrMs.adverse||{})};
+    const adv={...(g.rrMilestones?.adverse||{})};
     const sl=g.slMilestones||{};
     if(!adv[0.25]&&(sl['25']||sl[0.25]))adv[0.25]=sl['25']||sl[0.25];
     if(!adv[0.50]&&(sl['50']||sl[0.50]))adv[0.50]=sl['50']||sl[0.50];
     if(!adv[0.75]&&(sl['75']||sl[0.75]))adv[0.75]=sl['75']||sl[0.75];
     if(!adv[1.00]&&(sl['100']||sl[1.00]))adv[1.00]=sl['100']||sl[1.00];
-    const fav={...(_rrMs.favorable||{})};
+    const fav={...(g.rrMilestones?.favorable||{})};
     const maxRR=g.maxRR??0;
-    const maxRRCls=maxRR>=2?'g fw':maxRR>=1?'g':maxRR>=0.5?'y':'d';
+    const maxCls=maxRR>=2?'g fw':maxRR>=1?'g':maxRR>=0.5?'y':'d';
     return\`<tr class="\${tClass(g.symbol)}">
-      <td data-val="\${g.symbol}" class="b fw">\${g.symbol}</td>
-      <td>\${tyBadge(type)}</td>
+      <td data-val="\${g.symbol}" class="b fw" style="font-family:var(--fc);font-size:11px">\${g.symbol}</td>
+      <td>\${tyBadge(sTypeName(g.symbol))}</td>
       <td>\${sBadge(g.session)}</td>
       <td>\${dBadge(g.direction)}</td>
       <td>\${vBadge(g.vwapPosition)}</td>
-      <td data-val="\${maxRR}" class="\${maxRRCls}" style="font-size:13px;font-family:'Space Grotesk',sans-serif;">\${f(maxRR,2)}R</td>
+      <td data-val="\${maxRR}" class="\${maxCls}" style="font-family:var(--fc);font-size:14px">\${f(maxRR,2)}R</td>
       \${advTd(adv,0.25,g.openedAt,'o')}
       \${advTd(adv,0.50,g.openedAt,'o')}
       \${advTd(adv,0.75,g.openedAt,'r')}
       \${advTd(adv,1.00,g.openedAt,'r fw')}
       \${FAV_STEPS.map(s=>favTd(fav,s,g.openedAt)).join('')}
-      <td data-val="\${g.elapsedMin}" class="d">\${g.elapsedMin}min</td>
+      <td data-val="\${g.elapsedMin}" class="d" style="font-size:9px">\${msFmt(g.elapsedMin)}</td>
       <td data-val="\${g.openedAt}" class="d" style="font-size:9px">\${dtTs(g.openedAt)}</td>
     </tr>\`;
   }).join('');
 }
 
-// ── ④ GHOST HISTORY ──────────────────────────────────────
+/* ── Ghost History ───────────────────────────────────────────── */
 async function loadGhostHistory(){
   const d=await api('/ghosts/history?limit=5000');
-  if(!d){setDot('ghh-dot',false,'Failed');setTimeout(loadGhostHistory,10000);return;}
-  const rows=d?.rows||d||[];
-  setDot('ghh-dot',true,'OK — '+rows.length+' records');
-  // Filter: alleen trades ná compliance datum
-  const compRows=rows.filter(g=>g.openedAt&&new Date(g.openedAt)>=COMPLIANCE);
-  function elMin(openedAt,isoTs){if(!isoTs||!openedAt)return null;return Math.round((new Date(isoTs)-new Date(openedAt))/60000);}
-  function fmtMin(m){if(m==null)return'—';if(m<60)return m+'m';return Math.floor(m/60)+'h'+(m%60?String(m%60).padStart(2,'0'):'');}
-  const byKey={};
-  for(const g of compRows){
-    const key=g.optimizerKey||(g.symbol+'_'+g.session+'_'+g.direction+'_'+(g.vwapPosition||'unknown'));
-    if(!byKey[key])byKey[key]={sym:g.symbol,sess:g.session,dir:g.direction,vwap:g.vwapPosition,key,
-      count:0,evCount:0,bestMaxRR:0,sumRR:0,sumSLPct:0,nSL:0,
-      advSum:{0.25:0,0.50:0,0.75:0,1.00:0},advN:{0.25:0,0.50:0,0.75:0,1.00:0},
-      favSum:{0.5:0,1:0,1.5:0,2:0,3:0,5:0,10:0,15:0},favN:{0.5:0,1:0,1.5:0,2:0,3:0,5:0,10:0,15:0},
-      reasons:{}};
-    const b=byKey[key];
-    b.count++;
-    const maxRR=g.maxRRBeforeSL??g.maxRR??0;
-    b.bestMaxRR=Math.max(b.bestMaxRR,maxRR);b.sumRR+=maxRR;
-    const slPct=g.maxSlPctUsed??g.slPctUsed;
-    if(slPct!=null){b.sumSLPct+=slPct;b.nSL++;}
-    const adv=g.rrMilestones?.adverse||{};const fav=g.rrMilestones?.favorable||{};
-    const sl=g.slMilestones||{};
-    const aFb={0.25:sl['25'],0.50:sl['50'],0.75:sl['75'],1.00:sl['100']};
-    for(const step of[0.25,0.50,0.75,1.00]){const ts2=adv[step]||aFb[step];const m=elMin(g.openedAt,ts2);if(m!=null){b.advSum[step]+=m;b.advN[step]++;}}
-    for(const step of[0.5,1,1.5,2,3,5,10,15]){const ts2=fav[step]||fav[parseFloat(step+'.00')]||fav[step+'.00']||null;const m=elMin(g.openedAt,ts2);if(m!=null){b.favSum[step]+=m;b.favN[step]++;}}
-    let cr=g.stopReason||g.closeReason||'sl';
-    if(maxRR>=15)cr='maxRR';else if(cr==='phantom_sl'||cr==='sl')cr='sl';else if(cr.includes('timeout'))cr='timeout';else if(cr.includes('manual'))cr='manual';
-    b.reasons[cr]=(b.reasons[cr]||0)+1;
-    const evOk=(g.phantomSLHit||g.stopReason==='max_rr_15')&&(g.vwapPosition==='above'||g.vwapPosition==='below')&&maxRR>=0.5;
-    if(evOk)b.evCount++;
+  if(!d){setDot('ghh-dot',false);setTimeout(loadGhostHistory,10000);return;}
+  setDot('ghh-dot',true);
+  const rows=(d?.rows||d||[]).filter(g=>g.openedAt&&new Date(g.openedAt)>=COMPLIANCE);
+  document.getElementById('ghh-meta').textContent=Object.keys(byK(rows)).length+' combos · '+rows.length+' ghosts · 3 mei 2026+';
+  function elMin(o,ts){if(!ts||!o)return null;return Math.round((new Date(ts)-new Date(o))/60000);}
+  function byK(arr){
+    const bk={};
+    for(const g of arr){
+      const key=g.optimizerKey||(g.symbol+'_'+g.session+'_'+g.direction+'_'+(g.vwapPosition||'unknown'));
+      if(!bk[key])bk[key]={sym:g.symbol,sess:g.session,dir:g.direction,vwap:g.vwapPosition,key,
+        count:0,evCount:0,bestRR:0,sumRR:0,
+        advSum:{0.25:0,0.50:0,0.75:0,1.00:0},advN:{0.25:0,0.50:0,0.75:0,1.00:0},
+        favSum:{0.5:0,1:0,1.5:0,2:0,3:0,5:0,10:0,15:0},favN:{0.5:0,1:0,1.5:0,2:0,3:0,5:0,10:0,15:0},
+        sumSL:0,nSL:0,reasons:{}};
+      const b=bk[key];b.count++;
+      const mr=g.maxRRBeforeSL??g.maxRR??0;b.bestRR=Math.max(b.bestRR,mr);b.sumRR+=mr;
+      const slPct=g.maxSlPctUsed??g.slPctUsed;if(slPct!=null){b.sumSL+=slPct;b.nSL++;}
+      const adv=g.rrMilestones?.adverse||{};const fav=g.rrMilestones?.favorable||{};
+      const slMs=g.slMilestones||{};
+      const aFb={0.25:slMs['25'],0.50:slMs['50'],0.75:slMs['75'],1.00:slMs['100']};
+      for(const s of[0.25,0.50,0.75,1.00]){const m=elMin(g.openedAt,adv[s]||aFb[s]);if(m!=null){b.advSum[s]+=m;b.advN[s]++;}}
+      for(const s of[0.5,1,1.5,2,3,5,10,15]){const m=elMin(g.openedAt,fav[s]||fav[parseFloat(s+'.00')]||null);if(m!=null){b.favSum[s]+=m;b.favN[s]++;}}
+      let cr=g.stopReason||g.closeReason||'sl';
+      if(mr>=15)cr='maxRR';else if(cr.includes('timeout'))cr='timeout';else if(cr.includes('manual'))cr='manual';else cr='sl';
+      b.reasons[cr]=(b.reasons[cr]||0)+1;
+      if((g.phantomSLHit||g.stopReason==='max_rr_15')&&(g.vwapPosition==='above'||g.vwapPosition==='below')&&mr>=0.5)b.evCount++;
+    }
+    return bk;
   }
-  const combined=Object.values(byKey).filter(b=>b.sym&&b.vwap&&b.vwap!=='unknown');
-  document.getElementById('ghh-meta').textContent=combined.length+' combos · '+compRows.length+' ghosts (3 mei+)';
+  const combined=Object.values(byK(rows)).filter(b=>b.sym&&b.vwap&&b.vwap!=='unknown').sort((a,z)=>z.count-a.count);
   const tb=document.getElementById('ghh-body');
-  if(!combined.length){tb.innerHTML=emptyRow(26,'Geen ghost history ná compliance datum');return;}
-  combined.sort((a,b)=>b.count-a.count);
+  if(!combined.length){tb.innerHTML=emptyRow(26,'No ghost history after compliance date');return;}
+  function aAvg(b,s){const n=b.advN[s];return n>0?Math.round(b.advSum[s]/n):null;}
+  function fAvg(b,s){const n=b.favN[s];return n>0?Math.round(b.favSum[s]/n):null;}
+  function tCell(m,cls='d'){return\`<td class="\${m!=null?cls:'d'}" style="font-size:8.5px">\${m!=null?msFmt(m):'—'}</td>\`;}
+  function maePct(v,t1,t2){if(v==null)return'<td class="d">—</td>';const c=v<t1?'g':v<t2?'y':'r';return\`<td class="\${c}" style="font-size:8.5px">\${f(v,1)}%</td>\`;}
   tb.innerHTML=combined.map(g=>{
-    const type=sTypeName(g.sym||'');
-    const avgRR=g.count>0?(g.sumRR/g.count):0;
-    const avgSL=g.nSL>0?(g.sumSLPct/g.nSL):null;
-    const topReason=Object.entries(g.reasons).sort((a,b)=>b[1]-a[1])[0]?.[0]||'sl';
-    function aAvg(s){const n=g.advN[s];return n>0?Math.round(g.advSum[s]/n):null;}
-    function fAvg(s){const n=g.favN[s];return n>0?Math.round(g.favSum[s]/n):null;}
-    function tCell(m,cls='d'){return\`<td class="\${m!=null?cls:'d'}" style="font-size:8.5px">\${m!=null?fmtMin(m):'—'}</td>\`;}
+    const avgRR=g.count>0?g.sumRR/g.count:0;
+    const topR=Object.entries(g.reasons).sort((a,b)=>b[1]-a[1])[0]?.[0]||'sl';
     const mae=_maeData[g.key]??null;
-    const maeP50=mae?.maeP50;const maeP75=mae?.maeP75;const maeP90=mae?.maeP90;
     const slRec=mae?.slReduction;
-    function maePct(v,t1,t2){if(v==null)return'<td class="d">—</td>';const c=v<t1?'g':v<t2?'y':'r';return\`<td class="\${c}" style="font-size:8.5px">\${f(v,1)}%</td>\`;}
-    const slRecCell=slRec==null?'<td class="d">—</td>':\`<td class="\${slRec.color==='g'?'g':slRec.color==='y'?'y':'r'}" style="font-size:8.5px;white-space:nowrap">\${slRec.label}</td>\`;
     return\`<tr class="\${tClass(g.sym||'')}">
-      <td data-val="\${g.sym}" class="b fw">\${g.sym||'—'}</td>
-      <td>\${tyBadge(type)}</td>
+      <td data-val="\${g.sym}" class="b fw" style="font-family:var(--fc);font-size:11px">\${g.sym||'—'}</td>
+      <td>\${tyBadge(sTypeName(g.sym||''))}</td>
       <td>\${sBadge(g.sess)}</td><td>\${dBadge(g.dir)}</td><td>\${vBadge(g.vwap)}</td>
       <td data-val="\${g.count}" class="\${g.count>=5?'y fw':'c'}">\${g.count}</td>
       <td data-val="\${g.evCount}" class="\${g.evCount>=5?'y fw':g.evCount>=1?'c':'d'}">\${g.evCount}</td>
-      <td data-val="\${g.bestMaxRR}" class="\${g.bestMaxRR>0?'g fw':'d'}">\${f(g.bestMaxRR,2)}R</td>
+      <td data-val="\${g.bestRR}" class="\${g.bestRR>0?'g fw':'d'}">\${f(g.bestRR,2)}R</td>
       <td data-val="\${avgRR}" class="\${avgRR>=1?'g':avgRR>0?'y':'d'}">\${f(avgRR,2)}R</td>
-      \${tCell(aAvg(0.25),'o')}\${tCell(aAvg(0.50),'o')}\${tCell(aAvg(0.75),'r')}\${tCell(aAvg(1.00),'r')}
-      \${tCell(fAvg(0.5),'g')}\${tCell(fAvg(1),'g')}\${tCell(fAvg(1.5),'g')}\${tCell(fAvg(2),'g')}\${tCell(fAvg(3),'g')}\${tCell(fAvg(5),'g')}\${tCell(fAvg(10),'g')}\${tCell(fAvg(15),'g')}
-      <td>\${cBadge(topReason)}</td>
-      \${maePct(maeP50,40,65)}\${maePct(maeP75,50,75)}\${maePct(maeP90,50,80)}\${slRecCell}
+      \${tCell(aAvg(g,0.25),'o')}\${tCell(aAvg(g,0.50),'o')}\${tCell(aAvg(g,0.75),'r')}\${tCell(aAvg(g,1.00),'r')}
+      \${tCell(fAvg(g,0.5),'g')}\${tCell(fAvg(g,1),'g')}\${tCell(fAvg(g,1.5),'g')}\${tCell(fAvg(g,2),'g')}\${tCell(fAvg(g,3),'g')}\${tCell(fAvg(g,5),'g')}\${tCell(fAvg(g,10),'g')}\${tCell(fAvg(g,15),'g')}
+      <td style="font-size:9px">\${topR==='sl'?'<span class="bd b-sl">SL</span>':topR==='maxRR'?'<span class="bd b-mr">MAX-RR</span>':topR==='timeout'?'<span class="bd b-mn">TIMEOUT</span>':'<span class="bd" style="color:var(--ink3)">'+topR+'</span>'}</td>
+      \${maePct(mae?.maeP50,40,65)}\${maePct(mae?.maeP75,50,75)}\${maePct(mae?.maeP90,50,80)}
+      <td class="\${slRec?.color==='g'?'g':slRec?.color==='y'?'y':'r'}" style="font-size:8.5px">\${slRec?.label||'—'}</td>
     </tr>\`;
   }).join('');
-  // Also feed SL optimizer
-  renderSLOptimizer(combined);
+  renderSLOpt(combined);
 }
 
-// ── ⑦ SL OPTIMIZER — read only ───────────────────────────
-function renderSLOptimizer(combined){
-  const tb=document.getElementById('sl-opt-body');
-  const hasMae=combined.filter(g=>{const m=_maeData[g.key];return m?.maeP90!=null;});
-  if(!hasMae.length){tb.innerHTML=emptyRow(12,'Geen MAE data beschikbaar — wacht op ghost history');return;}
-  hasMae.sort((a,b)=>{
-    const ma=_maeData[a.key];const mb=_maeData[b.key];
-    const sa=(ma?.slReduction?.pct??100);const sb=(mb?.slReduction?.pct??100);
-    return sa-sb;
-  });
+function renderSLOpt(combined){
+  const hasMae=combined.filter(g=>_maeData[g.key]?.maeP90!=null).sort((a,z)=>{const r=(_maeData[a.key]?.slReduction?.pct??100)-(_maeData[z.key]?.slReduction?.pct??100);return r;});
+  const tb=document.getElementById('sl-body');
+  if(!hasMae.length){tb.innerHTML=emptyRow(11,'No MAE data available yet — waiting for ghost history');return;}
+  function maePct(v,t1,t2){if(v==null)return'<td class="d">—</td>';const c=v<t1?'g':v<t2?'y':'r';return\`<td class="\${c}">\${f(v,1)}%</td>\`;}
   tb.innerHTML=hasMae.map(g=>{
-    const type=sTypeName(g.sym||'');
-    const mae=_maeData[g.key]??null;
-    const p50=mae?.maeP50;const p75=mae?.maeP75;const p90=mae?.maeP90;
-    const slRec=mae?.slReduction;
-    function maePct(v,t1,t2){if(v==null)return'<td class="d">—</td>';const c=v<t1?'g':v<t2?'y':'r';return\`<td class="\${c}">\${f(v,1)}%</td>\`;}
-    const savings=slRec?.pct?(\`\${(100-slRec.pct).toFixed(0)}% smaller SL\`):'—';
+    const mae=_maeData[g.key];const slRec=mae?.slReduction;
     return\`<tr class="\${tClass(g.sym||'')}">
-      <td class="b fw">\${g.sym||'—'}</td>
-      <td>\${tyBadge(type)}</td>
+      <td class="b fw" style="font-family:var(--fc);font-size:11px">\${g.sym||'—'}</td>
+      <td>\${tyBadge(sTypeName(g.sym||''))}</td>
       <td>\${sBadge(g.sess)}</td><td>\${dBadge(g.dir)}</td><td>\${vBadge(g.vwap)}</td>
       <td class="\${g.count>=5?'y fw':'c'}">\${g.count}</td>
-      <td class="d">huidig</td>
-      \${maePct(p50,40,65)}\${maePct(p75,50,75)}\${maePct(p90,50,80)}
-      <td class="\${slRec?.color==='g'?'g':slRec?.color==='y'?'y':'r'}">\${slRec?.label||'—'}</td>
-      <td class="c">\${savings}</td>
+      \${maePct(mae?.maeP50,40,65)}\${maePct(mae?.maeP75,50,75)}\${maePct(mae?.maeP90,50,80)}
+      <td class="\${slRec?.color==='g'?'g fw':slRec?.color==='y'?'y':'r'}">\${slRec?.label||'—'}</td>
+      <td class="c">\${slRec?.pct?((100-slRec.pct).toFixed(0))+'% smaller SL':'—'}</td>
     </tr>\`;
   }).join('');
 }
 
-// ── ⑤ EV OPTIMIZER ───────────────────────────────────────
+/* ── EV Optimizer ────────────────────────────────────────────── */
 async function loadEV(){
-  const countD=await api('/trades?limit=1');
-  const realLimit=countD?.count??5000;
-  const [trD,tpD]=await Promise.all([api('/trades?limit='+Math.max(realLimit,5000)),api('/tp-locks')]);
-  if(!trD){setDot('ev-dot',false,'Failed');return;}
+  const [trD,tpD]=await Promise.all([api('/trades?limit=10000'),api('/tp-locks')]);
+  if(!trD){setDot('ev-dot',false);return;}
   _allTrades=trD.trades||[];
   _tpMap={};if(tpD)tpD.forEach(t=>{_tpMap[t.key]=t;});
   document.getElementById('k-tp').textContent=Object.values(_tpMap).filter(t=>(t.evAtLock??0)>0).length;
-  _buildCombos();
-  setDot('ev-dot',true,'EV data opbouwen...');
-  _loadEVWithRetry();
+  document.getElementById('ov-tp').textContent=Object.values(_tpMap).filter(t=>(t.evAtLock??0)>0).length;
+  _buildCombos();setDot('ev-dot',true);
+  _loadEVRetry();
 }
-
-async function _loadEVWithRetry(attempt=0){
-  const MAX=12,INTERVAL=5000;
+async function _loadEVRetry(n=0){
   const evD=await api('/ev');
-  _evMap={};
-  if(evD&&evD.length>0){
-    evD.forEach(e=>{_evMap[e.key]=e;});
-    setDot('ev-dot',true,'EV: '+evD.filter(e=>e.count>0).length+' combos met data');
-    _buildCombos();return;
-  }
-  if(attempt<MAX){setDot('ev-dot',false,'EV cache opbouwen... ('+(attempt+1)+'/'+MAX+')');setTimeout(()=>_loadEVWithRetry(attempt+1),INTERVAL);}
-  else setDot('ev-dot',false,'EV cache niet beschikbaar — klik REFRESH');
+  if(evD?.length>0){evD.forEach(e=>{_evMap[e.key]=e;});_buildCombos();setDot('ev-dot',true);return;}
+  if(n<12)setTimeout(()=>_loadEVRetry(n+1),5000);else setDot('ev-dot',false);
 }
-
 function _buildCombos(){
-  document.getElementById('k-tp').textContent=Object.values(_tpMap).filter(t=>(t.evAtLock??0)>0).length;
   const combos=[];
-  const allSyms=[...FOREX,...INDEX,...COMM,...STOCKS];
-  for(const sym of allSyms){
+  for(const sym of[...FOREX,...INDEX,...COMM,...STOCKS]){
     const type=sTypeName(sym);
     const sessions=type==='stock'?['ny']:['asia','london','ny'];
     for(const sess of sessions)for(const dir of['buy','sell'])for(const vwap of['above','below']){
       const key=sym+'_'+sess+'_'+dir+'_'+vwap;
       const trades=_allTrades.filter(t=>t.symbol===sym&&t.session===sess&&t.direction===dir&&t.vwapPosition===vwap&&t.closedAt!=null&&t.openedAt&&new Date(t.openedAt)>=COMPLIANCE);
-      const totalPnl=trades.reduce((s,t)=>s+(t.realizedPnlEUR??t.currentPnL??0),0);
-      combos.push({sym,sess,dir,vwap,key,trades,totalPnl,type,ev:_evMap[key]??null,tp:_tpMap[key]??null});
+      combos.push({sym,sess,dir,vwap,key,trades,totalPnl:trades.reduce((s,t)=>s+(t.realizedPnlEUR??t.currentPnL??0),0),type,ev:_evMap[key]??null,tp:_tpMap[key]??null});
     }
   }
-  _evData=combos;renderEV();loadGhostHistory();buildMatrix(combos);renderComboFilter(combos);
+  _evData=combos;renderEV();buildMatrix(combos);
 }
-
 function renderEV(){
-  let d=_evData;
+  let d=[..._evData];
   if(evF.type!=='all')d=d.filter(c=>c.type===evF.type);
   if(evF.sess!=='all')d=d.filter(c=>c.sess===evF.sess);
   if(evF.dir!=='all')d=d.filter(c=>c.dir===evF.dir);
-  if(evF.vwap!=='all')d=d.filter(c=>c.vwap===evF.vwap);
-  if(evF.min==='0')d=d.filter(c=>(c.ev?.count??0)>=1);
+  if(evF.min==='1')d=d.filter(c=>(c.ev?.count??0)>=1);
   else if(evF.min==='5')d=d.filter(c=>(c.ev?.count??0)>=5);
-  else if(evF.min==='10')d=d.filter(c=>(c.ev?.count??0)>=10);
-  else if(evF.min==='1')d=d.filter(c=>(c.ev?.count??0)>=1);
-  d.sort((a,b)=>{const ha=(a.ev?.count??0)>0,hb=(b.ev?.count??0)>0;if(ha!==hb)return ha?-1:1;return (b.ev?.bestEV??-999)-(a.ev?.bestEV??-999);});
+  d.sort((a,z)=>{const ha=(a.ev?.count??0)>0,hz=(z.ev?.count??0)>0;if(ha!==hz)return ha?-1:1;return(z.ev?.bestEV??-999)-(a.ev?.bestEV??-999);});
   const withData=d.filter(c=>c.ev&&c.ev.count>0);
   const pnl=d.reduce((s,c)=>s+c.totalPnl,0);
-  document.getElementById('ev-meta').textContent=d.length+' combos · '+withData.length+' met ghost data';
-  document.getElementById('ev-count').textContent=d.length;
-  document.getElementById('ev-trades').textContent=withData.length;
-  document.getElementById('ev-zero').textContent=d.filter(c=>!c.ev||c.ev.count===0).length;
-  const pEl=document.getElementById('ev-pnl');pEl.textContent=(pnl>=0?'+':'')+'€'+pnl.toFixed(0);pEl.className='sv2 '+pC(pnl);
-  document.getElementById('ev-locked').textContent=d.filter(c=>c.tp&&(c.ev?.bestEV??0)>0).length;
+  document.getElementById('ev-meta').textContent=d.length+' combos · '+withData.length+' with ghost data';
+  document.getElementById('ev-cnt').textContent=d.length;
+  document.getElementById('ev-data').textContent=withData.length;
+  document.getElementById('ev-lck').textContent=d.filter(c=>c.tp&&(c.ev?.bestEV??0)>0).length;
+  const pe=document.getElementById('ev-pnl');pe.textContent=eu(pnl);pe.className='ss-val '+pC(pnl);
   const tb=document.getElementById('ev-body');
-  if(!d.length){tb.innerHTML=emptyRow(16,'Geen combos met huidige filters');return;}
+  if(!d.length){tb.innerHTML=emptyRow(15,'No combos match current filters');return;}
   tb.innerHTML=d.map(c=>{
-    const ev=c.ev;const tp=c.tp;
-    const evV=ev?.bestEV??null;const ghostN=ev?.count??0;const tradeN=c.trades?.length??0;
-    const ready=ghostN>=5;const bestTP=tp?tp.lockedRR:(ev?.bestRR??null);
-    const rowStyle=ghostN===0&&tradeN===0?' style="opacity:.4"':'';
-    return\`<tr class="\${tClass(c.sym)}"\${rowStyle}>
-      <td data-val="\${c.sym}" class="b fw">\${c.sym}</td>
-      <td>\${tyBadge(c.type)}</td><td>\${sBadge(c.sess)}</td><td>\${dBadge(c.dir)}</td><td>\${vBadge(c.vwap)}</td>
-      <td data-val="\${ghostN}" class="\${ready?'y fw':ghostN>0?'c':'d'}">\${ghostN===0?'<span class="d">0</span>':ghostN+(ready?'':' <span class="d" style="font-size:8px">('+(5-ghostN)+'→5)</span>')}</td>
-      <td data-val="\${tradeN}" class="\${tradeN>0?'b':'d'}">\${tradeN}</td>
+    const ev=c.ev;const tp=c.tp;const evV=ev?.bestEV??null;const gN=ev?.count??0;const ready=gN>=5;
+    const bestTP=tp?tp.lockedRR:(ev?.bestRR??null);
+    const rs=gN===0&&c.trades.length===0?' style="opacity:.4"':'';
+    return\`<tr class="\${tClass(c.sym)}"\${rs}>
+      <td data-val="\${c.sym}" class="b fw" style="font-family:var(--fc);font-size:11px">\${c.sym}</td>
+      <td>\${tyBadge(c.type)}</td>
+      <td>\${sBadge(c.sess)}</td><td>\${dBadge(c.dir)}</td><td>\${vBadge(c.vwap)}</td>
+      <td data-val="\${gN}" class="\${ready?'y fw':gN>0?'c':'d'}">\${gN===0?'<span class="d">0</span>':gN+(ready?'':' <span class="d" style="font-size:8px">('+(5-gN)+'→5)</span>')}</td>
+      <td data-val="\${c.trades.length}" class="\${c.trades.length>0?'b':'d'}">\${c.trades.length}</td>
       <td data-val="\${bestTP??-99}" class="\${bestTP?'g fw':'d'}">\${bestTP!=null?f(bestTP,1)+'R':'—'}</td>
       <td data-val="\${ev?.avgRR??-99}" class="\${(ev?.avgRR??0)>=1?'g':'d'}">\${ev?.avgRR!=null?f(ev.avgRR,2)+'R':'—'}</td>
-      <td data-val="\${evV??-999}" class="\${evC(evV)} fw">\${evV!=null?evV.toFixed(3):'—'}</td>
-      <td>\${ready?(evV!=null?(evV>0?'<span class="bd bd-evp">EV+ ✓</span>':'<span class="bd bd-evn">EV-</span>'):'<span class="bd d">pending</span>'):('<span class="d" style="font-size:8.5px">'+(ghostN>0?'need '+(5-ghostN)+' more':'geen data')+'</span>')}</td>
-      <td>\${tp?\`<span class="bd bd-lck">★ \${tp.lockedRR.toFixed(1)}R</span>\`:'<span class="d">—</span>'}</td>
+      <td data-val="\${evV??-999}" class="\${evV==null?'d':evV>0?'g fw':'r fw'}">\${evV!=null?evV.toFixed(3):'—'}</td>
+      <td>\${ready?(evV!=null?(evV>0?'<span class="bd b-tp">EV+ ✓</span>':'<span class="bd b-sl">EV−</span>'):'<span class="bd" style="color:var(--ink3)">pending</span>'):gN>0?'<span class="d" style="font-size:8.5px">need '+(5-gN)+' more</span>':'<span class="d" style="font-size:8px">—</span>'}</td>
+      <td>\${tp?\`<span class="bd b-lk">★ \${tp.lockedRR.toFixed(1)}R</span>\`:'<span class="d">—</span>'}</td>
       <td data-val="\${ev?.avgTimeToSLMin??9999}" class="d">\${ev?.avgTimeToSLMin!=null?ev.avgTimeToSLMin+'min':'—'}</td>
       <td data-val="\${ev?.avgMaxSlPct??-1}" class="\${ev?.avgMaxSlPct!=null?(ev.avgMaxSlPct<50?'g':ev.avgMaxSlPct<80?'y':'o'):'d'}">\${ev?.avgMaxSlPct!=null?f(ev.avgMaxSlPct,1)+'%':'—'}</td>
-      <td data-val="\${ev?.bestWinnerSlPct??-1}" class="g">\${ev?.bestWinnerSlPct!=null?f(ev.bestWinnerSlPct,1)+'%':'—'}</td>
       <td data-val="\${c.totalPnl}" class="\${pC(c.totalPnl)} fw">\${eu(c.totalPnl)}</td>
     </tr>\`;
   }).join('');
 }
-
 function setEVF(k,v,btn){evF[k]=v;btn.closest('.fbar').querySelectorAll('.fb').forEach(b=>{if(b.getAttribute('onclick')?.includes("'"+k+"'"))b.classList.remove('on');});btn.classList.add('on');renderEV();}
 
-// ── ⑥ EV MATRIX ──────────────────────────────────────────
+/* ── EV Matrix ───────────────────────────────────────────────── */
 function buildMatrix(combos){
   const byKey={};combos.forEach(c=>{byKey[c.key]=c;});
-  const make=(syms,tid)=>{
-    const body=document.getElementById('mxb-'+tid);if(!body)return;
+  function make(syms,tid){
+    const body=document.getElementById(tid);if(!body)return;
     body.innerHTML=syms.map(sym=>{
       const isSK=STOCKS.includes(sym);
-      return'<tr>'+[\`<td class="sym">\${sym}</td>\`,...[['buy','above'],['buy','below'],['sell','above'],['sell','below']].map(([dir,vwap])=>{
+      return'<tr>'+[\`<td class="sym-cell">\${sym}</td>\`,...[['buy','above'],['buy','below'],['sell','above'],['sell','below']].map(([dir,vwap])=>{
         const keys=isSK?[sym+'_ny_'+dir+'_'+vwap]:['asia','london','ny'].map(s=>sym+'_'+s+'_'+dir+'_'+vwap);
         const cs=keys.map(k=>byKey[k]).filter(Boolean);
         const n=cs.reduce((s,c)=>s+c.trades.length,0);
-        if(!n)return'<td class="ez">—</td>';
+        if(!n)return'<td style="color:var(--ink3)">—</td>';
         const allEV=cs.map(c=>c.ev?.bestEV).filter(v=>v!=null);
         const evV=allEV.length?allEV.reduce((s,v)=>s+v,0)/allEV.length:null;
-        const allTPs=cs.map(c=>c.tp?.lockedRR).filter(v=>v!=null);
-        const tpV=allTPs.length?Math.max(...allTPs):null;
-        const cls=evV==null?'ez':evV>0?'ep':'en';
-        return\`<td class="\${cls}" title="n=\${n} EV=\${evV!=null?evV.toFixed(3):'?'}">\${tpV?'★':''}\${evV!=null?evV.toFixed(2):'?'}<br><span style="font-size:7.5px;color:var(--dim)">n=\${n}</span></td>\`;
+        const star=cs.some(c=>c.tp)?'★':'';
+        const cls=evV==null?'d':evV>0?'g fw':'r';
+        return\`<td class="\${cls}" title="n=\${n} EV=\${evV!=null?evV.toFixed(3):'?'}">\${star}\${evV!=null?evV.toFixed(2):'?'}<br><span style="font-size:7px;color:var(--ink3)">n=\${n}</span></td>\`;
       })].join('')+'</tr>';
     }).join('');
-  };
-  make(FOREX,'fx');make(INDEX,'ix');make(COMM,'cm');make(STOCKS,'sk');
+  }
+  make(FOREX,'mxb-fx');make([...INDEX,...COMM],'mxb-ix');make(STOCKS,'mxb-sk');
 }
 
-// ── ⑧ COMBO SELECTION ────────────────────────────────────
-function renderComboFilter(combos){
-  let d=[...combos];
-  if(cfF.show==='all')d=d.filter(c=>(c.ev?.count??0)>0||c.trades?.length>0);
-  else if(cfF.show==='ev+')d=d.filter(c=>(c.ev?.bestEV??0)>0);
-  else if(cfF.show==='ev-')d=d.filter(c=>c.ev?.bestEV!=null&&c.ev.bestEV<0);
-  else if(cfF.show==='min5')d=d.filter(c=>(c.ev?.count??0)>=5);
-  if(cfF.sort==='ev')d.sort((a,b)=>(b.ev?.bestEV??-999)-(a.ev?.bestEV??-999));
-  else if(cfF.sort==='pnl')d.sort((a,b)=>b.totalPnl-a.totalPnl);
-  else if(cfF.sort==='trades')d.sort((a,b)=>(b.ev?.count??0)-(a.ev?.count??0));
-  const tb=document.getElementById('cf-body');
-  if(!d.length){tb.innerHTML=emptyRow(11,'Geen traded combos');return;}
-  tb.innerHTML=d.map((c,i)=>{
-    const evV=c.ev?.bestEV??null;const ghostN=c.ev?.count??0;const ready=ghostN>=5;
-    let action='—',aCls='d';
-    if(ready){if(evV!=null&&evV>0.05){action='⬆ BEHOUDEN / SCHALEN';aCls='g';}else if(evV!=null&&evV<-0.05){action='⬇ OVERWEGEN SNIJDEN';aCls='r';}else{action='↔ NEUTRAAL';aCls='y';}}
-    else if(ghostN>0){action=\`wacht op \${5-ghostN} ghosts\`;aCls='d';}
-    else{action='geen data';aCls='d';}
-    return\`<tr class="\${tClass(c.sym)}">
-      <td class="d">\${i+1}</td><td class="b fw">\${c.sym}</td><td>\${tyBadge(c.type)}</td>
-      <td>\${sBadge(c.sess)}</td><td>\${dBadge(c.dir)}</td><td>\${vBadge(c.vwap)}</td>
-      <td class="\${ready?'y fw':ghostN>0?'c':'d'}">\${ghostN||0}</td>
-      <td class="\${(c.ev?.avgRR??0)>=1?'g':c.ev?.avgRR!=null?'r':'d'}">\${c.ev?.avgRR!=null?f(c.ev.avgRR,2)+'R':'—'}</td>
-      <td class="\${evC(evV)} fw">\${evV!=null?evV.toFixed(3):'—'}</td>
-      <td class="\${pC(c.totalPnl)}">\${eu(c.totalPnl)}</td>
-      <td class="\${aCls} fw" style="font-size:9.5px">\${action}</td>
-    </tr>\`;
-  }).join('');
-}
-function setCF(k,v,btn){cfF[k]=v;btn.closest('.fbar').querySelectorAll('.fb').forEach(b=>{if(b.getAttribute('onclick')?.includes("'"+k+"'"))b.classList.remove('on');});btn.classList.add('on');renderComboFilter(_evData);}
-
-// ── WEBHOOK ERRORS ────────────────────────────────────────
+/* ── Webhook Errors ──────────────────────────────────────────── */
 async function loadErrors(){
   const d=await api('/history');
-  if(!d){setDot('whe-dot',false,'Failed');document.getElementById('whe-meta').textContent='error';setTimeout(loadErrors,10000);return;}
-  const all=Array.isArray(d)?d:[];
-  const errs=all.filter(e=>['REJECTED','SL_TP_SET_FAILED','LOT_CALC_FAILED','ORDER_NOT_CONFIRMED','VWAP_BAND_EXHAUSTED','SPREAD_GUARD_CLOSE','RR_VERIFY_FAILED','CURRENCY_BUDGET_EXHAUSTED','OUTSIDE_WINDOW'].includes(e.type));
-  setDot('whe-dot',true,'OK — '+errs.length+' errors');
-  document.getElementById('whe-meta').textContent=errs.length+' errors';
-  document.getElementById('k-err').textContent=errs.length;
+  if(!d){setDot('sig-dot',false);document.getElementById('sig-meta').textContent='error';setTimeout(loadErrors,10000);return;}
+  const ERR_TYPES=['REJECTED','SL_TP_SET_FAILED','LOT_CALC_FAILED','ORDER_NOT_CONFIRMED','VWAP_BAND_EXHAUSTED','SPREAD_GUARD_CLOSE','RR_VERIFY_FAILED','CURRENCY_BUDGET_EXHAUSTED','OUTSIDE_WINDOW'];
+  const errs=(Array.isArray(d)?d:[]).filter(e=>ERR_TYPES.includes(e.type));
+  setDot('sig-dot',errs.length===0);
+  document.getElementById('sig-meta').textContent=errs.length+' errors';
+  document.getElementById('nb-sig').textContent=errs.length;
   const tb=document.getElementById('whe-body');
-  if(!errs.length){tb.innerHTML='<tr><td colspan="10" class="nodata g">✓ Geen errors</td></tr>';return;}
+  if(!errs.length){tb.innerHTML='<tr><td colspan="10" class="nd" style="color:var(--g)">✓ No webhook errors</td></tr>';return;}
   tb.innerHTML=errs.slice(0,80).map(e=>{
-    const p=e.payload||{};const bandPct=p.vwapBandPct||e.vwapBandPct;
+    const p=e.payload||{};const bp=p.vwapBandPct||e.vwapBandPct;
     return\`<tr>
       <td class="d" style="font-size:9px">\${ts(e.ts)}</td>
       <td><span class="r fw" style="font-size:9px">\${e.type}</span></td>
-      <td class="b">\${e.symbol||p.symbol||'—'}</td>
+      <td class="b fw">\${e.symbol||p.symbol||'—'}</td>
       <td>\${dBadge(e.direction||p.direction)}</td>
       <td>\${sBadge(e.session||p.session)}</td>
       <td>\${vBadge(e.vwapPos||p.vwapPosition)}</td>
       <td class="d">\${e.entry?f(e.entry,5):'—'}</td>
       <td class="o">\${p.slPctHuman||p.derivedSlPct||'—'}</td>
-      <td class="\${bandPct&&(+bandPct)>1.5?'r':'d'}">\${bandPct!=null?((+bandPct)*100).toFixed(0)+'%':'—'}</td>
+      <td class="\${bp&&(+bp)>1.5?'r':'d'}">\${bp!=null?((+bp)*100).toFixed(0)+'%':'—'}</td>
       <td class="d" style="max-width:200px;overflow:hidden;text-overflow:ellipsis;font-size:8.5px">\${e.reason||p.reason||''}</td>
     </tr>\`;
   }).join('');
 }
 
-// BLOCKED SIGNALS
 async function loadBlockedSignals(){
-  const [rejectD,histD]=await Promise.all([api('/signal-stats/rejects?since=2026-05-03T00:00:00.000Z'),api('/history')]);
-  if(!rejectD&&!histD)return;
-  const COMPLIANCE2=new Date('2026-05-03T00:00:00.000Z');
+  const rejectD=await api('/signal-stats/rejects?since=2026-05-03T00:00:00.000Z');
+  if(!rejectD)return;
   const byO={};(rejectD?.byOutcome||[]).forEach(r=>{byO[r.outcome]=r.pairs?.reduce((s,p)=>s+p.count,0)??0;});
-  document.getElementById('blk-total').textContent=(rejectD?.total||0)+'';
-  document.getElementById('blk-dup').textContent=((byO['DUPLICATE_OPEN']??0)+(byO['DUPLICATE_BLOCKED']??0)+(byO['DUPLICATE']??0))+'';
-  document.getElementById('blk-vwap').textContent=((byO['VWAP_BAND_EXHAUSTED']??0)+(byO['VWAP_EXHAUSTED']??0))+'';
-  document.getElementById('blk-win').textContent=((byO['OUTSIDE_WINDOW']??0)+(byO['OUTSIDE_HOURS']??0))+'';
-  document.getElementById('blk-cur').textContent=((byO['CURRENCY_BUDGET']??0)+(byO['BUDGET_EXHAUSTED']??0))+'';
+  document.getElementById('blk-tot').textContent=rejectD.total||0;
+  document.getElementById('blk-dup').textContent=((byO['DUPLICATE_OPEN']??0)+(byO['DUPLICATE_BLOCKED']??0)+(byO['DUPLICATE']??0));
+  document.getElementById('blk-vw').textContent=((byO['VWAP_BAND_EXHAUSTED']??0)+(byO['VWAP_EXHAUSTED']??0));
+  document.getElementById('blk-win').textContent=((byO['OUTSIDE_WINDOW']??0)+(byO['OUTSIDE_HOURS']??0));
+  document.getElementById('blk-cur').textContent=((byO['CURRENCY_BUDGET']??0)+(byO['BUDGET_EXHAUSTED']??0));
   const tb=document.getElementById('blk-body');
-  const allPairs=rejectD?.topPairs||[];
-  if(!allPairs.length){tb.innerHTML=emptyRow(7,'Geen geblokkeerde signalen ná 3 mei 2026');return;}
-  tb.innerHTML=allPairs.slice(0,30).map(p=>\`<tr>
-    <td><span class="bd bd-mn" style="font-size:7.5px">BLOCKED</span></td>
+  const allP=rejectD?.topPairs||[];
+  if(!allP.length){tb.innerHTML=emptyRow(7,'No blocked signals after compliance date');return;}
+  tb.innerHTML=allP.slice(0,30).map(p=>\`<tr>
+    <td><span class="bd b-mn" style="font-size:7.5px">BLOCKED</span></td>
     <td style="color:var(--o);font-size:9px">\${p.outcome}</td>
     <td class="b fw">\${p.symbol||'?'}</td>
     <td>\${p.direction?dBadge(p.direction):'—'}</td>
@@ -4205,22 +4165,21 @@ async function loadBlockedSignals(){
   </tr>\`).join('');
 }
 
-// BAND SIGNALS
-async function loadBandSignals(tier,prefix){
+async function loadBand(tier,prefix){
   const d=await api(\`/band-ghost-stats?tier=\${tier}\`);
   const rows=d?.rows||[];
   const tb=document.getElementById(prefix+'-body');
   const strip=document.getElementById(prefix+'-strip');
-  if(!rows.length){tb.innerHTML=emptyRow(9,\`Geen ghost data voor \${tier.replace('_','%–')}%\`);if(strip)strip.style.display='none';return;}
-  const totalN=rows.reduce((s,r)=>s+(+r.n||0),0);
+  if(!rows.length){tb.innerHTML=emptyRow(9,'No ghost data for this band');if(strip)strip.style.display='none';return;}
   const avgRR=rows.filter(r=>r.avgMaxRR!=null).reduce((s,r,_,a)=>s+(+r.avgMaxRR)/a.length,0);
   const avgSL=rows.filter(r=>r.avgSlPct!=null).reduce((s,r,_,a)=>s+(+r.avgSlPct)/a.length,0);
   if(strip)strip.style.display='flex';
-  const pfx=prefix==='band150'?'b150':'b250';
-  const nEl=document.getElementById(pfx+'-n');const rrEl=document.getElementById(pfx+'-rr');const slEl=document.getElementById(pfx+'-sl');
-  if(nEl)nEl.textContent=totalN;if(rrEl)rrEl.textContent=avgRR?f(avgRR,2)+'R':'—';if(slEl)slEl.textContent=avgSL?f(avgSL,1)+'%':'—';
+  document.getElementById(prefix+'-n').textContent=rows.reduce((s,r)=>s+(+r.n||0),0);
+  document.getElementById(prefix+'-rr').textContent=avgRR?f(avgRR,2)+'R':'—';
+  document.getElementById(prefix+'-sl').textContent=avgSL?f(avgSL,1)+'%':'—';
   tb.innerHTML=rows.map(r=>\`<tr class="\${tClass(r.symbol||'')}">
-    <td class="b fw">\${r.symbol||'—'}</td><td>\${sBadge(r.session)}</td><td>\${dBadge(r.direction)}</td><td>\${vBadge(r.vwapPosition)}</td>
+    <td class="b fw">\${r.symbol||'—'}</td><td>\${sBadge(r.session)}</td>
+    <td>\${dBadge(r.direction)}</td><td>\${vBadge(r.vwapPosition)}</td>
     <td class="\${(+r.n||0)>=5?'y fw':'c'}">\${r.n||0}</td>
     <td class="\${(+r.avgMaxRR||0)>=2?'g fw':(+r.avgMaxRR||0)>=1?'y':'d'}">\${r.avgMaxRR!=null?f(r.avgMaxRR,2)+'R':'—'}</td>
     <td class="g">\${r.maxMaxRR!=null?f(r.maxMaxRR,2)+'R':'—'}</td>
@@ -4229,79 +4188,62 @@ async function loadBandSignals(tier,prefix){
   </tr>\`).join('');
 }
 
-// SIGNAL STATS
-async function loadSignalStats(){
-  const [sigD,statsD]=await Promise.all([api('/signal-stats'),api('/stats')]);
-  if(sigD){const total=sigD.total||0;const placed=sigD.placed||0;const pct=total>0?((placed/total)*100).toFixed(0):'?';document.getElementById('k-tps').textContent=placed+' ('+pct+'%)';}
-  if(statsD){document.getElementById('k-err').textContent=statsD.totalClosedTrades??'?';}
-}
-
-// SHADOW SL
-async function loadShadowCount(){
-  const d=await api('/shadow');
-  const ready=(d?.results||[]).filter(r=>r.ready===true).length;
-  document.getElementById('k-sl').textContent=ready;
-}
-
-// MAE
-let _maeData={};
 async function loadMAE(){
-  const d=await api('/mae-stats');
-  if(!d?.rows)return;
+  const d=await api('/mae-stats');if(!d?.rows)return;
   _maeData={};for(const r of d.rows)_maeData[r.optimizerKey]=r;
 }
 
-// DEPLOY
+async function loadSignalStats(){
+  const [sig,stats]=await Promise.all([api('/signal-stats'),api('/stats')]);
+  if(stats)document.getElementById('k-pos').textContent=stats.totalClosedTrades??'?';
+}
+
+/* ── Deploy ──────────────────────────────────────────────────── */
 async function prepareDeploy(){
-  const statusEl=document.getElementById('deploy-status');const btn=document.getElementById('deploy-btn');
+  const sEl=document.getElementById('nav-status');const btn=document.getElementById('dbtn');
   const st=await api('/admin/deploy-status');
-  if(!st){statusEl.textContent='Error checking status';return;}
-  if(st.safeToDeployNow){statusEl.textContent='✓ Safe to deploy — 0 posities, 0 ghosts';return;}
-  if(!confirm('PREPARE DEPLOY\\n\\n'+(st.recommendation||'')+'\\n\\nFortgaan?'))return;
-  btn.disabled=true;statusEl.textContent='Sluiten posities...';
-  const secret=prompt('WEBHOOK_SECRET:');if(!secret){btn.disabled=false;return;}
-  const r1=await fetch(\`/admin/close-all-positions?secret=\${encodeURIComponent(secret)}\`,{method:'POST'});
+  if(!st){sEl.textContent='Error checking status';return;}
+  if(st.safeToDeployNow){sEl.textContent='✓ Safe to deploy';return;}
+  if(!confirm('DEPLOY\\n\\n'+st.recommendation+'\\n\\nFortgaan?'))return;
+  btn.disabled=true;sEl.textContent='Closing positions...';
+  const sec=prompt('WEBHOOK_SECRET:');if(!sec){btn.disabled=false;return;}
+  const r1=await fetch(\`/admin/close-all-positions?secret=\${encodeURIComponent(sec)}\`,{method:'POST'});
   const d1=await r1.json().catch(()=>({}));
-  if(d1.status!=='OK'){statusEl.textContent='Error: '+(d1.error||'unknown');btn.disabled=false;return;}
-  statusEl.textContent=\`Gesloten \${d1.closed}. Ghosts finaliseren...\`;
-  const r2=await fetch(\`/admin/finalize-all-ghosts?secret=\${encodeURIComponent(secret)}\`,{method:'POST'});
+  if(d1.status!=='OK'){sEl.textContent='Error: '+(d1.error||'?');btn.disabled=false;return;}
+  const r2=await fetch(\`/admin/finalize-all-ghosts?secret=\${encodeURIComponent(sec)}\`,{method:'POST'});
   const d2=await r2.json().catch(()=>({}));
-  if(d2.status!=='OK'){statusEl.textContent='Error: '+(d2.error||'unknown');btn.disabled=false;return;}
-  statusEl.textContent=\`✓ KLAAR VOOR DEPLOY — \${d1.closed} posities, \${d2.finalized} ghosts.\`;
-  btn.style.borderColor='var(--g)';btn.style.color='var(--g)';btn.textContent='✓ READY';
-  await loadAll();
+  sEl.textContent=\`✓ READY — \${d1.closed} positions, \${d2.finalized} ghosts\`;
+  btn.style.color='var(--g)';await loadAll();
 }
 
+/* ── Load All ────────────────────────────────────────────────── */
 async function loadAll(){
-  const t0=Date.now();_lastLoadMs=t0;
-  const gsText=document.getElementById('gs-text');const gsTime=document.getElementById('gs-time');
-  if(gsText)gsText.textContent='Laden...';
+  const t0=Date.now();_lastLoad=t0;
+  document.getElementById('nav-status').textContent='Loading...';
   await Promise.allSettled([
-    loadTradeStats().catch(e=>console.error('[stats]',e?.message)),
-    loadPositions().catch(e=>console.error('[pos]',e?.message)),
-    loadGhosts().catch(e=>console.error('[ghost]',e?.message)),
-    loadEV().catch(e=>console.error('[ev]',e?.message)),
-    loadErrors().catch(e=>console.error('[errors]',e?.message)),
-    loadBlockedSignals().catch(e=>console.error('[blocked]',e?.message)),
-    loadSignalStats().catch(e=>console.error('[sigsig]',e?.message)),
-    loadShadowCount().catch(e=>console.error('[shadow]',e?.message)),
-    loadMAE().catch(e=>console.error('[mae]',e?.message)),
+    loadTradeStats().catch(()=>{}),
+    loadPositions().catch(()=>{}),
+    loadGhosts().catch(()=>{}),
+    loadEV().catch(()=>{}),
+    loadGhostHistory().catch(()=>{}),
+    loadErrors().catch(()=>{}),
+    loadBlockedSignals().catch(()=>{}),
+    loadMAE().catch(()=>{}),
   ]);
-  const elapsed=Date.now()-t0;
-  if(gsText)gsText.textContent='Geladen';
-  if(gsTime)gsTime.textContent='Refresh: '+new Date().toLocaleTimeString('nl-BE',{hour:'2-digit',minute:'2-digit',second:'2-digit'})+' ('+elapsed+'ms)';
+  const ms=Date.now()-t0;
+  document.getElementById('nav-status').textContent='Updated: '+new Date().toLocaleTimeString('nl-BE',{hour:'2-digit',minute:'2-digit',second:'2-digit'})+' ('+ms+'ms)';
 }
 
-document.addEventListener('DOMContentLoaded',()=>{
-  initAll();
-  loadAll();
-  setInterval(loadAll,30000);
-});
+document.addEventListener('DOMContentLoaded',()=>{initAll();loadAll();setInterval(loadAll,30000);});
 </script>
 </body>
 </html>`);
 });
 
+</script>
+</body>
+</html>`);
+});
 
 
 
