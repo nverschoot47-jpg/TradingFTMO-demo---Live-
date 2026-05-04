@@ -372,7 +372,7 @@ const {
   getSession, isMarketOpen, canOpenNewTrade, isMonitoringActive,
   normalizeSymbol, getSymbolInfo,
   getVwapPosition, buildOptimizerKey,
-  COMPLIANCE_DATE, COMPLIANCE_DATE_MS,
+  COMPLIANCE_DATE, COMPLIANCE_DATE_MS,  // COMPLIANCE_DATE_MS behouden voor backward compat
   SL_BUFFER_MULT: SESSION_SL_BUFFER_MULT,
   STOCK_SL_BUFFER_MULT,
 } = require("./session");
@@ -1703,7 +1703,7 @@ async function evaluateDailyRisk() {
     let todayT = closedTrades.filter(t =>
       t.closedAt &&
       getBrusselsDateOnly(t.closedAt) === todayStr &&
-      new Date(t.closedAt).getTime() >= COMPLIANCE_DATE_MS &&
+      t.closedAt >= currentComplianceDate &&
       (t.vwapPosition === "above" || t.vwapPosition === "below")
     );
 
@@ -1723,7 +1723,7 @@ async function evaluateDailyRisk() {
             AND vwap_position IN ('above','below')
         `, [
           `${todayStr}T00:00:00`,
-          new Date(COMPLIANCE_DATE_MS).toISOString(),
+          currentComplianceDate,
         ]);
         todayT = r.rows.map(row => ({
           optimizerKey: row.optimizerKey,
