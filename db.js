@@ -35,7 +35,7 @@
 // ===============================================================
 
 // FIX 8: COMPLIANCE_DATE from single source of truth (startup default)
-const { COMPLIANCE_DATE: COMPLIANCE_DATE_DEFAULT, COMPLIANCE_DATE_MS } = require('./session');
+const { COMPLIANCE_DATE: COMPLIANCE_DATE_DEFAULT } = require('./session');
 
 // Live mutable compliance date — updated at startup from DB and via POST /compliance-date.
 // One date controls everything: open trades, ghost, history, EV, signals.
