@@ -1,7 +1,7 @@
 {
   "name": "nv-tradingview-webhook",
-  "version": "12.6.0",
-  "description": "TradingView -> MetaApi REST -> FTMO MT5 | PRONTO-AI v12.6.0 - security fixes, version consistency, dead code cleanup",
+  "version": "12.7.0",
+  "description": "TradingView -> MetaApi REST -> FTMO MT5 | PRONTO-AI v12.7.0 - dashboard fixes: empty state, secret security, EV retry, compliance banner, error counter",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
