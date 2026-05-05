@@ -1,5 +1,5 @@
 // ===============================================================
-// server.js  v12.7.0  |  PRONTO-AI
+// server.js  v13.0.0  |  PRONTO-AI
 // TradingView → MetaApi REST → FTMO MT5
 //
 // v12.7.0 — DASHBOARD FIXES (5 mei 2026):
@@ -3231,7 +3231,7 @@ app.get('/api/ev-sl-optimizer', async (req, res) => {
 app.get("/test", (req, res) => {
   res.json({
     status: "Railway is bereikbaar",
-    version: "12.6.0",
+    version: "13.0.0",
     time: new Date().toISOString(),
     headers: {
       "content-type": req.headers["content-type"] ?? "(geen)",
@@ -3260,7 +3260,7 @@ app.get("/health", async (req, res) => {
   const tradeWindowForex = canOpenNewTrade("EURUSD");
   const tradeWindowStock = canOpenNewTrade("AAPL");
   res.json({
-    status: "ok", version: "12.6.0", time: getBrusselsDateStr(),
+    status: "ok", version: "13.0.0", time: getBrusselsDateStr(),
     openPos: Object.keys(openPositions).length, ghosts: Object.keys(ghostTrackers).length,
     tpLocks: Object.keys(tpLocks).length, closedT: closedTrades.length, balance,
     fixedRiskPct: FIXED_RISK_PCT, marketOpen: isMarketOpen(), session: getSession(),
@@ -3783,38 +3783,37 @@ table:not(.hide-milestones) .fav-th { display: none; }
   <div class="logo">PRONTO<span>·</span>AI</div>
   <div class="hdr-kpis">
     <div class="hdr-kpi">
-      <div class="hk-lbl">MT5 Balance</div>
+      <div class="hk-lbl">Balance MT5</div>
       <div class="hk-val cb">€<span id="k-bal">${balance.toFixed(0)}</span></div>
+    </div>
+    <div class="hdr-kpi">
+      <div class="hk-lbl">Live P&amp;L</div>
+      <div class="hk-val" id="k-pnl">—</div>
+    </div>
+    <div class="hdr-kpi">
+      <div class="hk-lbl">% Gain</div>
+      <div class="hk-val cy" id="k-gain">—</div>
     </div>
     <div class="hdr-kpi">
       <div class="hk-lbl">Open Trades</div>
       <div class="hk-val cg" id="k-pos">—</div>
     </div>
     <div class="hdr-kpi">
-      <div class="hk-lbl">Live P&L</div>
-      <div class="hk-val" id="k-pnl">—</div>
-    </div>
-    <div class="hdr-kpi">
-      <div class="hk-lbl">Ghosts</div>
+      <div class="hk-lbl">Ghost Trackers</div>
       <div class="hk-val cp" id="k-gh">—</div>
     </div>
     <div class="hdr-kpi">
-      <div class="hk-lbl">Risk/Trade</div>
-      <div class="hk-val cc">${(FIXED_RISK_PCT*100).toFixed(4)}%</div>
+      <div class="hk-lbl">Closed Ghosts</div>
+      <div class="hk-val cc" id="k-ghh">—</div>
     </div>
     <div class="hdr-kpi">
-      <div class="hk-lbl">Win Rate</div>
-      <div class="hk-val cy" id="k-wr">—</div>
+      <div class="hk-lbl">Risk/Trade</div>
+      <div class="hk-val cd">${(FIXED_RISK_PCT*100).toFixed(4)}%</div>
     </div>
     <div class="hdr-kpi">
       <div class="hk-lbl">TP Locked</div>
       <div class="hk-val cy" id="k-tp">—</div>
     </div>
-    <div class="hdr-kpi">
-      <div class="hk-lbl">Total Trades DB</div>
-      <div class="hk-val cb">${dbTradeCount.toLocaleString()}</div>
-    </div>
-    <!-- FIX 10: globale API error badge -->
     <div class="hdr-kpi" id="api-err-kpi" style="display:none">
       <div class="hk-lbl" style="color:var(--r)">API Errors</div>
       <div class="hk-val cr" id="api-err-cnt">0</div>
@@ -3854,22 +3853,18 @@ table:not(.hide-milestones) .fav-th { display: none; }
   <div class="ntab" onclick="showPage('ev-sl')">
     EV SL Optimizer
   </div>
-  <div class="ntab" onclick="showPage('signals')">
-    Signals
-    <span class="ntab-badge err" id="nb-sig">—</span>
-  </div>
   <div class="ntab" onclick="showPage('blocked-raw')">
-    Blocked Raw
+    Signals &amp; Blocked
+    <span class="ntab-badge err" id="nb-sig">—</span>
   </div>
   <div id="nav-right">—</div>
 </nav>
 
 <!-- ══ COMPLIANCE BAR ════════════════════════════════════════════ -->
 <div class="comp-bar">
-  <span class="comp-icon">📅</span>
-  <!-- FIX 9: id's zodat JS de banner kan updaten na POST /compliance-date -->
-  <strong id="comp-bar-date">Compliance: 3 mei 2026 00:00 UTC</strong>
-  <span>— all EV, statistics &amp; P&amp;L calculated only on trades after this date</span>
+  <strong id="comp-bar-date" style="color:var(--c)">Compliance</strong>
+  <span style="color:var(--ink3)">—</span>
+  <span id="comp-bar-desc">all EV, statistics &amp; P&amp;L calculated only on trades after this date</span>
   <span style="margin-left: auto; font-family: var(--fm); color: var(--c); font-size: 10px;">${dbTradeCount.toLocaleString()} trades in DB</span>
 </div>
 
@@ -3878,185 +3873,141 @@ table:not(.hide-milestones) .fav-th { display: none; }
 ═══════════════════════════════════════════════════════════════ -->
 <div class="npage on" id="page-overview">
 
-  <!-- KPI Grid -->
-  <div class="ov-grid">
+  <!-- KPI Grid — investor focused -->
+  <div class="ov-grid" style="grid-template-columns:repeat(5,1fr)">
     <div class="ov-card" style="--accent: var(--b)">
       <div class="ov-lbl">Balance MT5</div>
       <div class="ov-val">€<span id="ov-bal">${balance.toFixed(0)}</span></div>
       <div class="ov-sub">Live account equity</div>
     </div>
     <div class="ov-card" style="--accent: var(--g)">
-      <div class="ov-lbl">Live P&L</div>
+      <div class="ov-lbl">Live P&amp;L</div>
       <div class="ov-val" id="ov-pnl">—</div>
-      <div class="ov-sub" id="ov-pnl-sub">—</div>
-    </div>
-    <div class="ov-card" style="--accent: var(--c)">
-      <div class="ov-lbl">Win Rate</div>
-      <div class="ov-val" id="ov-wr">—</div>
-      <div class="ov-sub" id="ov-wr-sub">compliance period</div>
+      <div class="ov-sub" id="ov-pnl-sub">open trades</div>
     </div>
     <div class="ov-card" style="--accent: var(--y)">
-      <div class="ov-lbl">Profit Factor</div>
-      <div class="ov-val cy" id="ov-pf">—</div>
-      <div class="ov-sub">Gross win / gross loss</div>
+      <div class="ov-lbl">% Gain (compliance+)</div>
+      <div class="ov-val cy" id="ov-gain">—</div>
+      <div class="ov-sub" id="ov-gain-sub">realized P&amp;L / balance</div>
     </div>
     <div class="ov-card" style="--accent: var(--p)">
-      <div class="ov-lbl">Active Ghosts</div>
-      <div class="ov-val cp" id="ov-gh">—</div>
-      <div class="ov-sub" id="ov-pos-sub">phantom SL trackers</div>
+      <div class="ov-lbl">Open Trades</div>
+      <div class="ov-val cg" id="ov-open">—</div>
+      <div class="ov-sub" id="ov-open-sub">live positions</div>
     </div>
     <div class="ov-card" style="--accent: var(--o)">
       <div class="ov-lbl">Compliance Trades</div>
       <div class="ov-val" id="ov-comp">—</div>
-      <div class="ov-sub">closed after 3 mei 2026</div>
+      <div class="ov-sub" id="ov-comp-sub">closed after compliance</div>
     </div>
   </div>
 
   <div class="page" style="padding-top:0">
-    <!-- Win Rate Breakdown -->
+
+    <!-- ── Trade Activity: Session / VWAP / Direction breakdown ──────── -->
     <div class="card">
       <div class="card-hdr">
         <div class="card-title">
           <div class="status-dot sd-wait" id="wr-dot"></div>
-          Win Rate — Trade / Session / VWAP / Direction
+          Trade Activity — Session / VWAP / Direction
         </div>
         <div class="card-meta" id="wr-meta">loading...</div>
       </div>
-
+      <!-- summary strip -->
       <div class="sstrip">
-        <div class="ss">
-          <div class="ss-lbl">Overall</div>
-          <div class="ss-val cg" id="wr-overall">—</div>
-          <div class="ss-sub" id="wr-overall-n">— trades</div>
-        </div>
-        <div class="ss">
-          <div class="ss-lbl">Long (Buy)</div>
-          <div class="ss-val cg" id="wr-buy">—</div>
-          <div class="ss-sub" id="wr-buy-n">—</div>
-        </div>
-        <div class="ss">
-          <div class="ss-lbl">Short (Sell)</div>
-          <div class="ss-val cr" id="wr-sell">—</div>
-          <div class="ss-sub" id="wr-sell-n">—</div>
-        </div>
-        <div class="ss">
-          <div class="ss-lbl">VWAP Above</div>
-          <div class="ss-val cb" id="wr-ab">—</div>
-          <div class="ss-sub" id="wr-ab-n">—</div>
-        </div>
-        <div class="ss">
-          <div class="ss-lbl">VWAP Below</div>
-          <div class="ss-val cp" id="wr-bw">—</div>
-          <div class="ss-sub" id="wr-bw-n">—</div>
-        </div>
-        <div class="ss">
-          <div class="ss-lbl">Asia</div>
-          <div class="ss-val cc" id="wr-asia">—</div>
-          <div class="ss-sub" id="wr-asia-n">—</div>
-        </div>
-        <div class="ss">
-          <div class="ss-lbl">London</div>
-          <div class="ss-val cg" id="wr-lon">—</div>
-          <div class="ss-sub" id="wr-lon-n">—</div>
-        </div>
-        <div class="ss">
-          <div class="ss-lbl">New York</div>
-          <div class="ss-val cp" id="wr-ny">—</div>
-          <div class="ss-sub" id="wr-ny-n">—</div>
-        </div>
+        <div class="ss"><div class="ss-lbl">Total Trades</div><div class="ss-val cb" id="wr-overall">—</div><div class="ss-sub" id="wr-overall-n">—</div></div>
+        <div class="ss"><div class="ss-lbl">Long (Buy)</div><div class="ss-val cg" id="wr-buy">—</div><div class="ss-sub" id="wr-buy-n">—</div></div>
+        <div class="ss"><div class="ss-lbl">Short (Sell)</div><div class="ss-val cr" id="wr-sell">—</div><div class="ss-sub" id="wr-sell-n">—</div></div>
+        <div class="ss"><div class="ss-lbl">VWAP Above</div><div class="ss-val cb" id="wr-ab">—</div><div class="ss-sub" id="wr-ab-n">—</div></div>
+        <div class="ss"><div class="ss-lbl">VWAP Below</div><div class="ss-val cp" id="wr-bw">—</div><div class="ss-sub" id="wr-bw-n">—</div></div>
+        <div class="ss"><div class="ss-lbl">Asia</div><div class="ss-val cc" id="wr-asia">—</div><div class="ss-sub" id="wr-asia-n">—</div></div>
+        <div class="ss"><div class="ss-lbl">London</div><div class="ss-val cg" id="wr-lon">—</div><div class="ss-sub" id="wr-lon-n">—</div></div>
+        <div class="ss"><div class="ss-lbl">New York</div><div class="ss-val cp" id="wr-ny">—</div><div class="ss-sub" id="wr-ny-n">—</div></div>
       </div>
-
-      <!-- Win Rate Table per combo -->
+      <!-- table: counts by combo, split by asset type in groups -->
       <div class="tw">
-        <table class="dist-table">
+        <table class="dist-table" id="wr-body-tbl">
           <thead><tr>
             <th data-col="0">Session</th>
             <th data-col="1">Direction</th>
             <th data-col="2">VWAP</th>
-            <th data-col="3">Wins</th>
-            <th data-col="4">Losses</th>
-            <th data-col="5">Total</th>
-            <th data-col="6">Win Rate</th>
-            <th>Win Rate Bar</th>
-            <th data-col="8">Avg W (€)</th>
-            <th data-col="9">Avg L (€)</th>
-            <th data-col="10">EV/trade</th>
+            <th data-col="99">Type</th>
+            <th data-col="5" title="Total trades in this combo">Trades</th>
           </tr></thead>
           <tbody id="wr-body"></tbody>
         </table>
       </div>
     </div>
 
-    <!-- Trade Distribution (open trades zichtbaar zodra geopend) -->
+    <!-- ── Trade Distribution split by asset type ────────────────────── -->
     <div class="card">
       <div class="card-hdr">
         <div class="card-title">
           <div class="status-dot sd-wait" id="dist-dot"></div>
-          Trade Distribution — 3 mei 2026+
+          Trade Distribution — by Asset Type
         </div>
         <div class="card-meta" id="dist-meta">loading...</div>
       </div>
       <div class="sstrip">
         <div class="ss"><div class="ss-lbl">Total Closed</div><div class="ss-val cb" id="d-tot">—</div></div>
+        <div class="ss"><div class="ss-lbl">Forex</div><div class="ss-val cc" id="d-fx">—</div></div>
+        <div class="ss"><div class="ss-lbl">Stocks</div><div class="ss-val cp" id="d-sk">—</div></div>
+        <div class="ss"><div class="ss-lbl">Index</div><div class="ss-val cb" id="d-ix">—</div></div>
+        <div class="ss"><div class="ss-lbl">Commodity</div><div class="ss-val cy" id="d-cm">—</div></div>
         <div class="ss"><div class="ss-lbl">Buy</div><div class="ss-val cg" id="d-buy">—</div></div>
         <div class="ss"><div class="ss-lbl">Sell</div><div class="ss-val cr" id="d-sell">—</div></div>
-        <div class="ss"><div class="ss-lbl">Above VWAP</div><div class="ss-val cb" id="d-ab">—</div></div>
-        <div class="ss"><div class="ss-lbl">Below VWAP</div><div class="ss-val cp" id="d-bw">—</div></div>
-        <div class="ss"><div class="ss-lbl">Asia</div><div class="ss-val cc" id="d-as">—</div></div>
-        <div class="ss"><div class="ss-lbl">London</div><div class="ss-val cg" id="d-lo">—</div></div>
-        <div class="ss"><div class="ss-lbl">NY</div><div class="ss-val cp" id="d-ny">—</div></div>
+        <div class="ss"><div class="ss-lbl">Above VWAP</div><div class="ss-val cd" id="d-ab">—</div></div>
+        <div class="ss"><div class="ss-lbl">Below VWAP</div><div class="ss-val cd" id="d-bw">—</div></div>
       </div>
       <div class="tw">
         <table class="dist-table">
           <thead><tr>
+            <th>Asset Type</th>
             <th>Session</th>
-            <th style="color:var(--g)">Buy / Above VWAP</th>
-            <th style="color:var(--g)">Buy / Below VWAP</th>
-            <th style="color:var(--r)">Sell / Above VWAP</th>
-            <th style="color:var(--r)">Sell / Below VWAP</th>
+            <th style="color:var(--g)">Buy / Above</th>
+            <th style="color:var(--g)">Buy / Below</th>
+            <th style="color:var(--r)">Sell / Above</th>
+            <th style="color:var(--r)">Sell / Below</th>
             <th>Total</th>
-            <th>Win Rate</th>
           </tr></thead>
           <tbody id="dist-body"></tbody>
           <tfoot>
             <tr style="background:var(--bg3);font-weight:700;border-top:2px solid var(--bdr2)">
-              <td class="cy fm">TOTAL</td>
+              <td class="cy fm" colspan="2">TOTAL</td>
               <td id="ft-ba" class="cg">—</td>
               <td id="ft-bb" class="cg">—</td>
               <td id="ft-sa" class="cr">—</td>
               <td id="ft-sb" class="cr">—</td>
               <td id="ft-t"  class="cb">—</td>
-              <td id="ft-wr" class="cy">—</td>
             </tr>
           </tfoot>
         </table>
       </div>
     </div>
 
-    <!-- ── Daily Breakdown (v12.6) ─────────────────────────────────── -->
+    <!-- ── Daily Breakdown ───────────────────────────────────────────── -->
     <div class="card" id="card-daily">
       <div class="card-hdr">
         <div class="card-title">
           <div class="status-dot sd-wait" id="daily-dot"></div>
-          Daily Breakdown — Per Dag Performance (compliance+)
+          Daily Breakdown — Per Day Performance (compliance+)
         </div>
         <div class="card-meta" id="daily-meta">loading...</div>
       </div>
-      <!-- Streak + Drawdown KPI strip -->
       <div class="sstrip" id="daily-kpi">
         <div class="ss"><div class="ss-lbl">Max Win Streak</div><div class="ss-val cg" id="d-wstrk">—</div></div>
         <div class="ss"><div class="ss-lbl">Max Loss Streak</div><div class="ss-val cr" id="d-lstrk">—</div></div>
-        <div class="ss"><div class="ss-lbl">Max Drawdown (dag-gebaseerd)</div><div class="ss-val cy" id="d-dd">—</div></div>
+        <div class="ss"><div class="ss-lbl">Max Drawdown (day-based)</div><div class="ss-val cy" id="d-dd">—</div></div>
       </div>
       <div class="tw">
         <table id="daily-tbl">
           <thead><tr>
-            <th data-col="0">Datum</th>
+            <th data-col="0">Date</th>
             <th data-col="1"># Trades</th>
             <th data-col="2">Wins</th>
             <th data-col="3">Losses</th>
             <th data-col="4">Win%</th>
-            <th data-col="5">Dag P&amp;L €</th>
+            <th data-col="5">Day P&amp;L €</th>
             <th data-col="6">Cum P&amp;L €</th>
             <th data-col="7">Avg Lots</th>
             <th data-col="8">Best RR</th>
@@ -4065,29 +4016,46 @@ table:not(.hide-milestones) .fav-th { display: none; }
           <tbody id="daily-body"></tbody>
         </table>
       </div>
-      <!-- Best / Worst setups -->
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:10px 14px;border-top:1px solid var(--bdr2)">
-        <div>
-          <div style="font-size:10px;color:var(--g);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;font-family:var(--fi)">🏆 Best 5 Setups</div>
-          <table id="best-tbl" style="font-size:10px;width:100%;border-collapse:collapse">
-            <thead><tr>
-              <th style="text-align:left;padding:3px 4px;color:var(--ink3)">Symbol</th>
-              <th>Dir</th><th>Session</th><th>VWAP</th>
-              <th>RR</th><th>P&amp;L €</th>
-            </tr></thead>
-            <tbody id="best-body"></tbody>
-          </table>
+
+      <!-- Best / Worst setups — Day / Week toggle -->
+      <div style="border-top:1px solid var(--bdr2);padding:10px 14px">
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">
+          <span style="font-size:10px;color:var(--ink3);font-family:var(--fi);text-transform:uppercase;letter-spacing:.5px">Period:</span>
+          <button class="fb on" onclick="setBWPeriod('day',this)">Today</button>
+          <button class="fb" onclick="setBWPeriod('week',this)">This Week</button>
+          <button class="fb" onclick="setBWPeriod('all',this)">All Time</button>
         </div>
-        <div>
-          <div style="font-size:10px;color:var(--r);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;font-family:var(--fi)">💀 Worst 5 Setups</div>
-          <table id="worst-tbl" style="font-size:10px;width:100%;border-collapse:collapse">
-            <thead><tr>
-              <th style="text-align:left;padding:3px 4px;color:var(--ink3)">Symbol</th>
-              <th>Dir</th><th>Session</th><th>VWAP</th>
-              <th>RR</th><th>P&amp;L €</th>
-            </tr></thead>
-            <tbody id="worst-body"></tbody>
-          </table>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+          <div>
+            <div style="font-size:10px;color:var(--g);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;font-family:var(--fi);display:flex;align-items:center;gap:6px">🏆 Best 5 Setups <span id="bw-period-lbl" style="color:var(--ink3)">all time</span></div>
+            <table style="font-size:10px;width:100%;border-collapse:collapse">
+              <thead><tr>
+                <th style="text-align:left;padding:3px 6px;color:var(--ink3);border-bottom:1px solid var(--bdr)">Symbol</th>
+                <th style="padding:3px 6px;color:var(--ink3);border-bottom:1px solid var(--bdr)">Dir</th>
+                <th style="padding:3px 6px;color:var(--ink3);border-bottom:1px solid var(--bdr)">Sess</th>
+                <th style="padding:3px 6px;color:var(--ink3);border-bottom:1px solid var(--bdr)">VWAP</th>
+                <th style="padding:3px 6px;color:var(--ink3);border-bottom:1px solid var(--bdr)">RR</th>
+                <th style="padding:3px 6px;color:var(--ink3);border-bottom:1px solid var(--bdr)">P&amp;L</th>
+                <th style="padding:3px 6px;color:var(--ink3);border-bottom:1px solid var(--bdr)">Date</th>
+              </tr></thead>
+              <tbody id="best-body"></tbody>
+            </table>
+          </div>
+          <div>
+            <div style="font-size:10px;color:var(--r);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;font-family:var(--fi);display:flex;align-items:center;gap:6px">💀 Worst 5 Setups <span style="color:var(--ink3)" id="bw-period-lbl2">all time</span></div>
+            <table style="font-size:10px;width:100%;border-collapse:collapse">
+              <thead><tr>
+                <th style="text-align:left;padding:3px 6px;color:var(--ink3);border-bottom:1px solid var(--bdr)">Symbol</th>
+                <th style="padding:3px 6px;color:var(--ink3);border-bottom:1px solid var(--bdr)">Dir</th>
+                <th style="padding:3px 6px;color:var(--ink3);border-bottom:1px solid var(--bdr)">Sess</th>
+                <th style="padding:3px 6px;color:var(--ink3);border-bottom:1px solid var(--bdr)">VWAP</th>
+                <th style="padding:3px 6px;color:var(--ink3);border-bottom:1px solid var(--bdr)">RR</th>
+                <th style="padding:3px 6px;color:var(--ink3);border-bottom:1px solid var(--bdr)">P&amp;L</th>
+                <th style="padding:3px 6px;color:var(--ink3);border-bottom:1px solid var(--bdr)">Date</th>
+              </tr></thead>
+              <tbody id="worst-body"></tbody>
+            </table>
+          </div>
         </div>
       </div>
     </div>
@@ -4107,20 +4075,22 @@ table:not(.hide-milestones) .fav-th { display: none; }
           Open Positions — Live
         </div>
         <div style="display:flex;align-items:center;gap:8px">
-          <!-- FIX 7: milestone kolommen toggle -->
           <button class="hbtn" onclick="toggleMilestoneCols()" id="ms-toggle-btn" style="font-size:10px;padding:4px 8px">± Milestones</button>
           <div class="card-meta" id="pos-meta">loading...</div>
         </div>
       </div>
 
-      <!-- Trade distribution shows also open trades -->
       <div class="sstrip" id="pos-strip" style="display:none">
         <div class="ss"><div class="ss-lbl">Open Trades</div><div class="ss-val cg" id="pos-cnt">—</div></div>
-        <div class="ss"><div class="ss-lbl">Total P&L</div><div class="ss-val" id="pos-pnl">—</div></div>
+        <div class="ss"><div class="ss-lbl">Total P&amp;L</div><div class="ss-val" id="pos-pnl">—</div></div>
+        <div class="ss"><div class="ss-lbl">Buy</div><div class="ss-val cg" id="pos-buys">—</div></div>
+        <div class="ss"><div class="ss-lbl">Sell</div><div class="ss-val cr" id="pos-sells">—</div></div>
+        <div class="ss"><div class="ss-lbl">Stocks</div><div class="ss-val cp" id="pos-stocks">—</div></div>
+        <div class="ss"><div class="ss-lbl">Index</div><div class="ss-val cb" id="pos-index">—</div></div>
+        <div class="ss"><div class="ss-lbl">Commodity</div><div class="ss-val cy" id="pos-comm">—</div></div>
+        <div class="ss"><div class="ss-lbl">Forex</div><div class="ss-val cc" id="pos-forex">—</div></div>
         <div class="ss"><div class="ss-lbl">Ghosted</div><div class="ss-val cp" id="pos-gh">—</div></div>
         <div class="ss"><div class="ss-lbl">EV+ Trades</div><div class="ss-val cg" id="pos-ev">—</div></div>
-        <div class="ss"><div class="ss-lbl">Buy / Sell</div><div class="ss-val" id="pos-bs">— / —</div></div>
-        <div class="ss"><div class="ss-lbl">Above / Below</div><div class="ss-val" id="pos-ab">— / —</div></div>
       </div>
 
       <div class="tw">
@@ -4137,13 +4107,12 @@ table:not(.hide-milestones) .fav-th { display: none; }
             <th data-col="8" title="Live RR based on current price">RR Now</th>
             <th data-col="9" title="Best favorable RR ever reached">Peak +RR</th>
             <th data-col="10" title="Worst adverse RR ever reached (% of SL dist)">Peak −RR</th>
-            <th title="SL distance consumed now">SL Used</th>
             <th data-col="11" title="TP target RR">→TP</th>
-            <th data-col="12">P&L €</th>
+            <th data-col="12">P&amp;L €</th>
             <th data-col="13">Lots</th>
             <th data-col="14" title="Actual risk% at SL hit">Risk %</th>
-            <!-- Adverse milestones -0.1 to -1.0 per 0.1 -->
-            ${ADV_STEPS.map(v=>`<th class="adv-th" title="Time to reach -${v}R">-${v}</th>`).join('')}
+            <!-- Adverse milestones -1.0 to -0.1 per 0.1 (reversed: worst first) -->
+            ${ADV_STEPS.slice().reverse().map(v=>`<th class="adv-th" title="Time to reach -${v}R">-${v}</th>`).join('')}
             <!-- Favorable milestones +0.1 to +15 -->
             ${FAV_STEPS.map(v=>`<th class="fav-th" title="Time to reach +${v}R">+${v}</th>`).join('')}
             <th data-col="99">Opened</th>
@@ -4166,18 +4135,23 @@ table:not(.hide-milestones) .fav-th { display: none; }
       <div class="card-hdr">
         <div class="card-title">
           <div class="status-dot sd-err" id="gh-dot"></div>
-          Ghost Tracker — Active (runs until phantom SL / 15R / 14 days)
+          Ghost Tracker — Active (phantom SL / 15R / 14 days)
         </div>
         <div style="display:flex;align-items:center;gap:8px">
           <button class="hbtn" onclick="toggleMilestoneCols()" style="font-size:10px;padding:4px 8px">± Milestones</button>
-          <div class="card-meta" id="gh-meta">Phantom SL = real SL at trade open</div>
+          <div class="card-meta" id="gh-meta">Phantom SL = real SL at trade open · runs until SL hit, 15R or timeout</div>
         </div>
       </div>
 
       <div class="sstrip" id="gh-strip" style="display:none">
         <div class="ss"><div class="ss-lbl">Active Ghosts</div><div class="ss-val cp" id="gh-cnt">—</div></div>
         <div class="ss"><div class="ss-lbl">Peak +RR (best)</div><div class="ss-val cg" id="gh-bestRR">—</div></div>
-        <div class="ss"><div class="ss-lbl">Peak -RR (worst)</div><div class="ss-val cr" id="gh-worstRR">—</div></div>
+        <div class="ss"><div class="ss-lbl">Peak −RR (worst)</div><div class="ss-val cr" id="gh-worstRR">—</div></div>
+        <div class="ss"><div class="ss-lbl">Buy</div><div class="ss-val cg" id="gh-buys">—</div></div>
+        <div class="ss"><div class="ss-lbl">Sell</div><div class="ss-val cr" id="gh-sells">—</div></div>
+        <div class="ss"><div class="ss-lbl">Stocks</div><div class="ss-val cp" id="gh-stocks">—</div></div>
+        <div class="ss"><div class="ss-lbl">Index</div><div class="ss-val cb" id="gh-index">—</div></div>
+        <div class="ss"><div class="ss-lbl">Forex</div><div class="ss-val cc" id="gh-forex">—</div></div>
         <div class="ss"><div class="ss-lbl">Avg Elapsed</div><div class="ss-val cd" id="gh-elapsed">—</div></div>
       </div>
 
@@ -4191,9 +4165,8 @@ table:not(.hide-milestones) .fav-th { display: none; }
             <th data-col="4">VWAP</th>
             <th data-col="5" title="Best favorable RR ever reached (peak positive)">Peak +RR</th>
             <th data-col="6" title="Worst adverse RR ever reached (% of SL distance, peak)">Peak −RR%</th>
-            <th title="SL distance consumed right now">SL Now</th>
-            <!-- Adverse -0.1 to -1.0 -->
-            ${ADV_STEPS.map(v=>`<th class="adv-th" title="T to -${v}R">-${v}</th>`).join('')}
+            <!-- Adverse -1.0 to -0.1 reversed order -->
+            ${ADV_STEPS.slice().reverse().map(v=>`<th class="adv-th" title="T to -${v}R">-${v}</th>`).join('')}
             <!-- Favorable +0.1 to +15 -->
             ${FAV_STEPS.map(v=>`<th class="fav-th" title="T to +${v}R">+${v}</th>`).join('')}
             <th data-col="98">Elapsed</th>
@@ -4214,12 +4187,12 @@ table:not(.hide-milestones) .fav-th { display: none; }
 <div class="npage" id="page-history">
   <div class="page">
 
-    <!-- Ghost History Grouped (v12.6: per-pair individuele lijnen + expand) -->
+    <!-- ── Ghost History: one table, grouped per pair, expandable rows ── -->
     <div class="card">
       <div class="card-hdr">
         <div class="card-title">
           <div class="status-dot sd-wait" id="ghh2-dot"></div>
-          Ghost History — Grouped per Pair · Klik rij voor detail
+          Ghost History — Grouped per Pair · Click row for full detail
         </div>
         <div class="card-meta" id="ghh2-meta">loading...</div>
       </div>
@@ -4233,38 +4206,48 @@ table:not(.hide-milestones) .fav-th { display: none; }
         <button class="fb on" onclick="setGHHF('dir','all',this)">All</button>
         <button class="fb" onclick="setGHHF('dir','buy',this)">Buy</button>
         <button class="fb" onclick="setGHHF('dir','sell',this)">Sell</button>
+        &nbsp;<span class="fl">Type:</span>
+        <button class="fb on" onclick="setGHHF('type','all',this)">All</button>
+        <button class="fb" onclick="setGHHF('type','forex',this)">Forex</button>
+        <button class="fb" onclick="setGHHF('type','stock',this)">Stock</button>
+        <button class="fb" onclick="setGHHF('type','index',this)">Index</button>
+        <button class="fb" onclick="setGHHF('type','commodity',this)">Comm</button>
       </div>
       <div class="tw">
         <table id="ghh2-tbl">
           <thead><tr>
-            <th>▶</th>
+            <th style="width:20px">▶</th>
             <th data-col="1">Symbol</th>
+            <th>Type</th>
             <th data-col="2">Session</th>
             <th data-col="3">Dir</th>
             <th data-col="4">VWAP</th>
-            <th data-col="5"># Ghosts</th>
-            <th>SL Hits</th>
-            <th>Max RR15</th>
-            <th>Timeout</th>
-            <th data-col="9">Avg Peak+RR</th>
-            <th data-col="10">Avg Peak−RR%</th>
-            <th>Max Peak+RR</th>
-            <th>Best TP (last 5)</th>
-            <th>Best SL% (last 5)</th>
+            <th data-col="5" title="Total completed ghost trades"># Ghosts</th>
+            <th title="Phantom SL hits">SL Hits</th>
+            <th title="Reached max 15R">15R Hits</th>
+            <th title="Expired by days">Timeout</th>
+            <th data-col="9" title="Average best favorable RR reached">Avg Peak+RR</th>
+            <th data-col="10" title="Average worst adverse RR (% of SL dist)">Avg Peak−RR%</th>
+            <th title="Best positive RR ever reached in this combo">Max Peak+RR</th>
+            <th title="EV TP: best avg TP from last 5 ghosts">EV TP (last 5)</th>
+            <th title="MAE p90 SL suggestion">EV SL (p90)</th>
           </tr></thead>
           <tbody id="ghh2-body"></tbody>
         </table>
       </div>
     </div>
 
-    <!-- Ghost History — klassiek gegroepeerd (bestaand) -->
+    <!-- ── Ghost History: signal combo grouped (EV data source) ──────── -->
     <div class="card">
       <div class="card-hdr">
         <div class="card-title">
           <div class="status-dot sd-wait" id="ghh-dot"></div>
-          Ghost History — Klassiek Grouped by Signal Combo
+          Ghost History — By Signal Combo · Milestones &amp; EV Data
         </div>
-        <div class="card-meta" id="ghh-meta">Peak RR negative &amp; positive per combo · 3 mei 2026+</div>
+        <div class="card-meta" id="ghh-meta">Only shows after compliance date · used for EV / SL optimizer</div>
+      </div>
+      <div style="padding:7px 14px;background:rgba(33,150,243,.04);border-bottom:1px solid rgba(33,150,243,.1);font-size:10px;color:var(--ink3);font-family:var(--fi)">
+        ℹ Each row = one signal combo (Symbol + Session + Dir + VWAP). Milestone columns show average time to reach each RR level. Minimum 5 ghosts required for EV lock.
       </div>
       <div class="tw">
         <table id="ghh-tbl">
@@ -4276,8 +4259,7 @@ table:not(.hide-milestones) .fav-th { display: none; }
             <th data-col="4">VWAP</th>
             <th data-col="5"># Ghosts</th>
             <th data-col="6" title="EV-eligible: SL hit, VWAP known, ≥0.5R"># EV</th>
-            <th data-col="7" title="Best positive RR reached">Peak +RR</th>
-            <th data-col="8" title="Best adverse RR before SL / timeout">Peak −RR</th>
+            <th data-col="7">Peak +RR</th>
             <th data-col="9">Avg RR</th>
             <th class="adv-th" title="Avg T to -¼R">T-¼R</th>
             <th class="adv-th" title="Avg T to -½R">T-½R</th>
@@ -4293,42 +4275,10 @@ table:not(.hide-milestones) .fav-th { display: none; }
             <th class="fav-th" title="Avg T to +15R">+15R</th>
             <th data-col="20">Stop Reason</th>
             <th>MAE p50</th><th>MAE p75</th><th data-col="23">MAE p90</th>
-            <th title="EV SL — read-only, MAE-based">EV SL</th>
-            <th title="EV TP — best WR+Risk from ghost history (updates after 5 trades)">EV TP</th>
+            <th title="EV SL — MAE-based, read only">EV SL</th>
+            <th title="EV TP — best RR from ghost history (≥5 trades)">EV TP</th>
           </tr></thead>
           <tbody id="ghh-body"></tbody>
-        </table>
-      </div>
-    </div>
-
-    <!-- SL Optimizer (read-only) -->
-    <div class="card">
-      <div class="card-hdr">
-        <div class="card-title">
-          <div class="status-dot sd-wait" id="sl-dot"></div>
-          EV SL Optimizer — READ ONLY · MAE-based recommendations
-        </div>
-        <div class="card-meta">Never auto-applied · informational · based on MAE p90 of winning ghost trades</div>
-      </div>
-      <div style="padding:7px 14px;background:rgba(6,182,212,.04);border-bottom:1px solid rgba(6,182,212,.1);font-size:10px;color:var(--ink3);font-family:var(--fi)">
-        ℹ These recommendations show how much the SL could theoretically be tightened. Requires ≥5 completed ghost trades per combo.
-      </div>
-      <div class="tw">
-        <table id="sl-tbl">
-          <thead><tr>
-            <th data-col="0">Symbol</th>
-            <th>Type</th>
-            <th data-col="2">Session</th>
-            <th data-col="3">Dir</th>
-            <th data-col="4">VWAP</th>
-            <th data-col="5"># Ghosts</th>
-            <th data-col="6">MAE p50</th>
-            <th data-col="7">MAE p75</th>
-            <th data-col="8">MAE p90</th>
-            <th data-col="9">SL Advice (READ ONLY)</th>
-            <th data-col="10">Potential SL Reduction</th>
-          </tr></thead>
-          <tbody id="sl-body"></tbody>
         </table>
       </div>
     </div>
@@ -4337,7 +4287,7 @@ table:not(.hide-milestones) .fav-th { display: none; }
 </div>
 
 <!-- ══════════════════════════════════════════════════════════════
-     PAGE: EV SL OPTIMIZER (v12.6)
+     PAGE: EV SL OPTIMIZER
 ═══════════════════════════════════════════════════════════════ -->
 <div class="npage" id="page-ev-sl">
   <div class="page">
@@ -4345,12 +4295,24 @@ table:not(.hide-milestones) .fav-th { display: none; }
       <div class="card-hdr">
         <div class="card-title">
           <div class="status-dot sd-wait" id="evsl-dot"></div>
-          EV SL Optimizer — MAE-based SL Reduction Recommendations
+          EV SL Optimizer — MAE-based SL Reduction · Read Only
         </div>
-        <div class="card-meta">READ ONLY · MAE p90 per combo · min 5 ghost trades vereist</div>
+        <div class="card-meta">Never auto-applied · minimum 5 ghost trades required per combo</div>
       </div>
-      <div style="padding:7px 14px;background:rgba(6,182,212,.04);border-bottom:1px solid rgba(6,182,212,.1);font-size:10px;color:var(--ink3);font-family:var(--fi)">
-        ℹ Gebaseerd op MAE (Max Adverse Excursion) van ghost trades. Hoe kleiner MAE p90 t.o.v. 100%, hoe meer de SL kan worden ingekort.
+      <!-- How it works explanation -->
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:1px;border-bottom:1px solid var(--bdr2)">
+        <div style="padding:12px 16px;background:var(--bg2)">
+          <div style="font-size:9px;color:var(--ink3);text-transform:uppercase;letter-spacing:.5px;font-family:var(--fi);margin-bottom:6px">Step 1 — Ghost data</div>
+          <div style="font-size:11px;color:var(--ink2);line-height:1.6">Every ghost trade records the <span class="cy fw">Max Adverse Excursion (MAE)</span> — how deep price moved against the position before recovering or hitting SL. Expressed as % of full SL distance.</div>
+        </div>
+        <div style="padding:12px 16px;background:var(--bg2);border-left:1px solid var(--bdr)">
+          <div style="font-size:9px;color:var(--ink3);text-transform:uppercase;letter-spacing:.5px;font-family:var(--fi);margin-bottom:6px">Step 2 — Percentiles</div>
+          <div style="font-size:11px;color:var(--ink2);line-height:1.6"><span class="cg fw">MAE p50</span> = half of trades went no deeper than this. <span class="cy fw">MAE p90</span> = 90% of trades stayed within this range. The smaller p90, the more the SL can be tightened safely.</div>
+        </div>
+        <div style="padding:12px 16px;background:var(--bg2);border-left:1px solid var(--bdr)">
+          <div style="font-size:9px;color:var(--ink3);text-transform:uppercase;letter-spacing:.5px;font-family:var(--fi);margin-bottom:6px">Step 3 — Recommendation</div>
+          <div style="font-size:11px;color:var(--ink2);line-height:1.6"><span class="cg fw">Green = strong tightening possible</span> (p90 &lt; 50%). <span class="cy fw">Yellow = moderate</span> (p90 50–75%). <span class="cr fw">Red = keep SL as-is</span> (p90 &gt; 75%). Always verify with your risk manager before applying.</div>
+        </div>
       </div>
       <div class="tw">
         <table id="evsl-tbl">
@@ -4360,15 +4322,15 @@ table:not(.hide-milestones) .fav-th { display: none; }
             <th data-col="2">Session</th>
             <th data-col="3">Dir</th>
             <th data-col="4">VWAP</th>
-            <th data-col="5"># Ghosts</th>
-            <th>MAE p50</th>
-            <th>MAE p75</th>
-            <th data-col="8">MAE p90</th>
-            <th data-col="9">EV SL Advies (READ ONLY)</th>
-            <th data-col="10">Best SL%</th>
-            <th>Potentiële Reductie</th>
-            <th>Shadow p50</th>
-            <th>Shadow p90</th>
+            <th data-col="5" title="Ghost trades used for calculation"># Ghosts</th>
+            <th title="50th percentile MAE — median max drawdown vs SL">MAE p50</th>
+            <th title="75th percentile MAE">MAE p75</th>
+            <th data-col="8" title="90th percentile MAE — used for SL advice">MAE p90</th>
+            <th data-col="9" title="Read-only SL advice based on MAE p90">SL Advice</th>
+            <th data-col="10" title="Optimal SL% derived from best ghost outcomes">Best SL%</th>
+            <th title="How much smaller the SL could be vs current 100%">Potential Reduction</th>
+            <th title="Shadow analysis p50 — alternative reference">Shadow p50</th>
+            <th title="Shadow analysis p90">Shadow p90</th>
           </tr></thead>
           <tbody id="evsl-body"></tbody>
         </table>
@@ -4378,31 +4340,185 @@ table:not(.hide-milestones) .fav-th { display: none; }
 </div>
 
 <!-- ══════════════════════════════════════════════════════════════
-     PAGE: BLOCKED RAW (v12.6)
+     PAGE: SIGNALS & BLOCKED (unified)
 ═══════════════════════════════════════════════════════════════ -->
 <div class="npage" id="page-blocked-raw">
   <div class="page">
+
+    <!-- ── Signal Intelligence Overview KPIs ── -->
     <div class="card">
       <div class="card-hdr">
-        <div class="card-title">Blocked Signals — Raw Grouped View</div>
-        <div class="card-meta" id="blkraw-meta">Compliance+ · gegroepeerd per symbol / dir / vwap / session / reason</div>
+        <div class="card-title">
+          <div class="status-dot sd-err" id="sig-dot"></div>
+          Signal Intelligence — Placed, Blocked &amp; Errors
+        </div>
+        <div class="card-meta" id="sig-meta">loading...</div>
       </div>
-      <div class="tw">
-        <table id="blkraw-tbl">
-          <thead><tr>
-            <th data-col="0">Symbol</th>
-            <th data-col="1">Dir</th>
-            <th data-col="2">VWAP</th>
-            <th data-col="3">Session</th>
-            <th data-col="4">Outcome</th>
-            <th data-col="5">Reject Reason</th>
-            <th data-col="6"># Geblokkeerd</th>
-            <th>Laatste Keer</th>
-          </tr></thead>
-          <tbody id="blkraw-body"></tbody>
-        </table>
+
+      <!-- Top KPI row -->
+      <div class="sstrip">
+        <div class="sig-stat" style="flex:1">
+          <div class="ss-lbl">Total Signals</div>
+          <div class="ss-val cb" id="sig-total">—</div>
+        </div>
+        <div class="sig-stat" style="flex:1">
+          <div class="ss-lbl">Placed</div>
+          <div class="ss-val cg" id="sig-placed">—</div>
+        </div>
+        <div class="sig-stat" style="flex:1">
+          <div class="ss-lbl">Conversion Rate</div>
+          <div class="ss-val cy" id="sig-conv">—</div>
+        </div>
+        <div class="sig-stat" style="flex:1">
+          <div class="ss-lbl">Total Blocked</div>
+          <div class="ss-val cr" id="blk-tot">—</div>
+        </div>
+        <div class="sig-stat" style="flex:1">
+          <div class="ss-lbl">Duplicate Open</div>
+          <div class="ss-val co" id="blk-dup">—</div>
+        </div>
+        <div class="sig-stat" style="flex:1">
+          <div class="ss-lbl">VWAP Exhausted</div>
+          <div class="ss-val cp" id="blk-vw">—</div>
+        </div>
+        <div class="sig-stat" style="flex:1">
+          <div class="ss-lbl">Outside Window</div>
+          <div class="ss-val cd" id="blk-win">—</div>
+        </div>
+        <div class="sig-stat" style="flex:1">
+          <div class="ss-lbl">Currency Budget</div>
+          <div class="ss-val cy" id="blk-cur">—</div>
+        </div>
+        <div class="sig-stat" style="flex:1">
+          <div class="ss-lbl">NY Dead Zone</div>
+          <div class="ss-val cr" id="blk-ny">—</div>
+        </div>
+      </div>
+
+      <!-- Two-column layout: placed + blocked side by side -->
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:1px;border-top:1px solid var(--bdr2)">
+
+        <!-- Left: Recent Placed Signals -->
+        <div>
+          <div style="padding:8px 14px;background:var(--bg3);border-bottom:1px solid var(--bdr);display:flex;align-items:center;gap:8px">
+            <div style="width:6px;height:6px;border-radius:50%;background:var(--g)"></div>
+            <span style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;color:var(--g)">Placed Signals</span>
+            <span style="font-size:9px;color:var(--ink3);margin-left:auto">recent in-memory log</span>
+          </div>
+          <div class="tw" style="max-height:400px;overflow-y:auto">
+            <table id="placed-tbl">
+              <thead><tr>
+                <th data-col="0">Time</th>
+                <th data-col="1">Symbol</th>
+                <th>Dir</th><th>Session</th><th>VWAP</th>
+                <th>Entry</th><th>SL%</th><th>TP RR</th>
+                <th>Latency</th><th>EV+</th>
+              </tr></thead>
+              <tbody id="placed-body"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Right: Blocked Signals -->
+        <div style="border-left:1px solid var(--bdr2)">
+          <div style="padding:8px 14px;background:var(--bg3);border-bottom:1px solid var(--bdr);display:flex;align-items:center;gap:8px">
+            <div style="width:6px;height:6px;border-radius:50%;background:var(--r)"></div>
+            <span style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;color:var(--r)">Blocked Signals</span>
+            <span style="font-size:9px;color:var(--ink3);margin-left:auto">grouped by reason</span>
+          </div>
+          <div class="tw" style="max-height:400px;overflow-y:auto">
+            <table id="blk-tbl">
+              <thead><tr>
+                <th>Reason</th>
+                <th data-col="2">Symbol</th>
+                <th data-col="3">Dir</th>
+                <th data-col="4">Session</th>
+                <th data-col="5">VWAP</th>
+                <th data-col="6">Count</th>
+              </tr></thead>
+              <tbody id="blk-body"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- Webhook errors full width -->
+      <div style="border-top:1px solid var(--bdr2)">
+        <div style="padding:8px 14px;background:var(--bg3);border-bottom:1px solid var(--bdr);display:flex;align-items:center;gap:8px">
+          <div style="width:6px;height:6px;border-radius:50%;background:var(--o)"></div>
+          <span style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;color:var(--o)">Webhook Errors</span>
+          <span style="font-size:9px;color:var(--ink3);margin-left:auto">last 80 in memory</span>
+        </div>
+        <div class="tw">
+          <table id="whe-tbl">
+            <thead><tr>
+              <th data-col="0">Time</th>
+              <th data-col="1">Type</th>
+              <th data-col="2">Symbol</th>
+              <th data-col="3">Dir</th>
+              <th data-col="4">Session</th>
+              <th data-col="5">VWAP</th>
+              <th>Entry</th><th>SL%</th><th>Band%</th>
+              <th>Reason</th>
+            </tr></thead>
+            <tbody id="whe-body"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Blocked Raw grouped (all time, compliance+) -->
+      <div style="border-top:1px solid var(--bdr2)">
+        <div style="padding:8px 14px;background:var(--bg3);border-bottom:1px solid var(--bdr);display:flex;align-items:center;gap:8px">
+          <div style="width:6px;height:6px;border-radius:50%;background:var(--p)"></div>
+          <span style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;color:var(--p)">Blocked Raw — All Time</span>
+          <div class="card-meta" id="blkraw-meta" style="margin-left:auto">compliance+ · grouped per symbol / dir / vwap / session / reason</div>
+        </div>
+        <div class="tw">
+          <table id="blkraw-tbl">
+            <thead><tr>
+              <th data-col="0">Symbol</th>
+              <th data-col="1">Dir</th>
+              <th data-col="2">VWAP</th>
+              <th data-col="3">Session</th>
+              <th data-col="4">Outcome</th>
+              <th data-col="5">Reject Reason</th>
+              <th data-col="6"># Blocked</th>
+              <th>Last Seen</th>
+            </tr></thead>
+            <tbody id="blkraw-body"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Band analysis -->
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:1px;border-top:1px solid var(--bdr2)">
+        <div>
+          <div style="padding:8px 14px;background:var(--bg3);border-bottom:1px solid var(--bdr)">
+            <span style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;color:var(--y)">Band 150–250%</span>
+            <span style="font-size:9px;color:var(--ink3);margin-left:8px">currently rejected — ghost potential shown</span>
+          </div>
+          <div class="sstrip" id="b150-strip" style="display:none">
+            <div class="ss"><div class="ss-lbl">Ghosts</div><div class="ss-val cb" id="b150-n">—</div></div>
+            <div class="ss"><div class="ss-lbl">Avg Max RR</div><div class="ss-val cg" id="b150-rr">—</div></div>
+            <div class="ss"><div class="ss-lbl">Avg SL%</div><div class="ss-val co" id="b150-sl">—</div></div>
+          </div>
+          <div class="tw"><table id="b150-tbl"><thead><tr><th>Symbol</th><th>Session</th><th>Dir</th><th>VWAP</th><th>n</th><th>Avg RR</th><th>Max RR</th><th>Avg SL%</th><th>Avg T→SL</th></tr></thead><tbody id="b150-body"></tbody></table></div>
+        </div>
+        <div style="border-left:1px solid var(--bdr2)">
+          <div style="padding:8px 14px;background:var(--bg3);border-bottom:1px solid var(--bdr)">
+            <span style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;color:var(--r)">Band 250–350%</span>
+            <span style="font-size:9px;color:var(--ink3);margin-left:8px">extreme outliers — read only</span>
+          </div>
+          <div class="sstrip" id="b250-strip" style="display:none">
+            <div class="ss"><div class="ss-lbl">Ghosts</div><div class="ss-val cb" id="b250-n">—</div></div>
+            <div class="ss"><div class="ss-lbl">Avg Max RR</div><div class="ss-val cg" id="b250-rr">—</div></div>
+            <div class="ss"><div class="ss-lbl">Avg SL%</div><div class="ss-val co" id="b250-sl">—</div></div>
+          </div>
+          <div class="tw"><table id="b250-tbl"><thead><tr><th>Symbol</th><th>Session</th><th>Dir</th><th>VWAP</th><th>n</th><th>Avg RR</th><th>Max RR</th><th>Avg SL%</th><th>Avg T→SL</th></tr></thead><tbody id="b250-body"></tbody></table></div>
+        </div>
       </div>
     </div>
+
   </div>
 </div>
 
@@ -4496,139 +4612,6 @@ table:not(.hide-milestones) .fav-th { display: none; }
   </div>
 </div>
 
-<!-- ══════════════════════════════════════════════════════════════
-     PAGE: SIGNALS
-═══════════════════════════════════════════════════════════════ -->
-<div class="npage" id="page-signals">
-  <div class="page">
-    <div class="card">
-      <div class="card-hdr">
-        <div class="card-title">
-          <div class="status-dot sd-err" id="sig-dot"></div>
-          Signal Log — Errors, Blocked &amp; Band Analysis
-        </div>
-        <div class="card-meta" id="sig-meta">loading...</div>
-      </div>
-
-      <!-- Signal Overview Stats -->
-      <div class="sig-stat-grid">
-        <div class="sig-stat">
-          <div class="sig-stat-lbl">Total Signals</div>
-          <div class="sig-stat-val cb" id="sig-total">—</div>
-        </div>
-        <div class="sig-stat">
-          <div class="sig-stat-lbl">Placed</div>
-          <div class="sig-stat-val cg" id="sig-placed">—</div>
-        </div>
-        <div class="sig-stat">
-          <div class="sig-stat-lbl">Blocked / Rejected</div>
-          <div class="sig-stat-val cr" id="sig-blocked">—</div>
-        </div>
-        <div class="sig-stat">
-          <div class="sig-stat-lbl">Conversion Rate</div>
-          <div class="sig-stat-val cy" id="sig-conv">—</div>
-        </div>
-      </div>
-
-      <!-- Blocked breakdown strip -->
-      <div class="sstrip">
-        <div class="ss"><div class="ss-lbl">Total Blocked</div><div class="ss-val cr" id="blk-tot">—</div></div>
-        <div class="ss"><div class="ss-lbl">Duplicate Open</div><div class="ss-val co" id="blk-dup">—</div></div>
-        <div class="ss"><div class="ss-lbl">VWAP Exhausted</div><div class="ss-val cp" id="blk-vw">—</div></div>
-        <div class="ss"><div class="ss-lbl">Outside Window</div><div class="ss-val cd" id="blk-win">—</div></div>
-        <div class="ss"><div class="ss-lbl">Currency Budget</div><div class="ss-val cy" id="blk-cur">—</div></div>
-        <div class="ss"><div class="ss-lbl">NY Dead Zone</div><div class="ss-val cr" id="blk-ny">—</div></div>
-      </div>
-
-      <div class="itabs">
-        <div class="itab on" onclick="showItab('sig','errors')">⚠ Webhook Errors</div>
-        <div class="itab" onclick="showItab('sig','rejects')">🚫 Blocked Signals</div>
-        <div class="itab" onclick="showItab('sig','placed')">✅ Placed Signals</div>
-        <div class="itab" onclick="showItab('sig','band150')">Band 150–250%</div>
-        <div class="itab" onclick="showItab('sig','band250')">Band 250–350%</div>
-      </div>
-
-      <!-- Webhook Errors -->
-      <div class="ipane on" id="sig-tab-errors">
-        <div class="tw">
-          <table id="whe-tbl">
-            <thead><tr>
-              <th data-col="0">Time</th>
-              <th data-col="1">Type</th>
-              <th data-col="2">Symbol</th>
-              <th data-col="3">Dir</th>
-              <th data-col="4">Session</th>
-              <th data-col="5">VWAP</th>
-              <th>Entry</th><th>SL%</th><th>Band%</th>
-              <th>Reason</th>
-            </tr></thead>
-            <tbody id="whe-body"></tbody>
-          </table>
-        </div>
-      </div>
-
-      <!-- Blocked Signals -->
-      <div class="ipane" id="sig-tab-rejects">
-        <div class="tw">
-          <table id="blk-tbl">
-            <thead><tr>
-              <th>Outcome</th>
-              <th>Reject Reason</th>
-              <th data-col="2">Symbol</th>
-              <th data-col="3">Dir</th>
-              <th data-col="4">Session</th>
-              <th data-col="5">VWAP</th>
-              <th data-col="6">Count</th>
-            </tr></thead>
-            <tbody id="blk-body"></tbody>
-          </table>
-        </div>
-      </div>
-
-      <!-- Placed Signals -->
-      <div class="ipane" id="sig-tab-placed">
-        <div class="tw">
-          <table id="placed-tbl">
-            <thead><tr>
-              <th data-col="0">Time</th>
-              <th data-col="1">Symbol</th>
-              <th>Dir</th><th>Session</th><th>VWAP</th>
-              <th>Entry</th><th>SL%</th><th>TP RR</th>
-              <th>Latency</th><th>EV+</th>
-            </tr></thead>
-            <tbody id="placed-body"></tbody>
-          </table>
-        </div>
-      </div>
-
-      <!-- Band 150-250 -->
-      <div class="ipane" id="sig-tab-band150">
-        <div style="padding:7px 14px;background:var(--bg3);border-bottom:1px solid var(--bdr2);font-size:10px;color:var(--ink3)">
-          <b class="cy">Band 150–250%</b> — signals with VWAP band distance 150%–250% of half-band (currently rejected). Ghost data shows actual RR potential.
-        </div>
-        <div class="sstrip" id="b150-strip" style="display:none">
-          <div class="ss"><div class="ss-lbl">Ghosts</div><div class="ss-val cb" id="b150-n">—</div></div>
-          <div class="ss"><div class="ss-lbl">Avg Max RR</div><div class="ss-val cg" id="b150-rr">—</div></div>
-          <div class="ss"><div class="ss-lbl">Avg SL%</div><div class="ss-val co" id="b150-sl">—</div></div>
-        </div>
-        <div class="tw"><table id="b150-tbl"><thead><tr><th>Symbol</th><th>Session</th><th>Dir</th><th>VWAP</th><th>n</th><th>Avg RR</th><th>Max RR</th><th>Avg SL%</th><th>Avg T→SL</th></tr></thead><tbody id="b150-body"></tbody></table></div>
-      </div>
-
-      <!-- Band 250-350 -->
-      <div class="ipane" id="sig-tab-band250">
-        <div style="padding:7px 14px;background:var(--bg3);border-bottom:1px solid var(--bdr2);font-size:10px;color:var(--ink3)">
-          <b class="cr">Band 250–350%</b> — extreme outliers. Read-only analysis.
-        </div>
-        <div class="sstrip" id="b250-strip" style="display:none">
-          <div class="ss"><div class="ss-lbl">Ghosts</div><div class="ss-val cb" id="b250-n">—</div></div>
-          <div class="ss"><div class="ss-lbl">Avg Max RR</div><div class="ss-val cg" id="b250-rr">—</div></div>
-          <div class="ss"><div class="ss-lbl">Avg SL%</div><div class="ss-val co" id="b250-sl">—</div></div>
-        </div>
-        <div class="tw"><table id="b250-tbl"><thead><tr><th>Symbol</th><th>Session</th><th>Dir</th><th>VWAP</th><th>n</th><th>Avg RR</th><th>Max RR</th><th>Avg SL%</th><th>Avg T→SL</th></tr></thead><tbody id="b250-body"></tbody></table></div>
-      </div>
-    </div>
-  </div>
-</div>
 
 <script>
 /* ══════════════════════════════════════════════════════════════
@@ -4786,7 +4769,6 @@ async function refreshComplianceBanner() {
   const dt = new Date(d.complianceDate);
   const label = dt.toLocaleString('nl-BE', {day:'numeric',month:'long',year:'numeric',hour:'2-digit',minute:'2-digit',timeZone:'UTC'}) + ' UTC';
   el.textContent = 'Compliance: ' + label;
-  // Update ook de JS COMPLIANCE variabele zodat filters meewerken
   window.COMPLIANCE = dt;
 }
 
@@ -4803,7 +4785,7 @@ function showPage(name) {
   // Lazy load on first visit
   if(name==='history'     && !_histLoaded)    { _histLoaded=true;    loadGhostHistory(); loadGhostHistoryGrouped(); }
   if(name==='ev-sl'       && !_evslLoaded)    { _evslLoaded=true;    loadEVSL(); }
-  if(name==='blocked-raw' && !_blkRawLoaded)  { _blkRawLoaded=true;  loadBlockedRaw(); }
+  if(name==='blocked-raw' && !_blkRawLoaded)  { _blkRawLoaded=true;  loadBlockedRaw(); loadBand(1,'b150'); loadBand(2,'b250'); }
 }
 let _histLoaded=false, _evslLoaded=false, _blkRawLoaded=false;
 
@@ -4903,6 +4885,15 @@ async function loadTradeStats() {
     return;
   }
   document.getElementById('ov-comp').textContent = total||'0';
+  document.getElementById('ov-open').textContent = '—'; // filled by loadPositions
+
+  // % gain: realized P&L / balance
+  const realizedPnl = trades.reduce((s,t)=>s+(t.realizedPnlEUR||0),0);
+  const gainPct = balance > 0 ? (realizedPnl/balance*100).toFixed(2)+'%' : '—';
+  const gainEl = document.getElementById('ov-gain');
+  if(gainEl){ gainEl.textContent = (realizedPnl>=0?'+':'')+gainPct; gainEl.className='ov-val '+(realizedPnl>=0?'cg':'cr'); }
+  const kGain = document.getElementById('k-gain');
+  if(kGain){ kGain.textContent = (realizedPnl>=0?'+':'')+gainPct; kGain.className='hk-val '+(realizedPnl>=0?'cg':'cr'); }
 
   // Helper: wins = hitTp=true OR closeReason='tp'
   const isWin = t => t.hitTp===true || t.closeReason==='tp';
@@ -4965,62 +4956,71 @@ async function loadTradeStats() {
       }
     }
   }
-  combos.sort((a,b)=>b.pct-a.pct);
+  combos.sort((a,b)=>b.n-a.n);
   document.getElementById('wr-body').innerHTML = combos.map(c=>{
-    const pctStr = c.pct.toFixed(1)+'%';
-    const cls = c.pct>=60?'cg fw':c.pct>=45?'cy':'cr';
+    const typeLabel = (() => {
+      // rough type based on session — stocks only NY, forex/index/comm all sessions
+      return '—';
+    })();
     return \`<tr>
       <td>\${sBadge(c.sess)}</td>
       <td>\${dBadge(c.dir)}</td>
       <td>\${vBadge(c.vwap)}</td>
-      <td class="cg fm">\${c.w}</td>
-      <td class="cr fm">\${c.n-c.w}</td>
-      <td class="cb fm">\${c.n}</td>
-      <td data-val="\${c.pct}" class="\${cls} fm">\${pctStr}</td>
-      <td>\${wrBar(c.pct, 120)}</td>
-      <td class="\${c.avgW!=null?(c.avgW>0?'cg':'cr'):'cd'} fm">\${c.avgW!=null?eu(c.avgW):'—'}</td>
-      <td class="\${c.avgL!=null?(c.avgL>0?'cg':'cr'):'cd'} fm">\${c.avgL!=null?eu(c.avgL):'—'}</td>
-      <td data-val="\${c.ev??-9999}" class="\${c.ev!=null?(c.ev>0?'cg':'cr'):'cd'} fm">\${c.ev!=null?eu(c.ev):'—'}</td>
+      <td class="cd" style="font-size:9px">—</td>
+      <td data-val="\${c.n}" class="cb fw fm">\${c.n}</td>
     </tr>\`;
   }).join('');
 
-  /* ── Trade Distribution Table ── */
+  /* ── Trade Distribution by asset type ── */
   document.getElementById('d-tot').textContent  = total;
   document.getElementById('d-buy').textContent  = trades.filter(t=>t.direction==='buy').length;
   document.getElementById('d-sell').textContent = trades.filter(t=>t.direction==='sell').length;
   document.getElementById('d-ab').textContent   = trades.filter(t=>t.vwapPosition==='above').length;
   document.getElementById('d-bw').textContent   = trades.filter(t=>t.vwapPosition==='below').length;
-  document.getElementById('d-as').textContent   = trades.filter(t=>t.session==='asia').length;
-  document.getElementById('d-lo').textContent   = trades.filter(t=>t.session==='london').length;
-  document.getElementById('d-ny').textContent   = trades.filter(t=>t.session==='ny').length;
+  const fxT  = trades.filter(t=>FOREX.includes(t.symbol));
+  const skT  = trades.filter(t=>STOCKS.includes(t.symbol));
+  const ixT  = trades.filter(t=>INDEX.includes(t.symbol));
+  const cmT  = trades.filter(t=>COMM.includes(t.symbol));
+  document.getElementById('d-fx').textContent = fxT.length;
+  document.getElementById('d-sk').textContent = skT.length;
+  document.getElementById('d-ix').textContent = ixT.length;
+  document.getElementById('d-cm').textContent = cmT.length;
 
   let ba_t=0,bb_t=0,sa_t=0,sb_t=0;
   const tb = document.getElementById('dist-body');
-  tb.innerHTML = ['asia','london','ny'].map(sess=>{
-    const st = trades.filter(t=>t.session===sess);
-    const ba=st.filter(t=>t.direction==='buy'&&t.vwapPosition==='above');
-    const bb=st.filter(t=>t.direction==='buy'&&t.vwapPosition==='below');
-    const sa=st.filter(t=>t.direction==='sell'&&t.vwapPosition==='above');
-    const sb=st.filter(t=>t.direction==='sell'&&t.vwapPosition==='below');
-    ba_t+=ba.length; bb_t+=bb.length; sa_t+=sa.length; sb_t+=sb.length;
-    const tw=st.filter(isWin).length, tn=st.length;
-    const wCls=tn>0?(tw/tn>=.6?'cg':tw/tn>=.45?'cy':'cr'):'cd';
-    return \`<tr>
-      <td>\${sBadge(sess)}</td>
-      <td class="cg fm fw">\${ba.length}</td>
-      <td class="cg fm">\${bb.length}</td>
-      <td class="cr fm fw">\${sa.length}</td>
-      <td class="cr fm">\${sb.length}</td>
-      <td class="cb fm fw">\${st.length}</td>
-      <td class="\${wCls} fm">\${tn>0?((tw/tn)*100).toFixed(1)+'%':'—'}</td>
-    </tr>\`;
-  }).join('');
+  const typeGroups = [
+    {label:'Forex',   arr:fxT,  badge:'<span class="bd b-fx">FX</span>', sessions:['asia','london','ny']},
+    {label:'Stock',   arr:skT,  badge:'<span class="bd b-sk">STK</span>', sessions:['ny']},
+    {label:'Index',   arr:ixT,  badge:'<span class="bd b-ix">IDX</span>', sessions:['asia','london','ny']},
+    {label:'Comm',    arr:cmT,  badge:'<span class="bd b-cm">COM</span>', sessions:['asia','london','ny']},
+  ];
+  const rows = [];
+  for(const tg of typeGroups) {
+    for(const sess of tg.sessions) {
+      const st = tg.arr.filter(t=>t.session===sess);
+      if(!st.length) continue;
+      const ba=st.filter(t=>t.direction==='buy'&&t.vwapPosition==='above');
+      const bb=st.filter(t=>t.direction==='buy'&&t.vwapPosition==='below');
+      const sa=st.filter(t=>t.direction==='sell'&&t.vwapPosition==='above');
+      const sb=st.filter(t=>t.direction==='sell'&&t.vwapPosition==='below');
+      ba_t+=ba.length; bb_t+=bb.length; sa_t+=sa.length; sb_t+=sb.length;
+      rows.push(\`<tr>
+        <td>\${tg.badge}</td>
+        <td>\${sBadge(sess)}</td>
+        <td class="cg fm fw">\${ba.length}</td>
+        <td class="cg fm">\${bb.length}</td>
+        <td class="cr fm fw">\${sa.length}</td>
+        <td class="cr fm">\${sb.length}</td>
+        <td class="cb fm fw">\${st.length}</td>
+      </tr>\`);
+    }
+  }
+  tb.innerHTML = rows.join('') || emptyRow(7,'Geen trades na compliance datum');
   document.getElementById('ft-ba').textContent = ba_t;
   document.getElementById('ft-bb').textContent = bb_t;
   document.getElementById('ft-sa').textContent = sa_t;
   document.getElementById('ft-sb').textContent = sb_t;
   document.getElementById('ft-t').textContent  = total;
-  document.getElementById('ft-wr').textContent = total>0?((overall/total)*100).toFixed(1)+'%':'—';
 }
 
 /* ══ OPEN POSITIONS ════════════════════════════════════════════ */
@@ -5051,11 +5051,21 @@ async function loadPositions() {
     const evp=d.positions?.filter(p=>p.isEvPlus).length||0;
     const buys=d.positions?.filter(p=>p.direction==='buy').length||0;
     const sells=cnt-buys;
-    const ab=d.positions?.filter(p=>p.vwapPosition==='above').length||0;
+    const stocks=d.positions?.filter(p=>STOCKS.includes(p.symbol)).length||0;
+    const index=d.positions?.filter(p=>INDEX.includes(p.symbol)).length||0;
+    const comm=d.positions?.filter(p=>COMM.includes(p.symbol)).length||0;
+    const forex=d.positions?.filter(p=>FOREX.includes(p.symbol)).length||0;
     document.getElementById('pos-gh').textContent=ghd;
     document.getElementById('pos-ev').textContent=evp;
-    document.getElementById('pos-bs').textContent=buys+' / '+sells;
-    document.getElementById('pos-ab').textContent=ab+' / '+(cnt-ab);
+    document.getElementById('pos-buys').textContent=buys;
+    document.getElementById('pos-sells').textContent=sells;
+    document.getElementById('pos-stocks').textContent=stocks;
+    document.getElementById('pos-index').textContent=index;
+    document.getElementById('pos-comm').textContent=comm;
+    document.getElementById('pos-forex').textContent=forex;
+    // overview card
+    document.getElementById('ov-open').textContent=cnt;
+    document.getElementById('ov-open-sub').textContent=buys+' buy · '+sells+' sell';
   }
 
   const tb = document.getElementById('pos-body');
@@ -5096,12 +5106,11 @@ async function loadPositions() {
       <td data-val="\${rrNow??-99}" class="\${rrCls} fm" style="font-size:13px">\${rrNow!=null?rrNow+'R':'—'}</td>
       <td data-val="\${peakPos}" class="\${peakPos>=2?'cg fw':peakPos>=1?'cg':peakPos>0?'cy':'cd'} fm">\${f(peakPos,2)}R</td>
       <td data-val="\${peakNeg}" class="\${peakNeg>80?'cr fw':peakNeg>50?'cr':peakNeg>25?'co':'cd'} fm">\${peakNeg>0?'-'+f(peakNeg,0)+'%':'—'}</td>
-      <td>\${slBar(p.slPctUsed)}</td>
       <td data-val="\${tpRR??-99}" class="cy fm">\${tpRR!=null?f(tpRR,2)+'R':'—'}</td>
       <td data-val="\${p.currentPnL??-99999}" class="\${pC(p.currentPnL)} fw fm">\${eu(p.currentPnL)}</td>
       <td data-val="\${p.lots}" class="cd fm">\${f(p.lots,2)}</td>
       <td data-val="\${rPct??-1}" class="\${rPct&&rPct>0.04?'cr fw':rPct&&rPct>0.025?'co':'cg'} fm">\${rPct!=null?f(rPct,3)+'%':'—'}</td>
-      \${ADV_STEPS.map(s=>msT(advFull[s],p.openedAt,false)).join('')}
+      \${ADV_STEPS.slice().reverse().map(s=>msT(advFull[s],p.openedAt,false)).join('')}
       \${FAV_STEPS.map(s=>msT(getMilestone(favMs,s),p.openedAt,true)).join('')}
       <td data-val="\${p.openedAt}" class="cd" style="font-size:9px">\${dtTs(p.openedAt)}</td>
     </tr>\`;
@@ -5131,6 +5140,14 @@ async function loadGhosts() {
     const elapsed = d.ghosts?.map(g=>g.elapsedMin||0);
     const avgElap = elapsed?.length>0?Math.round(elapsed.reduce((s,v)=>s+v,0)/elapsed.length):0;
     document.getElementById('gh-elapsed').textContent = msFmt(avgElap);
+    const ghBuys = d.ghosts?.filter(g=>g.direction==='buy').length||0;
+    document.getElementById('gh-buys').textContent = ghBuys;
+    document.getElementById('gh-sells').textContent = cnt-ghBuys;
+    document.getElementById('gh-stocks').textContent = d.ghosts?.filter(g=>STOCKS.includes(g.symbol)).length||0;
+    document.getElementById('gh-index').textContent  = d.ghosts?.filter(g=>INDEX.includes(g.symbol)).length||0;
+    document.getElementById('gh-forex').textContent  = d.ghosts?.filter(g=>FOREX.includes(g.symbol)).length||0;
+    // update header KPI
+    document.getElementById('k-ghh') && (document.getElementById('k-ghh').textContent = '—');
   }
 
   const tb=document.getElementById('gh-body');
@@ -5158,8 +5175,7 @@ async function loadGhosts() {
       <td>\${vBadge(g.vwapPosition)}</td>
       <td data-val="\${peakPos}" class="\${peakPos>=2?'cg fw':peakPos>=1?'cg':peakPos>0?'cy':'cd'} fm">\${f(peakPos,2)}R</td>
       <td data-val="\${peakNeg}" class="\${peakNeg>80?'cr fw':peakNeg>50?'cr':peakNeg>25?'co':'cd'} fm">\${peakNeg>0?'-'+f(peakNeg,0)+'%':'—'}</td>
-      <td>\${slBar(g.slPctUsed)}</td>
-      \${ADV_STEPS.map(s=>msT(advMs[s],g.openedAt,false)).join('')}
+      \${ADV_STEPS.slice().reverse().map(s=>msT(advMs[s],g.openedAt,false)).join('')}
       \${FAV_STEPS.map(s=>msT(getMilestone(favMs,s),g.openedAt,true)).join('')}
       <td data-val="\${g.elapsedMin??0}" class="cd fm">\${msFmt(g.elapsedMin)}</td>
       <td data-val="\${g.openedAt}" class="cd" style="font-size:9px">\${dtTs(g.openedAt)}</td>
@@ -5200,19 +5216,61 @@ async function loadDailyBreakdown() {
   }).join('')||emptyRow(10,'Geen data');
 
   const setupRow = t => \`<tr style="border-bottom:1px solid var(--bdr)">
-    <td class="cb fm" style="padding:2px 4px;font-size:9px">\${t.symbol}</td>
+    <td class="cb fm" style="padding:3px 6px;font-size:9px">\${t.symbol}</td>
     <td>\${dBadge(t.direction)}</td>
     <td>\${sBadge(t.session)}</td>
     <td>\${vBadge(t.vwapPosition)}</td>
     <td class="cy fm" style="font-size:9px">\${f(parseFloat(t.maxRR??0),2)}R</td>
     <td class="\${(t.pnl??0)>=0?'cg':'cr'} fw fm" style="font-size:9px">\${eu(parseFloat(t.pnl??0))}</td>
+    <td class="cd" style="font-size:8px;padding:3px 4px">\${t.closedAt?new Date(t.closedAt).toLocaleDateString('nl-BE'):'—'}</td>
   </tr>\`;
-  document.getElementById('best-body').innerHTML  = (d.bestTrades||[]).map(setupRow).join('')||emptyRow(6,'—');
-  document.getElementById('worst-body').innerHTML = (d.worstTrades||[]).map(setupRow).join('')||emptyRow(6,'—');
+  document.getElementById('best-body').innerHTML  = (d.bestTrades||[]).map(setupRow).join('')||emptyRow(7,'—');
+  document.getElementById('worst-body').innerHTML = (d.worstTrades||[]).map(setupRow).join('')||emptyRow(7,'—');
+
+  // Store full data for period filtering
+  window._dailyData = d;
 }
 
+let _bwPeriod = 'all';
+function setBWPeriod(period, btn) {
+  _bwPeriod = period;
+  document.querySelectorAll('.fb[onclick*="setBWPeriod"]').forEach(b=>b.classList.remove('on'));
+  btn.classList.add('on');
+  const lbl = period==='day'?'today':period==='week'?'this week':'all time';
+  document.querySelectorAll('#bw-period-lbl,#bw-period-lbl2').forEach(e=>e.textContent=lbl);
+  if(!window._dailyData) return;
+  const d = window._dailyData;
+  const now = new Date();
+  const startOfDay = new Date(now); startOfDay.setHours(0,0,0,0);
+  const startOfWeek = new Date(now); startOfWeek.setDate(now.getDate()-now.getDay()); startOfWeek.setHours(0,0,0,0);
+  function filterByPeriod(trades) {
+    if(!trades) return [];
+    if(period==='all') return trades;
+    return trades.filter(t=>{
+      if(!t.closedAt) return false;
+      const d = new Date(t.closedAt);
+      return period==='day' ? d>=startOfDay : d>=startOfWeek;
+    });
+  }
+  const setupRow = t => \`<tr style="border-bottom:1px solid var(--bdr)">
+    <td class="cb fm" style="padding:3px 6px;font-size:9px">\${t.symbol}</td>
+    <td>\${dBadge(t.direction)}</td>
+    <td>\${sBadge(t.session)}</td>
+    <td>\${vBadge(t.vwapPosition)}</td>
+    <td class="cy fm" style="font-size:9px">\${f(parseFloat(t.maxRR??0),2)}R</td>
+    <td class="\${(t.pnl??0)>=0?'cg':'cr'} fw fm" style="font-size:9px">\${eu(parseFloat(t.pnl??0))}</td>
+    <td class="cd" style="font-size:8px;padding:3px 4px">\${t.closedAt?new Date(t.closedAt).toLocaleDateString('nl-BE'):'—'}</td>
+  </tr>\`;
+  const best  = filterByPeriod(d.bestTrades||[]).slice(0,5);
+  const worst = filterByPeriod(d.worstTrades||[]).slice(0,5);
+  document.getElementById('best-body').innerHTML  = best.map(setupRow).join('')||emptyRow(7,'No trades in this period');
+  document.getElementById('worst-body').innerHTML = worst.map(setupRow).join('')||emptyRow(7,'No trades in this period');
+}
+
+/* ══ EV SL OPTIMIZER ═══════════════════════════════════════════ */
+
 /* ══ GHOST HISTORY GROUPED (v12.6) ════════════════════════════ */
-let _ghhData2=[], _ghhF2={sess:'all',dir:'all'};
+let _ghhData2=[], _ghhF2={sess:'all',dir:'all',type:'all'};
 function setGHHF(k,v,btn){
   _ghhF2[k]=v;
   document.querySelectorAll(\`.fb[onclick*="setGHHF('\${k}'"]\`).forEach(b=>b.classList.remove('on'));
@@ -5224,6 +5282,9 @@ async function loadGhostHistoryGrouped() {
   const d = await api('/api/ghost-history-by-pair');
   if(!d) return;
   _ghhData2=d;
+  // Update header KPI
+  const kghh = document.getElementById('k-ghh');
+  if(kghh) kghh.textContent = d.reduce((s,g)=>s+(g.n||0),0);
   renderGhostHistoryGrouped();
 }
 
@@ -5231,64 +5292,12 @@ function renderGhostHistoryGrouped() {
   const data = _ghhData2.filter(g=>{
     if(_ghhF2.sess!=='all'&&g.session!==_ghhF2.sess) return false;
     if(_ghhF2.dir !=='all'&&g.direction!==_ghhF2.dir)  return false;
+    if(_ghhF2.type!=='all'&&sTypeName(g.symbol)!==_ghhF2.type) return false;
     return true;
   });
   const meta = document.getElementById('ghh2-meta');
   if(meta) meta.textContent = data.length+' combos · compliance+';
 
-  const tb = document.getElementById('ghh2-body');
-  if(!tb) return;
-  tb.innerHTML = data.map(g=>{
-    const tpRRs  = (g.trades||[]).filter(t=>parseFloat(t.peakRRPos??0)>0).map(t=>parseFloat(t.peakRRPos));
-    const last5TP = tpRRs.slice(0,5);
-    const bestTP = last5TP.length>0?'avg '+f(last5TP.reduce((s,v)=>s+v,0)/last5TP.length,2)+'R':'—';
-    const slPcts = (g.trades||[]).filter(t=>parseFloat(t.maxSlPct??0)>0).map(t=>parseFloat(t.maxSlPct)).sort((a,b)=>a-b);
-    const last5SL = slPcts.slice(0,5);
-    const bestSL  = last5SL.length>0?'p90: '+(last5SL[Math.min(last5SL.length-1,Math.floor(last5SL.length*.9))]??'—')+'%':'—';
-    const safeKey = g.optimizerKey.replace(/[^a-zA-Z0-9_]/g,'_');
-    return \`<tr style="cursor:pointer" onclick="toggleGHH2('\${safeKey}')">
-      <td style="color:var(--ink3);font-size:9px">▶</td>
-      <td data-val="\${g.symbol}" class="cb fw fm" style="font-size:11px">\${g.symbol}</td>
-      <td>\${sBadge(g.session)}</td>
-      <td>\${dBadge(g.direction)}</td>
-      <td>\${vBadge(g.vwapPosition)}</td>
-      <td data-val="\${g.n}" class="\${g.n>=5?'cy fw':'cc'} fm">\${g.n}</td>
-      <td class="cr fm">\${g.nSLHit}</td>
-      <td class="cg fm">\${g.nMaxRR15}</td>
-      <td class="cy fm">\${g.nMaxDays}</td>
-      <td data-val="\${g.avgPeakPos}" class="cg fm">\${f(g.avgPeakPos,2)}R</td>
-      <td data-val="\${g.avgPeakNeg}" class="cr fm">\${f(g.avgPeakNeg,1)}%</td>
-      <td class="cg fw fm">\${f(g.maxPeakPos,2)}R</td>
-      <td class="cy fm" style="font-size:9px">\${bestTP}</td>
-      <td class="cd fm" style="font-size:9px">\${bestSL}</td>
-    </tr>
-    <tr class="ghh2-detail" id="ghh2-detail-\${safeKey}" style="display:none">
-      <td colspan="14" style="padding:0;background:var(--bg3)">
-        <table style="width:100%;font-size:9px;border-collapse:collapse">
-          <thead><tr style="background:var(--bg4)">
-            <th style="padding:4px 6px">#</th>
-            <th>Opened</th><th>Close Reason</th>
-            <th>TP RR</th><th>Max RR</th>
-            <th>Peak+RR</th><th>Peak−RR%</th><th>MAE%</th>
-          </tr></thead>
-          <tbody>\${(g.trades||[]).map((t,i)=>{
-            const sr = t.stopReason==='phantom_sl'?'cr':t.stopReason==='max_rr_15'?'cg':'cy';
-            return \`<tr style="border-bottom:1px solid var(--bdr)">
-              <td style="padding:3px 6px;color:var(--ink3)">\${i+1}</td>
-              <td class="cd" style="font-size:8px">\${t.openedAt?new Date(t.openedAt).toLocaleDateString('nl-BE'):'—'}</td>
-              <td class="\${sr}" style="font-size:8px">\${t.stopReason??'—'}</td>
-              <td class="cy fm">\${t.tpRRUsed??'—'}</td>
-              <td class="cy fm">\${f(parseFloat(t.maxRR??0),2)}R</td>
-              <td class="cg fm">\${f(parseFloat(t.peakRRPos??0),2)}R</td>
-              <td class="cr fm">\${f(parseFloat(t.peakRRNeg??0),1)}%</td>
-              <td class="cd fm">\${f(parseFloat(t.maxSlPct??0),1)}%</td>
-            </tr>\`;
-          }).join('')}</tbody>
-        </table>
-      </td>
-    </tr>\`;
-  }).join('')||emptyRow(14,'Geen ghost history');
-}
 function toggleGHH2(key){
   const el=document.getElementById('ghh2-detail-'+key);
   if(el) el.style.display=el.style.display==='none'?'':'none';
@@ -5558,6 +5567,7 @@ async function loadErrors(){
   }
 
   setDot('sig-dot',errs.length===0);
+  document.getElementById('nb-sig').textContent = errs.length||'';
 
   if(isEmpty && dbStats) {
     document.getElementById('sig-meta').textContent='In-memory log leeg na restart — DB totalen:';
@@ -5905,7 +5915,7 @@ async function start() {
   const missing = ["META_API_TOKEN", "META_ACCOUNT_ID", "WEBHOOK_SECRET"].filter(k => !process.env[k]);
   if (missing.length) { console.error(`[ERR] Missing env: ${missing.join(", ")}`); process.exit(1); }
 
-  console.log("🚀 PRONTO-AI v12.7.0 starting...");
+  console.log("🚀 PRONTO-AI v13.0.0 starting...");
   await initDB();
 
   // v12.5.1: sync trade_number sequence met huidige DB waarde
