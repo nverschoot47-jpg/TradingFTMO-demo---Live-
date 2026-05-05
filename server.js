@@ -5713,7 +5713,7 @@ async function loadAll(){
   ]);
   const ms=Date.now()-t0;
   // FIX 8: countdown zit al in updateClock(); hier tonen we de updated timestamp
-  const errStr = _apiFails>0 ? ` · ⚠ ${_apiFails} API errors` : '';
+  const errStr = _apiFails>0 ? ' · ⚠ ' + _apiFails + ' API errors' : '';
   if(ns)ns.textContent='Updated: '+new Date().toLocaleTimeString('nl-BE',{hour:'2-digit',minute:'2-digit',second:'2-digit'})+' ('+ms+'ms)'+errStr;
 }
 
