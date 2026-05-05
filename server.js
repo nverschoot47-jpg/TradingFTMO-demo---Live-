@@ -1019,26 +1019,43 @@ function startGhostTracker(pos, restoreData = null) {
   const originalTpRR   = tpRRUsed;
   let   lastStateSaveTs = Date.now();
 
-  // FIX v12.2: RR milestone timestamps — twee assen elke 0.1R:
+  // v12.6: RR milestone timestamps — twee assen:
   //   adverse:   -0.1R ... -1.0R (per 0.1 stap)
-  //   favorable: +0.1R ... +15R  (per 0.1 stap tot 1R, daarna grotere stappen)
-  // Worden ingevuld bij EERSTE overschrijding van elke drempel.
-  // Bij -1.00R (= phantom SL) → ghost stopt onmiddellijk.
+  //   favorable: +0.1R ... +15R  (stappen zie array)
+  // FIX v12.6: herstel opgeslagen milestones uit ghost_state zodat timing
+  // NA een Railway deploy NIET verloren gaat voor lopende trades.
   const RR_ADVERSE_STEPS   = [0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0];
   const RR_FAVORABLE_STEPS = [0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0,1.2,1.4,1.5,1.6,1.8,2.0,2.5,3.0,3.5,4.0,4.5,5.0,6.0,7.0,8.0,9.0,10.0,12.0,15.0];
-  const rrMilestones = {
-    adverse:   {},
-    favorable: {},
-  };
-  RR_ADVERSE_STEPS.forEach(s => { rrMilestones.adverse[s] = null; });
-  RR_FAVORABLE_STEPS.forEach(s => { rrMilestones.favorable[s] = null; });
-  // slMilestones as alias: 10→0.1R, 20→0.2R ... 100→1.0R (% of SL distance)
-  const slMilestones = {};
-  RR_ADVERSE_STEPS.forEach(s => { slMilestones[Math.round(s*100)] = null; });
 
-  // Peak RR tracking — beide kanten
-  let peakRRPos = restoreData?.peakRRPos ?? restoreData?.maxRR ?? 0;  // beste positieve RR
-  let peakRRNeg = restoreData?.peakRRNeg ?? 0;  // slechtste negatieve (als positief getal, % van SL)
+  // Initialiseer alle stappen op null, daarna overschrijven met opgeslagen waarden
+  const rrMilestones = { adverse: {}, favorable: {} };
+  RR_ADVERSE_STEPS.forEach(s => { rrMilestones.adverse[s]   = null; });
+  RR_FAVORABLE_STEPS.forEach(s => { rrMilestones.favorable[s] = null; });
+  const slMilestones = {};
+  RR_ADVERSE_STEPS.forEach(s => { slMilestones[Math.round(s * 100)] = null; });
+
+  // Herstel adverse milestones uit restoreData.rrMilestones (overleeft deploy)
+  if (restoreData?.rrMilestones?.adverse) {
+    for (const [k, v] of Object.entries(restoreData.rrMilestones.adverse)) {
+      if (v != null) rrMilestones.adverse[parseFloat(k)] = v;
+    }
+  }
+  // Herstel favorable milestones uit restoreData.rrMilestones
+  if (restoreData?.rrMilestones?.favorable) {
+    for (const [k, v] of Object.entries(restoreData.rrMilestones.favorable)) {
+      if (v != null) rrMilestones.favorable[parseFloat(k)] = v;
+    }
+  }
+  // Herstel slMilestones (pct-keys "10".."100") uit restoreData
+  if (restoreData?.slMilestones) {
+    for (const [k, v] of Object.entries(restoreData.slMilestones)) {
+      if (v != null) slMilestones[k] = v;
+    }
+  }
+
+  // Peak RR tracking — beide kanten, herstel uit restoreData
+  let peakRRPos = restoreData?.peakRRPos ?? restoreData?.maxRR ?? 0;
+  let peakRRNeg = restoreData?.peakRRNeg ?? 0;
 
   ghostTrackers[positionId] = {
     positionId, symbol, mt5Symbol, session, direction,
@@ -1047,20 +1064,31 @@ function startGhostTracker(pos, restoreData = null) {
     slPct: originalSlPct,
     tpRRUsed: originalTpRR,
     openedAt, maxPrice, maxSlPctUsed,
-    maxRR: restoreData?.maxRR ?? 0,
+    maxRR:    restoreData?.maxRR ?? 0,
     peakRRPos,
     peakRRNeg,
+    rrMilestones,   // v12.6: expose op tracker object zodat /live/ghosts het uitstuurt
+    slMilestones,
     tradeNumber: pos.tradeNumber ?? restoreData?.tradeNumber ?? null,
     startTs, timer,
   };
 
-  // Write initial state to DB (or update if restored)
-  saveGhostState({ positionId, optimizerKey, symbol, mt5Symbol, session, direction,
-    vwapPosition, entry, sl: originalSL, slPct: originalSlPct, tpRRUsed: originalTpRR,
-    maxPrice, maxRR: restoreData?.maxRR ?? 0, maxSlPctUsed, openedAt,
-    riskPct: pos.riskPct ?? null, riskEUR: pos.riskEUR ?? null,
-    evMult: pos.evMult ?? 1.0, dayMult: pos.dayMult ?? 1.0,
-  }).catch(() => {});
+  // FIX v12.6: sla ALLEEN op als dit een NIEUWE ghost is (geen restoreData).
+  // Bij een restore willen we de bestaande DB-rij NIET overschrijven — die heeft
+  // de volledige milestone history. Enkel updaten als er nieuwe data is.
+  if (!restoreData) {
+    saveGhostState({
+      positionId, optimizerKey, symbol, mt5Symbol, session, direction,
+      vwapPosition, entry, sl: originalSL, slPct: originalSlPct, tpRRUsed: originalTpRR,
+      maxPrice, maxRR: 0, maxSlPctUsed: 0, openedAt,
+      riskPct: pos.riskPct ?? null, riskEUR: pos.riskEUR ?? null,
+      evMult: pos.evMult ?? 1.0, dayMult: pos.dayMult ?? 1.0,
+      rrMilestones, slMilestones,
+      peakRRPos: 0, peakRRNeg: 0,
+    }).catch(() => {});
+  } else {
+    console.log(`[Ghost] ${positionId}: restored — adv milestones: ${Object.values(rrMilestones.adverse).filter(Boolean).length}/10 | fav: ${Object.values(rrMilestones.favorable).filter(Boolean).length}/${RR_FAVORABLE_STEPS.length}`);
+  }
 
   async function tick() {
     try {
@@ -1462,10 +1490,15 @@ async function syncOpenPositions() {
         }
       }
 
-      // v12.5.1: SL + RR milestone timing voor open posities (elke 0.1R)
-      // Bijhoudt wanneer elke adverse drempel voor het eerst bereikt werd.
+      // v12.6: favorable milestones synchroniseren vanuit ghost tracker naar positie object.
+      // Ghost tracker is authoritative voor favorable milestones (+0.1R..+15R).
+      if (!local.rrMilestones) local.rrMilestones = { adverse: {}, favorable: {} };
+      const gt = ghostTrackers[id];
+      if (gt?.rrMilestones?.favorable) local.rrMilestones.favorable = gt.rrMilestones.favorable;
+      if (gt?.rrMilestones?.adverse)   local.rrMilestones.adverse   = gt.rrMilestones.adverse;
+
+      // v12.5.1: Adverse SL milestone timing voor open posities (elke 0.1R)
       // Drempels: -0.1R (10%) t/m -1.0R (100%) per 0.1 stap.
-      // Favorable: +0.1R t/m +15R — wordt bijgehouden via ghostTracker.
       if (local.sl && local.entry && cur) {
         const slDist = Math.abs(local.entry - local.sl);
         if (slDist > 0) {
@@ -1473,18 +1506,18 @@ async function syncOpenPositions() {
           const adverseRR   = Math.max(0, adverseMove) / slDist;
           if (!local.slMilestones) local.slMilestones = {};
           const nowIso = new Date().toISOString();
-          // Elke 0.1R drempel van -0.1R tot -1.0R
           const OPEN_POS_ADV_STEPS = [0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0];
           let newMilestone = false;
           for (const step of OPEN_POS_ADV_STEPS) {
             const pctKey = Math.round(step * 100).toString();
             if (!local.slMilestones[pctKey] && adverseRR >= step) {
               local.slMilestones[pctKey] = nowIso;
+              if (!local.rrMilestones.adverse) local.rrMilestones.adverse = {};
+              local.rrMilestones.adverse[step] = nowIso;
               newMilestone = true;
               console.log(`[Pos] ${local.positionId} adverse -${step}R (${pctKey}% SL) bereikt @ ${nowIso}`);
             }
           }
-          // Persisteer enkel als er een nieuwe milestone is (niet elke sync)
           if (newMilestone) {
             saveGhostState({
               positionId:   local.positionId,
@@ -1507,6 +1540,7 @@ async function syncOpenPositions() {
               evMult:       local.evMult,
               dayMult:      local.dayMult,
               slMilestones: local.slMilestones,
+              rrMilestones: local.rrMilestones,
               tradeNumber:  local.tradeNumber,
               peakRRPos:    local.peakRRPos,
               peakRRNeg:    local.peakRRNeg,
@@ -1696,19 +1730,21 @@ async function restorePositionsFromMT5() {
         direction: dir, vwapPosition: vpPos, optimizerKey: optKey,
         entry, sl: lp.stopLoss ?? 0, tp: lp.takeProfit ?? null,
         lots: lp.volume ?? 0.01,
-        riskEUR: restoredRiskEUR,
-        riskPct: restoredRiskPct,
-        evMult:  restoredEvMult,
-        dayMult: restoredDayMult,
+        riskEUR:  restoredRiskEUR,
+        riskPct:  restoredRiskPct,
+        evMult:   restoredEvMult,
+        dayMult:  restoredDayMult,
         session: sess, openedAt: lp.time ?? new Date().toISOString(),
-        maxPrice: entry, maxRR: 0, currentPnL: lp.unrealizedProfit ?? 0,
+        maxPrice: gs?.maxPrice ?? entry,
+        maxRR:    gs?.maxRR    ?? 0,
+        maxSlPctUsed: gs?.maxSlPctUsed ?? 0,
+        currentPnL: lp.unrealizedProfit ?? 0,
         slPct: gs?.slPct ?? null, restoredAfterRestart: true,
-        // v12.5: herstel slMilestones uit ghost_state zodat timing overleeft na restart
-        slMilestones: (gs?.slMilestones && typeof gs.slMilestones === 'object')
-          ? gs.slMilestones : {},
-        // v12.5.1: herstel trade_number en peak RR
+        // v12.6: herstel volledige milestone data uit ghost_state
+        slMilestones: (gs?.slMilestones  && typeof gs.slMilestones  === 'object') ? gs.slMilestones  : {},
+        rrMilestones: (gs?.rrMilestones  && typeof gs.rrMilestones  === 'object') ? gs.rrMilestones  : { adverse: {}, favorable: {} },
         tradeNumber: gs?.tradeNumber ?? null,
-        peakRRPos:   gs?.peakRRPos   ?? 0,
+        peakRRPos:   gs?.peakRRPos   ?? gs?.maxRR ?? 0,
         peakRRNeg:   gs?.peakRRNeg   ?? 0,
       };
       console.log(`[Restart] ${sym} (${id}): vwapPosition='${vpPos}' riskPct=${(restoredRiskPct*100).toFixed(4)}% riskEUR=€${restoredRiskEUR.toFixed(2)} evMult=×${restoredEvMult.toFixed(2)}`);
@@ -5696,7 +5732,7 @@ async function start() {
   const missing = ["META_API_TOKEN", "META_ACCOUNT_ID", "WEBHOOK_SECRET"].filter(k => !process.env[k]);
   if (missing.length) { console.error(`[ERR] Missing env: ${missing.join(", ")}`); process.exit(1); }
 
-  console.log("🚀 PRONTO-AI v12.5.1 starting...");
+  console.log("🚀 PRONTO-AI v12.6.0 starting...");
   await initDB();
 
   // v12.5.1: sync trade_number sequence met huidige DB waarde
