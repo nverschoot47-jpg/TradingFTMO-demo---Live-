@@ -2248,4 +2248,4 @@ module.exports = {
   loadDailyBreakdown,
   loadGhostHistoryByPair,
   loadBlockedRaw,
-};
+}; 
