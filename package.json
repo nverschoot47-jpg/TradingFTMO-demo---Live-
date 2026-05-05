@@ -1,7 +1,7 @@
 {
   "name": "nv-tradingview-webhook",
-  "version": "12.5.0",
-  "description": "TradingView -> MetaApi REST -> FTMO MT5 | PRONTO-AI v12.5.0 - SL milestone timing, performance KPI's, MAE SL-inkort analyse, ghost grouped view",
+  "version": "12.6.0",
+  "description": "TradingView -> MetaApi REST -> FTMO MT5 | PRONTO-AI v12.6.0 - security fixes, version consistency, dead code cleanup",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
