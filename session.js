@@ -282,7 +282,7 @@ function canOpenNewTrade(rawSymbol, date = null) {
         reason:  `OUTSIDE_WINDOW: ${hhmm} (need 0200–2100 Brussels)`,
       };
     }
-  } else {
+  } else if (type === "forex" || type === "commodity") {
     // Forex + commodity: 02:00–21:00 met NY dead zone 15:30–18:00
     if (hhmm < 200 || hhmm >= 2100) {
       return {
@@ -297,6 +297,13 @@ function canOpenNewTrade(rawSymbol, date = null) {
         reason:  `NY_DEAD_ZONE: ${hhmm} (${type} geblokkeerd 1530–1800 Brussels — hoge spread NYSE open)`,
       };
     }
+  } else {
+    // Onbekend symbooltype — niet in catalog gevonden.
+    // Expliciet weigeren i.p.v. silent forex-fallthrough.
+    return {
+      allowed: false,
+      reason:  `UNKNOWN_SYMBOL_TYPE: type="${type}" voor "${rawSymbol}" — niet in SYMBOL_CATALOG`,
+    };
   }
 
   return { allowed: true, reason: null };
@@ -351,7 +358,9 @@ const SESSION_LABELS = {
 };
 
 // ── Data quality compliance date (FIX 8: single source of truth) ────
-const COMPLIANCE_DATE    = '2026-05-03 00:00:00';  // 14:00 Brussels (UTC+2 summer) — v10.8
+// Alle stats (EV, ghost, shadow, signals) filteren op opened_at/closed_at >= deze datum.
+// Aanpasbaar via POST /compliance-date (beveiligd met WEBHOOK_SECRET).
+const COMPLIANCE_DATE    = '2026-05-03 00:00:00';  // UTC midnight → Brussels 02:00 CEST
 const COMPLIANCE_DATE_MS = new Date('2026-05-03T00:00:00.000Z').getTime();
 
 module.exports = {
