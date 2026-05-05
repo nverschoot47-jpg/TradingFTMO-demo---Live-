@@ -1,7 +1,12 @@
 // ===============================================================
-// db.js  v12.4  |  PRONTO-AI
+// db.js  v12.6  |  PRONTO-AI
 //
-// Changes v12.4:
+// Changes v12.6:
+//  - saveLotOverride / loadLotOverrides gemarkeerd als deprecated dead code
+//    en verwijderd uit module.exports. De functies worden omgedoopt naar
+//    _saveLotOverride / _loadLotOverrides (private). De DB tabel blijft.
+//    Achtergrond: lot overrides werden verwijderd in v11.0 (FIX R4).
+//
 //  - FIX GH2: ghost_state tabel krijgt extra kolommen voor risk/ev data:
 //    risk_pct, risk_eur, ev_mult, day_mult via ADD COLUMN IF NOT EXISTS.
 //    restorePositionsFromMT5() in server.js leest deze terug bij restart
@@ -1207,8 +1212,12 @@ async function computeEVStats(optimizerKey) {
   } catch (e) { return { key: optimizerKey, count: 0, rrLevels: [], bestRR: null, bestEV: null, avgRR: null, avgTimeToSLMin: null, avgMaxSlPct: null, bestWinnerSlPct: null }; }
 }
 
-// ── lot_overrides (FIX 2) ──────────────────────────────────────
-async function saveLotOverride(symbol, baseLots) {
+// ── lot_overrides — DEPRECATED (verwijderd in v11.0 FIX R4) ──────
+// lotDivisor en lot overrides werden verwijderd voor uniform 0.15% risk.
+// Functies behouden voor backward compat (DB tabel bestaat nog), maar
+// worden niet meer aangeroepen door server.js. Niet langer geëxporteerd.
+// De lot_overrides DB tabel blijft aanwezig — verwijder pas bij schema reset.
+async function _saveLotOverride(symbol, baseLots) {
   try {
     await pool.query(`
       INSERT INTO lot_overrides (symbol, base_lots, updated_at)
@@ -1218,7 +1227,7 @@ async function saveLotOverride(symbol, baseLots) {
   } catch (e) { console.warn('[!] saveLotOverride:', e.message); }
 }
 
-async function loadLotOverrides() {
+async function _loadLotOverrides() {
   try {
     const r = await pool.query(`SELECT symbol, CAST(base_lots AS FLOAT) AS base_lots FROM lot_overrides`);
     const map = {};
@@ -2207,8 +2216,7 @@ module.exports = {
   upsertSymbolRisk,
   loadSymbolRiskConfig,
   // Lot overrides (FIX 2)
-  saveLotOverride,
-  loadLotOverrides,
+  // Lot overrides — DEPRECATED in v11.0, niet meer geëxporteerd
   // Key risk multipliers (FIX 19 + v10.6 evMult/dayMult)
   saveKeyRiskMult,
   loadKeyRiskMults,
