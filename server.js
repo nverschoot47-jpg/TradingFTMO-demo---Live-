@@ -1,5 +1,5 @@
 // ===============================================================
-// server.js  v12.4.0  |  PRONTO-AI
+// server.js  v12.6.0  |  PRONTO-AI
 // TradingView → MetaApi REST → FTMO MT5
 //
 // v12.4.0 — STABILITY FIXES (30 April 2026):
@@ -505,7 +505,7 @@ async function metaFetch(path, options = {}, timeoutMs = 8000) {
 async function fetchOpenPositions()         { return metaFetch("/positions"); }
 async function fetchAccountInfo() {
   const info = await metaFetch("/accountInformation");
-  if (info?.balance) {
+  if (info?.balance != null && parseFloat(info.balance) >= 0) {
     liveBalance   = parseFloat(info.balance);
     liveBalanceAt = Date.now();
     console.log(`[Balance] Live MT5 balance: €${liveBalance.toFixed(2)}`);
@@ -3176,7 +3176,7 @@ app.get('/api/ev-sl-optimizer', async (req, res) => {
 app.get("/test", (req, res) => {
   res.json({
     status: "Railway is bereikbaar",
-    version: "12.3.0",
+    version: "12.6.0",
     time: new Date().toISOString(),
     headers: {
       "content-type": req.headers["content-type"] ?? "(geen)",
@@ -3205,7 +3205,7 @@ app.get("/health", async (req, res) => {
   const tradeWindowForex = canOpenNewTrade("EURUSD");
   const tradeWindowStock = canOpenNewTrade("AAPL");
   res.json({
-    status: "ok", version: "12.5.0", time: getBrusselsDateStr(),
+    status: "ok", version: "12.6.0", time: getBrusselsDateStr(),
     openPos: Object.keys(openPositions).length, ghosts: Object.keys(ghostTrackers).length,
     tpLocks: Object.keys(tpLocks).length, closedT: closedTrades.length, balance,
     fixedRiskPct: FIXED_RISK_PCT, marketOpen: isMarketOpen(), session: getSession(),
@@ -5689,7 +5689,7 @@ app.get("/api/summary", async (req, res) => {
       recentWebhooks,
     });
   } catch (err) {
-    res.status(500).json({ error: err.message, stack: err.stack });
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -5706,6 +5706,11 @@ app.get("/compliance-date", async (req, res) => {
 });
 
 app.post("/compliance-date", async (req, res) => {
+  // Beveiligd: alleen WEBHOOK_SECRET mag de compliance datum wijzigen.
+  const secret = req.query.secret || req.body?.secret;
+  if (secret !== WEBHOOK_SECRET) {
+    return res.status(401).json({ error: "Unauthorized — geef ?secret= mee (zelfde als webhook secret)" });
+  }
   try {
     const raw = req.body?.date;
     if (!raw) return res.status(400).json({ error: "Geef { date: 'YYYY-MM-DD' } of ISO string mee" });
@@ -5820,7 +5825,7 @@ async function start() {
   rebuildEVCache().catch(() => {});
 
   app.listen(PORT, () => {
-    console.log(`[✓] PRONTO-AI v12.5.0 on port ${PORT}`);
+    console.log(`[✓] PRONTO-AI v12.6.0 on port ${PORT}`);
     console.log(`   🔹 Dashboard:      /`);
     console.log(`   🔹 Health:         /health`);
     console.log(`   🔹 EV Table:       /ev`);
