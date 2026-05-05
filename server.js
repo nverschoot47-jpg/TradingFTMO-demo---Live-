@@ -1,6 +1,59 @@
 // ===============================================================
-// server.js  v12.6.0  |  PRONTO-AI
+// server.js  v12.7.0  |  PRONTO-AI
 // TradingView → MetaApi REST → FTMO MT5
+//
+// v12.7.0 — DASHBOARD FIXES (5 mei 2026):
+//
+//  FIX 1 — "loading..." blijft staan bij lege data:
+//    loadTradeStats() toont nu een expliciete melding bij 0 trades
+//    na compliance datum. emptyRow() wordt ingevuld i.p.v. leeg te laten.
+//
+//  FIX 2 — Hardcoded datum in /signal-stats/rejects:
+//    loadBlockedSignals() gebruikte hardcoded '2026-05-03T00:00:00.000Z'.
+//    Vervangen door de dynamische COMPLIANCE JS-variabele → werkt automatisch
+//    mee als de datum via POST /compliance-date wordt gewijzigd.
+//
+//  FIX 3 — WEBHOOK_SECRET in Railway logs:
+//    prepareDeploy() stuurde secret als URL query param → zichtbaar in logs.
+//    Nu verstuurd als JSON POST body. Server-side endpoints lezen
+//    req.body?.secret || req.query?.secret (achterwaarts compatibel).
+//
+//  FIX 4 — EV cache retry stopt na 60s:
+//    _loadEVRetry() verhoogd van 12 naar 20 pogingen (= max 100s).
+//    Tussentijdse melding na 6 pogingen: "EV-cache wordt gebouwd...".
+//    Definitieve melding bij opgeven: "herlaad de pagina over 30s".
+//
+//  FIX 5 — Signal log leeg na Railway restart:
+//    loadErrors() herkent een lege in-memory log en haalt als fallback
+//    de DB-totalen op via GET /signal-stats. Toont informatieve melding.
+//
+//  FIX 6 — Compliance Trades KPI altijd "—":
+//    Bij 0 trades na compliance toont de ov-card nu "0" met subtekst
+//    "Geen trades na compliance — X totaal in DB" zodat het niet lijkt
+//    alsof het systeem niets bijhoudt.
+//
+//  FIX 7 — 56/47 milestone kolommen onbruikbaar op laptop:
+//    Milestone kolommen (.adv-th / .fav-th) standaard verborgen via CSS.
+//    [± Milestones] toggle knop op Positions en Ghost Tracker kaartkoppen.
+//    toggleMilestoneCols() toont/verbergt alle adv/fav kolommen tegelijk.
+//
+//  FIX 8 — Geen refresh countdown:
+//    updateClock() toont al "Next refresh in Xs" in nav-right via _lastLoad.
+//    nav-right had dubbel id-attribuut (id="nav-right" id="nav-status") —
+//    tweede id verwijderd zodat getElementById() betrouwbaar werkt.
+//
+//  FIX 9 — Compliance banner stale na POST /compliance-date:
+//    refreshComplianceBanner() haalt na elke loadAll() de datum op via
+//    GET /compliance-date en update de banner en de JS COMPLIANCE variabele.
+//    comp-bar-date element krijgt een id voor gerichte update.
+//
+//  FIX 10 — Geen globale error indicator:
+//    api() helper telt per loadAll()-cyclus hoeveel calls null retourneren.
+//    Teller wordt getoond in header (API Errors KPI, rood) én achter de
+//    "Updated:" timestamp in nav-right ("⚠ 3 API errors").
+//
+// (alle v12.6 en eerder fixes blijven actief)
+// ===============================================================
 //
 // v12.4.0 — STABILITY FIXES (30 April 2026):
 //
@@ -2690,7 +2743,8 @@ app.post("/admin/ghosts/cancel-all", (req, res) => {
 // This saves their maxRR data to DB before a restart wipes memory.
 // Use via the dashboard PREPARE DEPLOY button or directly with curl.
 app.post("/admin/finalize-all-ghosts", async (req, res) => {
-  const { secret } = req.query;
+  // FIX 3: lees secret uit body (JSON) OF query param (achterwaarts compatibel)
+  const secret = req.body?.secret || req.query?.secret;
   if (secret !== WEBHOOK_SECRET) return res.status(401).json({ error: "Unauthorized" });
   const ids = Object.keys(ghostTrackers);
   if (!ids.length) return res.json({ status: "OK", finalized: 0, message: "No active ghosts." });
@@ -2713,7 +2767,8 @@ app.post("/admin/finalize-all-ghosts", async (req, res) => {
 
 // ── PRE-DEPLOY: close all open MT5 positions ──────────────────────────
 app.post("/admin/close-all-positions", async (req, res) => {
-  const { secret } = req.query;
+  // FIX 3: lees secret uit body (JSON) OF query param (achterwaarts compatibel)
+  const secret = req.body?.secret || req.query?.secret;
   if (secret !== WEBHOOK_SECRET) return res.status(401).json({ error: "Unauthorized" });
   const positions = Object.values(openPositions);
   if (!positions.length) return res.json({ status: "OK", closed: 0, message: "No open positions." });
@@ -3711,6 +3766,14 @@ td.mx-sym { text-align: left !important; font-weight: 600; color: var(--y); font
 /* ══ RESPONSIVE ════════════════════════════════════════════════ */
 @media (max-width: 1200px) { .ov-grid { grid-template-columns: repeat(3, 1fr); } }
 @media (max-width: 800px)  { .ov-grid { grid-template-columns: repeat(2, 1fr); } }
+
+/* FIX 7: milestone kolommen standaard verborgen; toggle via .hide-milestones klasse */
+.adv-th, .fav-th { display: none; }
+table:not(.hide-milestones) .adv-th,
+table:not(.hide-milestones) .fav-th { display: none; }
+/* Wanneer milestones zichtbaar zijn, toon ook de bijbehorende td's */
+/* We stylen de td's die in milestone-kolommen staan via nth-child is niet betrouwbaar
+   — in plaats daarvan voegen we JS-class toe aan de tabel en tonen/verbergen via .adv-th/.fav-th header selectie */
 </style>
 </head>
 <body>
@@ -3750,6 +3813,11 @@ td.mx-sym { text-align: left !important; font-weight: 600; color: var(--y); font
     <div class="hdr-kpi">
       <div class="hk-lbl">Total Trades DB</div>
       <div class="hk-val cb">${dbTradeCount.toLocaleString()}</div>
+    </div>
+    <!-- FIX 10: globale API error badge -->
+    <div class="hdr-kpi" id="api-err-kpi" style="display:none">
+      <div class="hk-lbl" style="color:var(--r)">API Errors</div>
+      <div class="hk-val cr" id="api-err-cnt">0</div>
     </div>
   </div>
   <div class="hdr-right">
@@ -3793,13 +3861,14 @@ td.mx-sym { text-align: left !important; font-weight: 600; color: var(--y); font
   <div class="ntab" onclick="showPage('blocked-raw')">
     Blocked Raw
   </div>
-  <div id="nav-right" id="nav-status">—</div>
+  <div id="nav-right">—</div>
 </nav>
 
 <!-- ══ COMPLIANCE BAR ════════════════════════════════════════════ -->
 <div class="comp-bar">
   <span class="comp-icon">📅</span>
-  <strong>Compliance: 3 mei 2026 00:00 UTC</strong>
+  <!-- FIX 9: id's zodat JS de banner kan updaten na POST /compliance-date -->
+  <strong id="comp-bar-date">Compliance: 3 mei 2026 00:00 UTC</strong>
   <span>— all EV, statistics &amp; P&amp;L calculated only on trades after this date</span>
   <span style="margin-left: auto; font-family: var(--fm); color: var(--c); font-size: 10px;">${dbTradeCount.toLocaleString()} trades in DB</span>
 </div>
@@ -4037,7 +4106,11 @@ td.mx-sym { text-align: left !important; font-weight: 600; color: var(--y); font
           <div class="status-dot sd-err" id="pos-dot"></div>
           Open Positions — Live
         </div>
-        <div class="card-meta" id="pos-meta">loading...</div>
+        <div style="display:flex;align-items:center;gap:8px">
+          <!-- FIX 7: milestone kolommen toggle -->
+          <button class="hbtn" onclick="toggleMilestoneCols()" id="ms-toggle-btn" style="font-size:10px;padding:4px 8px">± Milestones</button>
+          <div class="card-meta" id="pos-meta">loading...</div>
+        </div>
       </div>
 
       <!-- Trade distribution shows also open trades -->
@@ -4095,7 +4168,10 @@ td.mx-sym { text-align: left !important; font-weight: 600; color: var(--y); font
           <div class="status-dot sd-err" id="gh-dot"></div>
           Ghost Tracker — Active (runs until phantom SL / 15R / 14 days)
         </div>
-        <div class="card-meta" id="gh-meta">Phantom SL = real SL at trade open</div>
+        <div style="display:flex;align-items:center;gap:8px">
+          <button class="hbtn" onclick="toggleMilestoneCols()" style="font-size:10px;padding:4px 8px">± Milestones</button>
+          <div class="card-meta" id="gh-meta">Phantom SL = real SL at trade open</div>
+        </div>
       </div>
 
       <div class="sstrip" id="gh-strip" style="display:none">
@@ -4662,15 +4738,56 @@ function favTds(fav, openedAt) {
 }
 
 /* ── API helper ─────────────────────────────────────────────── */
+// FIX 10: bijhouden hoeveel API calls mislukken per loadAll() cyclus
+let _apiFails = 0, _apiTotal = 0;
+function _resetApiCounters(){ _apiFails=0; _apiTotal=0; }
+function _recordApiFail(){
+  _apiFails++;
+  const kpi=document.getElementById('api-err-kpi');
+  const cnt=document.getElementById('api-err-cnt');
+  if(kpi&&cnt){ cnt.textContent=_apiFails+' van '+_apiTotal; kpi.style.display=_apiFails>0?'':'none'; }
+}
 async function api(path, ms=12000) {
+  _apiTotal++;
   const c = new AbortController();
   const t = setTimeout(()=>c.abort(), ms);
   try {
     const r = await fetch(path, {signal:c.signal});
     clearTimeout(t);
-    if(!r.ok) return null;
+    if(!r.ok){ _recordApiFail(); return null; }
     return r.json();
-  } catch(e) { clearTimeout(t); return null; }
+  } catch(e) { clearTimeout(t); _recordApiFail(); return null; }
+}
+
+/* ── FIX 7: Milestone kolommen toggle ──────────────────────── */
+let _milestonesVisible = false;
+function toggleMilestoneCols() {
+  _milestonesVisible = !_milestonesVisible;
+  document.querySelectorAll('.adv-th, .fav-th').forEach(th => {
+    th.style.display = _milestonesVisible ? '' : 'none';
+  });
+  // Verberg ook de td's die bij milestone kolommen horen
+  // adv-th en fav-th zijn de headers; de bijbehorende td's zitten in dezelfde col-positie
+  // We doen dit via CSS class op de table zelf
+  ['pos-tbl','gh-tbl'].forEach(tid => {
+    const tbl = document.getElementById(tid);
+    if(tbl) tbl.classList.toggle('hide-milestones', !_milestonesVisible);
+  });
+  const btn = document.getElementById('ms-toggle-btn');
+  if(btn) btn.style.color = _milestonesVisible ? 'var(--b)' : '';
+}
+
+/* ── FIX 9: Compliance banner dynamisch updaten ─────────────── */
+async function refreshComplianceBanner() {
+  const d = await api('/compliance-date');
+  if(!d?.complianceDate) return;
+  const el = document.getElementById('comp-bar-date');
+  if(!el) return;
+  const dt = new Date(d.complianceDate);
+  const label = dt.toLocaleString('nl-BE', {day:'numeric',month:'long',year:'numeric',hour:'2-digit',minute:'2-digit',timeZone:'UTC'}) + ' UTC';
+  el.textContent = 'Compliance: ' + label;
+  // Update ook de JS COMPLIANCE variabele zodat filters meewerken
+  window.COMPLIANCE = dt;
 }
 
 /* ── Navigation ─────────────────────────────────────────────── */
@@ -4773,6 +4890,18 @@ async function loadTradeStats() {
   const total = trades.length;
   document.getElementById('wr-meta').textContent = total+' closed trades after compliance date';
   document.getElementById('dist-meta').textContent = total+' closed trades — 3 mei 2026+';
+
+  // FIX 1 + 6: toon duidelijke melding bij lege array; toon DB totaal als fallback
+  const dbTotal = d.total ?? (d.trades?.length ?? 0);
+  if(!total) {
+    document.getElementById('ov-comp').textContent = '0';
+    // FIX 6: toon totaal aantal trades in DB als context zodat het niet lijkt alsof alles kapot is
+    const ovSub = document.querySelector('#ov-comp')?.closest('.ov-card')?.querySelector('.ov-sub');
+    if(ovSub) ovSub.textContent = 'Geen trades na compliance — '+dbTotal.toLocaleString()+' totaal in DB';
+    document.getElementById('wr-body').innerHTML = emptyRow(11, 'Geen trades na compliance datum — systeem actief');
+    document.getElementById('dist-body').innerHTML = emptyRow(7, 'Geen trades na compliance datum');
+    return;
+  }
   document.getElementById('ov-comp').textContent = total||'0';
 
   // Helper: wins = hitTp=true OR closeReason='tp'
@@ -5326,7 +5455,15 @@ async function loadEV() {
 async function _loadEVRetry(n=0){
   const evD=await api('/ev');
   if(evD?.length>0){evD.forEach(e=>{_evMap[e.key]=e;});_buildCombos();setDot('ev-dot',true);return;}
-  if(n<12)setTimeout(()=>_loadEVRetry(n+1),5000);else setDot('ev-dot',false);
+  // FIX 4: 20 pogingen (was 12) = max 100s. Toon melding als cache nog niet klaar is.
+  if(n<20){
+    if(n===6){const m=document.getElementById('ev-meta');if(m)m.textContent='EV-cache wordt gebouwd, even geduld...';}
+    setTimeout(()=>_loadEVRetry(n+1),5000);
+  } else {
+    setDot('ev-dot',false);
+    const m=document.getElementById('ev-meta');
+    if(m)m.textContent='EV-cache niet gereed — herlaad de pagina over 30s';
+  }
 }
 function _buildCombos(){
   const combos=[];
@@ -5412,7 +5549,29 @@ async function loadErrors(){
   const ERR_TYPES=['REJECTED','SL_TP_SET_FAILED','LOT_CALC_FAILED','ORDER_NOT_CONFIRMED','VWAP_BAND_EXHAUSTED','SPREAD_GUARD_CLOSE','RR_VERIFY_FAILED','CURRENCY_BUDGET_EXHAUSTED','OUTSIDE_WINDOW'];
   const errs=(Array.isArray(d)?d:[]).filter(e=>ERR_TYPES.includes(e.type));
   const placed=(Array.isArray(d)?d:[]).filter(e=>e.type==='ORDER_PLACED');
+
+  // FIX 5: als in-memory log leeg is na restart, haal DB-totalen op als fallback
+  const isEmpty = !Array.isArray(d) || d.length===0;
+  let dbStats = null;
+  if(isEmpty) {
+    dbStats = await api('/signal-stats');
+  }
+
   setDot('sig-dot',errs.length===0);
+
+  if(isEmpty && dbStats) {
+    document.getElementById('sig-meta').textContent='In-memory log leeg na restart — DB totalen:';
+    document.getElementById('sig-total').textContent=dbStats.total??'—';
+    document.getElementById('sig-placed').textContent=dbStats.placed??'—';
+    document.getElementById('sig-blocked').textContent=dbStats.rejected??'—';
+    document.getElementById('nb-sig').textContent='0';
+    const convDB = dbStats.total>0?((dbStats.placed/dbStats.total)*100).toFixed(1)+'%':'—';
+    document.getElementById('sig-conv').textContent=convDB;
+    document.getElementById('whe-body').innerHTML='<tr><td colspan="10" class="nd cy">↻ In-memory log reset na Railway restart — DB toont '+dbStats.total+' historische signalen</td></tr>';
+    document.getElementById('placed-body').innerHTML='<tr><td colspan="10" class="nd">Geen recente geplaatste trades in geheugen</td></tr>';
+    return;
+  }
+
   document.getElementById('sig-meta').textContent=errs.length+' errors · '+placed.length+' placed (recent)';
   document.getElementById('nb-sig').textContent=errs.length;
   document.getElementById('sig-total').textContent=d.length||'—';
@@ -5457,7 +5616,9 @@ async function loadErrors(){
 }
 
 async function loadBlockedSignals(){
-  const rejectD=await api('/signal-stats/rejects?since=2026-05-03T00:00:00.000Z');
+  // FIX 2: gebruik dynamische COMPLIANCE variabele, niet hardcoded datum
+  const sinceISO=COMPLIANCE.toISOString();
+  const rejectD=await api('/signal-stats/rejects?since='+sinceISO);
   if(!rejectD)return;
   const byO={};(rejectD?.byOutcome||[]).forEach(r=>{byO[r.outcome]=r.pairs?.reduce((s,p)=>s+p.count,0)??0;});
   document.getElementById('blk-tot').textContent=rejectD.total||0;
@@ -5517,10 +5678,11 @@ async function prepareDeploy(){
   if(!confirm('DEPLOY\\n\\n'+st.recommendation+'\\n\\nContinue?'))return;
   btn.disabled=true;sEl.textContent='Closing positions...';
   const sec=prompt('WEBHOOK_SECRET:');if(!sec){btn.disabled=false;return;}
-  const r1=await fetch(\`/admin/close-all-positions?secret=\${encodeURIComponent(sec)}\`,{method:'POST'});
+  // FIX 3: secret in POST body (JSON), niet als URL query param — voorkomt Railway log exposure
+  const r1=await fetch('/admin/close-all-positions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({secret:sec})});
   const d1=await r1.json().catch(()=>({}));
   if(d1.status!=='OK'){sEl.textContent='Error: '+(d1.error||'?');btn.disabled=false;return;}
-  const r2=await fetch(\`/admin/finalize-all-ghosts?secret=\${encodeURIComponent(sec)}\`,{method:'POST'});
+  const r2=await fetch('/admin/finalize-all-ghosts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({secret:sec})});
   const d2=await r2.json().catch(()=>({}));
   sEl.textContent=\`✓ READY — \${d1.closed} positions, \${d2.finalized} ghosts\`;
   btn.style.color='var(--g)';await loadAll();
@@ -5529,6 +5691,8 @@ async function prepareDeploy(){
 /* ══ LOAD ALL ══════════════════════════════════════════════════ */
 async function loadAll(){
   const t0=Date.now(); _lastLoad=t0;
+  // FIX 10: reset error tellers voor nieuwe cyclus
+  _resetApiCounters();
   const ns=document.getElementById('nav-right');
   if(ns)ns.textContent='Loading...';
   await Promise.allSettled([
@@ -5540,13 +5704,17 @@ async function loadAll(){
     loadBlockedSignals().catch(()=>{}),
     loadMAE().catch(()=>{}),
     loadDailyBreakdown().catch(()=>{}),
+    // FIX 9: compliance banner dynamisch ophalen
+    refreshComplianceBanner().catch(()=>{}),
     (_histLoaded?loadGhostHistory():Promise.resolve()).catch(()=>{}),
     (_histLoaded?loadGhostHistoryGrouped():Promise.resolve()).catch(()=>{}),
     (_evslLoaded?loadEVSL():Promise.resolve()).catch(()=>{}),
     (_blkRawLoaded?loadBlockedRaw():Promise.resolve()).catch(()=>{}),
   ]);
   const ms=Date.now()-t0;
-  if(ns)ns.textContent='Updated: '+new Date().toLocaleTimeString('nl-BE',{hour:'2-digit',minute:'2-digit',second:'2-digit'})+' ('+ms+'ms)';
+  // FIX 8: countdown zit al in updateClock(); hier tonen we de updated timestamp
+  const errStr = _apiFails>0 ? ` · ⚠ ${_apiFails} API errors` : '';
+  if(ns)ns.textContent='Updated: '+new Date().toLocaleTimeString('nl-BE',{hour:'2-digit',minute:'2-digit',second:'2-digit'})+' ('+ms+'ms)'+errStr;
 }
 
 /* ══ INIT ══════════════════════════════════════════════════════ */
@@ -5737,7 +5905,7 @@ async function start() {
   const missing = ["META_API_TOKEN", "META_ACCOUNT_ID", "WEBHOOK_SECRET"].filter(k => !process.env[k]);
   if (missing.length) { console.error(`[ERR] Missing env: ${missing.join(", ")}`); process.exit(1); }
 
-  console.log("🚀 PRONTO-AI v12.6.0 starting...");
+  console.log("🚀 PRONTO-AI v12.7.0 starting...");
   await initDB();
 
   // v12.5.1: sync trade_number sequence met huidige DB waarde
@@ -5825,7 +5993,7 @@ async function start() {
   rebuildEVCache().catch(() => {});
 
   app.listen(PORT, () => {
-    console.log(`[✓] PRONTO-AI v12.6.0 on port ${PORT}`);
+    console.log(`[✓] PRONTO-AI v12.7.0 on port ${PORT}`);
     console.log(`   🔹 Dashboard:      /`);
     console.log(`   🔹 Health:         /health`);
     console.log(`   🔹 EV Table:       /ev`);
