@@ -521,17 +521,31 @@ apiGet("/api/symbol-risk",         () => db.loadSymbolRiskConfig(),            {
 app.get("/api/open-positions", (req, res) => {
   const out = [];
   for (const [id, pos] of openPositions) {
-    out.push({ positionId: id, symbol: pos.symbol, direction: pos.direction,
+    out.push({
+      positionId: id, symbol: pos.symbol, direction: pos.direction,
       session: pos.session, vwapPosition: pos.vwapPosition, optimizerKey: pos.optimizerKey,
       entry: pos.entry, sl: pos.sl, tp: pos.tp, lots: pos.lots,
       riskPct: pos.riskPct, riskEUR: pos.riskEUR, openedAt: pos.openedAt,
       tradeNumber: pos.tradeNumber,
-      ghost: pos.ghost ? { maxRR: pos.ghost.maxRR, maxSlPctUsed: pos.ghost.maxSlPctUsed,
-        peakRRPos: pos.ghost.peakRRPos, peakRRNeg: pos.ghost.peakRRNeg,
-        slMilestones: pos.ghost.slMilestones, rrMilestones: pos.ghost.rrMilestones } : null });
+      // currentPrice not available server-side without live fetch — omit
+      ghost: pos.ghost ? {
+        maxRR:        pos.ghost.maxRR,
+        maxSlPctUsed: pos.ghost.maxSlPctUsed,
+        peakRRPos:    pos.ghost.peakRRPos,
+        peakRRNeg:    pos.ghost.peakRRNeg,
+        slMilestones: pos.ghost.slMilestones,   // {25: iso, 50: iso, 75: iso, 90: iso, 100: iso}
+        rrMilestones: pos.ghost.rrMilestones,   // {1: iso, 2: iso, 3: iso, 5: iso, 10: iso}
+        phantomSLHit: pos.ghost.phantomSLHit,
+        stopReason:   pos.ghost.stopReason,
+        openedAt:     pos.ghost.openedAt,
+        entry:        pos.ghost.entry,
+        sl:           pos.ghost.sl,
+      } : null,
+    });
   }
   res.json(out);
 });
+
 
 app.get("/api/tp-config", (req, res) => res.json(tpConfigs));
 
@@ -1334,8 +1348,18 @@ async function pollStatus(){
   if(!d) return;
   const eq=d.account?.equity;
   const bal=d.account?.balance;
-  if(eq!=null){ document.getElementById('h-pnl').textContent=(eq-bal>=0?'+':'')+'€'+((eq-bal)||0).toFixed(2); document.getElementById('h-pnl').className='hkv '+(eq-bal>=0?'cg':'cr'); }
-  if(bal!=null){ document.getElementById('h-bal').textContent='€'+f0(bal); document.getElementById('ov-bal').textContent='€'+f0(bal); }
+  if(eq!=null&&bal!=null){
+    const livePnl=eq-bal;
+    document.getElementById('h-pnl').textContent=(livePnl>=0?'+':'')+'€'+livePnl.toFixed(2);
+    document.getElementById('h-pnl').className='hkv '+(livePnl>=0?'cg':'cr');
+    document.getElementById('ov-pnl').textContent=(livePnl>=0?'+':'')+'€'+livePnl.toFixed(2);
+    document.getElementById('ov-pnl').className='ov-val '+(livePnl>=0?'cg':'cr');
+    document.getElementById('ov-pnl-sub').textContent=(livePnl>=0?'+':'')+livePnl.toFixed(2)+' on open trades';
+  }
+  if(bal!=null){
+    document.getElementById('h-bal').textContent='€'+f0(bal);
+    document.getElementById('ov-bal').textContent='€'+f0(bal);
+  }
   // Compliance date
   if(d.complianceDate){
     const cd=document.getElementById('cbar-date'); if(cd) cd.textContent='Compliance: '+d.complianceDate+' UTC';
@@ -1358,6 +1382,9 @@ async function loadAll(){
   loadPositions();
   loadGhostTrackers();
   renderOverview(_allTrades, daily, ghGrouped);
+  // Store best/worst from daily endpoint for period filtering
+  window._bestTrades  = daily?.bestTrades  || [];
+  window._worstTrades = daily?.worstTrades || [];
 }
 
 async function loadPositions(){
@@ -1420,15 +1447,21 @@ async function loadPositions(){
       '<td class="'+(pC(p.currentPnL))+' fw">'+eu(p.currentPnL)+'</td>'+
       '<td class="cd">'+f2(p.lots)+'</td>'+
       '<td class="'+(rPct&&rPct>0.04?'cr fw':rPct&&rPct>0.025?'co':'cg')+'">'+(rPct!=null?rPct+'%':'—')+'</td>'+
-      // Adverse milestones: -1.0 → -0.1
+      // ADV milestones: slMilestones keys = {25,50,75,90,100} = % SL used
+      // -1.0R = 100% SL, -0.5R = 50%, -0.1R ≈ 10% — map closest
       ADV_STEPS.map(v=>{
-        const pct=Math.round(v*100);
-        const ms=advMs[pct]||advMs[100-pct]||advMs[Math.round(v*100)];
+        // v=1.0→100%, v=0.9→90%, v=0.5→50%, v=0.1→10%
+        const pctKey=Math.round(v*100);
+        // Find closest key in slMilestones
+        const keys=Object.keys(advMs).map(Number).sort((a,b)=>Math.abs(a-pctKey)-Math.abs(b-pctKey));
+        const ms=keys.length&&Math.abs(keys[0]-pctKey)<=15?advMs[keys[0]]:null;
         return msT(ms,p.openedAt,false);
       }).join('')+
-      // Favorable milestones: +0.1 → +15.0
+      // FAV milestones: rrMilestones keys = {1,2,3,5,10} integers
       FAV_STEPS.map(v=>{
-        const ms=favMs[v]||favMs[Math.round(v*10)/10];
+        // Find exact or nearest integer key
+        const intV=Math.round(v);
+        const ms=favMs[v]||favMs[intV]||null;
         return msT(ms,p.openedAt,true);
       }).join('')+
       '<td class="cd" style="font-size:9px">'+dt(p.openedAt)+'</td>'+
@@ -1479,12 +1512,14 @@ async function loadGhostTrackers(){
       '<td class="'+(peakPos>=1?'cg fw':peakPos>0?'cy':'cd')+'">'+f2(peakPos)+'R</td>'+
       '<td class="'+(peakNeg>80?'cr fw':peakNeg>50?'cr':peakNeg>25?'co':'cd')+'">'+( peakNeg>0?'-'+f0(peakNeg)+'%':'—')+'</td>'+
       ADV_STEPS.map(v=>{
-        const pct=Math.round(v*100);
-        const ms=advMs[pct];
+        const pctKey=Math.round(v*100);
+        const keys=Object.keys(advMs).map(Number).sort((a,b)=>Math.abs(a-pctKey)-Math.abs(b-pctKey));
+        const ms=keys.length&&Math.abs(keys[0]-pctKey)<=15?advMs[keys[0]]:null;
         return msT(ms,g.openedAt,false);
       }).join('')+
       FAV_STEPS.map(v=>{
-        const ms=favMs[v]||favMs[Math.round(v*10)/10];
+        const intV=Math.round(v);
+        const ms=favMs[v]||favMs[intV]||null;
         return msT(ms,g.openedAt,true);
       }).join('')+
       '<td class="cd">'+msFmt(elapsed)+'</td>'+
@@ -1566,16 +1601,17 @@ function renderOverview(trades, daily, ghGrouped){
   document.getElementById('ft-sb').textContent=sb_t;
   document.getElementById('ft-t').textContent=total;
 
-  // % gain (realized P&L / balance)
-  const pnlSum=trades.reduce((s,t)=>s+(t.realizedPnlEUR||0),0);
-  const balEl=document.getElementById('ov-bal');
-  const balStr=balEl?.textContent?.replace('€','').replace(/,/g,'');
+  // % gain: use realized P&L from trades / balance from status
+  const pnlSum=(_allTrades||[]).reduce((s,t)=>s+(t.realizedPnlEUR||0),0);
+  const balStr=(document.getElementById('ov-bal')?.textContent||'').replace('€','').replace(/[,\s]/g,'');
   const bal=parseFloat(balStr)||0;
   if(bal>0){
-    const g=(pnlSum/bal*100).toFixed(2)+'%';
+    const gainPct=(pnlSum/bal*100);
+    const gainStr=(gainPct>=0?'+':'')+gainPct.toFixed(2)+'%';
     const gainEl=document.getElementById('ov-gain');
-    if(gainEl){ gainEl.textContent=(pnlSum>=0?'+':'')+g; gainEl.className='ov-val '+(pnlSum>=0?'cg':'cr'); }
-    document.getElementById('h-gain').textContent=(pnlSum>=0?'+':'')+g;
+    if(gainEl){ gainEl.textContent=gainStr; gainEl.className='ov-val '+(gainPct>=0?'cg':'cr'); }
+    document.getElementById('h-gain').textContent=gainStr;
+    document.getElementById('ov-gain-sub').textContent=(gainPct>=0?'+':'')+eu(pnlSum)+' realized';
   }
 
   // Ghost history count
@@ -1601,7 +1637,7 @@ function renderOverview(trades, daily, ghGrouped){
     '<td class="cb">'+(r.trades||0)+'</td>'+
     '<td class="cg">'+(r.wins||0)+'</td>'+
     '<td class="cr">'+(r.losses||0)+'</td>'+
-    '<td class="'+(+r.win_pct>=50?'cg':+r.win_pct>=40?'cy':'cr')+'">'+(r.win_pct!=null?f1(r.win_pct)+'%':'—')+'</td>'+
+    '<td class="'+(+r.trades>0&&(r.wins/r.trades*100)>=50?'cg':(+r.trades>0&&(r.wins/r.trades*100)>=40?'cy':'cr'))+'">'+(r.trades>0?f1(r.wins/r.trades*100)+'%':'—')+'</td>'+
     '<td class="'+pC(r.day_pnl)+' fw">'+eu(r.day_pnl)+'</td>'+
     '<td class="'+pC(r.cum_pnl)+'">'+eu(r.cum_pnl)+'</td>'+
     '<td class="cd">'+f2(r.avg_lots)+'</td>'+
@@ -1624,8 +1660,8 @@ function renderWRTable(typeFilter){
   }
   const rows=Object.entries(combos).sort((a,b)=>b[1]-a[1]).map(([k,n])=>{
     const [sess,dir,vwap,type]=k.split('|');
-    return '<tr>'+sBadge(sess)+dBadge(dir)+vBadge(vwap)+tBadge(type)+'<td class="cb fw">'+n+'</td></tr>';
-  }).map(r=>'<tr>'+r.replace(/<\/tr>/,'')).join('');
+    return '<tr><td>'+sBadge(sess)+'</td><td>'+dBadge(dir)+'</td><td>'+vBadge(vwap)+'</td><td>'+tBadge(type)+'</td><td class="cb fw">'+n+'</td></tr>';
+  }).join('');
   document.getElementById('wr-body').innerHTML=rows||emptyRow(5,'No trades');
   document.getElementById('wr-meta').textContent=filtered.length+' trades · compliance+';
 }
@@ -1640,25 +1676,32 @@ function setWRType(type,btn){
 
 // Best/worst setups
 function renderBW(period){
-  const trades=_allTrades;
+  // Use trades from daily API (has pnl field) for all-time
+  // For day/week filter, use _allTrades (full list with closedAt)
   const now=new Date();
   const today=new Date(now); today.setHours(0,0,0,0);
   const weekStart=new Date(now); weekStart.setDate(now.getDate()-now.getDay()); weekStart.setHours(0,0,0,0);
-  function filterT(arr){
-    if(period==='all') return arr;
-    return arr.filter(t=>{ const d=new Date(t.closedAt||t.openedAt); return period==='day'?d>=today:d>=weekStart; });
+  let best, worst;
+  if(period==='all'){
+    best  = (window._bestTrades  || []).slice(0,5);
+    worst = (window._worstTrades || []).slice(0,5);
+  } else {
+    const pool = _allTrades.filter(t=>{
+      const d=new Date(t.closedAt||t.openedAt);
+      return period==='day'?d>=today:d>=weekStart;
+    });
+    const sorted=pool.filter(t=>t.realizedPnlEUR!=null).sort((a,b)=>(b.realizedPnlEUR||0)-(a.realizedPnlEUR||0));
+    best  = sorted.slice(0,5);
+    worst = sorted.slice(-5).reverse();
   }
-  const filtered=filterT(trades);
-  const sorted=filtered.filter(t=>t.realizedPnlEUR!=null).sort((a,b)=>(b.realizedPnlEUR||0)-(a.realizedPnlEUR||0));
-  const best=sorted.slice(0,5), worst=sorted.slice(-5).reverse();
   const row=t=>'<tr>'+
     '<td class="cb fw" style="font-size:10px">'+t.symbol+'</td>'+
     '<td>'+dBadge(t.direction)+'</td>'+
     '<td>'+sBadge(t.session)+'</td>'+
     '<td>'+vBadge(t.vwapPosition)+'</td>'+
-    '<td class="cy" style="font-size:10px">'+f2(t.maxRR)+'R</td>'+
-    '<td class="'+(+t.realizedPnlEUR>=0?'cg':'cr')+' fw" style="font-size:10px">'+eu(t.realizedPnlEUR)+'</td>'+
-    '<td class="cd" style="font-size:9px">'+dtS(t.closedAt)+'</td>'+
+    '<td class="cy" style="font-size:10px">'+f2(t.maxRR||t.maxRR||0)+'R</td>'+
+    '<td class="'+((+(t.pnl||t.realizedPnlEUR||0))>=0?'cg':'cr')+' fw" style="font-size:10px">'+eu(t.pnl!=null?t.pnl:t.realizedPnlEUR)+'</td>'+
+    '<td class="cd" style="font-size:9px">'+dtS(t.openedAt||t.closedAt)+'</td>'+
   '</tr>';
   document.getElementById('best-body').innerHTML=best.map(row).join('')||emptyRow(7,'No trades');
   document.getElementById('worst-body').innerHTML=worst.map(row).join('')||emptyRow(7,'No trades');
@@ -1773,9 +1816,9 @@ async function loadGhostCombo(){
   document.getElementById('ghc-meta').textContent=rows.length+' combos · only finalized ghosts';
   if(!rows.length){ body.innerHTML=emptyRow(26,'No ghost combo data yet'); return; }
   body.innerHTML=rows.map(g=>{
-    const ms=g.milestones??{};
-    const mT=k=>ms[k]?msFmt(Math.round(ms[k])):'—';
-    const evCls=g.evScore>0?'cg fw':g.evScore<0?'cr':'cd';
+    // loadGhostGrouped returns: {optimizerKey, symbol, session, direction, vwapPosition,
+    //   n, avgMaxRR, bestMaxRR, avgSlPct, avgTpRR, slHits, lastOpened}
+    // Milestone timing not available from this endpoint — show what we have
     return '<tr>'+
       '<td class="cb fw">'+g.symbol+'</td>'+
       '<td>'+tBadge(symType(g.symbol))+'</td>'+
@@ -1783,21 +1826,15 @@ async function loadGhostCombo(){
       '<td>'+dBadge(g.direction)+'</td>'+
       '<td>'+vBadge(g.vwapPosition)+'</td>'+
       '<td class="'+(g.n>=5?'cy fw':'cc')+'">'+g.n+'</td>'+
-      '<td class="cc">'+(g.nEV||0)+'</td>'+
+      '<td class="cc">'+g.n+'</td>'+
       '<td class="cg fw">'+f2(g.bestMaxRR)+'R</td>'+
       '<td class="cd">'+f2(g.avgMaxRR)+'R</td>'+
-      '<td class="cd">'+mT('sl_25')+'</td><td class="cd">'+mT('sl_50')+'</td>'+
-      '<td class="cd">'+mT('sl_75')+'</td><td class="cd">'+mT('sl_100')+'</td>'+
-      '<td class="cg">'+mT('rr_05')+'</td><td class="cg">'+mT('rr_1')+'</td>'+
-      '<td class="cg">'+mT('rr_2')+'</td><td class="cg">'+mT('rr_3')+'</td>'+
-      '<td class="cg">'+mT('rr_5')+'</td><td class="cg">'+mT('rr_10')+'</td>'+
-      '<td class="cg">'+mT('rr_15')+'</td>'+
-      '<td class="cd" style="font-size:9px">'+(g.topStopReason||'—')+'</td>'+
-      '<td class="cd">'+f1(g.maeP50)+'%</td>'+
-      '<td class="cd">'+f1(g.maeP75)+'%</td>'+
-      '<td class="'+(g.maeP90<50?'cg':g.maeP90<75?'cy':'cr')+'">'+f1(g.maeP90)+'%</td>'+
-      '<td class="'+(g.evSL?'cy':'cd')+'" style="font-size:9px">'+(g.evSL||'—')+'</td>'+
-      '<td class="'+(g.lockedRR?'cg fw':'cd')+'" style="font-size:9px">'+(g.lockedRR?g.lockedRR+'R':'need≥5')+'</td>'+
+      '<td class="cd" colspan="4">'+f1(g.avgSlPct)+'% avg SL used</td>'+
+      '<td class="cg" colspan="7">'+f2(g.avgTpRR)+'R avg TP used</td>'+
+      '<td class="cr" style="font-size:9px">'+(g.slHits||0)+' SL hits</td>'+
+      '<td class="cd" colspan="3">'+dt(g.lastOpened)+'</td>'+
+      '<td class="cd">—</td>'+
+      '<td class="'+(g.avgTpRR>=2?'cg fw':'cd')+'">'+f2(g.avgTpRR)+'R</td>'+
     '</tr>';
   }).join('');
 }
@@ -1841,15 +1878,15 @@ function renderEV(){
       '<td>'+dBadge(r.direction)+'</td>'+
       '<td>'+vBadge(r.vwapPosition)+'</td>'+
       '<td class="'+(r.n>=5?'cy fw':'cc')+'">'+r.n+'</td>'+
-      '<td class="cd">'+(r.nTrades||0)+'</td>'+
+      '<td class="cd">'+r.n+'</td>'+
       '<td class="cg">'+(r.bestMaxRR?f2(r.bestMaxRR)+'R':'—')+'</td>'+
       '<td class="cd">'+f2(r.avgMaxRR)+'R</td>'+
-      '<td class="'+(r.evScore>0?'cg fw':r.evScore<0?'cr':'cd')+'">'+(r.evScore!=null?f2(r.evScore):'—')+'</td>'+
+      '<td class="cd">—</td>'+
       '<td class="'+(hasEV?'cg':'cy')+'" style="font-size:9px">'+(hasEV?'✓ EV+ Locked':'need≥5')+'</td>'+
       '<td class="'+(tp?.lockedRR?'cg fw':'cd')+'">'+(tp?.lockedRR?tp.lockedRR+'R':'—')+'</td>'+
-      '<td class="cd">'+(r.avgTimeToSL?msFmt(r.avgTimeToSL):'—')+'</td>'+
-      '<td class="'+(r.maeP90<50?'cg':r.maeP90<75?'cy':'cr')+'">'+(r.maeP90!=null?f1(r.maeP90)+'%':'—')+'</td>'+
-      '<td class="'+(r.totalPnl>=0?'cg':'cr')+' fw">'+(r.totalPnl!=null?eu(r.totalPnl):'—')+'</td>'+
+      '<td class="cd">'+f1(r.avgSlPct)+'% avg SL</td>'+
+      '<td class="cd">—</td>'+
+      '<td class="cd">—</td>'+
     '</tr>';
   }).join('');
 }
@@ -1858,27 +1895,36 @@ function renderEV(){
 async function loadEVSL(){
   const d=await api('/api/mae-stats')||[];
   const body=document.getElementById('evsl-body');
-  if(!d.length){ body.innerHTML=emptyRow(14,'Min 5 ghost trades required per combo'); return; }
+  if(!d.length){ body.innerHTML=emptyRow(14,'Min 3 ghost trades required per combo · waiting for ghost data'); return; }
+  // Response: {optimizerKey, nTotal, nSurvivors, nSLHit, maeP50, maeP75, maeP90, maeAvg, slReduction}
+  // slReduction: {pct, label, color} or null
   body.innerHTML=d.map(r=>{
+    // Parse optimizerKey: SYMBOL_session_direction_vwap
+    const parts=(r.optimizerKey||'').split('_');
+    const sym=parts[0]||'—';
+    const sess=parts[1]||'—';
+    const dir=parts[2]||'—';
+    const vwap=parts[3]||'—';
     const p90=r.maeP90!=null?parseFloat(r.maeP90):null;
-    const cls=p90==null?'cd':p90<50?'cg':p90<75?'cy':'cr';
-    const advice=p90==null?'—':p90<50?'✓ Tighten SL':p90<75?'⚠ Moderate':'✗ Keep SL';
-    const pot=p90!=null&&p90<100?(100-p90).toFixed(1)+'% reduction possible':'—';
+    const n=r.nTotal||0;
+    const slRec=r.slReduction;
+    const cls=slRec?.color==='g'?'cg':slRec?.color==='y'?'cy':slRec?.color==='r'?'cr':'cd';
+    const pot=p90!=null&&p90<100?(100-p90).toFixed(1)+'% possible':'—';
     return '<tr>'+
-      '<td class="cb fw">'+r.symbol+'</td>'+
-      '<td>'+tBadge(symType(r.symbol))+'</td>'+
-      '<td>'+sBadge(r.session)+'</td>'+
-      '<td>'+dBadge(r.direction)+'</td>'+
-      '<td>'+vBadge(r.vwapPosition)+'</td>'+
-      '<td class="'+(r.n>=5?'cy':'cc')+'">'+r.n+'</td>'+
+      '<td class="cb fw">'+sym+'</td>'+
+      '<td>'+tBadge(symType(sym))+'</td>'+
+      '<td>'+sBadge(sess)+'</td>'+
+      '<td>'+dBadge(dir)+'</td>'+
+      '<td>'+vBadge(vwap)+'</td>'+
+      '<td class="'+(n>=5?'cy':'cc')+'">'+n+' <span class="cd" style="font-size:9px">('+r.nSurvivors+' surv / '+r.nSLHit+' SL)</span></td>'+
       '<td class="cg">'+f1(r.maeP50)+'%</td>'+
       '<td class="cy">'+f1(r.maeP75)+'%</td>'+
       '<td class="'+cls+' fw">'+f1(r.maeP90)+'%</td>'+
-      '<td class="'+cls+' fw" style="font-size:9px">'+advice+'</td>'+
-      '<td class="cd">'+(r.bestSlPct!=null?f1(r.bestSlPct)+'%':'—')+'</td>'+
+      '<td class="'+cls+' fw" style="font-size:9px">'+(slRec?.label||'—')+'</td>'+
+      '<td class="cd">'+f1(r.maeAvg)+'% avg</td>'+
       '<td class="'+(pot!=='—'?'cg':'cd')+'" style="font-size:9px">'+pot+'</td>'+
-      '<td class="cd">'+(r.shadowP50!=null?f1(r.shadowP50)+'%':'—')+'</td>'+
-      '<td class="cd">'+(r.shadowP90!=null?f1(r.shadowP90)+'%':'—')+'</td>'+
+      '<td class="cd">—</td>'+
+      '<td class="cd">—</td>'+
     '</tr>';
   }).join('');
 }
@@ -1890,13 +1936,19 @@ async function loadSignals(){
   document.getElementById('sig-tot').textContent=s.total||0;
   document.getElementById('sig-placed').textContent=s.placed||0;
   document.getElementById('sig-conv').textContent=s.conversionPct!=null?pct(s.conversionPct):'—';
-  const blocks=s.breakdown||{};
-  document.getElementById('blk-tot').textContent=s.totalBlocked||0;
-  document.getElementById('blk-dup').textContent=blocks.duplicate_open||0;
-  document.getElementById('blk-vw').textContent=blocks.vwap_exhausted||0;
-  document.getElementById('blk-win').textContent=blocks.outside_window||0;
-  document.getElementById('blk-cur').textContent=blocks.currency_budget||0;
-  document.getElementById('blk-ny').textContent=blocks.ny_dead_zone||0;
+  // byOutcome: [{outcome:'PLACED',count:n},{outcome:'REJECTED',count:n},...]
+  const totalBlocked=(s.byOutcome||[]).filter(o=>o.outcome==='REJECTED').reduce((sum,o)=>sum+(o.count||0),0);
+  document.getElementById('blk-tot').textContent=totalBlocked;
+  // topRejectReasons: [{reason:'DUPLICATE_OPEN',count:n,pairs:[...]},...]
+  const reasons={}; (s.topRejectReasons||[]).forEach(r=>reasons[r.reason?.toLowerCase()]=r.count||0);
+  document.getElementById('blk-dup').textContent=reasons['duplicate_open']||reasons['duplicate']||0;
+  document.getElementById('blk-vw').textContent=reasons['vwap_exhausted']||reasons['vwap']||0;
+  document.getElementById('blk-win').textContent=reasons['outside_window']||reasons['outside']||0;
+  document.getElementById('blk-cur').textContent=reasons['currency_budget']||reasons['budget']||0;
+  document.getElementById('blk-ny').textContent=reasons['ny_dead_zone']||reasons['dead_zone']||0;
+  // nb-sig badge
+  const nbSig=document.getElementById('nb-sig');
+  if(nbSig&&totalBlocked>0){nbSig.textContent=totalBlocked;nbSig.style.display='';}
 
   const h=(hist||[]).filter(r=>r.status==='OK');
   document.getElementById('placed-body').innerHTML=h.length?h.map(r=>
