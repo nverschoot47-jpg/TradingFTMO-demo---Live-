@@ -1040,28 +1040,36 @@ app.get("/api/mae-stats", async (req, res) => {
   }
 });
 
+// Helper: wrap any DB call with a timeout
+function withTimeout(promise, ms, fallback) {
+  return Promise.race([
+    promise,
+    new Promise(resolve => setTimeout(() => resolve(fallback), ms))
+  ]);
+}
+
 app.get("/api/performance", async (req, res) => {
+  const empty = { total: 0, tpCount: 0, slCount: 0, winRate: 0,
+    avgWinner: 0, avgLoser: 0, grossWins: 0, grossLosses: 0,
+    profitFactor: null, totalPnl: 0, avgPnlPerTrade: 0,
+    maxDrawdown: 0, pnlCurve: [] };
   try {
-    const data = await db.loadPerformanceSummary();
-    res.json(data ?? {
-      total: 0, tpCount: 0, slCount: 0, winRate: 0,
-      avgWinner: 0, avgLoser: 0, grossWins: 0, grossLosses: 0,
-      profitFactor: null, totalPnl: 0, avgPnlPerTrade: 0,
-      maxDrawdown: 0, pnlCurve: [],
-    });
+    const data = await withTimeout(db.loadPerformanceSummary(), 7000, empty);
+    res.json(data ?? empty);
   } catch (e) {
     recordError(`/api/performance: ${e.message}`);
-    res.json({ total: 0, tpCount: 0, slCount: 0, winRate: 0, pnlCurve: [] });
+    res.json(empty);
   }
 });
 
 app.get("/api/daily-breakdown", async (req, res) => {
+  const empty = { days: [], maxWinStreak: 0, maxLossStreak: 0, maxDrawdownDay: 0, bestTrades: [], worstTrades: [] };
   try {
-    const data = await db.loadDailyBreakdown();
-    res.json(data ?? { days: [], maxWinStreak: 0, maxLossStreak: 0, maxDrawdownDay: 0, bestTrades: [], worstTrades: [] });
+    const data = await withTimeout(db.loadDailyBreakdown(), 7000, empty);
+    res.json(data ?? empty);
   } catch (e) {
     recordError(`/api/daily-breakdown: ${e.message}`);
-    res.json({ days: [], maxWinStreak: 0, maxLossStreak: 0, maxDrawdownDay: 0, bestTrades: [], worstTrades: [] });
+    res.json(empty);
   }
 });
 
@@ -1470,9 +1478,10 @@ setInterval(updateClock, 1000);
 // ── Status poller ────────────────────────────────────────────────
 let statusOK = false;
 async function pollStatus() {
-  const data = await apiFetch('/status', 5000);
   const sb = $('sbadge');
   const eb = $('ebadge');
+  // Use short timeout — /status should always respond in <3s
+  const data = await apiFetch('/status', 4000);
   if (!data) {
     sb.textContent = '✖ offline';
     sb.className = 'badge err';
@@ -1481,16 +1490,13 @@ async function pollStatus() {
   }
   statusOK = true;
   const eq = data.account?.equity;
-  sb.textContent = (eq != null ? '€' + f0(eq) + ' | ' : '') + data.openPositions + ' pos open';
+  sb.textContent = (eq != null ? '€' + f0(eq) + ' | ' : '') +
+                   (data.openPositions || 0) + ' pos open';
   sb.className = 'badge ok';
-
-  // Compliance banner
   if (data.complianceDate) {
     $('banner').textContent = '📅 Data vanaf: ' + data.complianceDate + ' UTC';
   }
-
-  // Error badge
-  if (data.errorCount > 0) {
+  if ((data.errorCount || 0) > 0) {
     eb.textContent = '⚠ ' + data.errorCount + ' fout' + (data.errorCount > 1 ? 'en' : '') + ' /1u';
     eb.className = 'badge warn';
     eb.style.display = '';
@@ -1500,58 +1506,82 @@ async function pollStatus() {
 }
 
 // ── Overview ─────────────────────────────────────────────────────
-async function loadOverview() {
+function renderKPIs(p) {
   const kg = $('kpi-grid');
-  const dw = $('daily-wrap');
-
-  const [perf, daily] = await Promise.all([
-    apiFetch('/api/performance'),
-    apiFetch('/api/daily-breakdown'),
-  ]);
-
-  const p = perf || {};
-  const kpis = [
-    ['Trades',        f0(p.total),                          ''],
-    ['Win Rate',      pct(p.winRate),                       p.winRate >= 50 ? 'gr' : 'rd'],
-    ['Profit Factor', p.profitFactor != null ? f2(p.profitFactor) : '—', (p.profitFactor||0) >= 1 ? 'gr' : 'rd'],
-    ['Totaal PnL',    eur(p.totalPnl),                      clr(p.totalPnl)],
-    ['Gem. Winner',   eur(p.avgWinner),                     'gr'],
-    ['Gem. Loser',    eur(p.avgLoser),                      'rd'],
-    ['Max Drawdown',  eur(p.maxDrawdown),                   'rd'],
-    ['TP Trades',     f0(p.tpCount),                        'gr'],
-    ['SL Trades',     f0(p.slCount),                        'rd'],
-  ];
-
-  if (!p.total && p.total !== 0) {
-    kg.innerHTML = '<div class="kpi"><div class="kpi-label">Status</div><div class="kpi-value rd">DB fout</div></div>';
-  } else if (p.total === 0) {
-    kg.innerHTML = '<div class="kpi" style="grid-column:1/-1"><div class="kpi-label">Status</div><div class="kpi-value mt">Geen trades nog</div></div>';
-  } else {
-    kg.innerHTML = kpis.map(([l, v, c]) =>
-      '<div class="kpi"><div class="kpi-label">' + l + '</div><div class="kpi-value ' + c + '">' + v + '</div></div>'
-    ).join('');
+  if (!p || p === null) {
+    kg.innerHTML = kpiBox('DB Fout','—','rd') + kpiBox('Herlaad','pagina','yl');
+    return;
   }
+  const total = parseInt(p.total) || 0;
+  if (total === 0) {
+    kg.innerHTML = '<div class="kpi" style="grid-column:1/-1">' +
+      '<div class="kpi-label">Systeem Status</div>' +
+      '<div class="kpi-value gr">✓ Online</div>' +
+      '<div class="kpi-label" style="margin-top:6px">Wacht op eerste trades…</div></div>';
+    return;
+  }
+  kg.innerHTML = [
+    kpiBox('Trades',        f0(total),                                    ''),
+    kpiBox('Win Rate',      pct(p.winRate),                               (p.winRate||0)>=50?'gr':'rd'),
+    kpiBox('Profit Factor', p.profitFactor!=null?f2(p.profitFactor):'—', (p.profitFactor||0)>=1?'gr':'rd'),
+    kpiBox('Totaal PnL',    eur(p.totalPnl),                              clr(p.totalPnl||0)),
+    kpiBox('Gem. Winner',   eur(p.avgWinner),                             'gr'),
+    kpiBox('Gem. Loser',    eur(p.avgLoser),                              'rd'),
+    kpiBox('Max Drawdown',  eur(p.maxDrawdown),                           'rd'),
+    kpiBox('TP',            f0(p.tpCount),                                'gr'),
+    kpiBox('SL',            f0(p.slCount),                                'rd'),
+  ].join('');
+}
 
+function kpiBox(label, value, cls) {
+  return '<div class="kpi"><div class="kpi-label">'+label+'</div><div class="kpi-value '+cls+'">'+value+'</div></div>';
+}
+
+function renderDaily(daily) {
+  const dw  = $('daily-wrap');
   const days = daily?.days || [];
   if (!days.length) {
-    dw.innerHTML = '<div class="empty">Geen dagdata beschikbaar</div>';
-  } else {
-    dw.innerHTML = '<table><thead><tr>' +
-      '<th>Datum</th><th>Trades</th><th>W</th><th>L</th><th>PnL €</th><th>Cum PnL</th><th>Gem RR</th>' +
-      '</tr></thead><tbody>' +
-      days.slice(0, 30).map(d =>
-        '<tr>' +
-        '<td class="mt">' + (d.trade_date || '—') + '</td>' +
-        '<td>' + (d.trades || 0) + '</td>' +
-        '<td class="gr">' + (d.wins || 0) + '</td>' +
-        '<td class="rd">' + (d.losses || 0) + '</td>' +
-        '<td class="' + clr(d.day_pnl) + '">' + eur(d.day_pnl) + '</td>' +
-        '<td class="' + clr(d.cum_pnl) + '">' + eur(d.cum_pnl) + '</td>' +
-        '<td>' + f2(d.avg_rr) + '</td>' +
-        '</tr>'
-      ).join('') +
-      '</tbody></table>';
+    dw.innerHTML = '<div class="empty">Nog geen dagdata</div>';
+    return;
   }
+  dw.innerHTML = '<div style="overflow-x:auto"><table><thead><tr>' +
+    '<th>Datum</th><th>Trades</th><th>W</th><th>L</th>' +
+    '<th>PnL €</th><th>Cum €</th><th>Gem RR</th>' +
+    '</tr></thead><tbody>' +
+    days.slice(0,30).map(d =>
+      '<tr>' +
+      '<td class="mt">'+  (d.trade_date||'—')              +'</td>'+
+      '<td>'+             (d.trades||0)                     +'</td>'+
+      '<td class="gr">'+  (d.wins||0)                       +'</td>'+
+      '<td class="rd">'+  (d.losses||0)                     +'</td>'+
+      '<td class="'+clr(d.day_pnl||0)+'">'+eur(d.day_pnl)  +'</td>'+
+      '<td class="'+clr(d.cum_pnl||0)+'">'+eur(d.cum_pnl)  +'</td>'+
+      '<td>'+             f2(d.avg_rr)                      +'</td>'+
+      '</tr>'
+    ).join('') +
+    '</tbody></table></div>';
+}
+
+async function loadOverview() {
+  // Show placeholder KPIs immediately so page never looks broken
+  const kg = $('kpi-grid');
+  if (kg.children.length <= 1) {
+    kg.innerHTML = [
+      kpiBox('Trades','…','mt'), kpiBox('Win Rate','…','mt'),
+      kpiBox('Profit Factor','…','mt'), kpiBox('Totaal PnL','…','mt'),
+      kpiBox('Gem. Winner','…','mt'), kpiBox('Gem. Loser','…','mt'),
+      kpiBox('Max Drawdown','…','mt'), kpiBox('TP','…','mt'), kpiBox('SL','…','mt'),
+    ].join('');
+  }
+
+  // Fetch both in parallel with individual timeouts
+  const [perf, daily] = await Promise.all([
+    apiFetch('/api/performance',     10000),
+    apiFetch('/api/daily-breakdown', 10000),
+  ]);
+
+  renderKPIs(perf);
+  renderDaily(daily);
 }
 
 // ── Posities ─────────────────────────────────────────────────────
@@ -1754,15 +1784,13 @@ async function loadSpreads() {
 }
 
 // ── Init ─────────────────────────────────────────────────────────
-// Load status + overview immediately on page load
-(async () => {
-  await pollStatus();
-  await loadOverview();
-})();
+// Fire ALL in parallel — never await sequentially
+pollStatus();
+loadOverview();
 
 // Refresh intervals
-setInterval(pollStatus,  15000);   // status every 15s
-setInterval(loadOverview, 60000);  // overview every 60s
+setInterval(pollStatus,   15000);
+setInterval(loadOverview, 60000);
 
 </script>
 </body>
