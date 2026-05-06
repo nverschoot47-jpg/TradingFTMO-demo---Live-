@@ -1,6 +1,6 @@
 "use strict";
 // ═══════════════════════════════════════════════════════════════
-//  PRONTO-AI  v13.0.0  server.js
+//  PRONTO-AI  v13.1.0  server.js
 //  KEY FIX: app.listen() fires BEFORE any DB/MetaAPI call.
 //  The server is always reachable. DB init runs in background.
 // ═══════════════════════════════════════════════════════════════
@@ -310,9 +310,15 @@ app.get("/", (req, res) => {
   res.send(dashboardHTML());
 });
 
+// /dashboard → alias for root (fixes broken /dashboard link)
+app.get("/dashboard", (req, res) => {
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(dashboardHTML());
+});
+
 // ── Health ────────────────────────────────────────────────────────
 app.get("/health", (req, res) => {
-  res.json({ ok: true, version: "13.0.0", dbReady, ts: new Date().toISOString() });
+  res.json({ ok: true, version: "13.1.0", dbReady, ts: new Date().toISOString() });
 });
 
 // ── Status (always fast) ──────────────────────────────────────────
@@ -584,6 +590,117 @@ app.post("/api/symbol-risk", async (req, res) => {
   if (dbReady) await db.upsertSymbolRisk(symbol, riskPct).catch(e => recordError(e.message));
   symbolRiskMap[symbol] = parseFloat(riskPct);
   res.json({ ok: true, symbol, riskPct });
+});
+
+// ══════════════════════════════════════════════════════════════════
+//  /api/snapshot  — full system state in one call (for Claude / monitoring)
+//  Secret required. Returns everything needed to diagnose any issue.
+// ══════════════════════════════════════════════════════════════════
+app.get("/api/snapshot", async (req, res) => {
+  if (!checkSecret(req, res)) return;
+  const safe = async (fn, fallback) => { try { return await fn(); } catch { return fallback; } };
+
+  const [acct, positions, trades, ghostGrouped, daily, performance,
+         signalStats, tpConfig, symbolRisk, shadowAnalysis, webhookHistory,
+         signalRejects, blockedRaw, spreadStats, evKeys] = await Promise.all([
+    safe(getAccountInfo,                        null),
+    safe(getPositions,                          []),
+    safe(() => dbReady ? db.loadAllTrades()                          : [], []),
+    safe(() => dbReady ? db.loadGhostGrouped()                       : [], []),
+    safe(() => dbReady ? db.loadDailyBreakdown()                     : {}  , {}),
+    safe(() => dbReady ? db.loadPerformanceSummary()                 : {}  , {}),
+    safe(() => dbReady ? db.loadSignalStats()                        : {}  , {}),
+    safe(() => Promise.resolve(tpConfigs),                           {}),
+    safe(() => Promise.resolve(symbolRiskMap),                       {}),
+    safe(() => dbReady ? db.loadAllShadowAnalysis()                  : [], []),
+    safe(() => dbReady ? db.loadWebhookHistory(50)                   : [], []),
+    safe(() => dbReady ? db.loadSignalRejects({})                    : [], []),
+    safe(() => dbReady ? db.loadBlockedRaw()                         : [], []),
+    safe(() => dbReady ? db.loadSpreadStats({})                      : [], []),
+    safe(() => Promise.resolve(Object.keys(keyRiskMults)),           []),
+  ]);
+
+  res.json({
+    meta: {
+      version: "13.1.0",
+      ts: new Date().toISOString(),
+      dbReady,
+      errorCount: getErrorCount(),
+      recentErrors: errorLog.slice(-20),
+      complianceDate: liveComplianceDate,
+      openPositionCount: openPositions.size,
+    },
+    account: acct ? {
+      balance: acct.balance, equity: acct.equity,
+      margin: acct.margin, freeMargin: acct.freeMargin,
+      marginLevel: acct.marginLevel, currency: acct.currency,
+    } : null,
+    livePositions: positions.map(p => ({
+      id: p.id, symbol: p.symbol, type: p.type,
+      volume: p.volume, openPrice: p.openPrice,
+      currentPrice: p.currentPrice, profit: p.profit,
+      swap: p.swap, openTime: p.openTime,
+    })),
+    openPositions: (() => {
+      const out = [];
+      for (const [id, pos] of openPositions)
+        out.push({ positionId: id, symbol: pos.symbol, direction: pos.direction,
+          session: pos.session, entry: pos.entry, sl: pos.sl, tp: pos.tp,
+          riskPct: pos.riskPct, riskEUR: pos.riskEUR, openedAt: pos.openedAt,
+          ghost: pos.ghost ? { maxRR: pos.ghost.maxRR, maxSlPctUsed: pos.ghost.maxSlPctUsed,
+            phantomSLHit: pos.ghost.phantomSLHit, stopReason: pos.ghost.stopReason } : null });
+      return out;
+    })(),
+    performance,
+    daily,
+    signalStats,
+    tpConfig,
+    symbolRisk,
+    keyRiskMults,
+    evKeys,
+    recentTrades:  (trades  || []).slice(-30),
+    ghostGrouped:  (ghostGrouped || []).slice(0, 50),
+    shadowAnalysis:(shadowAnalysis || []).slice(0, 30),
+    webhookHistory:(webhookHistory || []).slice(0, 50),
+    signalRejects: (signalRejects || []).slice(0, 30),
+    blockedRaw:    (blockedRaw || []).slice(0, 50),
+    spreadStats:   (spreadStats || []).slice(0, 30),
+    endpoints: [
+      "GET  /",
+      "GET  /dashboard",
+      "GET  /health",
+      "GET  /status",
+      "GET  /compliance-date",
+      "POST /compliance-date          [secret]",
+      "POST /webhook                  [secret]",
+      "POST /close/:id                [secret]",
+      "POST /history-deals            [secret]",
+      "GET  /api/snapshot             [secret]",
+      "GET  /api/open-positions",
+      "GET  /api/trades",
+      "GET  /api/daily-breakdown",
+      "GET  /api/performance",
+      "GET  /api/tp-config",
+      "GET  /api/ev-stats?key=",
+      "GET  /api/ghost-trades",
+      "GET  /api/ghost-grouped",
+      "GET  /api/ghost-history-by-pair",
+      "GET  /api/ghost-combo-analysis",
+      "GET  /api/shadow-analysis",
+      "GET  /api/shadow-winners",
+      "GET  /api/mae-stats",
+      "GET  /api/signal-stats",
+      "GET  /api/signal-rejects",
+      "GET  /api/blocked-raw",
+      "GET  /api/webhook-history",
+      "GET  /api/spread-stats",
+      "GET  /api/spread-log",
+      "GET  /api/band-ghosts",
+      "GET  /api/band-ghost-stats?bandTier=",
+      "GET  /api/symbol-risk",
+      "POST /api/symbol-risk          [secret]",
+    ],
+  });
 });
 
 // ══════════════════════════════════════════════════════════════════
