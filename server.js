@@ -1,6 +1,6 @@
 "use strict";
 // ═══════════════════════════════════════════════════════════════
-//  PRONTO-AI  v12.7.1  server.js
+//  PRONTO-AI  v13.0.0  server.js
 //  KEY FIX: app.listen() fires BEFORE any DB/MetaAPI call.
 //  The server is always reachable. DB init runs in background.
 // ═══════════════════════════════════════════════════════════════
@@ -312,13 +312,13 @@ app.get("/", (req, res) => {
 
 // ── Health ────────────────────────────────────────────────────────
 app.get("/health", (req, res) => {
-  res.json({ ok: true, version: "12.7.1", dbReady, ts: new Date().toISOString() });
+  res.json({ ok: true, version: "13.0.0", dbReady, ts: new Date().toISOString() });
 });
 
 // ── Status (always fast) ──────────────────────────────────────────
 app.get("/status", async (req, res) => {
   const base = {
-    version:        "12.7.1",
+    version:        "13.0.0",
     dbReady,
     openPositions:  openPositions.size,
     complianceDate: liveComplianceDate,
@@ -576,383 +576,1431 @@ app.post("/api/symbol-risk", async (req, res) => {
 //  DASHBOARD HTML  (self-contained — all JS inline)
 // ══════════════════════════════════════════════════════════════════
 function dashboardHTML() {
+// Symbol type maps (mirrored from session.js for client-side use)
+const FOREX_SYMS     = ['AUDCAD','AUDCHF','AUDNZD','AUDUSD','CADCHF','EURAUD','EURCHF','EURUSD','GBPAUD','GBPNZD','GBPUSD','NZDCAD','NZDCHF','NZDUSD','USDCAD','USDCHF'];
+const INDEX_SYMS     = ['DE30EUR','NAS100USD','UK100GBP','US30USD'];
+const COMM_SYMS      = ['XAUUSD'];
+const FIXED_RISK_PCT = 0.000375;
+const COMPLIANCE_MS  = new Date('2026-05-03T00:00:00.000Z').getTime();
+
+// Build milestone arrays: -1.0 → -0.1 then +0.1 → +15.0 in 0.1 steps
+const ADV_STEPS = [];
+for (let v = 1.0; v >= 0.1 - 1e-9; v = Math.round((v - 0.1) * 10) / 10) ADV_STEPS.push(v);
+// ADV_STEPS = [1.0, 0.9, ..., 0.1]
+const FAV_STEPS = [];
+for (let v = 0.1; v <= 15.0 + 1e-9; v = Math.round((v + 0.1) * 10) / 10) FAV_STEPS.push(v);
+
 return `<!DOCTYPE html>
-<html lang="nl">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PRONTO-AI v12.7.1</title>
+<title>PRONTO·AI v13.0</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-:root{--bg:#0d1117;--sur:#161b22;--bor:#30363d;--tx:#c9d1d9;--mt:#8b949e;
-  --gr:#3fb950;--rd:#f85149;--yl:#d29922;--bl:#58a6ff}
-body{background:var(--bg);color:var(--tx);font:13px/1.5 'SF Mono',Consolas,monospace;min-height:100vh}
-a{color:var(--bl)}
+:root{
+  --bg:#080c12;--bg2:#0d1117;--bg3:#161b22;--bg4:#1c2128;
+  --bdr:#21262d;--bdr2:#30363d;
+  --ink:#e6edf3;--ink2:#c9d1d9;--ink3:#8b949e;
+  --b:#58a6ff;--g:#3fb950;--r:#f85149;--y:#d29922;--p:#bc8cff;--c:#39d0d8;--o:#f0883e;
+  --b2:rgba(88,166,255,.12);--g2:rgba(63,185,80,.12);--r2:rgba(248,81,73,.12);
+  --y2:rgba(210,153,34,.12);--p2:rgba(188,140,255,.12);
+}
+body{background:var(--bg);color:var(--ink2);font:12px/1.5 'SF Mono',Consolas,monospace;height:100vh;display:flex;flex-direction:column;overflow:hidden}
 /* header */
-header{background:var(--sur);border-bottom:1px solid var(--bor);
-  padding:8px 14px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-header h1{font-size:14px;color:var(--bl)}
-.chip{padding:2px 8px;border-radius:4px;font-size:11px;background:var(--bor);white-space:nowrap}
-.chip.ok {background:#0f2d0f;color:var(--gr);border:1px solid #2a5a2a}
-.chip.err{background:#2d0f0f;color:var(--rd);border:1px solid #5a2a2a}
-.chip.yl {background:#2d200f;color:var(--yl);border:1px solid #5a4a1a}
-#clock{margin-left:auto;color:var(--mt);font-size:11px}
-/* banner */
-#banner{background:#0d1830;border-bottom:1px solid var(--bor);
-  padding:4px 14px;color:var(--mt);font-size:11px}
-/* tabs */
-nav{display:flex;border-bottom:1px solid var(--bor);overflow-x:auto}
-.tab{padding:8px 13px;cursor:pointer;color:var(--mt);white-space:nowrap;
-  border-bottom:2px solid transparent;font-size:13px;transition:color .1s}
-.tab:hover{color:var(--tx)}
-.tab.on{color:var(--bl);border-bottom-color:var(--bl)}
-/* panels */
-.panel{display:none;padding:14px}
-.panel.on{display:block}
-/* kpi grid */
-.kgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:8px;margin-bottom:16px}
-.kpi{background:var(--sur);border:1px solid var(--bor);border-radius:6px;padding:10px}
-.kl{font-size:10px;color:var(--mt);text-transform:uppercase;letter-spacing:.4px;margin-bottom:2px}
-.kv{font-size:20px;font-weight:700}
+header{background:var(--bg2);border-bottom:1px solid var(--bdr2);padding:0 14px;display:flex;align-items:center;height:44px;gap:0;flex-shrink:0}
+.hbrand{font-size:14px;font-weight:700;color:var(--b);letter-spacing:-.3px;margin-right:14px;white-space:nowrap}
+.hkpis{display:flex;align-items:stretch;gap:0;flex:1;overflow:hidden;height:100%}
+.hkpi{display:flex;flex-direction:column;justify-content:center;padding:0 12px;border-right:1px solid var(--bdr);min-width:0;flex-shrink:0}
+.hkl{font-size:8px;font-weight:500;letter-spacing:.8px;text-transform:uppercase;color:var(--ink3);margin-bottom:1px}
+.hkv{font-size:16px;font-weight:700;white-space:nowrap}
+.hright{display:flex;align-items:center;gap:8px;margin-left:auto;padding-left:12px;flex-shrink:0}
+.live-dot{width:7px;height:7px;border-radius:50%;background:var(--g);box-shadow:0 0 6px var(--g);animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.sess-badge{padding:2px 8px;border-radius:3px;font-size:10px;font-weight:700;background:var(--b2);color:var(--b);border:1px solid rgba(88,166,255,.25)}
+#hclock{font-size:11px;color:var(--ink3)}
+.hbtn{padding:3px 10px;border-radius:4px;border:1px solid var(--bdr2);background:var(--bg3);color:var(--ink2);font:11px/1.4 'SF Mono',monospace;cursor:pointer}
+.hbtn:hover{border-color:var(--b);color:var(--b)}
+/* compliance bar */
+#cbar{background:#0a1628;border-bottom:1px solid rgba(88,166,255,.15);padding:3px 14px;font-size:10px;color:var(--ink3);flex-shrink:0;display:flex;align-items:center;gap:6px}
+#cbar strong{color:var(--c)}
+/* nav */
+nav{display:flex;border-bottom:1px solid var(--bdr2);background:var(--bg2);flex-shrink:0;overflow-x:auto}
+.ntab{padding:8px 14px;cursor:pointer;color:var(--ink3);white-space:nowrap;border-bottom:2px solid transparent;font-size:12px;transition:color .15s}
+.ntab:hover{color:var(--ink)}
+.ntab.on{color:var(--b);border-bottom-color:var(--b)}
+.nbadge{display:inline-flex;align-items:center;justify-content:center;min-width:18px;height:16px;border-radius:8px;font-size:9px;font-weight:700;padding:0 4px;margin-left:4px;background:var(--r2);color:var(--r)}
+/* pages */
+.npage{display:none;flex:1;overflow-y:auto}
+.npage.on{display:block}
+.pg{padding:14px;display:flex;flex-direction:column;gap:12px}
+/* card */
+.card{background:var(--bg2);border:1px solid var(--bdr);border-radius:8px;overflow:hidden}
+.card-hdr{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid var(--bdr);background:var(--bg3)}
+.card-title{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;display:flex;align-items:center;gap:6px}
+.dot{width:6px;height:6px;border-radius:50%;background:var(--g)}
+.dot.r{background:var(--r)}.dot.y{background:var(--y)}
+.cmeta{font-size:10px;color:var(--ink3)}
+/* kpi strip */
+.kstrip{display:flex;border-bottom:1px solid var(--bdr)}
+.ks{flex:1;padding:10px 12px;border-right:1px solid var(--bdr);min-width:0}
+.ks:last-child{border-right:none}
+.ksl{font-size:9px;color:var(--ink3);text-transform:uppercase;letter-spacing:.5px;margin-bottom:2px}
+.ksv{font-size:18px;font-weight:700;white-space:nowrap}
+.kss{font-size:9px;color:var(--ink3);margin-top:1px}
+/* section label */
+.slabel{font-size:9px;color:var(--ink3);text-transform:uppercase;letter-spacing:.5px;padding:7px 14px 4px;font-weight:600;border-bottom:1px solid var(--bdr)}
 /* table */
-.tbl-wrap{overflow-x:auto}
-table{width:100%;border-collapse:collapse;font-size:12px;min-width:500px}
-th{color:var(--mt);font-weight:400;font-size:10px;text-transform:uppercase;
-  padding:5px 8px;border-bottom:1px solid var(--bor);text-align:left;white-space:nowrap}
-td{padding:5px 8px;border-bottom:1px solid #1c2128;white-space:nowrap}
-tr:hover td{background:#1c2128}
-/* colors */
-.gr{color:var(--gr)}.rd{color:var(--rd)}.yl{color:var(--yl)}.bl{color:var(--bl)}.mt{color:var(--mt)}
-/* misc */
-h3{font-size:11px;color:var(--mt);text-transform:uppercase;letter-spacing:.4px;margin:14px 0 7px}
-.empty{color:var(--mt);padding:30px 0;text-align:center}
+.tw{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:11px}
+th{color:var(--ink3);font-weight:400;font-size:9px;text-transform:uppercase;letter-spacing:.4px;padding:5px 8px;border-bottom:1px solid var(--bdr);text-align:left;white-space:nowrap;position:sticky;top:0;background:var(--bg3);z-index:1}
+td{padding:4px 8px;border-bottom:1px solid var(--bdr);white-space:nowrap}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:var(--bg4)}
+.nd{text-align:center;color:var(--ink3);padding:20px!important}
+/* color helpers */
+.cb{color:var(--b)}.cg{color:var(--g)}.cr{color:var(--r)}.cy{color:var(--y)}
+.cp{color:var(--p)}.cc{color:var(--c)}.co{color:var(--o)}.cd{color:var(--ink3)}
+.fw{font-weight:700}
+/* badges */
+.bd{display:inline-flex;align-items:center;padding:1px 6px;border-radius:3px;font-size:9px;font-weight:700;line-height:1.4}
+.bd-buy{background:var(--g2);color:var(--g);border:1px solid rgba(63,185,80,.25)}
+.bd-sell{background:var(--r2);color:var(--r);border:1px solid rgba(248,81,73,.25)}
+.bd-ab{background:var(--b2);color:var(--b);border:1px solid rgba(88,166,255,.2)}
+.bd-bw{background:var(--p2);color:var(--p);border:1px solid rgba(188,140,255,.2)}
+.bd-asia{background:rgba(57,208,216,.1);color:var(--c);border:1px solid rgba(57,208,216,.2)}
+.bd-lon{background:rgba(63,185,80,.1);color:var(--g);border:1px solid rgba(63,185,80,.2)}
+.bd-ny{background:rgba(240,136,62,.1);color:var(--o);border:1px solid rgba(240,136,62,.2)}
+.bd-fx{background:rgba(88,166,255,.1);color:var(--b);border:1px solid rgba(88,166,255,.2)}
+.bd-sk{background:rgba(188,140,255,.1);color:var(--p);border:1px solid rgba(188,140,255,.2)}
+.bd-ix{background:rgba(57,208,216,.1);color:var(--c);border:1px solid rgba(57,208,216,.2)}
+.bd-cm{background:rgba(210,153,34,.1);color:var(--y);border:1px solid rgba(210,153,34,.2)}
+/* filter bar */
+.fbar{display:flex;align-items:center;gap:4px;padding:6px 12px;border-bottom:1px solid var(--bdr);flex-wrap:wrap}
+.fl{font-size:9px;color:var(--ink3);text-transform:uppercase;letter-spacing:.4px;margin-right:2px}
+.fb{padding:2px 8px;border-radius:3px;border:1px solid var(--bdr2);background:transparent;color:var(--ink3);font:10px 'SF Mono',monospace;cursor:pointer}
+.fb:hover{color:var(--ink);border-color:var(--bdr2)}
+.fb.on{background:var(--b2);color:var(--b);border-color:rgba(88,166,255,.4)}
+/* milestone header colors */
+.adv-th{background:rgba(248,81,73,.06)!important;color:var(--r)!important}
+.fav-th{background:rgba(63,185,80,.06)!important;color:var(--g)!important}
+/* best/worst toggle */
+.bw-section{border-top:1px solid var(--bdr);padding:10px 14px}
+.bw-hdr{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+.bw-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+/* 2-col layout */
+.two-col{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:var(--bdr)}
+.col-pane{background:var(--bg2)}
+.col-hdr{padding:7px 12px;border-bottom:1px solid var(--bdr);display:flex;align-items:center;gap:6px}
+.col-hdr-title{font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.5px}
+/* 3-col explain */
+.explain-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--bdr);border-bottom:1px solid var(--bdr)}
+.explain-cell{background:var(--bg2);padding:12px 14px}
+.explain-step{font-size:8px;color:var(--ink3);text-transform:uppercase;letter-spacing:.5px;margin-bottom:5px;font-weight:600}
+.explain-body{font-size:10px;color:var(--ink2);line-height:1.6}
+/* signal stat grid */
+.sig-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:1px;background:var(--bdr);border-bottom:1px solid var(--bdr)}
+.sig-cell{background:var(--bg2);padding:10px 12px}
+.sig-lbl{font-size:8px;color:var(--ink3);text-transform:uppercase;letter-spacing:.5px;margin-bottom:2px}
+.sig-val{font-size:20px;font-weight:700}
+/* overview ov-grid */
+.ov-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:1px;background:var(--bdr);margin:0}
+.ov-card{background:var(--bg2);padding:14px 14px 12px;border-bottom:1px solid var(--bdr)}
+.ov-lbl{font-size:9px;color:var(--ink3);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px}
+.ov-val{font-size:28px;font-weight:700;line-height:1;margin-bottom:3px}
+.ov-sub{font-size:9px;color:var(--ink3)}
+/* spinner */
 .spin{display:inline-block;animation:sp 1s linear infinite}
 @keyframes sp{to{transform:rotate(360deg)}}
 </style>
 </head>
 <body>
 
+<!-- ═══════════════════════ HEADER ═════════════════════════════ -->
 <header>
-  <h1>🤖 PRONTO-AI</h1>
-  <span class="chip" id="ver">v12.7.1</span>
-  <span class="chip" id="sb"><span class="spin">⟳</span>&nbsp;verbinden…</span>
-  <span class="chip yl" id="db-chip" style="display:none">⚠ DB init…</span>
-  <span class="chip err" id="err-chip" style="display:none"></span>
-  <span id="clock"></span>
+  <div class="hbrand">PRONTO·AI</div>
+  <div class="hkpis">
+    <div class="hkpi"><div class="hkl">Balance MT5</div><div class="hkv cb" id="h-bal">—</div></div>
+    <div class="hkpi"><div class="hkl">Live P&amp;L</div><div class="hkv" id="h-pnl">—</div></div>
+    <div class="hkpi"><div class="hkl">% Gain</div><div class="hkv cy" id="h-gain">—</div></div>
+    <div class="hkpi"><div class="hkl">Open Trades</div><div class="hkv cg" id="h-pos">—</div></div>
+    <div class="hkpi"><div class="hkl">Ghost Trackers</div><div class="hkv cp" id="h-gh">—</div></div>
+    <div class="hkpi"><div class="hkl">Closed Ghosts</div><div class="hkv cc" id="h-ghh">—</div></div>
+    <div class="hkpi"><div class="hkl">Risk/Trade</div><div class="hkv cd">${(FIXED_RISK_PCT*100).toFixed(4)}%</div></div>
+    <div class="hkpi"><div class="hkl">TP Locked</div><div class="hkv cy" id="h-tp">—</div></div>
+  </div>
+  <div class="hright">
+    <div class="live-dot"></div>
+    <div class="sess-badge" id="h-sess">—</div>
+    <div id="hclock">—</div>
+    <button class="hbtn" onclick="loadAll()">⟳ Refresh</button>
+  </div>
 </header>
-<div id="banner">📅 Data van: laden…</div>
 
+<!-- ═══════════════════════ COMPLIANCE BAR ══════════════════════ -->
+<div id="cbar">
+  <strong id="cbar-date">Compliance</strong>
+  <span>—</span>
+  <span id="cbar-desc">all EV, statistics &amp; P&amp;L calculated only on trades after this date</span>
+</div>
+
+<!-- ═══════════════════════ NAV ════════════════════════════════ -->
 <nav>
-  <div class="tab on"  onclick="tab('ov',this)">Overview</div>
-  <div class="tab"     onclick="tab('pos',this)">Posities</div>
-  <div class="tab"     onclick="tab('tr',this)">Trades</div>
-  <div class="tab"     onclick="tab('gh',this)">Ghost</div>
-  <div class="tab"     onclick="tab('ev',this)">EV</div>
-  <div class="tab"     onclick="tab('sig',this)">Signalen</div>
-  <div class="tab"     onclick="tab('spr',this)">Spreads</div>
+  <div class="ntab on"  onclick="showPage('overview',this)">Overview</div>
+  <div class="ntab"     onclick="showPage('positions',this)">Open Positions<span class="nbadge" id="nb-pos">—</span></div>
+  <div class="ntab"     onclick="showPage('ghosts',this)">Ghost Tracker<span class="nbadge" id="nb-gh">—</span></div>
+  <div class="ntab"     onclick="showPage('history',this)">Ghost History</div>
+  <div class="ntab"     onclick="showPage('ev',this)">EV TP Optimizer</div>
+  <div class="ntab"     onclick="showPage('evsl',this)">EV SL Optimizer</div>
+  <div class="ntab"     onclick="showPage('signals',this)">Signals &amp; Blocked<span class="nbadge" id="nb-sig" style="display:none"></span></div>
 </nav>
 
-<!-- OVERVIEW -->
-<div class="panel on" id="pov">
-  <div class="kgrid" id="kg"></div>
-  <h3>Dagelijkse P&amp;L</h3>
-  <div id="dw" class="tbl-wrap"><div class="empty"><span class="spin">⟳</span></div></div>
+<!-- ══════════════ PAGE: OVERVIEW ══════════════════════════════ -->
+<div class="npage on" id="page-overview">
+  <div class="pg">
+
+    <!-- KPI Row -->
+    <div class="card" style="overflow:hidden">
+      <div class="ov-grid">
+        <div class="ov-card"><div class="ov-lbl">Balance MT5</div><div class="ov-val cb" id="ov-bal">—</div><div class="ov-sub">Live account equity</div></div>
+        <div class="ov-card"><div class="ov-lbl">Live P&amp;L</div><div class="ov-val" id="ov-pnl">—</div><div class="ov-sub" id="ov-pnl-sub">open positions</div></div>
+        <div class="ov-card"><div class="ov-lbl">% Gain (compliance+)</div><div class="ov-val cy" id="ov-gain">—</div><div class="ov-sub" id="ov-gain-sub">realized P&amp;L / balance</div></div>
+        <div class="ov-card"><div class="ov-lbl">Open Trades</div><div class="ov-val cg" id="ov-open">—</div><div class="ov-sub" id="ov-open-sub">live positions</div></div>
+        <div class="ov-card"><div class="ov-lbl">Compliance Trades</div><div class="ov-val" id="ov-comp">—</div><div class="ov-sub">closed after compliance date</div></div>
+      </div>
+    </div>
+
+    <!-- Trade Activity by Session/VWAP/Direction + asset split -->
+    <div class="card">
+      <div class="card-hdr">
+        <div class="card-title"><div class="dot" id="wr-dot"></div>Trade Activity — Session / VWAP / Direction</div>
+        <div class="cmeta" id="wr-meta">loading…</div>
+      </div>
+      <!-- Summary strip -->
+      <div class="kstrip">
+        <div class="ks"><div class="ksl">Total</div><div class="ksv cb" id="wr-tot">—</div><div class="kss" id="wr-tot-n"></div></div>
+        <div class="ks"><div class="ksl">Buy</div><div class="ksv cg" id="wr-buy">—</div></div>
+        <div class="ks"><div class="ksl">Sell</div><div class="ksv cr" id="wr-sell">—</div></div>
+        <div class="ks"><div class="ksl">Above VWAP</div><div class="ksv cb" id="wr-ab">—</div></div>
+        <div class="ks"><div class="ksl">Below VWAP</div><div class="ksv cp" id="wr-bw">—</div></div>
+        <div class="ks"><div class="ksl">Asia</div><div class="ksv cc" id="wr-asia">—</div></div>
+        <div class="ks"><div class="ksl">London</div><div class="ksv cg" id="wr-lon">—</div></div>
+        <div class="ks"><div class="ksl">New York</div><div class="ksv co" id="wr-ny">—</div></div>
+      </div>
+      <!-- Table per combo per asset type -->
+      <div id="wr-type-tabs" style="display:flex;gap:4px;padding:6px 12px;border-bottom:1px solid var(--bdr)">
+        <span class="fl">Asset:</span>
+        <button class="fb on" onclick="setWRType('all',this)">All</button>
+        <button class="fb" onclick="setWRType('forex',this)">Forex</button>
+        <button class="fb" onclick="setWRType('stock',this)">Stock</button>
+        <button class="fb" onclick="setWRType('index',this)">Index</button>
+        <button class="fb" onclick="setWRType('commodity',this)">Commodity</button>
+      </div>
+      <div class="tw">
+        <table><thead><tr>
+          <th>Session</th><th>Direction</th><th>VWAP</th><th>Asset Type</th><th>Trades</th>
+        </tr></thead><tbody id="wr-body"><tr><td colspan="5" class="nd"><span class="spin">⟳</span></td></tr></tbody></table>
+      </div>
+    </div>
+
+    <!-- Trade Distribution by asset type -->
+    <div class="card">
+      <div class="card-hdr">
+        <div class="card-title"><div class="dot" id="dist-dot"></div>Trade Distribution — by Asset Type</div>
+        <div class="cmeta" id="dist-meta">loading…</div>
+      </div>
+      <div class="kstrip">
+        <div class="ks"><div class="ksl">Total Closed</div><div class="ksv cb" id="d-tot">—</div></div>
+        <div class="ks"><div class="ksl">Forex</div><div class="ksv" style="color:var(--b)" id="d-fx">—</div></div>
+        <div class="ks"><div class="ksl">Stock</div><div class="ksv cp" id="d-sk">—</div></div>
+        <div class="ks"><div class="ksl">Index</div><div class="ksv cc" id="d-ix">—</div></div>
+        <div class="ks"><div class="ksl">Commodity</div><div class="ksv cy" id="d-cm">—</div></div>
+        <div class="ks"><div class="ksl">Buy</div><div class="ksv cg" id="d-buy">—</div></div>
+        <div class="ks"><div class="ksl">Sell</div><div class="ksv cr" id="d-sell">—</div></div>
+      </div>
+      <div class="tw">
+        <table><thead><tr>
+          <th>Asset Type</th><th>Session</th>
+          <th class="cg">Buy / Above</th><th class="cg">Buy / Below</th>
+          <th class="cr">Sell / Above</th><th class="cr">Sell / Below</th>
+          <th>Total</th>
+        </tr></thead>
+        <tbody id="dist-body"><tr><td colspan="7" class="nd"><span class="spin">⟳</span></td></tr></tbody>
+        <tfoot><tr style="background:var(--bg3);font-weight:700">
+          <td class="cy" colspan="2">TOTAL</td>
+          <td id="ft-ba" class="cg">—</td><td id="ft-bb" class="cg">—</td>
+          <td id="ft-sa" class="cr">—</td><td id="ft-sb" class="cr">—</td>
+          <td id="ft-t" class="cb">—</td>
+        </tr></tfoot>
+        </table>
+      </div>
+    </div>
+
+    <!-- Daily Breakdown -->
+    <div class="card">
+      <div class="card-hdr">
+        <div class="card-title"><div class="dot" id="daily-dot"></div>Daily Breakdown — Performance (compliance+)</div>
+        <div class="cmeta" id="daily-meta">loading…</div>
+      </div>
+      <div class="kstrip">
+        <div class="ks"><div class="ksl">Max Win Streak</div><div class="ksv cg" id="d-wstrk">—</div></div>
+        <div class="ks"><div class="ksl">Max Loss Streak</div><div class="ksv cr" id="d-lstrk">—</div></div>
+        <div class="ks"><div class="ksl">Max Drawdown</div><div class="ksv cy" id="d-dd">—</div></div>
+      </div>
+      <div class="tw">
+        <table><thead><tr>
+          <th>Date</th><th># Trades</th><th>Wins</th><th>Losses</th><th>Win%</th>
+          <th>Day P&amp;L</th><th>Cum P&amp;L</th><th>Avg Lots</th><th>Best RR</th><th>Avg RR</th>
+        </tr></thead><tbody id="daily-body"><tr><td colspan="10" class="nd"><span class="spin">⟳</span></td></tr></tbody></table>
+      </div>
+
+      <!-- Best / Worst Setups -->
+      <div class="bw-section">
+        <div class="bw-hdr">
+          <span class="fl">Period:</span>
+          <button class="fb on" onclick="setBWP('all',this)">All Time</button>
+          <button class="fb" onclick="setBWP('week',this)">This Week</button>
+          <button class="fb" onclick="setBWP('day',this)">Today</button>
+          <span id="bw-period-lbl" style="font-size:9px;color:var(--ink3);margin-left:4px">all time</span>
+        </div>
+        <div class="bw-grid">
+          <div>
+            <div style="font-size:9px;color:var(--g);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;font-weight:700">🏆 Best 5 Setups</div>
+            <table style="font-size:10px"><thead><tr>
+              <th>Symbol</th><th>Dir</th><th>Sess</th><th>VWAP</th><th>RR</th><th>P&amp;L</th><th>Date</th>
+            </tr></thead><tbody id="best-body"></tbody></table>
+          </div>
+          <div>
+            <div style="font-size:9px;color:var(--r);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;font-weight:700">💀 Worst 5 Setups</div>
+            <table style="font-size:10px"><thead><tr>
+              <th>Symbol</th><th>Dir</th><th>Sess</th><th>VWAP</th><th>RR</th><th>P&amp;L</th><th>Date</th>
+            </tr></thead><tbody id="worst-body"></tbody></table>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
 </div>
 
-<!-- POSITIES -->
-<div class="panel" id="ppos">
-  <div id="posw" class="tbl-wrap"><div class="empty"><span class="spin">⟳</span></div></div>
+<!-- ══════════════ PAGE: OPEN POSITIONS ════════════════════════ -->
+<div class="npage" id="page-positions">
+  <div class="pg">
+    <div class="card">
+      <div class="card-hdr">
+        <div class="card-title"><div class="dot r" id="pos-dot"></div>Open Positions — Live</div>
+        <div style="display:flex;gap:6px;align-items:center">
+          <button class="fb" onclick="toggleMsCols()" id="ms-btn">± Milestones</button>
+          <div class="cmeta" id="pos-meta">loading…</div>
+        </div>
+      </div>
+      <div class="kstrip" id="pos-strip" style="display:none">
+        <div class="ks"><div class="ksl">Open</div><div class="ksv cg" id="pos-cnt">—</div></div>
+        <div class="ks"><div class="ksl">P&amp;L</div><div class="ksv" id="pos-pnl">—</div></div>
+        <div class="ks"><div class="ksl">Buy</div><div class="ksv cg" id="pos-buy">—</div></div>
+        <div class="ks"><div class="ksl">Sell</div><div class="ksv cr" id="pos-sell">—</div></div>
+        <div class="ks"><div class="ksl">Stock</div><div class="ksv cp" id="pos-sk">—</div></div>
+        <div class="ks"><div class="ksl">Index</div><div class="ksv cc" id="pos-ix">—</div></div>
+        <div class="ks"><div class="ksl">Forex</div><div class="ksv cb" id="pos-fx">—</div></div>
+        <div class="ks"><div class="ksl">Commodity</div><div class="ksv cy" id="pos-cm">—</div></div>
+        <div class="ks"><div class="ksl">Ghosted</div><div class="ksv cp" id="pos-gh">—</div></div>
+      </div>
+      <div class="tw">
+        <table id="pos-tbl">
+          <thead><tr>
+            <th>Symbol</th><th>Type</th><th>Dir</th><th>VWAP</th><th>Session</th>
+            <th>Entry</th><th>SL</th><th>TP</th>
+            <th>RR Now</th><th title="Best favorable RR">Peak+RR</th><th title="Worst adverse RR%">Peak−RR%</th>
+            <th>→TP</th><th>P&amp;L€</th><th>Lots</th><th>Risk%</th>
+            <th colspan="${ADV_STEPS.length}" class="adv-th" style="text-align:center">← Adverse (−1R to −0.1R)</th>
+            <th colspan="${FAV_STEPS.length}" class="fav-th" style="text-align:center">Favorable (+0.1R to +15R) →</th>
+            <th>Opened</th>
+          </tr>
+          <tr>
+            <th colspan="15"></th>
+            ${ADV_STEPS.map(v=>`<th class="adv-th">-${v.toFixed(1)}</th>`).join('')}
+            ${FAV_STEPS.map(v=>`<th class="fav-th">+${v.toFixed(1)}</th>`).join('')}
+            <th></th>
+          </tr></thead>
+          <tbody id="pos-body"><tr><td colspan="100" class="nd"><span class="spin">⟳</span></td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
 </div>
 
-<!-- TRADES -->
-<div class="panel" id="ptr">
-  <div id="trw" class="tbl-wrap"><div class="empty"><span class="spin">⟳</span></div></div>
+<!-- ══════════════ PAGE: GHOST TRACKER ═════════════════════════ -->
+<div class="npage" id="page-ghosts">
+  <div class="pg">
+    <div class="card">
+      <div class="card-hdr">
+        <div class="card-title"><div class="dot r" id="gh-dot"></div>Ghost Tracker — Active (until SL hit | 15R | timeout)</div>
+        <div style="display:flex;gap:6px;align-items:center">
+          <button class="fb" onclick="toggleMsCols()">± Milestones</button>
+          <div class="cmeta" id="gh-meta">Phantom SL = real SL at open · runs until closed</div>
+        </div>
+      </div>
+      <div class="kstrip" id="gh-strip" style="display:none">
+        <div class="ks"><div class="ksl">Active</div><div class="ksv cp" id="gh-cnt">—</div></div>
+        <div class="ks"><div class="ksl">Peak+RR Best</div><div class="ksv cg" id="gh-best">—</div></div>
+        <div class="ks"><div class="ksl">Peak−RR Worst</div><div class="ksv cr" id="gh-worst">—</div></div>
+        <div class="ks"><div class="ksl">Buy</div><div class="ksv cg" id="gh-buy">—</div></div>
+        <div class="ks"><div class="ksl">Sell</div><div class="ksv cr" id="gh-sell">—</div></div>
+        <div class="ks"><div class="ksl">Stock</div><div class="ksv cp" id="gh-sk">—</div></div>
+        <div class="ks"><div class="ksl">Index</div><div class="ksv cc" id="gh-ix">—</div></div>
+        <div class="ks"><div class="ksl">Forex</div><div class="ksv cb" id="gh-fx">—</div></div>
+        <div class="ks"><div class="ksl">Avg Elapsed</div><div class="ksv cd" id="gh-el">—</div></div>
+      </div>
+      <div class="tw">
+        <table id="gh-tbl">
+          <thead><tr>
+            <th>Symbol</th><th>Type</th><th>Session</th><th>Dir</th><th>VWAP</th>
+            <th title="Best favorable RR">Peak+RR</th><th title="Worst adverse RR%">Peak−RR%</th>
+            <th colspan="${ADV_STEPS.length}" class="adv-th" style="text-align:center">← Adverse</th>
+            <th colspan="${FAV_STEPS.length}" class="fav-th" style="text-align:center">Favorable →</th>
+            <th>Elapsed</th><th>Opened</th>
+          </tr>
+          <tr>
+            <th colspan="7"></th>
+            ${ADV_STEPS.map(v=>`<th class="adv-th">-${v.toFixed(1)}</th>`).join('')}
+            ${FAV_STEPS.map(v=>`<th class="fav-th">+${v.toFixed(1)}</th>`).join('')}
+            <th colspan="2"></th>
+          </tr></thead>
+          <tbody id="gh-body"><tr><td colspan="100" class="nd">No active ghost trackers</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
 </div>
 
-<!-- GHOST -->
-<div class="panel" id="pgh">
-  <div id="ghw" class="tbl-wrap"><div class="empty"><span class="spin">⟳</span></div></div>
+<!-- ══════════════ PAGE: GHOST HISTORY ═════════════════════════ -->
+<div class="npage" id="page-history">
+  <div class="pg">
+    <!-- Grouped by pair - expandable -->
+    <div class="card">
+      <div class="card-hdr">
+        <div class="card-title"><div class="dot" id="ghh-dot"></div>Ghost History — Grouped per Pair · Click row for detail</div>
+        <div class="cmeta" id="ghh-meta">loading…</div>
+      </div>
+      <div class="fbar">
+        <span class="fl">Session:</span>
+        <button class="fb on" onclick="setGHF('sess','all',this)">All</button>
+        <button class="fb" onclick="setGHF('sess','asia',this)">Asia</button>
+        <button class="fb" onclick="setGHF('sess','london',this)">London</button>
+        <button class="fb" onclick="setGHF('sess','ny',this)">NY</button>
+        &nbsp;<span class="fl">Dir:</span>
+        <button class="fb on" onclick="setGHF('dir','all',this)">All</button>
+        <button class="fb" onclick="setGHF('dir','buy',this)">Buy</button>
+        <button class="fb" onclick="setGHF('dir','sell',this)">Sell</button>
+        &nbsp;<span class="fl">Type:</span>
+        <button class="fb on" onclick="setGHF('type','all',this)">All</button>
+        <button class="fb" onclick="setGHF('type','forex',this)">Forex</button>
+        <button class="fb" onclick="setGHF('type','stock',this)">Stock</button>
+        <button class="fb" onclick="setGHF('type','index',this)">Index</button>
+        <button class="fb" onclick="setGHF('type','commodity',this)">Comm</button>
+      </div>
+      <div class="tw">
+        <table id="ghh-tbl">
+          <thead><tr>
+            <th style="width:16px"></th>
+            <th>Symbol</th><th>Type</th><th>Session</th><th>Dir</th><th>VWAP</th>
+            <th># Ghosts</th><th>SL Hits</th><th>15R Hits</th><th>Timeout</th>
+            <th>Avg Peak+RR</th><th>Avg Peak−RR%</th><th>Max Peak+RR</th>
+            <th>EV TP (last 5)</th><th>Close Reason</th>
+          </tr></thead>
+          <tbody id="ghh-body"><tr><td colspan="15" class="nd"><span class="spin">⟳</span></td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Signal combo grouped — only completed ghosts -->
+    <div class="card">
+      <div class="card-hdr">
+        <div class="card-title"><div class="dot" id="ghc-dot"></div>Ghost History — By Signal Combo · EV Data Source</div>
+        <div class="cmeta" id="ghc-meta">Only finalized ghosts · used for EV optimizer</div>
+      </div>
+      <div style="padding:6px 14px;background:rgba(88,166,255,.04);border-bottom:1px solid rgba(88,166,255,.1);font-size:10px;color:var(--ink3)">
+        ℹ Each row = one signal combo (Symbol + Session + Dir + VWAP). Milestone columns show avg time to reach each RR level. Min 5 ghosts for EV lock.
+      </div>
+      <div class="tw">
+        <table id="ghc-tbl">
+          <thead><tr>
+            <th>Symbol</th><th>Type</th><th>Session</th><th>Dir</th><th>VWAP</th>
+            <th># Ghosts</th><th># EV</th><th>Peak+RR</th><th>Avg RR</th>
+            <th class="adv-th">T-¼R</th><th class="adv-th">T-½R</th>
+            <th class="adv-th">T-¾R</th><th class="adv-th">T-1R</th>
+            <th class="fav-th">T+½R</th><th class="fav-th">T+1R</th>
+            <th class="fav-th">T+2R</th><th class="fav-th">T+3R</th>
+            <th class="fav-th">T+5R</th><th class="fav-th">T+10R</th>
+            <th class="fav-th">T+15R</th>
+            <th>Stop Reason</th><th>MAE p50</th><th>MAE p75</th><th>MAE p90</th>
+            <th>EV SL</th><th>EV TP</th>
+          </tr></thead>
+          <tbody id="ghc-body"><tr><td colspan="26" class="nd"><span class="spin">⟳</span></td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
 </div>
 
-<!-- EV -->
-<div class="panel" id="pev">
-  <div id="evw" class="tbl-wrap"><div class="empty"><span class="spin">⟳</span></div></div>
+<!-- ══════════════ PAGE: EV TP OPTIMIZER ═══════════════════════ -->
+<div class="npage" id="page-ev">
+  <div class="pg">
+    <div class="card">
+      <div class="card-hdr">
+        <div class="card-title"><div class="dot r" id="ev-dot"></div>EV / TP Optimizer — All Signal Combos</div>
+        <div class="cmeta" id="ev-meta">EV locked at ≥5 ghost trades</div>
+      </div>
+      <div class="fbar">
+        <span class="fl">Type:</span>
+        <button class="fb on" onclick="setEVF('type','all',this)">All</button>
+        <button class="fb" onclick="setEVF('type','forex',this)">Forex</button>
+        <button class="fb" onclick="setEVF('type','index',this)">Index</button>
+        <button class="fb" onclick="setEVF('type','stock',this)">Stock</button>
+        <button class="fb" onclick="setEVF('type','commodity',this)">Comm</button>
+        &nbsp;<span class="fl">Session:</span>
+        <button class="fb on" onclick="setEVF('sess','all',this)">All</button>
+        <button class="fb" onclick="setEVF('sess','asia',this)">Asia</button>
+        <button class="fb" onclick="setEVF('sess','london',this)">London</button>
+        <button class="fb" onclick="setEVF('sess','ny',this)">New York</button>
+        &nbsp;<span class="fl">Dir:</span>
+        <button class="fb on" onclick="setEVF('dir','all',this)">All</button>
+        <button class="fb" onclick="setEVF('dir','buy',this)">Buy</button>
+        <button class="fb" onclick="setEVF('dir','sell',this)">Sell</button>
+        &nbsp;<span class="fl">Min Ghosts:</span>
+        <button class="fb on" onclick="setEVF('min','5',this)">≥5</button>
+        <button class="fb" onclick="setEVF('min','10',this)">≥10</button>
+        <button class="fb" onclick="setEVF('min','20',this)">≥20</button>
+      </div>
+      <div class="kstrip">
+        <div class="ks"><div class="ksl">Combos Shown</div><div class="ksv cb" id="ev-cnt">0</div></div>
+        <div class="ks"><div class="ksl">With Ghost Data</div><div class="ksv cc" id="ev-data">0</div></div>
+        <div class="ks"><div class="ksl">EV+ Locked</div><div class="ksv cg" id="ev-lock">0</div></div>
+        <div class="ks"><div class="ksl">Total P&amp;L (compliance+)</div><div class="ksv cy" id="ev-pnl">+€0.00</div></div>
+      </div>
+      <div class="tw">
+        <table id="ev-tbl">
+          <thead><tr>
+            <th>Symbol</th><th>Type</th><th>Session</th><th>Dir</th><th>VWAP</th>
+            <th># Ghosts</th><th># Trades</th><th>Best TP RR</th><th>Avg RR</th>
+            <th>EV Score</th><th>Status</th><th>TP Lock</th>
+            <th>Avg T→SL</th><th>Avg MAE%</th><th>P&amp;L€</th>
+          </tr></thead>
+          <tbody id="ev-body"><tr><td colspan="15" class="nd">No combos match current filters</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
 </div>
 
-<!-- SIGNALEN -->
-<div class="panel" id="psig">
-  <div class="kgrid" id="sigkg"></div>
-  <h3>Webhook History</h3>
-  <div id="sigw" class="tbl-wrap"><div class="empty"><span class="spin">⟳</span></div></div>
+<!-- ══════════════ PAGE: EV SL OPTIMIZER ══════════════════════ -->
+<div class="npage" id="page-evsl">
+  <div class="pg">
+    <div class="card">
+      <div class="card-hdr">
+        <div class="card-title"><div class="dot" id="evsl-dot"></div>EV SL Optimizer — MAE-based SL Reduction · Read Only</div>
+        <div class="cmeta">Never auto-applied · min 5 ghost trades required per combo</div>
+      </div>
+      <div class="explain-grid">
+        <div class="explain-cell">
+          <div class="explain-step">Step 1 — Ghost MAE data</div>
+          <div class="explain-body">Every ghost trade records the <span class="cy fw">Max Adverse Excursion (MAE)</span> — how deep price went against the position before recovery or SL hit. Expressed as % of full SL distance (0–100%).</div>
+        </div>
+        <div class="explain-cell">
+          <div class="explain-step">Step 2 — Percentile analysis</div>
+          <div class="explain-body"><span class="cg fw">MAE p50</span> = median trade went no deeper than this. <span class="cy fw">MAE p90</span> = 90% of trades stayed within this level. Smaller p90 = more room to tighten the SL safely.</div>
+        </div>
+        <div class="explain-cell">
+          <div class="explain-step">Step 3 — What to do</div>
+          <div class="explain-body"><span class="cg fw">Green (p90 &lt;50%)</span>: strong tightening possible. <span class="cy fw">Yellow (50–75%)</span>: moderate. <span class="cr fw">Red (&gt;75%)</span>: keep SL as-is. Always verify with risk manager before applying.</div>
+        </div>
+      </div>
+      <div class="tw">
+        <table id="evsl-tbl">
+          <thead><tr>
+            <th>Symbol</th><th>Type</th><th>Session</th><th>Dir</th><th>VWAP</th>
+            <th># Ghosts</th><th>MAE p50</th><th>MAE p75</th><th>MAE p90</th>
+            <th>SL Advice</th><th>Best SL%</th><th>Potential Reduction</th>
+            <th>Shadow p50</th><th>Shadow p90</th>
+          </tr></thead>
+          <tbody id="evsl-body"><tr><td colspan="14" class="nd"><span class="spin">⟳</span></td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
 </div>
 
-<!-- SPREADS -->
-<div class="panel" id="pspr">
-  <div id="sprw" class="tbl-wrap"><div class="empty"><span class="spin">⟳</span></div></div>
+<!-- ══════════════ PAGE: SIGNALS & BLOCKED ═════════════════════ -->
+<div class="npage" id="page-signals">
+  <div class="pg">
+    <div class="card">
+      <div class="card-hdr">
+        <div class="card-title"><div class="dot r" id="sig-dot"></div>Signal Intelligence — Placed, Blocked &amp; Errors</div>
+        <div class="cmeta" id="sig-meta">loading…</div>
+      </div>
+      <!-- KPI grid -->
+      <div class="sig-grid">
+        <div class="sig-cell"><div class="sig-lbl">Total Signals</div><div class="sig-val cb" id="sig-tot">—</div></div>
+        <div class="sig-cell"><div class="sig-lbl">Placed</div><div class="sig-val cg" id="sig-placed">—</div></div>
+        <div class="sig-cell"><div class="sig-lbl">Conversion%</div><div class="sig-val cy" id="sig-conv">—</div></div>
+        <div class="sig-cell"><div class="sig-lbl">Total Blocked</div><div class="sig-val cr" id="blk-tot">—</div></div>
+        <div class="sig-cell"><div class="sig-lbl">Duplicate Open</div><div class="sig-val co" id="blk-dup">—</div></div>
+        <div class="sig-cell"><div class="sig-lbl">VWAP Exhausted</div><div class="sig-val cp" id="blk-vw">—</div></div>
+        <div class="sig-cell"><div class="sig-lbl">Outside Window</div><div class="sig-val cd" id="blk-win">—</div></div>
+        <div class="sig-cell"><div class="sig-lbl">Currency Budget</div><div class="sig-val cy" id="blk-cur">—</div></div>
+        <div class="sig-cell"><div class="sig-lbl">NY Dead Zone</div><div class="sig-val cr" id="blk-ny">—</div></div>
+      </div>
+
+      <!-- Placed + Blocked side by side -->
+      <div class="two-col">
+        <div class="col-pane">
+          <div class="col-hdr">
+            <div style="width:6px;height:6px;border-radius:50%;background:var(--g)"></div>
+            <span class="col-hdr-title" style="color:var(--g)">Recent Placed Signals</span>
+            <span class="cmeta" style="margin-left:auto">in-memory log</span>
+          </div>
+          <div class="tw" style="max-height:350px;overflow-y:auto">
+            <table id="placed-tbl"><thead><tr>
+              <th>Time</th><th>Symbol</th><th>Dir</th><th>Session</th><th>VWAP</th>
+              <th>Entry</th><th>SL%</th><th>Latency</th>
+            </tr></thead><tbody id="placed-body"><tr><td colspan="8" class="nd">—</td></tr></tbody></table>
+          </div>
+        </div>
+        <div class="col-pane" style="border-left:1px solid var(--bdr)">
+          <div class="col-hdr">
+            <div style="width:6px;height:6px;border-radius:50%;background:var(--r)"></div>
+            <span class="col-hdr-title" style="color:var(--r)">Blocked Signals</span>
+            <span class="cmeta" style="margin-left:auto">grouped by reason</span>
+          </div>
+          <div class="tw" style="max-height:350px;overflow-y:auto">
+            <table id="blk-tbl"><thead><tr>
+              <th>Reason</th><th>Symbol</th><th>Dir</th><th>Session</th><th>VWAP</th><th>Count</th>
+            </tr></thead><tbody id="blk-body"><tr><td colspan="6" class="nd">—</td></tr></tbody></table>
+          </div>
+        </div>
+      </div>
+
+      <!-- Webhook Errors full width -->
+      <div class="col-hdr" style="border-top:1px solid var(--bdr)">
+        <div style="width:6px;height:6px;border-radius:50%;background:var(--o)"></div>
+        <span class="col-hdr-title" style="color:var(--o)">Webhook Errors</span>
+        <span class="cmeta" style="margin-left:auto">last 80 in memory</span>
+      </div>
+      <div class="tw">
+        <table id="whe-tbl"><thead><tr>
+          <th>Time</th><th>Symbol</th><th>Dir</th><th>Session</th><th>VWAP</th>
+          <th>Entry</th><th>SL%</th><th>Band%</th><th>Reason</th>
+        </tr></thead><tbody id="whe-body"><tr><td colspan="9" class="nd"><span class="spin">⟳</span></td></tr></tbody></table>
+      </div>
+
+      <!-- Blocked Raw all-time -->
+      <div class="col-hdr" style="border-top:1px solid var(--bdr)">
+        <div style="width:6px;height:6px;border-radius:50%;background:var(--p)"></div>
+        <span class="col-hdr-title" style="color:var(--p)">Blocked Raw — All Time (compliance+)</span>
+        <div class="cmeta" id="blkraw-meta" style="margin-left:auto">grouped per symbol / dir / vwap / session / reason</div>
+      </div>
+      <div class="tw">
+        <table id="blkraw-tbl"><thead><tr>
+          <th>Symbol</th><th>Dir</th><th>VWAP</th><th>Session</th>
+          <th>Outcome</th><th>Reject Reason</th><th># Blocked</th><th>Last Seen</th>
+        </tr></thead><tbody id="blkraw-body"><tr><td colspan="8" class="nd"><span class="spin">⟳</span></td></tr></tbody></table>
+      </div>
+
+      <!-- Band analysis 2-col -->
+      <div class="two-col" style="border-top:1px solid var(--bdr)">
+        <div class="col-pane">
+          <div class="col-hdr">
+            <span class="col-hdr-title cy">Band 150–250%</span>
+            <span class="cmeta" style="margin-left:auto">rejected — ghost potential shown</span>
+          </div>
+          <div class="tw"><table id="b150-tbl"><thead><tr>
+            <th>Symbol</th><th>Session</th><th>Dir</th><th>VWAP</th><th>n</th>
+            <th>Avg RR</th><th>Max RR</th><th>Avg SL%</th>
+          </tr></thead><tbody id="b150-body"><tr><td colspan="8" class="nd">—</td></tr></tbody></table></div>
+        </div>
+        <div class="col-pane" style="border-left:1px solid var(--bdr)">
+          <div class="col-hdr">
+            <span class="col-hdr-title cr">Band 250–350%</span>
+            <span class="cmeta" style="margin-left:auto">extreme outliers · read only</span>
+          </div>
+          <div class="tw"><table id="b250-tbl"><thead><tr>
+            <th>Symbol</th><th>Session</th><th>Dir</th><th>VWAP</th><th>n</th>
+            <th>Avg RR</th><th>Max RR</th><th>Avg SL%</th>
+          </tr></thead><tbody id="b250-body"><tr><td colspan="8" class="nd">—</td></tr></tbody></table></div>
+        </div>
+      </div>
+    </div>
+  </div>
 </div>
 
 <script>
 'use strict';
-// ── utils ────────────────────────────────────────────────────────
-const $  = id => document.getElementById(id);
-const n2 = v => v == null ? '—' : (+v).toFixed(2);
-const n1 = v => v == null ? '—' : (+v).toFixed(1);
-const n0 = v => v == null ? '—' : (+v).toFixed(0);
-const eu = v => v == null ? '—' : '€' + (+v).toFixed(2);
-const pc = v => v == null ? '—' : (+v).toFixed(1) + '%';
-const cc = v => +v >= 0 ? 'gr' : 'rd';
-const dt = s => { try { return new Date(s).toLocaleString('nl-BE',{timeZone:'Europe/Brussels',hour12:false,day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}); } catch { return s||'—'; }};
+// ── Symbol type maps ─────────────────────────────────────────────
+const FOREX_S = new Set(['AUDCAD','AUDCHF','AUDNZD','AUDUSD','CADCHF','EURAUD','EURCHF','EURUSD','GBPAUD','GBPNZD','GBPUSD','NZDCAD','NZDCHF','NZDUSD','USDCAD','USDCHF']);
+const INDEX_S = new Set(['DE30EUR','NAS100USD','UK100GBP','US30USD']);
+const COMM_S  = new Set(['XAUUSD']);
+function symType(s){ if(FOREX_S.has(s)) return 'forex'; if(INDEX_S.has(s)) return 'index'; if(COMM_S.has(s)) return 'commodity'; return 'stock'; }
 
-// ── safe fetch (never throws, always returns null on error) ───────
+// ── Milestone steps (mirrored from server) ───────────────────────
+const ADV_STEPS=[], FAV_STEPS=[];
+for(let v=1.0; v>=0.1-1e-9; v=Math.round((v-0.1)*10)/10) ADV_STEPS.push(+v.toFixed(1));
+for(let v=0.1; v<=15.0+1e-9; v=Math.round((v+0.1)*10)/10) FAV_STEPS.push(+v.toFixed(1));
+
+// ── Formatters ───────────────────────────────────────────────────
+const f2  = v => v==null?'—':(+v).toFixed(2);
+const f1  = v => v==null?'—':(+v).toFixed(1);
+const f0  = v => v==null?'—':(+v).toFixed(0);
+const eu  = v => v==null?'—':(v>=0?'+':'')+'€'+(+v).toFixed(2);
+const pct = v => v==null?'—':(+v).toFixed(1)+'%';
+const pC  = v => (+v||0)>=0?'cg':'cr';
+const dt  = s => { try{ return new Date(s).toLocaleString('nl-BE',{timeZone:'Europe/Brussels',hour12:false,day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}); }catch{return s||'—';} };
+const dtS = s => { try{ return new Date(s).toLocaleDateString('nl-BE'); }catch{return s||'—';} };
+const msFmt = m => { if(!m) return '—'; const h=Math.floor(m/60); return h>0?h+'h'+(m%60)+'m':(m%60)+'m'; };
+
+// ── Badges ───────────────────────────────────────────────────────
+const dBadge = d => d==='buy'?'<span class="bd bd-buy">BUY</span>':'<span class="bd bd-sell">SELL</span>';
+const vBadge = v => v==='above'?'<span class="bd bd-ab">ABOVE</span>':'<span class="bd bd-bw">BELOW</span>';
+const sBadge = s => s==='asia'?'<span class="bd bd-asia">ASIA</span>':s==='london'?'<span class="bd bd-lon">LON</span>':s==='ny'?'<span class="bd bd-ny">NY</span>':'<span class="bd" style="color:var(--ink3)">'+s+'</span>';
+const tBadge = t => t==='forex'?'<span class="bd bd-fx">FX</span>':t==='stock'?'<span class="bd bd-sk">STK</span>':t==='index'?'<span class="bd bd-ix">IDX</span>':'<span class="bd bd-cm">COM</span>';
+const emptyRow = (cols, msg) => '<tr><td colspan="'+cols+'" class="nd">'+msg+'</td></tr>';
+
+// ── API helper ───────────────────────────────────────────────────
 async function api(url, ms=9000) {
-  const ctrl = new AbortController();
-  const tid  = setTimeout(() => ctrl.abort(), ms);
-  try {
-    const r = await fetch(url, { signal: ctrl.signal });
-    clearTimeout(tid);
-    if (!r.ok) throw 0;
-    return await r.json();
-  } catch { clearTimeout(tid); return null; }
+  const ctrl=new AbortController(), tid=setTimeout(()=>ctrl.abort(), ms);
+  try{ const r=await fetch(url,{signal:ctrl.signal}); clearTimeout(tid); if(!r.ok) throw 0; return await r.json(); }
+  catch{ clearTimeout(tid); return null; }
 }
 
-// ── tab switching ────────────────────────────────────────────────
-const panels = ['ov','pos','tr','gh','ev','sig','spr'];
-function tab(name, el) {
-  document.querySelectorAll('.tab').forEach(t => t.classList.remove('on'));
-  panels.forEach(p => $('p'+p).classList.remove('on'));
-  el.classList.add('on');
-  $('p'+name).classList.add('on');
-  if (name==='pos') loadPos();
-  if (name==='tr')  loadTr();
-  if (name==='gh')  loadGh();
-  if (name==='ev')  loadEV();
-  if (name==='sig') loadSig();
-  if (name==='spr') loadSpr();
+// ── Clock + session ──────────────────────────────────────────────
+function updateClock(){
+  try{
+    const now=new Date();
+    document.getElementById('hclock').textContent=now.toLocaleString('nl-BE',{timeZone:'Europe/Brussels',hour12:false});
+    const h=new Date(now.toLocaleString('en-US',{timeZone:'Europe/Brussels'})).getHours();
+    const m=new Date(now.toLocaleString('en-US',{timeZone:'Europe/Brussels'})).getMinutes();
+    const t=h*60+m;
+    let sess='OUTSIDE';
+    if(t>=120&&t<480) sess='ASIA';
+    else if(t>=480&&t<930) sess='LONDON';
+    else if(t>=930&&t<1260) sess='NEW YORK';
+    document.getElementById('h-sess').textContent=sess;
+  }catch{}
+}
+setInterval(updateClock,1000); updateClock();
+
+// ── Page navigation ──────────────────────────────────────────────
+const PAGES=['overview','positions','ghosts','history','ev','evsl','signals'];
+let _loaded={};
+function showPage(name, el){
+  PAGES.forEach(p=>{
+    const pg=document.getElementById('page-'+p); if(pg) pg.classList.remove('on');
+  });
+  document.querySelectorAll('.ntab').forEach(t=>t.classList.remove('on'));
+  const pg=document.getElementById('page-'+name); if(pg) pg.classList.add('on');
+  if(el) el.classList.add('on');
+  if(!_loaded[name]){
+    _loaded[name]=true;
+    if(name==='history') { loadGhostHistory(); loadGhostCombo(); }
+    if(name==='evsl')    loadEVSL();
+    if(name==='signals') { loadSignals(); loadBlockedRaw(); loadBand(); }
+    if(name==='ev')      loadEV();
+  }
 }
 
-// ── clock ────────────────────────────────────────────────────────
-setInterval(() => {
-  try { $('clock').textContent = new Date().toLocaleString('nl-BE',{timeZone:'Europe/Brussels',hour12:false}); } catch{}
-}, 1000);
+// ── Milestone column toggle ───────────────────────────────────────
+let _msVisible=false;
+function toggleMsCols(){
+  _msVisible=!_msVisible;
+  document.querySelectorAll('.adv-th,.fav-th').forEach(el=>{
+    el.style.display=_msVisible?'':'none';
+  });
+  // Also toggle td cells via CSS class trick
+  const style=document.getElementById('ms-style')||document.head.appendChild(Object.assign(document.createElement('style'),{id:'ms-style'}));
+  style.textContent=_msVisible?''
+    +'.ms-adv,.ms-fav{display:none}'
+    :'';
+  if(_msVisible) style.textContent='';
+  else style.textContent='.ms-adv,.ms-fav{display:none}';
+}
+// Initially hide milestones
+document.addEventListener('DOMContentLoaded',()=>{
+  const s=document.head.appendChild(Object.assign(document.createElement('style'),{id:'ms-style'}));
+  s.textContent='.ms-adv,.ms-fav{display:none}';
+  document.querySelectorAll('.adv-th,.fav-th').forEach(el=>el.style.display='none');
+});
 
-// ── status ───────────────────────────────────────────────────────
-async function pollStatus() {
-  const d = await api('/status', 5000);
-  const sb = $('sb');
-  if (!d) { sb.textContent = '✖ offline'; sb.className = 'chip err'; return; }
-  const eq = d.account?.equity;
-  sb.textContent = (eq != null ? '€'+n0(eq)+' | ' : '') + (d.openPositions||0) + ' pos';
-  sb.className = 'chip ok';
-  if (d.complianceDate) $('banner').textContent = '📅 Data vanaf: ' + d.complianceDate + ' UTC';
-  // DB status chip
-  const dc = $('db-chip');
-  dc.style.display = d.dbReady ? 'none' : '';
-  // Error chip
-  const ec = $('err-chip');
-  if ((d.errorCount||0) > 0) { ec.textContent = '⚠ ' + d.errorCount + ' fout(en)/1u'; ec.style.display=''; }
-  else ec.style.display = 'none';
+// ── Status poll ──────────────────────────────────────────────────
+async function pollStatus(){
+  const d=await api('/status',5000);
+  if(!d) return;
+  const eq=d.account?.equity;
+  const bal=d.account?.balance;
+  if(eq!=null){ document.getElementById('h-pnl').textContent=(eq-bal>=0?'+':'')+'€'+((eq-bal)||0).toFixed(2); document.getElementById('h-pnl').className='hkv '+(eq-bal>=0?'cg':'cr'); }
+  if(bal!=null){ document.getElementById('h-bal').textContent='€'+f0(bal); document.getElementById('ov-bal').textContent='€'+f0(bal); }
+  // Compliance date
+  if(d.complianceDate){
+    const cd=document.getElementById('cbar-date'); if(cd) cd.textContent='Compliance: '+d.complianceDate+' UTC';
+  }
+  // Open positions count
+  document.getElementById('h-pos').textContent=d.openPositions||0;
 }
 
-// ── kpi box ──────────────────────────────────────────────────────
-const kpi = (l,v,c='') => '<div class="kpi"><div class="kl">'+l+'</div><div class="kv '+c+'">'+v+'</div></div>';
+// ── Load all (overview data) ─────────────────────────────────────
+let _allTrades=[], _bwPeriod='all';
 
-// ── overview ─────────────────────────────────────────────────────
-async function loadOv() {
-  // Show skeleton immediately
-  $('kg').innerHTML = ['Trades','Win Rate','Profit Factor','Totaal PnL',
-    'Gem. Winner','Gem. Loser','Max DD','TP','SL'].map(l=>kpi(l,'…','mt')).join('');
+async function loadAll(){
+  pollStatus();
+  const [trades, daily, ghGrouped] = await Promise.all([
+    api('/api/trades'),
+    api('/api/daily-breakdown'),
+    api('/api/ghost-grouped'),
+  ]);
+  _allTrades = (trades||[]).filter(t=>t.openedAt && new Date(t.openedAt).getTime()>=new Date('2026-05-03T00:00:00Z').getTime());
+  loadPositions();
+  loadGhostTrackers();
+  renderOverview(_allTrades, daily, ghGrouped);
+}
 
-  const [p, d] = await Promise.all([api('/api/performance'), api('/api/daily-breakdown')]);
+async function loadPositions(){
+  const d=await api('/api/open-positions')||[];
+  const cnt=d.length;
+  document.getElementById('h-pos').textContent=cnt;
+  document.getElementById('nb-pos').textContent=cnt||'';
+  document.getElementById('ov-open').textContent=cnt;
+  if(!cnt){ document.getElementById('pos-body').innerHTML=emptyRow(100,'No open positions'); return; }
 
-  // KPIs
-  const perf = p || {};
-  const tot  = parseInt(perf.total)||0;
-  if (!tot) {
-    $('kg').innerHTML = kpi('Systeem','✓ Online','gr') + kpi('Trades','0 nog','mt');
-  } else {
-    $('kg').innerHTML = [
-      kpi('Trades',       n0(perf.total),                                  ''),
-      kpi('Win Rate',     pc(perf.winRate),                                (perf.winRate||0)>=50?'gr':'rd'),
-      kpi('Profit Factor',perf.profitFactor!=null?n2(perf.profitFactor):'—',(perf.profitFactor||0)>=1?'gr':'rd'),
-      kpi('Totaal PnL',   eu(perf.totalPnl),                               cc(perf.totalPnl||0)),
-      kpi('Gem. Winner',  eu(perf.avgWinner),                              'gr'),
-      kpi('Gem. Loser',   eu(perf.avgLoser),                               'rd'),
-      kpi('Max Drawdown', eu(perf.maxDrawdown),                            'rd'),
-      kpi('TP',           n0(perf.tpCount),                                'gr'),
-      kpi('SL',           n0(perf.slCount),                                'rd'),
-    ].join('');
+  const strip=document.getElementById('pos-strip'); if(strip) strip.style.display='flex';
+  const pnl=d.reduce((s,p)=>s+(p.currentPnL||0),0);
+  const buys=d.filter(p=>p.direction==='buy').length;
+  const ghd=d.filter(p=>p.ghost?.maxRR>0).length;
+  document.getElementById('pos-cnt').textContent=cnt;
+  document.getElementById('pos-pnl').textContent=eu(pnl);
+  document.getElementById('pos-pnl').className='ksv '+(pnl>=0?'cg':'cr');
+  document.getElementById('pos-buy').textContent=buys;
+  document.getElementById('pos-sell').textContent=cnt-buys;
+  document.getElementById('pos-sk').textContent=d.filter(p=>symType(p.symbol)==='stock').length;
+  document.getElementById('pos-ix').textContent=d.filter(p=>symType(p.symbol)==='index').length;
+  document.getElementById('pos-fx').textContent=d.filter(p=>symType(p.symbol)==='forex').length;
+  document.getElementById('pos-cm').textContent=d.filter(p=>symType(p.symbol)==='commodity').length;
+  document.getElementById('pos-gh').textContent=ghd;
+  document.getElementById('ov-pnl').textContent=eu(pnl);
+  document.getElementById('ov-pnl').className='ov-val '+(pnl>=0?'cg':'cr');
+  document.getElementById('ov-open-sub').textContent=buys+' buy · '+(cnt-buys)+' sell';
+
+  const body=document.getElementById('pos-body');
+  body.innerHTML=d.map(p=>{
+    const dec=p.symbol.includes('JPY')?3:5;
+    const slDist=Math.abs(p.entry-p.sl);
+    const rrNow=slDist>0?parseFloat(((p.direction==='buy'?p.currentPrice-p.entry:p.entry-p.currentPrice)/slDist).toFixed(2)):null;
+    const tpRR=slDist>0?parseFloat((Math.abs(p.tp-p.entry)/slDist).toFixed(2)):null;
+    const peakPos=p.ghost?.peakRRPos??0;
+    const peakNeg=p.ghost?.peakRRNeg??0;
+    const rPct=p.riskPct?+(p.riskPct*100).toFixed(3):null;
+    const favMs=p.ghost?.rrMilestones??{};
+    const advMs=p.ghost?.slMilestones??{};
+    // Map milestone times
+    const msT=(ms,opened,isFav)=>{
+      const cls=isFav?'ms-fav':'ms-adv';
+      if(!ms||!opened) return '<td class="'+cls+' cd" style="font-size:8px">—</td>';
+      const mins=Math.round((new Date(ms)-new Date(opened))/60000);
+      return '<td class="'+cls+(isFav?' cg':' cr')+'" style="font-size:8px">'+msFmt(mins)+'</td>';
+    };
+    return '<tr>'+
+      '<td class="cb fw">'+p.symbol+'</td>'+
+      '<td>'+tBadge(symType(p.symbol))+'</td>'+
+      '<td>'+dBadge(p.direction)+'</td>'+
+      '<td>'+vBadge(p.vwapPosition)+'</td>'+
+      '<td>'+sBadge(p.session)+'</td>'+
+      '<td class="cd" style="font-size:10px">'+f2(p.entry)+'</td>'+
+      '<td class="cr" style="font-size:10px">'+f2(p.sl)+'</td>'+
+      '<td class="cg" style="font-size:10px">'+f2(p.tp)+'</td>'+
+      '<td class="'+(rrNow==null?'cd':rrNow>=1?'cg fw':rrNow>=0?'cy':'cr fw')+' fw">'+( rrNow!=null?rrNow+'R':'—')+'</td>'+
+      '<td class="'+(peakPos>=1?'cg fw':peakPos>0?'cy':'cd')+'">'+f2(peakPos)+'R</td>'+
+      '<td class="'+(peakNeg>80?'cr fw':peakNeg>50?'cr':peakNeg>25?'co':'cd')+'">'+( peakNeg>0?'-'+f0(peakNeg)+'%':'—')+'</td>'+
+      '<td class="cy">'+(tpRR!=null?f2(tpRR)+'R':'—')+'</td>'+
+      '<td class="'+(pC(p.currentPnL))+' fw">'+eu(p.currentPnL)+'</td>'+
+      '<td class="cd">'+f2(p.lots)+'</td>'+
+      '<td class="'+(rPct&&rPct>0.04?'cr fw':rPct&&rPct>0.025?'co':'cg')+'">'+(rPct!=null?rPct+'%':'—')+'</td>'+
+      // Adverse milestones: -1.0 → -0.1
+      ADV_STEPS.map(v=>{
+        const pct=Math.round(v*100);
+        const ms=advMs[pct]||advMs[100-pct]||advMs[Math.round(v*100)];
+        return msT(ms,p.openedAt,false);
+      }).join('')+
+      // Favorable milestones: +0.1 → +15.0
+      FAV_STEPS.map(v=>{
+        const ms=favMs[v]||favMs[Math.round(v*10)/10];
+        return msT(ms,p.openedAt,true);
+      }).join('')+
+      '<td class="cd" style="font-size:9px">'+dt(p.openedAt)+'</td>'+
+    '</tr>';
+  }).join('');
+}
+
+async function loadGhostTrackers(){
+  const d=await api('/api/open-positions')||[];
+  const ghosts=d.filter(p=>p.ghost?.maxRR!=null||p.ghost?.peakRRPos!=null);
+  const cnt=ghosts.length;
+  document.getElementById('h-gh').textContent=cnt;
+  document.getElementById('nb-gh').textContent=cnt||'';
+  if(!cnt){ document.getElementById('gh-body').innerHTML=emptyRow(100,'No active ghost trackers'); return; }
+
+  const strip=document.getElementById('gh-strip'); if(strip) strip.style.display='flex';
+  const best=Math.max(...ghosts.map(g=>g.ghost?.peakRRPos??0));
+  const worst=Math.max(...ghosts.map(g=>g.ghost?.peakRRNeg??0));
+  const buys=ghosts.filter(g=>g.direction==='buy').length;
+  document.getElementById('gh-cnt').textContent=cnt;
+  document.getElementById('gh-best').textContent=f2(best)+'R';
+  document.getElementById('gh-worst').textContent=worst>0?'-'+f0(worst)+'%':'—';
+  document.getElementById('gh-buy').textContent=buys;
+  document.getElementById('gh-sell').textContent=cnt-buys;
+  document.getElementById('gh-sk').textContent=ghosts.filter(g=>symType(g.symbol)==='stock').length;
+  document.getElementById('gh-ix').textContent=ghosts.filter(g=>symType(g.symbol)==='index').length;
+  document.getElementById('gh-fx').textContent=ghosts.filter(g=>symType(g.symbol)==='forex').length;
+
+  const body=document.getElementById('gh-body');
+  body.innerHTML=ghosts.map(g=>{
+    const peakPos=g.ghost?.peakRRPos??0;
+    const peakNeg=g.ghost?.peakRRNeg??0;
+    const favMs=g.ghost?.rrMilestones??{};
+    const advMs=g.ghost?.slMilestones??{};
+    const msT=(ms,opened,isFav)=>{
+      const cls=isFav?'ms-fav':'ms-adv';
+      if(!ms||!opened) return '<td class="'+cls+' cd" style="font-size:8px">—</td>';
+      const mins=Math.round((new Date(ms)-new Date(opened))/60000);
+      return '<td class="'+cls+(isFav?' cg':' cr')+'" style="font-size:8px">'+msFmt(mins)+'</td>';
+    };
+    const elapsed=g.openedAt?Math.round((Date.now()-new Date(g.openedAt))/60000):null;
+    return '<tr>'+
+      '<td class="cb fw">'+g.symbol+'</td>'+
+      '<td>'+tBadge(symType(g.symbol))+'</td>'+
+      '<td>'+sBadge(g.session)+'</td>'+
+      '<td>'+dBadge(g.direction)+'</td>'+
+      '<td>'+vBadge(g.vwapPosition)+'</td>'+
+      '<td class="'+(peakPos>=1?'cg fw':peakPos>0?'cy':'cd')+'">'+f2(peakPos)+'R</td>'+
+      '<td class="'+(peakNeg>80?'cr fw':peakNeg>50?'cr':peakNeg>25?'co':'cd')+'">'+( peakNeg>0?'-'+f0(peakNeg)+'%':'—')+'</td>'+
+      ADV_STEPS.map(v=>{
+        const pct=Math.round(v*100);
+        const ms=advMs[pct];
+        return msT(ms,g.openedAt,false);
+      }).join('')+
+      FAV_STEPS.map(v=>{
+        const ms=favMs[v]||favMs[Math.round(v*10)/10];
+        return msT(ms,g.openedAt,true);
+      }).join('')+
+      '<td class="cd">'+msFmt(elapsed)+'</td>'+
+      '<td class="cd" style="font-size:9px">'+dt(g.openedAt)+'</td>'+
+    '</tr>';
+  }).join('');
+}
+
+// ── Overview rendering ────────────────────────────────────────────
+function renderOverview(trades, daily, ghGrouped){
+  const total=trades.length;
+  document.getElementById('ov-comp').textContent=total;
+
+  // WR summary strip
+  document.getElementById('wr-tot').textContent=total;
+  document.getElementById('wr-tot-n').textContent=total+' trades';
+  const buys=trades.filter(t=>t.direction==='buy').length;
+  const sells=total-buys;
+  const ab=trades.filter(t=>t.vwapPosition==='above').length;
+  const asia=trades.filter(t=>t.session==='asia').length;
+  const lon=trades.filter(t=>t.session==='london').length;
+  const ny=trades.filter(t=>t.session==='ny').length;
+  document.getElementById('wr-buy').textContent=buys;
+  document.getElementById('wr-sell').textContent=sells;
+  document.getElementById('wr-ab').textContent=ab;
+  document.getElementById('wr-bw').textContent=total-ab;
+  document.getElementById('wr-asia').textContent=asia;
+  document.getElementById('wr-lon').textContent=lon;
+  document.getElementById('wr-ny').textContent=ny;
+
+  // Store all trades for filter
+  window._wrTrades=trades;
+  renderWRTable('all');
+
+  // Distribution
+  const fxT=trades.filter(t=>symType(t.symbol)==='forex');
+  const skT=trades.filter(t=>symType(t.symbol)==='stock');
+  const ixT=trades.filter(t=>symType(t.symbol)==='index');
+  const cmT=trades.filter(t=>symType(t.symbol)==='commodity');
+  document.getElementById('d-tot').textContent=total;
+  document.getElementById('d-fx').textContent=fxT.length;
+  document.getElementById('d-sk').textContent=skT.length;
+  document.getElementById('d-ix').textContent=ixT.length;
+  document.getElementById('d-cm').textContent=cmT.length;
+  document.getElementById('d-buy').textContent=buys;
+  document.getElementById('d-sell').textContent=sells;
+  document.getElementById('dist-meta').textContent=total+' trades · compliance+';
+
+  let ba_t=0,bb_t=0,sa_t=0,sb_t=0;
+  const typeGroups=[
+    {label:'Forex',    arr:fxT, badge:'bd-fx', sessions:['asia','london','ny']},
+    {label:'Stock',    arr:skT, badge:'bd-sk', sessions:['ny']},
+    {label:'Index',    arr:ixT, badge:'bd-ix', sessions:['asia','london','ny']},
+    {label:'Commodity',arr:cmT, badge:'bd-cm', sessions:['asia','london','ny']},
+  ];
+  const distRows=[];
+  for(const tg of typeGroups){
+    for(const sess of tg.sessions){
+      const st=tg.arr.filter(t=>t.session===sess);
+      if(!st.length) continue;
+      const ba=st.filter(t=>t.direction==='buy'&&t.vwapPosition==='above').length;
+      const bb=st.filter(t=>t.direction==='buy'&&t.vwapPosition==='below').length;
+      const sa=st.filter(t=>t.direction==='sell'&&t.vwapPosition==='above').length;
+      const sb=st.filter(t=>t.direction==='sell'&&t.vwapPosition==='below').length;
+      ba_t+=ba; bb_t+=bb; sa_t+=sa; sb_t+=sb;
+      distRows.push('<tr>'+
+        '<td><span class="bd '+tg.badge+'">'+tg.label+'</span></td>'+
+        '<td>'+sBadge(sess)+'</td>'+
+        '<td class="cg fw">'+ba+'</td><td class="cg">'+bb+'</td>'+
+        '<td class="cr fw">'+sa+'</td><td class="cr">'+sb+'</td>'+
+        '<td class="cb fw">'+(ba+bb+sa+sb)+'</td>'+
+      '</tr>');
+    }
+  }
+  document.getElementById('dist-body').innerHTML=distRows.join('')||emptyRow(7,'No trades after compliance date');
+  document.getElementById('ft-ba').textContent=ba_t;
+  document.getElementById('ft-bb').textContent=bb_t;
+  document.getElementById('ft-sa').textContent=sa_t;
+  document.getElementById('ft-sb').textContent=sb_t;
+  document.getElementById('ft-t').textContent=total;
+
+  // % gain (realized P&L / balance)
+  const pnlSum=trades.reduce((s,t)=>s+(t.realizedPnlEUR||0),0);
+  const balEl=document.getElementById('ov-bal');
+  const balStr=balEl?.textContent?.replace('€','').replace(/,/g,'');
+  const bal=parseFloat(balStr)||0;
+  if(bal>0){
+    const g=(pnlSum/bal*100).toFixed(2)+'%';
+    const gainEl=document.getElementById('ov-gain');
+    if(gainEl){ gainEl.textContent=(pnlSum>=0?'+':'')+g; gainEl.className='ov-val '+(pnlSum>=0?'cg':'cr'); }
+    document.getElementById('h-gain').textContent=(pnlSum>=0?'+':'')+g;
   }
 
-  // Daily table
-  const days = d?.days || [];
-  if (!days.length) { $('dw').innerHTML = '<div class="empty">Geen dagdata</div>'; return; }
-  $('dw').innerHTML = '<table><thead><tr>'+
-    '<th>Datum</th><th>Trades</th><th>W</th><th>L</th><th>PnL</th><th>Cum</th><th>Gem RR</th>'+
-    '</tr></thead><tbody>'+
-    days.slice(0,30).map(r =>
+  // Ghost history count
+  if(ghGrouped){
+    const closed=ghGrouped.reduce((s,g)=>s+(g.n||0),0);
+    document.getElementById('h-ghh').textContent=closed;
+  }
+
+  // TP locked
+  const tpLocked=ghGrouped?.filter(g=>(g.n||0)>=5).length||0;
+  document.getElementById('h-tp').textContent=tpLocked;
+
+  // Daily breakdown
+  const days=daily?.days||[];
+  document.getElementById('daily-meta').textContent=days.length+' trading days · compliance+';
+  if(daily?.maxWinStreak!=null) document.getElementById('d-wstrk').textContent=(daily.maxWinStreak||0)+' days';
+  if(daily?.maxLossStreak!=null) document.getElementById('d-lstrk').textContent=(daily.maxLossStreak||0)+' days';
+  if(daily?.maxDrawdownDay!=null) document.getElementById('d-dd').textContent='€'+f2(daily.maxDrawdownDay);
+
+  document.getElementById('daily-body').innerHTML=days.length?days.slice(0,60).map(r=>
+    '<tr>'+
+    '<td class="cd" style="font-size:10px">'+(r.trade_date||'—')+'</td>'+
+    '<td class="cb">'+(r.trades||0)+'</td>'+
+    '<td class="cg">'+(r.wins||0)+'</td>'+
+    '<td class="cr">'+(r.losses||0)+'</td>'+
+    '<td class="'+(+r.win_pct>=50?'cg':+r.win_pct>=40?'cy':'cr')+'">'+(r.win_pct!=null?f1(r.win_pct)+'%':'—')+'</td>'+
+    '<td class="'+pC(r.day_pnl)+' fw">'+eu(r.day_pnl)+'</td>'+
+    '<td class="'+pC(r.cum_pnl)+'">'+eu(r.cum_pnl)+'</td>'+
+    '<td class="cd">'+f2(r.avg_lots)+'</td>'+
+    '<td class="cy">'+f2(r.best_rr)+'R</td>'+
+    '<td class="cd">'+f2(r.avg_rr)+'R</td>'+
+    '</tr>'
+  ).join(''): emptyRow(10,'No daily data');
+
+  // Best/Worst setups
+  renderBW('all');
+}
+
+function renderWRTable(typeFilter){
+  const trades=window._wrTrades||[];
+  const filtered=typeFilter==='all'?trades:trades.filter(t=>symType(t.symbol)===typeFilter);
+  const combos={};
+  for(const t of filtered){
+    const k=(t.session||'?')+'|'+(t.direction||'?')+'|'+(t.vwapPosition||'?')+'|'+symType(t.symbol);
+    combos[k]=(combos[k]||0)+1;
+  }
+  const rows=Object.entries(combos).sort((a,b)=>b[1]-a[1]).map(([k,n])=>{
+    const [sess,dir,vwap,type]=k.split('|');
+    return '<tr>'+sBadge(sess)+dBadge(dir)+vBadge(vwap)+tBadge(type)+'<td class="cb fw">'+n+'</td></tr>';
+  }).map(r=>'<tr>'+r.replace(/<\/tr>/,'')).join('');
+  document.getElementById('wr-body').innerHTML=rows||emptyRow(5,'No trades');
+  document.getElementById('wr-meta').textContent=filtered.length+' trades · compliance+';
+}
+
+let _wrType='all';
+function setWRType(type,btn){
+  _wrType=type;
+  document.querySelectorAll('#wr-type-tabs .fb').forEach(b=>b.classList.remove('on'));
+  btn.classList.add('on');
+  renderWRTable(type);
+}
+
+// Best/worst setups
+function renderBW(period){
+  const trades=_allTrades;
+  const now=new Date();
+  const today=new Date(now); today.setHours(0,0,0,0);
+  const weekStart=new Date(now); weekStart.setDate(now.getDate()-now.getDay()); weekStart.setHours(0,0,0,0);
+  function filterT(arr){
+    if(period==='all') return arr;
+    return arr.filter(t=>{ const d=new Date(t.closedAt||t.openedAt); return period==='day'?d>=today:d>=weekStart; });
+  }
+  const filtered=filterT(trades);
+  const sorted=filtered.filter(t=>t.realizedPnlEUR!=null).sort((a,b)=>(b.realizedPnlEUR||0)-(a.realizedPnlEUR||0));
+  const best=sorted.slice(0,5), worst=sorted.slice(-5).reverse();
+  const row=t=>'<tr>'+
+    '<td class="cb fw" style="font-size:10px">'+t.symbol+'</td>'+
+    '<td>'+dBadge(t.direction)+'</td>'+
+    '<td>'+sBadge(t.session)+'</td>'+
+    '<td>'+vBadge(t.vwapPosition)+'</td>'+
+    '<td class="cy" style="font-size:10px">'+f2(t.maxRR)+'R</td>'+
+    '<td class="'+(+t.realizedPnlEUR>=0?'cg':'cr')+' fw" style="font-size:10px">'+eu(t.realizedPnlEUR)+'</td>'+
+    '<td class="cd" style="font-size:9px">'+dtS(t.closedAt)+'</td>'+
+  '</tr>';
+  document.getElementById('best-body').innerHTML=best.map(row).join('')||emptyRow(7,'No trades');
+  document.getElementById('worst-body').innerHTML=worst.map(row).join('')||emptyRow(7,'No trades');
+}
+
+function setBWP(p,btn){
+  _bwPeriod=p;
+  document.querySelectorAll('.fb[onclick*="setBWP"]').forEach(b=>b.classList.remove('on'));
+  btn.classList.add('on');
+  document.getElementById('bw-period-lbl').textContent=p==='day'?'today':p==='week'?'this week':'all time';
+  renderBW(p);
+}
+
+// ── Ghost History ─────────────────────────────────────────────────
+let _ghhData=[], _ghhF={sess:'all',dir:'all',type:'all'};
+function setGHF(k,v,btn){
+  _ghhF[k]=v;
+  document.querySelectorAll('.fb[onclick*="setGHF(\\''+k+'\\'"]').forEach(b=>b.classList.remove('on'));
+  btn.classList.add('on');
+  renderGhostHistory();
+}
+async function loadGhostHistory(){
+  const d=await api('/api/ghost-history-by-pair')||[];
+  _ghhData=d;
+  document.getElementById('h-ghh').textContent=d.reduce((s,g)=>s+(g.n||0),0);
+  renderGhostHistory();
+}
+function renderGhostHistory(){
+  const data=_ghhData.filter(g=>{
+    if(_ghhF.sess!=='all'&&g.session!==_ghhF.sess) return false;
+    if(_ghhF.dir!=='all'&&g.direction!==_ghhF.dir) return false;
+    if(_ghhF.type!=='all'&&symType(g.symbol)!==_ghhF.type) return false;
+    return true;
+  });
+  document.getElementById('ghh-meta').textContent=data.length+' combos · compliance+';
+  const body=document.getElementById('ghh-body');
+  if(!data.length){ body.innerHTML=emptyRow(15,'No ghost history'); return; }
+  body.innerHTML=data.map(g=>{
+    const safeKey=(g.optimizerKey||'').replace(/[^a-z0-9_]/gi,'_');
+    const tpRRs=(g.trades||[]).filter(t=>parseFloat(t.peakRRPos||0)>0).map(t=>parseFloat(t.peakRRPos));
+    const last5=tpRRs.slice(0,5);
+    const bestTP=last5.length?'avg '+f2(last5.reduce((s,v)=>s+v,0)/last5.length)+'R':'—';
+    const reasons=(g.trades||[]).map(t=>t.stopReason).filter(Boolean);
+    const mainReason=reasons.length?reasons.sort((a,b)=>reasons.filter(r=>r===b).length-reasons.filter(r=>r===a).length)[0]:'—';
+    return '<tr style="cursor:pointer" onclick="toggleGHHRow(\''+safeKey+'\')">'+
+      '<td class="cd" style="font-size:9px">▶</td>'+
+      '<td class="cb fw">'+g.symbol+'</td>'+
+      '<td>'+tBadge(symType(g.symbol))+'</td>'+
+      '<td>'+sBadge(g.session)+'</td>'+
+      '<td>'+dBadge(g.direction)+'</td>'+
+      '<td>'+vBadge(g.vwapPosition)+'</td>'+
+      '<td class="'+(g.n>=5?'cy fw':'cc')+'">'+g.n+'</td>'+
+      '<td class="cr">'+g.nSLHit+'</td>'+
+      '<td class="cg">'+g.nMaxRR15+'</td>'+
+      '<td class="cy">'+g.nMaxDays+'</td>'+
+      '<td class="cg fw">'+f2(g.avgPeakPos)+'R</td>'+
+      '<td class="cr">'+f1(g.avgPeakNeg)+'%</td>'+
+      '<td class="cg fw">'+f2(g.maxPeakPos)+'R</td>'+
+      '<td class="cy" style="font-size:9px">'+bestTP+'</td>'+
+      '<td class="cd" style="font-size:9px">'+mainReason+'</td>'+
+    '</tr>'+
+    '<tr class="ghh-detail" id="ghh-d-'+safeKey+'" style="display:none">'+
+      '<td colspan="15" style="padding:0;background:var(--bg3)">'+
+        '<table style="font-size:9px"><thead><tr>'+
+          '<th>#</th><th>Date</th><th>Close Reason</th><th>TP RR</th><th>Max RR</th>'+
+          '<th>Peak+RR</th><th>Peak−RR%</th><th>MAE%</th>'+
+          // Milestone columns in expanded view
+          ADV_STEPS.map(v=>'<th class="adv-th">-'+v.toFixed(1)+'</th>').join('')+
+          FAV_STEPS.map(v=>'<th class="fav-th">+'+v.toFixed(1)+'</th>').join('')+
+        '</tr></thead><tbody>'+
+        (g.trades||[]).map((t,i)=>{
+          const sr=t.stopReason==='phantom_sl'?'cr':t.stopReason==='max_rr_15'?'cg':'cy';
+          const favMs=t.rrMilestones??{};
+          const advMs=t.slMilestones??{};
+          return '<tr>'+
+            '<td class="cd">'+(i+1)+'</td>'+
+            '<td class="cd" style="font-size:8px">'+(t.openedAt?dtS(t.openedAt):'—')+'</td>'+
+            '<td class="'+sr+'" style="font-size:8px">'+(t.stopReason||'—')+'</td>'+
+            '<td class="cy">'+(t.tpRRUsed||'—')+'</td>'+
+            '<td class="cy">'+f2(t.maxRR)+'R</td>'+
+            '<td class="cg">'+f2(t.peakRRPos)+'R</td>'+
+            '<td class="cr">'+f1(t.peakRRNeg)+'%</td>'+
+            '<td class="cd">'+f1(t.maxSlPct)+'%</td>'+
+            ADV_STEPS.map(v=>{
+              const ms=advMs[Math.round(v*100)];
+              if(!ms||!t.openedAt) return '<td class="cd ms-adv" style="font-size:7px">—</td>';
+              const m=Math.round((new Date(ms)-new Date(t.openedAt))/60000);
+              return '<td class="cr ms-adv" style="font-size:7px">'+msFmt(m)+'</td>';
+            }).join('')+
+            FAV_STEPS.map(v=>{
+              const ms=favMs[v]||favMs[Math.round(v*10)/10];
+              if(!ms||!t.openedAt) return '<td class="cd ms-fav" style="font-size:7px">—</td>';
+              const m=Math.round((new Date(ms)-new Date(t.openedAt))/60000);
+              return '<td class="cg ms-fav" style="font-size:7px">'+msFmt(m)+'</td>';
+            }).join('')+
+          '</tr>';
+        }).join('')+
+        '</tbody></table>'+
+      '</td>'+
+    '</tr>';
+  }).join('');
+}
+function toggleGHHRow(key){
+  const el=document.getElementById('ghh-d-'+key);
+  if(el) el.style.display=el.style.display==='none'?'':'none';
+}
+
+async function loadGhostCombo(){
+  const d=await api('/api/ghost-grouped')||[];
+  const body=document.getElementById('ghc-body');
+  const rows=d.filter(g=>(g.n||0)>=1);
+  document.getElementById('ghc-meta').textContent=rows.length+' combos · only finalized ghosts';
+  if(!rows.length){ body.innerHTML=emptyRow(26,'No ghost combo data yet'); return; }
+  body.innerHTML=rows.map(g=>{
+    const ms=g.milestones??{};
+    const mT=k=>ms[k]?msFmt(Math.round(ms[k])):'—';
+    const evCls=g.evScore>0?'cg fw':g.evScore<0?'cr':'cd';
+    return '<tr>'+
+      '<td class="cb fw">'+g.symbol+'</td>'+
+      '<td>'+tBadge(symType(g.symbol))+'</td>'+
+      '<td>'+sBadge(g.session)+'</td>'+
+      '<td>'+dBadge(g.direction)+'</td>'+
+      '<td>'+vBadge(g.vwapPosition)+'</td>'+
+      '<td class="'+(g.n>=5?'cy fw':'cc')+'">'+g.n+'</td>'+
+      '<td class="cc">'+(g.nEV||0)+'</td>'+
+      '<td class="cg fw">'+f2(g.bestMaxRR)+'R</td>'+
+      '<td class="cd">'+f2(g.avgMaxRR)+'R</td>'+
+      '<td class="cd">'+mT('sl_25')+'</td><td class="cd">'+mT('sl_50')+'</td>'+
+      '<td class="cd">'+mT('sl_75')+'</td><td class="cd">'+mT('sl_100')+'</td>'+
+      '<td class="cg">'+mT('rr_05')+'</td><td class="cg">'+mT('rr_1')+'</td>'+
+      '<td class="cg">'+mT('rr_2')+'</td><td class="cg">'+mT('rr_3')+'</td>'+
+      '<td class="cg">'+mT('rr_5')+'</td><td class="cg">'+mT('rr_10')+'</td>'+
+      '<td class="cg">'+mT('rr_15')+'</td>'+
+      '<td class="cd" style="font-size:9px">'+(g.topStopReason||'—')+'</td>'+
+      '<td class="cd">'+f1(g.maeP50)+'%</td>'+
+      '<td class="cd">'+f1(g.maeP75)+'%</td>'+
+      '<td class="'+(g.maeP90<50?'cg':g.maeP90<75?'cy':'cr')+'">'+f1(g.maeP90)+'%</td>'+
+      '<td class="'+(g.evSL?'cy':'cd')+'" style="font-size:9px">'+(g.evSL||'—')+'</td>'+
+      '<td class="'+(g.lockedRR?'cg fw':'cd')+'" style="font-size:9px">'+(g.lockedRR?g.lockedRR+'R':'need≥5')+'</td>'+
+    '</tr>';
+  }).join('');
+}
+
+// ── EV TP Optimizer ───────────────────────────────────────────────
+let _evData=[], _evF={type:'all',sess:'all',dir:'all',min:'5'};
+function setEVF(k,v,btn){
+  _evF[k]=v;
+  document.querySelectorAll('.fb[onclick*="setEVF(\\''+k+'\\'"]').forEach(b=>b.classList.remove('on'));
+  btn.classList.add('on');
+  renderEV();
+}
+async function loadEV(){
+  const [g, tp] = await Promise.all([api('/api/ghost-grouped'), api('/api/tp-config')]);
+  _evData=(g||[]).map(r=>({...r, tpLocked:(tp||{})[r.optimizerKey]}));
+  renderEV();
+}
+function renderEV(){
+  const minN=parseInt(_evF.min)||5;
+  const rows=_evData.filter(g=>{
+    if((g.n||0)<minN) return false;
+    if(_evF.type!=='all'&&symType(g.symbol)!==_evF.type) return false;
+    if(_evF.sess!=='all'&&g.session!==_evF.sess) return false;
+    if(_evF.dir!=='all'&&g.direction!==_evF.dir) return false;
+    return true;
+  });
+  const locked=rows.filter(r=>r.tpLocked?.lockedRR).length;
+  document.getElementById('ev-cnt').textContent=rows.length;
+  document.getElementById('ev-data').textContent=rows.filter(r=>r.n>0).length;
+  document.getElementById('ev-lock').textContent=locked;
+  document.getElementById('ev-meta').textContent=rows.length+' combos · ≥'+minN+' ghost trades required for EV lock';
+  const body=document.getElementById('ev-body');
+  if(!rows.length){ body.innerHTML=emptyRow(15,'No combos match current filters'); return; }
+  body.innerHTML=rows.map(r=>{
+    const tp=r.tpLocked;
+    const hasEV=tp?.lockedRR;
+    return '<tr>'+
+      '<td class="cb fw">'+r.symbol+'</td>'+
+      '<td>'+tBadge(symType(r.symbol))+'</td>'+
+      '<td>'+sBadge(r.session)+'</td>'+
+      '<td>'+dBadge(r.direction)+'</td>'+
+      '<td>'+vBadge(r.vwapPosition)+'</td>'+
+      '<td class="'+(r.n>=5?'cy fw':'cc')+'">'+r.n+'</td>'+
+      '<td class="cd">'+(r.nTrades||0)+'</td>'+
+      '<td class="cg">'+(r.bestMaxRR?f2(r.bestMaxRR)+'R':'—')+'</td>'+
+      '<td class="cd">'+f2(r.avgMaxRR)+'R</td>'+
+      '<td class="'+(r.evScore>0?'cg fw':r.evScore<0?'cr':'cd')+'">'+(r.evScore!=null?f2(r.evScore):'—')+'</td>'+
+      '<td class="'+(hasEV?'cg':'cy')+'" style="font-size:9px">'+(hasEV?'✓ EV+ Locked':'need≥5')+'</td>'+
+      '<td class="'+(tp?.lockedRR?'cg fw':'cd')+'">'+(tp?.lockedRR?tp.lockedRR+'R':'—')+'</td>'+
+      '<td class="cd">'+(r.avgTimeToSL?msFmt(r.avgTimeToSL):'—')+'</td>'+
+      '<td class="'+(r.maeP90<50?'cg':r.maeP90<75?'cy':'cr')+'">'+(r.maeP90!=null?f1(r.maeP90)+'%':'—')+'</td>'+
+      '<td class="'+(r.totalPnl>=0?'cg':'cr')+' fw">'+(r.totalPnl!=null?eu(r.totalPnl):'—')+'</td>'+
+    '</tr>';
+  }).join('');
+}
+
+// ── EV SL Optimizer ───────────────────────────────────────────────
+async function loadEVSL(){
+  const d=await api('/api/mae-stats')||[];
+  const body=document.getElementById('evsl-body');
+  if(!d.length){ body.innerHTML=emptyRow(14,'Min 5 ghost trades required per combo'); return; }
+  body.innerHTML=d.map(r=>{
+    const p90=r.maeP90!=null?parseFloat(r.maeP90):null;
+    const cls=p90==null?'cd':p90<50?'cg':p90<75?'cy':'cr';
+    const advice=p90==null?'—':p90<50?'✓ Tighten SL':p90<75?'⚠ Moderate':'✗ Keep SL';
+    const pot=p90!=null&&p90<100?(100-p90).toFixed(1)+'% reduction possible':'—';
+    return '<tr>'+
+      '<td class="cb fw">'+r.symbol+'</td>'+
+      '<td>'+tBadge(symType(r.symbol))+'</td>'+
+      '<td>'+sBadge(r.session)+'</td>'+
+      '<td>'+dBadge(r.direction)+'</td>'+
+      '<td>'+vBadge(r.vwapPosition)+'</td>'+
+      '<td class="'+(r.n>=5?'cy':'cc')+'">'+r.n+'</td>'+
+      '<td class="cg">'+f1(r.maeP50)+'%</td>'+
+      '<td class="cy">'+f1(r.maeP75)+'%</td>'+
+      '<td class="'+cls+' fw">'+f1(r.maeP90)+'%</td>'+
+      '<td class="'+cls+' fw" style="font-size:9px">'+advice+'</td>'+
+      '<td class="cd">'+(r.bestSlPct!=null?f1(r.bestSlPct)+'%':'—')+'</td>'+
+      '<td class="'+(pot!=='—'?'cg':'cd')+'" style="font-size:9px">'+pot+'</td>'+
+      '<td class="cd">'+(r.shadowP50!=null?f1(r.shadowP50)+'%':'—')+'</td>'+
+      '<td class="cd">'+(r.shadowP90!=null?f1(r.shadowP90)+'%':'—')+'</td>'+
+    '</tr>';
+  }).join('');
+}
+
+// ── Signals & Blocked ─────────────────────────────────────────────
+async function loadSignals(){
+  const [stats, hist] = await Promise.all([api('/api/signal-stats'), api('/api/webhook-history?limit=50')]);
+  const s=stats||{};
+  document.getElementById('sig-tot').textContent=s.total||0;
+  document.getElementById('sig-placed').textContent=s.placed||0;
+  document.getElementById('sig-conv').textContent=s.conversionPct!=null?pct(s.conversionPct):'—';
+  const blocks=s.breakdown||{};
+  document.getElementById('blk-tot').textContent=s.totalBlocked||0;
+  document.getElementById('blk-dup').textContent=blocks.duplicate_open||0;
+  document.getElementById('blk-vw').textContent=blocks.vwap_exhausted||0;
+  document.getElementById('blk-win').textContent=blocks.outside_window||0;
+  document.getElementById('blk-cur').textContent=blocks.currency_budget||0;
+  document.getElementById('blk-ny').textContent=blocks.ny_dead_zone||0;
+
+  const h=(hist||[]).filter(r=>r.status==='OK');
+  document.getElementById('placed-body').innerHTML=h.length?h.map(r=>
+    '<tr>'+
+    '<td class="cd" style="font-size:9px">'+dt(r.ts)+'</td>'+
+    '<td class="cb fw">'+r.symbol+'</td>'+
+    '<td>'+dBadge(r.direction)+'</td>'+
+    '<td>'+sBadge(r.session)+'</td>'+
+    '<td>'+vBadge(r.vwapPosition)+'</td>'+
+    '<td class="cd">'+f2(r.entry)+'</td>'+
+    '<td class="cd">'+(r.slPct!=null?pct(r.slPct*100):'—')+'</td>'+
+    '<td class="cd">'+(r.latency_ms!=null?r.latency_ms+'ms':'—')+'</td>'+
+    '</tr>'
+  ).join(''):emptyRow(8,'No placed signals in memory');
+
+  const errs=(hist||[]).filter(r=>r.status!=='OK');
+  document.getElementById('whe-body').innerHTML=errs.length?errs.map(r=>
+    '<tr>'+
+    '<td class="cd" style="font-size:9px">'+dt(r.ts)+'</td>'+
+    '<td class="cb">'+r.symbol+'</td>'+
+    '<td>'+dBadge(r.direction)+'</td>'+
+    '<td>'+sBadge(r.session)+'</td>'+
+    '<td>'+vBadge(r.vwapPosition)+'</td>'+
+    '<td class="cd">'+f2(r.entry)+'</td>'+
+    '<td class="cd">'+(r.slPct!=null?pct(r.slPct*100):'—')+'</td>'+
+    '<td class="cd">'+(r.bandPct!=null?pct(r.bandPct):'—')+'</td>'+
+    '<td class="cr" style="font-size:9px">'+(r.reason||r.status||'—')+'</td>'+
+    '</tr>'
+  ).join(''):emptyRow(9,'No webhook errors in memory');
+
+  const rejects=await api('/api/signal-rejects')||[];
+  const rByReason={};
+  for(const r of rejects){
+    const key=(r.rejectReason||'unknown');
+    if(!rByReason[key]) rByReason[key]=[];
+    rByReason[key].push(r);
+  }
+  const blkRows=Object.entries(rByReason).sort((a,b)=>b[1].length-a[1].length);
+  document.getElementById('blk-body').innerHTML=blkRows.length?blkRows.flatMap(([reason,arr])=>
+    arr.slice(0,3).map(r=>
       '<tr>'+
-      '<td class="mt">'+(r.trade_date||'—')+'</td>'+
-      '<td>'+(r.trades||0)+'</td>'+
-      '<td class="gr">'+(r.wins||0)+'</td>'+
-      '<td class="rd">'+(r.losses||0)+'</td>'+
-      '<td class="'+cc(r.day_pnl||0)+'">'+eu(r.day_pnl)+'</td>'+
-      '<td class="'+cc(r.cum_pnl||0)+'">'+eu(r.cum_pnl)+'</td>'+
-      '<td>'+n2(r.avg_rr)+'</td>'+
+      '<td class="cr" style="font-size:9px">'+reason+'</td>'+
+      '<td class="cb">'+r.symbol+'</td>'+
+      '<td>'+dBadge(r.direction)+'</td>'+
+      '<td>'+sBadge(r.session)+'</td>'+
+      '<td>'+vBadge(r.vwapPosition)+'</td>'+
+      '<td class="cr fw">'+arr.length+'</td>'+
       '</tr>'
-    ).join('') + '</tbody></table>';
+    )
+  ).join(''):emptyRow(6,'No blocked signals');
 }
 
-// ── posities ─────────────────────────────────────────────────────
-async function loadPos() {
-  $('posw').innerHTML = '<div class="empty"><span class="spin">⟳</span></div>';
-  const d = await api('/api/open-positions') || [];
-  if (!d.length) { $('posw').innerHTML = '<div class="empty">Geen open posities</div>'; return; }
-  $('posw').innerHTML = '<table><thead><tr>'+
-    '<th>#</th><th>Symbol</th><th>Dir</th><th>Entry</th><th>SL</th><th>TP</th>'+
-    '<th>Lots</th><th>Risk</th><th>MaxRR</th><th>SL%</th><th>Open</th>'+
-    '</tr></thead><tbody>'+
-    d.map(p => '<tr>'+
-      '<td class="mt">'+(p.tradeNumber||'—')+'</td>'+
-      '<td class="bl">'+p.symbol+'</td>'+
-      '<td class="'+(p.direction==='buy'?'gr':'rd')+'">'+p.direction+'</td>'+
-      '<td>'+n2(p.entry)+'</td>'+
-      '<td class="rd">'+n2(p.sl)+'</td>'+
-      '<td class="gr">'+n2(p.tp)+'</td>'+
-      '<td>'+n2(p.lots)+'</td>'+
-      '<td>'+eu(p.riskEUR)+'</td>'+
-      '<td class="'+(+(p.ghost?.maxRR||0)>0?'gr':'')+'">'+n2(p.ghost?.maxRR)+'</td>'+
-      '<td>'+n1(p.ghost?.maxSlPctUsed)+'%</td>'+
-      '<td class="mt">'+dt(p.openedAt)+'</td>'+
-      '</tr>'
-    ).join('') + '</tbody></table>';
+async function loadBlockedRaw(){
+  const d=await api('/api/blocked-raw')||[];
+  const body=document.getElementById('blkraw-body');
+  document.getElementById('blkraw-meta').textContent=d.length+' entries · compliance+';
+  body.innerHTML=d.length?d.slice(0,200).map(r=>
+    '<tr>'+
+    '<td class="cb fw">'+r.symbol+'</td>'+
+    '<td>'+dBadge(r.direction)+'</td>'+
+    '<td>'+vBadge(r.vwapPosition)+'</td>'+
+    '<td>'+sBadge(r.session)+'</td>'+
+    '<td class="'+(r.outcome==='PLACED'?'cg':'cr')+'" style="font-size:9px">'+(r.outcome||'—')+'</td>'+
+    '<td class="cr" style="font-size:9px">'+(r.rejectReason||'—')+'</td>'+
+    '<td class="cr fw">'+(r.count||1)+'</td>'+
+    '<td class="cd" style="font-size:9px">'+dt(r.lastTs||r.createdAt)+'</td>'+
+    '</tr>'
+  ).join(''):emptyRow(8,'No blocked raw data');
 }
 
-// ── trades ───────────────────────────────────────────────────────
-async function loadTr() {
-  $('trw').innerHTML = '<div class="empty"><span class="spin">⟳</span></div>';
-  const d = await api('/api/trades') || [];
-  if (!d.length) { $('trw').innerHTML = '<div class="empty">Geen gesloten trades</div>'; return; }
-  $('trw').innerHTML = '<table><thead><tr>'+
-    '<th>#</th><th>Symbol</th><th>Dir</th><th>Uitkomst</th><th>PnL</th>'+
-    '<th>MaxRR</th><th>Lots</th><th>Sessie</th><th>Gesloten</th>'+
-    '</tr></thead><tbody>'+
-    d.slice(0,200).map((t,i) => '<tr>'+
-      '<td class="mt">'+(d.length-i)+'</td>'+
-      '<td class="bl">'+t.symbol+'</td>'+
-      '<td class="'+(t.direction==='buy'?'gr':'rd')+'">'+t.direction+'</td>'+
-      '<td class="'+(t.hitTP?'gr':'rd')+'">'+(t.hitTP?'TP':'SL')+' <span class="mt">('+( t.closeReason||'?')+')</span></td>'+
-      '<td class="'+cc(t.realizedPnlEUR||0)+'">'+eu(t.realizedPnlEUR)+'</td>'+
-      '<td>'+n2(t.maxRR)+'</td>'+
-      '<td>'+n2(t.lots)+'</td>'+
-      '<td class="mt">'+(t.session||'—')+'</td>'+
-      '<td class="mt">'+dt(t.closedAt)+'</td>'+
-      '</tr>'
-    ).join('') + '</tbody></table>';
+async function loadBand(){
+  const [b1,b2]=await Promise.all([api('/api/band-ghost-stats?bandTier=150'), api('/api/band-ghost-stats?bandTier=250')]);
+  const renderBandTable=(data,bodyId)=>{
+    const body=document.getElementById(bodyId);
+    if(!data?.length){ body.innerHTML=emptyRow(8,'No data'); return; }
+    body.innerHTML=data.map(r=>'<tr>'+
+      '<td class="cb fw">'+r.symbol+'</td>'+
+      '<td>'+sBadge(r.session)+'</td>'+
+      '<td>'+dBadge(r.direction)+'</td>'+
+      '<td>'+vBadge(r.vwapPosition)+'</td>'+
+      '<td class="cc">'+r.n+'</td>'+
+      '<td class="cg">'+f2(r.avgMaxRR)+'R</td>'+
+      '<td class="cg fw">'+f2(r.bestMaxRR)+'R</td>'+
+      '<td class="cd">'+f1(r.avgSlPct)+'%</td>'+
+    '</tr>').join('');
+  };
+  renderBandTable(b1,'b150-body');
+  renderBandTable(b2,'b250-body');
 }
 
-// ── ghost ────────────────────────────────────────────────────────
-async function loadGh() {
-  $('ghw').innerHTML = '<div class="empty"><span class="spin">⟳</span></div>';
-  const d = await api('/api/ghost-grouped') || [];
-  if (!d.length) { $('ghw').innerHTML = '<div class="empty">Nog geen ghost data</div>'; return; }
-  $('ghw').innerHTML = '<table><thead><tr>'+
-    '<th>Key</th><th>N</th><th>SL Hits</th><th>Gem MaxRR</th><th>Best MaxRR</th><th>Gem SL%</th><th>Laatste</th>'+
-    '</tr></thead><tbody>'+
-    d.map(g => '<tr>'+
-      '<td class="bl">'+(g.optimizerKey||'—')+'</td>'+
-      '<td>'+(g.n||0)+'</td>'+
-      '<td class="rd">'+(g.slHits||0)+'</td>'+
-      '<td>'+n2(g.avgMaxRR)+'</td>'+
-      '<td class="gr">'+n2(g.bestMaxRR)+'</td>'+
-      '<td>'+n1(g.avgSlPct)+'%</td>'+
-      '<td class="mt">'+dt(g.lastOpened)+'</td>'+
-      '</tr>'
-    ).join('') + '</tbody></table>';
-}
-
-// ── ev optimizer ─────────────────────────────────────────────────
-async function loadEV() {
-  $('evw').innerHTML = '<div class="empty"><span class="spin">⟳</span></div>';
-  const [g, tp, combo] = await Promise.all([
-    api('/api/ghost-grouped'), api('/api/tp-config'), api('/api/ghost-combo-analysis')
+// ── Boot ─────────────────────────────────────────────────────────
+async function loadAll(){
+  await Promise.all([pollStatus(), loadPositions(), loadGhostTrackers()]);
+  const [trades, daily, ghGrouped]=await Promise.all([
+    api('/api/trades'),
+    api('/api/daily-breakdown'),
+    api('/api/ghost-grouped'),
   ]);
-  const rows  = (g||[]).filter(r => (r.n||0)>=5);
-  const tpMap = tp || {};
-  const cmap  = {};
-  (combo||[]).forEach(c => cmap[c.optimizerKey]=c);
-  if (!rows.length) { $('evw').innerHTML = '<div class="empty">Nog geen EV data (min. 5 ghost trades)</div>'; return; }
-  $('evw').innerHTML = '<table><thead><tr>'+
-    '<th>Key</th><th>N</th><th>Locked TP</th><th>Best EV</th><th>Win Rate</th><th>Gem RR</th>'+
-    '</tr></thead><tbody>'+
-    rows.map(r => {
-      const c = cmap[r.optimizerKey]; const t = tpMap[r.optimizerKey];
-      return '<tr>'+
-        '<td class="bl">'+(r.optimizerKey||'—')+'</td>'+
-        '<td>'+(r.n||0)+'</td>'+
-        '<td class="'+((t?.lockedRR||0)>=2?'gr':'yl')+'">'+(t?.lockedRR!=null?t.lockedRR+'R':'—')+'</td>'+
-        '<td class="'+((c?.evScore||0)>0?'gr':'rd')+'">'+(c?.evScore!=null?n2(c.evScore):'—')+'</td>'+
-        '<td>'+(c?.winRate!=null?pc(c.winRate):'—')+'</td>'+
-        '<td>'+n2(r.avgMaxRR)+'</td>'+
-        '</tr>';
-    }).join('') + '</tbody></table>';
+  _allTrades=(trades||[]).filter(t=>t.openedAt&&new Date(t.openedAt).getTime()>=new Date('2026-05-03T00:00:00Z').getTime());
+  renderOverview(_allTrades, daily, ghGrouped);
 }
 
-// ── signalen ─────────────────────────────────────────────────────
-async function loadSig() {
-  $('sigw').innerHTML = '<div class="empty"><span class="spin">⟳</span></div>';
-  const [stats, hist] = await Promise.all([
-    api('/api/signal-stats'), api('/api/webhook-history?limit=50')
-  ]);
-  const s = stats||{};
-  $('sigkg').innerHTML = [
-    kpi('Signalen',  n0(s.total),          ''),
-    kpi('Geplaatst', n0(s.placed),         'gr'),
-    kpi('Conversie', pc(s.conversionPct),  (s.conversionPct||0)>=15?'gr':'yl'),
-  ].join('');
-  const h = hist||[];
-  if (!h.length) { $('sigw').innerHTML = '<div class="empty">Geen webhook history</div>'; return; }
-  $('sigw').innerHTML = '<table><thead><tr>'+
-    '<th>Tijd</th><th>Symbol</th><th>Dir</th><th>Status</th><th>Reden</th><th>Latency</th>'+
-    '</tr></thead><tbody>'+
-    h.map(r => '<tr>'+
-      '<td class="mt">'+dt(r.ts)+'</td>'+
-      '<td class="bl">'+(r.symbol||'—')+'</td>'+
-      '<td class="'+(r.direction==='buy'?'gr':'rd')+'">'+(r.direction||'—')+'</td>'+
-      '<td class="'+(r.status==='OK'?'gr':'rd')+'">'+(r.status||'—')+'</td>'+
-      '<td class="mt">'+(r.reason||'')+'</td>'+
-      '<td>'+(r.latency_ms!=null?r.latency_ms+'ms':'—')+'</td>'+
-      '</tr>'
-    ).join('') + '</tbody></table>';
-}
-
-// ── spreads ──────────────────────────────────────────────────────
-async function loadSpr() {
-  $('sprw').innerHTML = '<div class="empty"><span class="spin">⟳</span></div>';
-  const d = await api('/api/spread-stats') || [];
-  if (!d.length) { $('sprw').innerHTML = '<div class="empty">Geen spread data</div>'; return; }
-  $('sprw').innerHTML = '<table><thead><tr>'+
-    '<th>Symbol</th><th>Sessie</th><th>Uur</th><th>N</th><th>Gem</th><th>P50</th><th>P90</th><th>Max</th>'+
-    '</tr></thead><tbody>'+
-    d.slice(0,100).map(r => '<tr>'+
-      '<td class="bl">'+(r.symbol||'—')+'</td>'+
-      '<td>'+(r.session||'—')+'</td>'+
-      '<td>'+(r.hour_brussels!=null?r.hour_brussels+':00':'—')+'</td>'+
-      '<td class="mt">'+(r.samples||0)+'</td>'+
-      '<td>'+(r.avg_spread_abs!=null?(+r.avg_spread_abs).toFixed(6):'—')+'</td>'+
-      '<td>'+(r.p50_spread!=null?(+r.p50_spread).toFixed(6):'—')+'</td>'+
-      '<td>'+(r.p90_spread!=null?(+r.p90_spread).toFixed(6):'—')+'</td>'+
-      '<td class="rd">'+(r.max_spread!=null?(+r.max_spread).toFixed(6):'—')+'</td>'+
-      '</tr>'
-    ).join('') + '</tbody></table>';
-}
-
-// ── boot ────────────────────────────────────────────────────────
-// Fire everything in parallel — no sequential awaits
-pollStatus();
-loadOv();
-
-setInterval(pollStatus, 15000);
-setInterval(loadOv,     60000);
+loadAll();
+setInterval(loadAll, 30000);
 </script>
 </body>
 </html>`;
