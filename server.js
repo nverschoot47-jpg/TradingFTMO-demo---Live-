@@ -759,14 +759,14 @@ tr:hover td{background:var(--bg4)}
 </div>
 
 <!-- ═══════════════════════ NAV ════════════════════════════════ -->
-<nav>
-  <div class="ntab on"  onclick="showPage('overview',this)">Overview</div>
-  <div class="ntab"     onclick="showPage('positions',this)">Open Positions<span class="nbadge" id="nb-pos">—</span></div>
-  <div class="ntab"     onclick="showPage('ghosts',this)">Ghost Tracker<span class="nbadge" id="nb-gh">—</span></div>
-  <div class="ntab"     onclick="showPage('history',this)">Ghost History</div>
-  <div class="ntab"     onclick="showPage('ev',this)">EV TP Optimizer</div>
-  <div class="ntab"     onclick="showPage('evsl',this)">EV SL Optimizer</div>
-  <div class="ntab"     onclick="showPage('signals',this)">Signals &amp; Blocked<span class="nbadge" id="nb-sig" style="display:none"></span></div>
+<nav id="main-nav">
+  <div class="ntab on"  data-page="overview">Overview</div>
+  <div class="ntab"     data-page="positions">Open Positions<span class="nbadge" id="nb-pos" style="pointer-events:none">—</span></div>
+  <div class="ntab"     data-page="ghosts">Ghost Tracker<span class="nbadge" id="nb-gh" style="pointer-events:none">—</span></div>
+  <div class="ntab"     data-page="history">Ghost History</div>
+  <div class="ntab"     data-page="ev">EV TP Optimizer</div>
+  <div class="ntab"     data-page="evsl">EV SL Optimizer</div>
+  <div class="ntab"     data-page="signals">Signals &amp; Blocked<span class="nbadge" id="nb-sig" style="pointer-events:none;display:none"></span></div>
 </nav>
 
 <!-- ══════════════ PAGE: OVERVIEW ══════════════════════════════ -->
@@ -1248,69 +1248,68 @@ tr:hover td{background:var(--bg4)}
 
 <script>
 'use strict';
-// ── Symbol type maps ─────────────────────────────────────────────
+
+// ── Symbol type lookup ────────────────────────────────────────────
 const FOREX_S = new Set(['AUDCAD','AUDCHF','AUDNZD','AUDUSD','CADCHF','EURAUD','EURCHF','EURUSD','GBPAUD','GBPNZD','GBPUSD','NZDCAD','NZDCHF','NZDUSD','USDCAD','USDCHF']);
 const INDEX_S = new Set(['DE30EUR','NAS100USD','UK100GBP','US30USD']);
 const COMM_S  = new Set(['XAUUSD']);
 function symType(s){ if(FOREX_S.has(s)) return 'forex'; if(INDEX_S.has(s)) return 'index'; if(COMM_S.has(s)) return 'commodity'; return 'stock'; }
 
-// ── Milestone steps (mirrored from server) ───────────────────────
-const ADV_STEPS=[], FAV_STEPS=[];
-for(let v=1.0; v>=0.1-1e-9; v=Math.round((v-0.1)*10)/10) ADV_STEPS.push(+v.toFixed(1));
-for(let v=0.1; v<=15.0+1e-9; v=Math.round((v+0.1)*10)/10) FAV_STEPS.push(+v.toFixed(1));
+// ── Milestone steps: -1.0→-0.1 then +0.1→+15.0 ──────────────────
+const ADV_STEPS=[],FAV_STEPS=[];
+for(let v=1.0;v>=0.1-1e-9;v=Math.round((v-0.1)*10)/10) ADV_STEPS.push(+v.toFixed(1));
+for(let v=0.1;v<=15.0+1e-9;v=Math.round((v+0.1)*10)/10) FAV_STEPS.push(+v.toFixed(1));
 
 // ── Formatters ───────────────────────────────────────────────────
-const f2  = v => v==null?'—':(+v).toFixed(2);
-const f1  = v => v==null?'—':(+v).toFixed(1);
-const f0  = v => v==null?'—':(+v).toFixed(0);
-const eu  = v => v==null?'—':(v>=0?'+':'')+'€'+(+v).toFixed(2);
+const f2  = v => v==null||isNaN(+v)?'—':(+v).toFixed(2);
+const f1  = v => v==null||isNaN(+v)?'—':(+v).toFixed(1);
+const f0  = v => v==null||isNaN(+v)?'—':(+v).toFixed(0);
+const eu  = v => v==null?'—':((+v)>=0?'+':'')+'€'+(+v).toFixed(2);
 const pct = v => v==null?'—':(+v).toFixed(1)+'%';
 const pC  = v => (+v||0)>=0?'cg':'cr';
-const dt  = s => { try{ return new Date(s).toLocaleString('nl-BE',{timeZone:'Europe/Brussels',hour12:false,day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}); }catch{return s||'—';} };
+const dt  = s => { try{ return new Date(s).toLocaleString('nl-BE',{timeZone:'Europe/Brussels',day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}); }catch{return s||'—';} };
 const dtS = s => { try{ return new Date(s).toLocaleDateString('nl-BE'); }catch{return s||'—';} };
-const msFmt = m => { if(!m) return '—'; const h=Math.floor(m/60); return h>0?h+'h'+(m%60)+'m':(m%60)+'m'; };
+const msFmt = m => { if(!m&&m!==0) return '—'; m=Math.round(+m); const h=Math.floor(m/60),mn=m%60; return h>0?h+'h'+mn+'m':mn+'m'; };
 
-// ── Badges ───────────────────────────────────────────────────────
+// ── Badge helpers ─────────────────────────────────────────────────
 const dBadge = d => d==='buy'?'<span class="bd bd-buy">BUY</span>':'<span class="bd bd-sell">SELL</span>';
 const vBadge = v => v==='above'?'<span class="bd bd-ab">ABOVE</span>':'<span class="bd bd-bw">BELOW</span>';
-const sBadge = s => s==='asia'?'<span class="bd bd-asia">ASIA</span>':s==='london'?'<span class="bd bd-lon">LON</span>':s==='ny'?'<span class="bd bd-ny">NY</span>':'<span class="bd" style="color:var(--ink3)">'+s+'</span>';
-const tBadge = t => t==='forex'?'<span class="bd bd-fx">FX</span>':t==='stock'?'<span class="bd bd-sk">STK</span>':t==='index'?'<span class="bd bd-ix">IDX</span>':'<span class="bd bd-cm">COM</span>';
-const emptyRow = (cols, msg) => '<tr><td colspan="'+cols+'" class="nd">'+msg+'</td></tr>';
+const sBadge = s => ({asia:'<span class="bd bd-asia">ASIA</span>',london:'<span class="bd bd-lon">LON</span>',ny:'<span class="bd bd-ny">NY</span>'}[s])||'<span class="bd cd">'+s+'</span>';
+const tBadge = t => ({forex:'<span class="bd bd-fx">FX</span>',stock:'<span class="bd bd-sk">STK</span>',index:'<span class="bd bd-ix">IDX</span>',commodity:'<span class="bd bd-cm">COM</span>'}[t])||'<span class="bd cd">'+t+'</span>';
+const emptyRow = (cols,msg) => '<tr><td colspan="'+cols+'" class="nd">'+msg+'</td></tr>';
 
 // ── API helper ───────────────────────────────────────────────────
-async function api(url, ms=9000) {
-  const ctrl=new AbortController(), tid=setTimeout(()=>ctrl.abort(), ms);
-  try{ const r=await fetch(url,{signal:ctrl.signal}); clearTimeout(tid); if(!r.ok) throw 0; return await r.json(); }
-  catch{ clearTimeout(tid); return null; }
+async function api(url, ms=12000){
+  const ctrl=new AbortController(), tid=setTimeout(()=>ctrl.abort(),ms);
+  try{
+    const r=await fetch(url,{signal:ctrl.signal});
+    clearTimeout(tid);
+    if(!r.ok) throw new Error(r.status);
+    return await r.json();
+  }catch(e){ clearTimeout(tid); console.warn('[API]',url,e.message||e); return null; }
 }
 
-// ── Clock + session ──────────────────────────────────────────────
+// ── Clock ────────────────────────────────────────────────────────
 function updateClock(){
   try{
     const now=new Date();
-    document.getElementById('hclock').textContent=now.toLocaleString('nl-BE',{timeZone:'Europe/Brussels',hour12:false});
-    const h=new Date(now.toLocaleString('en-US',{timeZone:'Europe/Brussels'})).getHours();
-    const m=new Date(now.toLocaleString('en-US',{timeZone:'Europe/Brussels'})).getMinutes();
-    const t=h*60+m;
-    let sess='OUTSIDE';
-    if(t>=120&&t<480) sess='ASIA';
-    else if(t>=480&&t<930) sess='LONDON';
-    else if(t>=930&&t<1260) sess='NEW YORK';
-    document.getElementById('h-sess').textContent=sess;
+    const el=document.getElementById('hclock'); if(el) el.textContent=now.toLocaleTimeString('nl-BE',{timeZone:'Europe/Brussels',hour12:false});
+    const bx=new Date(now.toLocaleString('en-US',{timeZone:'Europe/Brussels'}));
+    const t=bx.getHours()*60+bx.getMinutes();
+    const sess=t>=120&&t<480?'ASIA':t>=480&&t<930?'LONDON':t>=930&&t<1260?'NEW YORK':'CLOSED';
+    const se=document.getElementById('h-sess'); if(se) se.textContent=sess;
   }catch{}
 }
 setInterval(updateClock,1000); updateClock();
 
-// ── Page navigation ──────────────────────────────────────────────
+// ── Page nav (event delegation) ──────────────────────────────────
 const PAGES=['overview','positions','ghosts','history','ev','evsl','signals'];
-let _loaded={};
-function showPage(name, el){
-  PAGES.forEach(p=>{
-    const pg=document.getElementById('page-'+p); if(pg) pg.classList.remove('on');
-  });
+const _loaded={};
+function showPage(name){
+  PAGES.forEach(p=>{ const pg=document.getElementById('page-'+p); if(pg) pg.classList.remove('on'); });
   document.querySelectorAll('.ntab').forEach(t=>t.classList.remove('on'));
   const pg=document.getElementById('page-'+name); if(pg) pg.classList.add('on');
-  if(el) el.classList.add('on');
+  const tab=document.querySelector('.ntab[data-page="'+name+'"]'); if(tab) tab.classList.add('on');
   if(!_loaded[name]){
     _loaded[name]=true;
     if(name==='history') { loadGhostHistory(); loadGhostCombo(); }
@@ -1319,120 +1318,95 @@ function showPage(name, el){
     if(name==='ev')      loadEV();
   }
 }
+document.addEventListener('click',e=>{
+  const t=e.target.closest('.ntab[data-page]'); if(t) showPage(t.dataset.page);
+});
 
-// ── Milestone column toggle ───────────────────────────────────────
+// ── Milestone toggle ─────────────────────────────────────────────
 let _msVisible=false;
 function toggleMsCols(){
   _msVisible=!_msVisible;
-  document.querySelectorAll('.adv-th,.fav-th').forEach(el=>{
-    el.style.display=_msVisible?'':'none';
-  });
-  // Also toggle td cells via CSS class trick
-  const style=document.getElementById('ms-style')||document.head.appendChild(Object.assign(document.createElement('style'),{id:'ms-style'}));
-  style.textContent=_msVisible?''
-    +'.ms-adv,.ms-fav{display:none}'
-    :'';
-  if(_msVisible) style.textContent='';
-  else style.textContent='.ms-adv,.ms-fav{display:none}';
+  let s=document.getElementById('ms-style');
+  if(!s){ s=document.createElement('style'); s.id='ms-style'; document.head.appendChild(s); }
+  s.textContent=_msVisible?'':'.ms-adv,.ms-fav{display:none!important}';
+  document.querySelectorAll('th.adv-th,th.fav-th').forEach(el=>el.style.display=_msVisible?'':'none');
 }
-// Initially hide milestones
-document.addEventListener('DOMContentLoaded',()=>{
-  const s=document.head.appendChild(Object.assign(document.createElement('style'),{id:'ms-style'}));
-  s.textContent='.ms-adv,.ms-fav{display:none}';
-  document.querySelectorAll('.adv-th,.fav-th').forEach(el=>el.style.display='none');
-});
 
-// ── Status poll ──────────────────────────────────────────────────
+// ── pollStatus — fills header KPIs from /status ──────────────────
 async function pollStatus(){
-  const d=await api('/status',5000);
-  if(!d) return;
-  const eq=d.account?.equity;
-  const bal=d.account?.balance;
-  if(eq!=null&&bal!=null){
-    const livePnl=eq-bal;
-    document.getElementById('h-pnl').textContent=(livePnl>=0?'+':'')+'€'+livePnl.toFixed(2);
-    document.getElementById('h-pnl').className='hkv '+(livePnl>=0?'cg':'cr');
-    document.getElementById('ov-pnl').textContent=(livePnl>=0?'+':'')+'€'+livePnl.toFixed(2);
-    document.getElementById('ov-pnl').className='ov-val '+(livePnl>=0?'cg':'cr');
-    document.getElementById('ov-pnl-sub').textContent=(livePnl>=0?'+':'')+livePnl.toFixed(2)+' on open trades';
-  }
+  const d=await api('/status',5000); if(!d) return;
+  const bal=d.account?.balance, eq=d.account?.equity;
   if(bal!=null){
-    document.getElementById('h-bal').textContent='€'+f0(bal);
-    document.getElementById('ov-bal').textContent='€'+f0(bal);
+    setText('h-bal','€'+f0(bal));
+    setText('ov-bal','€'+f0(bal));
   }
-  // Compliance date
-  if(d.complianceDate){
-    const cd=document.getElementById('cbar-date'); if(cd) cd.textContent='Compliance: '+d.complianceDate+' UTC';
+  if(bal!=null&&eq!=null){
+    const live=eq-bal;
+    setHtml('h-pnl','<span class="'+(live>=0?'cg':'cr')+'">'+(live>=0?'+':'')+'€'+live.toFixed(2)+'</span>');
+    setText('ov-pnl',(live>=0?'+':'')+'€'+live.toFixed(2));
+    setClass('ov-pnl','ov-val '+(live>=0?'cg':'cr'));
+    setText('ov-pnl-sub',(live>=0?'+':'')+live.toFixed(2)+' on open trades');
   }
-  // Open positions count
-  document.getElementById('h-pos').textContent=d.openPositions||0;
+  if(d.openPositions!=null){ setText('h-pos',d.openPositions); setText('nb-pos',d.openPositions); }
+  if(d.complianceDate){ setText('cbar-date','Compliance: '+d.complianceDate.slice(0,10)+' UTC'); }
 }
 
-// ── Load all (overview data) ─────────────────────────────────────
-let _allTrades=[], _bwPeriod='all';
+// ── Helpers ───────────────────────────────────────────────────────
+function setText(id,v){ const el=document.getElementById(id); if(el) el.textContent=v; }
+function setHtml(id,v){ const el=document.getElementById(id); if(el) el.innerHTML=v; }
+function setClass(id,v){ const el=document.getElementById(id); if(el) el.className=v; }
 
-async function loadAll(){
-  pollStatus();
-  const [trades, daily, ghGrouped] = await Promise.all([
-    api('/api/trades'),
-    api('/api/daily-breakdown'),
-    api('/api/ghost-grouped'),
-  ]);
-  _allTrades = (trades||[]).filter(t=>t.openedAt && new Date(t.openedAt).getTime()>=new Date('2026-05-03T00:00:00Z').getTime());
-  loadPositions();
-  loadGhostTrackers();
-  renderOverview(_allTrades, daily, ghGrouped);
-  // Store best/worst from daily endpoint for period filtering
-  window._bestTrades  = daily?.bestTrades  || [];
-  window._worstTrades = daily?.worstTrades || [];
-}
-
+// ── loadPositions — uses /api/open-positions ─────────────────────
 async function loadPositions(){
   const d=await api('/api/open-positions')||[];
   const cnt=d.length;
-  document.getElementById('h-pos').textContent=cnt;
-  document.getElementById('nb-pos').textContent=cnt||'';
-  document.getElementById('ov-open').textContent=cnt;
-  if(!cnt){ document.getElementById('pos-body').innerHTML=emptyRow(100,'No open positions'); return; }
-
-  const strip=document.getElementById('pos-strip'); if(strip) strip.style.display='flex';
-  const pnl=d.reduce((s,p)=>s+(p.currentPnL||0),0);
+  setText('h-pos',cnt); setText('nb-pos',cnt||''); setText('ov-open',cnt);
+  const posStrip=document.getElementById('pos-strip');
+  if(!cnt){
+    setHtml('pos-body',emptyRow(100,'No open positions'));
+    if(posStrip) posStrip.style.display='none';
+    setText('ov-open-sub','no live positions');
+    return;
+  }
+  if(posStrip) posStrip.style.display='flex';
   const buys=d.filter(p=>p.direction==='buy').length;
-  const ghd=d.filter(p=>p.ghost?.maxRR>0).length;
-  document.getElementById('pos-cnt').textContent=cnt;
-  document.getElementById('pos-pnl').textContent=eu(pnl);
-  document.getElementById('pos-pnl').className='ksv '+(pnl>=0?'cg':'cr');
-  document.getElementById('pos-buy').textContent=buys;
-  document.getElementById('pos-sell').textContent=cnt-buys;
-  document.getElementById('pos-sk').textContent=d.filter(p=>symType(p.symbol)==='stock').length;
-  document.getElementById('pos-ix').textContent=d.filter(p=>symType(p.symbol)==='index').length;
-  document.getElementById('pos-fx').textContent=d.filter(p=>symType(p.symbol)==='forex').length;
-  document.getElementById('pos-cm').textContent=d.filter(p=>symType(p.symbol)==='commodity').length;
-  document.getElementById('pos-gh').textContent=ghd;
-  document.getElementById('ov-pnl').textContent=eu(pnl);
-  document.getElementById('ov-pnl').className='ov-val '+(pnl>=0?'cg':'cr');
-  document.getElementById('ov-open-sub').textContent=buys+' buy · '+(cnt-buys)+' sell';
+  const ghd=d.filter(p=>p.ghost!=null).length;
+  setText('pos-cnt',cnt);
+  setText('pos-buy',buys); setText('pos-sell',cnt-buys);
+  setText('pos-sk',d.filter(p=>symType(p.symbol)==='stock').length);
+  setText('pos-ix',d.filter(p=>symType(p.symbol)==='index').length);
+  setText('pos-fx',d.filter(p=>symType(p.symbol)==='forex').length);
+  setText('pos-cm',d.filter(p=>symType(p.symbol)==='commodity').length);
+  setText('pos-gh',ghd);
+  setText('ov-open-sub',buys+' buy · '+(cnt-buys)+' sell');
 
-  const body=document.getElementById('pos-body');
-  body.innerHTML=d.map(p=>{
-    const dec=p.symbol.includes('JPY')?3:5;
-    const slDist=Math.abs(p.entry-p.sl);
-    const rrNow=slDist>0?parseFloat(((p.direction==='buy'?p.currentPrice-p.entry:p.entry-p.currentPrice)/slDist).toFixed(2)):null;
-    const tpRR=slDist>0?parseFloat((Math.abs(p.tp-p.entry)/slDist).toFixed(2)):null;
-    const peakPos=p.ghost?.peakRRPos??0;
-    const peakNeg=p.ghost?.peakRRNeg??0;
-    const rPct=p.riskPct?+(p.riskPct*100).toFixed(3):null;
-    const favMs=p.ghost?.rrMilestones??{};
-    const advMs=p.ghost?.slMilestones??{};
-    // Map milestone times
+  // Use live P&L from header (set by pollStatus)
+  const livePnlTxt=document.getElementById('h-pnl')?.textContent||'—';
+  setText('pos-pnl',livePnlTxt);
+
+  const tbody=document.getElementById('pos-body');
+  if(!tbody) return;
+  tbody.innerHTML=d.map(p=>{
+    const dec=(p.symbol||'').includes('JPY')?3:p.lots<0.5?5:4;
+    const slDist=Math.abs((p.entry||0)-(p.sl||0));
+    const peakPos=p.ghost?.peakRRPos??p.ghost?.maxRR??0;
+    const peakNeg=p.ghost?.peakRRNeg??p.ghost?.maxSlPctUsed??0;
+    const tpRR=slDist>0?Math.abs((p.tp||0)-(p.entry||0))/slDist:null;
+    const rPct=p.riskPct?(p.riskPct*100).toFixed(3):null;
+    // Milestone time helper
     const msT=(ms,opened,isFav)=>{
-      const cls=isFav?'ms-fav':'ms-adv';
-      if(!ms||!opened) return '<td class="'+cls+' cd" style="font-size:8px">—</td>';
+      const cls='td class="'+(isFav?'ms-fav cg':'ms-adv cr')+'" style="font-size:8px"';
+      if(!ms||!opened) return '<'+cls+'>—</td>';
       const mins=Math.round((new Date(ms)-new Date(opened))/60000);
-      return '<td class="'+cls+(isFav?' cg':' cr')+'" style="font-size:8px">'+msFmt(mins)+'</td>';
+      return '<'+cls+'>'+msFmt(mins)+'</td>';
     };
+    // slMilestones keys: {25,50,75,90,100} → map ADV step to nearest pct key
+    const advMs=p.ghost?.slMilestones||{};
+    const favMs=p.ghost?.rrMilestones||{};
+    const advKeys=Object.keys(advMs).map(Number);
+    const favKeys=Object.keys(favMs).map(Number);
     return '<tr>'+
-      '<td class="cb fw">'+p.symbol+'</td>'+
+      '<td class="cb fw" style="font-size:11px">'+p.symbol+'</td>'+
       '<td>'+tBadge(symType(p.symbol))+'</td>'+
       '<td>'+dBadge(p.direction)+'</td>'+
       '<td>'+vBadge(p.vwapPosition)+'</td>'+
@@ -1440,28 +1414,25 @@ async function loadPositions(){
       '<td class="cd" style="font-size:10px">'+f2(p.entry)+'</td>'+
       '<td class="cr" style="font-size:10px">'+f2(p.sl)+'</td>'+
       '<td class="cg" style="font-size:10px">'+f2(p.tp)+'</td>'+
-      '<td class="'+(rrNow==null?'cd':rrNow>=1?'cg fw':rrNow>=0?'cy':'cr fw')+' fw">'+( rrNow!=null?rrNow+'R':'—')+'</td>'+
-      '<td class="'+(peakPos>=1?'cg fw':peakPos>0?'cy':'cd')+'">'+f2(peakPos)+'R</td>'+
+      '<td class="'+(peakPos>=1?'cg fw':peakPos>0?'cy':'cd')+' fw">'+f2(peakPos)+'R</td>'+
+      '<td class="'+(peakPos>=2?'cg fw':peakPos>=1?'cg':peakPos>0?'cy':'cd')+'">'+f2(peakPos)+'R</td>'+
       '<td class="'+(peakNeg>80?'cr fw':peakNeg>50?'cr':peakNeg>25?'co':'cd')+'">'+( peakNeg>0?'-'+f0(peakNeg)+'%':'—')+'</td>'+
       '<td class="cy">'+(tpRR!=null?f2(tpRR)+'R':'—')+'</td>'+
-      '<td class="'+(pC(p.currentPnL))+' fw">'+eu(p.currentPnL)+'</td>'+
+      '<td class="cd">—</td>'+
       '<td class="cd">'+f2(p.lots)+'</td>'+
-      '<td class="'+(rPct&&rPct>0.04?'cr fw':rPct&&rPct>0.025?'co':'cg')+'">'+(rPct!=null?rPct+'%':'—')+'</td>'+
-      // ADV milestones: slMilestones keys = {25,50,75,90,100} = % SL used
-      // -1.0R = 100% SL, -0.5R = 50%, -0.1R ≈ 10% — map closest
+      '<td class="'+(rPct&&+rPct>0.04?'cr fw':rPct&&+rPct>0.025?'co':'cg')+'">'+(rPct!=null?rPct+'%':'—')+'</td>'+
+      // ADV milestones (-1.0 to -0.1): slMilestones keys 100,90,75,50,25
       ADV_STEPS.map(v=>{
-        // v=1.0→100%, v=0.9→90%, v=0.5→50%, v=0.1→10%
         const pctKey=Math.round(v*100);
-        // Find closest key in slMilestones
-        const keys=Object.keys(advMs).map(Number).sort((a,b)=>Math.abs(a-pctKey)-Math.abs(b-pctKey));
-        const ms=keys.length&&Math.abs(keys[0]-pctKey)<=15?advMs[keys[0]]:null;
+        const nearest=advKeys.sort((a,b)=>Math.abs(a-pctKey)-Math.abs(b-pctKey))[0];
+        const ms=nearest!=null&&Math.abs(nearest-pctKey)<=15?advMs[nearest]:null;
         return msT(ms,p.openedAt,false);
       }).join('')+
-      // FAV milestones: rrMilestones keys = {1,2,3,5,10} integers
+      // FAV milestones (+0.1 to +15): rrMilestones keys 1,2,3,5,10
       FAV_STEPS.map(v=>{
-        // Find exact or nearest integer key
         const intV=Math.round(v);
-        const ms=favMs[v]||favMs[intV]||null;
+        const nearest=favKeys.sort((a,b)=>Math.abs(a-intV)-Math.abs(b-intV))[0];
+        const ms=nearest!=null&&Math.abs(nearest-intV)<=1?favMs[nearest]:null;
         return msT(ms,p.openedAt,true);
       }).join('')+
       '<td class="cd" style="font-size:9px">'+dt(p.openedAt)+'</td>'+
@@ -1469,57 +1440,63 @@ async function loadPositions(){
   }).join('');
 }
 
+// ── loadGhostTrackers — reuses /api/open-positions ghost data ─────
 async function loadGhostTrackers(){
   const d=await api('/api/open-positions')||[];
-  const ghosts=d.filter(p=>p.ghost?.maxRR!=null||p.ghost?.peakRRPos!=null);
+  const ghosts=d.filter(p=>p.ghost!=null);
   const cnt=ghosts.length;
-  document.getElementById('h-gh').textContent=cnt;
-  document.getElementById('nb-gh').textContent=cnt||'';
-  if(!cnt){ document.getElementById('gh-body').innerHTML=emptyRow(100,'No active ghost trackers'); return; }
-
-  const strip=document.getElementById('gh-strip'); if(strip) strip.style.display='flex';
-  const best=Math.max(...ghosts.map(g=>g.ghost?.peakRRPos??0));
-  const worst=Math.max(...ghosts.map(g=>g.ghost?.peakRRNeg??0));
+  setText('h-gh',cnt); setText('nb-gh',cnt||'');
+  const ghStrip=document.getElementById('gh-strip');
+  if(!cnt){ setHtml('gh-body',emptyRow(100,'No active ghost trackers')); if(ghStrip) ghStrip.style.display='none'; return; }
+  if(ghStrip) ghStrip.style.display='flex';
+  const best=Math.max(...ghosts.map(g=>g.ghost?.peakRRPos??g.ghost?.maxRR??0));
+  const worst=Math.max(...ghosts.map(g=>g.ghost?.peakRRNeg??g.ghost?.maxSlPctUsed??0));
   const buys=ghosts.filter(g=>g.direction==='buy').length;
-  document.getElementById('gh-cnt').textContent=cnt;
-  document.getElementById('gh-best').textContent=f2(best)+'R';
-  document.getElementById('gh-worst').textContent=worst>0?'-'+f0(worst)+'%':'—';
-  document.getElementById('gh-buy').textContent=buys;
-  document.getElementById('gh-sell').textContent=cnt-buys;
-  document.getElementById('gh-sk').textContent=ghosts.filter(g=>symType(g.symbol)==='stock').length;
-  document.getElementById('gh-ix').textContent=ghosts.filter(g=>symType(g.symbol)==='index').length;
-  document.getElementById('gh-fx').textContent=ghosts.filter(g=>symType(g.symbol)==='forex').length;
+  const elapsed=ghosts.map(g=>g.openedAt?Math.round((Date.now()-new Date(g.openedAt))/60000):0);
+  const avgEl=elapsed.length?Math.round(elapsed.reduce((s,v)=>s+v,0)/elapsed.length):0;
+  setText('gh-cnt',cnt);
+  setText('gh-best',f2(best)+'R');
+  setText('gh-worst',worst>0?'-'+f0(worst)+'%':'—');
+  setText('gh-buy',buys); setText('gh-sell',cnt-buys);
+  setText('gh-sk',ghosts.filter(g=>symType(g.symbol)==='stock').length);
+  setText('gh-ix',ghosts.filter(g=>symType(g.symbol)==='index').length);
+  setText('gh-fx',ghosts.filter(g=>symType(g.symbol)==='forex').length);
+  setText('gh-el',msFmt(avgEl));
 
-  const body=document.getElementById('gh-body');
-  body.innerHTML=ghosts.map(g=>{
-    const peakPos=g.ghost?.peakRRPos??0;
-    const peakNeg=g.ghost?.peakRRNeg??0;
-    const favMs=g.ghost?.rrMilestones??{};
-    const advMs=g.ghost?.slMilestones??{};
-    const msT=(ms,opened,isFav)=>{
-      const cls=isFav?'ms-fav':'ms-adv';
-      if(!ms||!opened) return '<td class="'+cls+' cd" style="font-size:8px">—</td>';
-      const mins=Math.round((new Date(ms)-new Date(opened))/60000);
-      return '<td class="'+cls+(isFav?' cg':' cr')+'" style="font-size:8px">'+msFmt(mins)+'</td>';
-    };
+  const msT=(ms,opened,isFav)=>{
+    const cls='td class="'+(isFav?'ms-fav cg':'ms-adv cr')+'" style="font-size:8px"';
+    if(!ms||!opened) return '<'+cls+'>—</td>';
+    const mins=Math.round((new Date(ms)-new Date(opened))/60000);
+    return '<'+cls+'>'+msFmt(mins)+'</td>';
+  };
+  const tbody=document.getElementById('gh-body');
+  if(!tbody) return;
+  tbody.innerHTML=ghosts.map(g=>{
+    const peakPos=g.ghost?.peakRRPos??g.ghost?.maxRR??0;
+    const peakNeg=g.ghost?.peakRRNeg??g.ghost?.maxSlPctUsed??0;
+    const advMs=g.ghost?.slMilestones||{};
+    const favMs=g.ghost?.rrMilestones||{};
+    const advKeys=Object.keys(advMs).map(Number);
+    const favKeys=Object.keys(favMs).map(Number);
     const elapsed=g.openedAt?Math.round((Date.now()-new Date(g.openedAt))/60000):null;
     return '<tr>'+
-      '<td class="cb fw">'+g.symbol+'</td>'+
+      '<td class="cb fw" style="font-size:11px">'+g.symbol+'</td>'+
       '<td>'+tBadge(symType(g.symbol))+'</td>'+
       '<td>'+sBadge(g.session)+'</td>'+
       '<td>'+dBadge(g.direction)+'</td>'+
       '<td>'+vBadge(g.vwapPosition)+'</td>'+
-      '<td class="'+(peakPos>=1?'cg fw':peakPos>0?'cy':'cd')+'">'+f2(peakPos)+'R</td>'+
+      '<td class="'+(peakPos>=2?'cg fw':peakPos>=1?'cg':peakPos>0?'cy':'cd')+'">'+f2(peakPos)+'R</td>'+
       '<td class="'+(peakNeg>80?'cr fw':peakNeg>50?'cr':peakNeg>25?'co':'cd')+'">'+( peakNeg>0?'-'+f0(peakNeg)+'%':'—')+'</td>'+
       ADV_STEPS.map(v=>{
         const pctKey=Math.round(v*100);
-        const keys=Object.keys(advMs).map(Number).sort((a,b)=>Math.abs(a-pctKey)-Math.abs(b-pctKey));
-        const ms=keys.length&&Math.abs(keys[0]-pctKey)<=15?advMs[keys[0]]:null;
+        const nearest=advKeys.sort((a,b)=>Math.abs(a-pctKey)-Math.abs(b-pctKey))[0];
+        const ms=nearest!=null&&Math.abs(nearest-pctKey)<=15?advMs[nearest]:null;
         return msT(ms,g.openedAt,false);
       }).join('')+
       FAV_STEPS.map(v=>{
         const intV=Math.round(v);
-        const ms=favMs[v]||favMs[intV]||null;
+        const nearest=favKeys.sort((a,b)=>Math.abs(a-intV)-Math.abs(b-intV))[0];
+        const ms=nearest!=null&&Math.abs(nearest-intV)<=1?favMs[nearest]:null;
         return msT(ms,g.openedAt,true);
       }).join('')+
       '<td class="cd">'+msFmt(elapsed)+'</td>'+
@@ -1528,128 +1505,119 @@ async function loadGhostTrackers(){
   }).join('');
 }
 
-// ── Overview rendering ────────────────────────────────────────────
+// ── renderOverview — called after trades+daily+ghGrouped load ────
+let _allTrades=[];
 function renderOverview(trades, daily, ghGrouped){
+  // Trades: realizedPnlEUR, direction, vwapPosition, session, symbol, openedAt, closedAt, maxRR, hitTP
   const total=trades.length;
-  document.getElementById('ov-comp').textContent=total;
+  setText('ov-comp',total);
+  setText('wr-meta',total+' trades · compliance+');
+  setText('dist-meta',total+' trades · compliance+');
 
-  // WR summary strip
-  document.getElementById('wr-tot').textContent=total;
-  document.getElementById('wr-tot-n').textContent=total+' trades';
+  // Summary strip
   const buys=trades.filter(t=>t.direction==='buy').length;
-  const sells=total-buys;
   const ab=trades.filter(t=>t.vwapPosition==='above').length;
-  const asia=trades.filter(t=>t.session==='asia').length;
-  const lon=trades.filter(t=>t.session==='london').length;
-  const ny=trades.filter(t=>t.session==='ny').length;
-  document.getElementById('wr-buy').textContent=buys;
-  document.getElementById('wr-sell').textContent=sells;
-  document.getElementById('wr-ab').textContent=ab;
-  document.getElementById('wr-bw').textContent=total-ab;
-  document.getElementById('wr-asia').textContent=asia;
-  document.getElementById('wr-lon').textContent=lon;
-  document.getElementById('wr-ny').textContent=ny;
+  setText('wr-tot',total); setText('wr-tot-n',total+' trades');
+  setText('wr-buy',buys); setText('wr-sell',total-buys);
+  setText('wr-ab',ab); setText('wr-bw',total-ab);
+  setText('wr-asia',trades.filter(t=>t.session==='asia').length);
+  setText('wr-lon', trades.filter(t=>t.session==='london').length);
+  setText('wr-ny',  trades.filter(t=>t.session==='ny').length);
 
-  // Store all trades for filter
+  // % gain
+  const pnlSum=trades.reduce((s,t)=>s+(t.realizedPnlEUR||0),0);
+  const balStr=(document.getElementById('ov-bal')?.textContent||'').replace('€','').replace(/[,\s]/g,'');
+  const bal=parseFloat(balStr)||0;
+  if(bal>0){
+    const gPct=(pnlSum/bal*100);
+    const gStr=(gPct>=0?'+':'')+gPct.toFixed(2)+'%';
+    setText('ov-gain',gStr); setClass('ov-gain','ov-val '+(gPct>=0?'cg':'cr'));
+    setText('h-gain',gStr);
+    setText('ov-gain-sub',(gPct>=0?'+':'')+eu(pnlSum)+' realized');
+  }
+
+  // Ghost history count
+  if(ghGrouped){
+    const closed=ghGrouped.reduce((s,g)=>s+(g.n||0),0);
+    setText('h-ghh',closed);
+    const tpLocked=ghGrouped.filter(g=>(g.n||0)>=5).length;
+    setText('h-tp',tpLocked);
+  }
+
+  // Trade activity table
   window._wrTrades=trades;
-  renderWRTable('all');
+  renderWRTable(window._wrTypeFilter||'all');
 
   // Distribution
   const fxT=trades.filter(t=>symType(t.symbol)==='forex');
   const skT=trades.filter(t=>symType(t.symbol)==='stock');
   const ixT=trades.filter(t=>symType(t.symbol)==='index');
   const cmT=trades.filter(t=>symType(t.symbol)==='commodity');
-  document.getElementById('d-tot').textContent=total;
-  document.getElementById('d-fx').textContent=fxT.length;
-  document.getElementById('d-sk').textContent=skT.length;
-  document.getElementById('d-ix').textContent=ixT.length;
-  document.getElementById('d-cm').textContent=cmT.length;
-  document.getElementById('d-buy').textContent=buys;
-  document.getElementById('d-sell').textContent=sells;
-  document.getElementById('dist-meta').textContent=total+' trades · compliance+';
+  setText('d-tot',total); setText('d-fx',fxT.length); setText('d-sk',skT.length);
+  setText('d-ix',ixT.length); setText('d-cm',cmT.length);
+  setText('d-buy',buys); setText('d-sell',total-buys);
 
   let ba_t=0,bb_t=0,sa_t=0,sb_t=0;
   const typeGroups=[
-    {label:'Forex',    arr:fxT, badge:'bd-fx', sessions:['asia','london','ny']},
-    {label:'Stock',    arr:skT, badge:'bd-sk', sessions:['ny']},
-    {label:'Index',    arr:ixT, badge:'bd-ix', sessions:['asia','london','ny']},
-    {label:'Commodity',arr:cmT, badge:'bd-cm', sessions:['asia','london','ny']},
+    {label:'Forex',    arr:fxT, cls:'bd-fx', sessions:['asia','london','ny']},
+    {label:'Stock',    arr:skT, cls:'bd-sk', sessions:['ny']},
+    {label:'Index',    arr:ixT, cls:'bd-ix', sessions:['asia','london','ny']},
+    {label:'Commodity',arr:cmT, cls:'bd-cm', sessions:['asia','london','ny']},
   ];
-  const distRows=[];
+  const dRows=[];
   for(const tg of typeGroups){
     for(const sess of tg.sessions){
-      const st=tg.arr.filter(t=>t.session===sess);
-      if(!st.length) continue;
+      const st=tg.arr.filter(t=>t.session===sess); if(!st.length) continue;
       const ba=st.filter(t=>t.direction==='buy'&&t.vwapPosition==='above').length;
       const bb=st.filter(t=>t.direction==='buy'&&t.vwapPosition==='below').length;
       const sa=st.filter(t=>t.direction==='sell'&&t.vwapPosition==='above').length;
       const sb=st.filter(t=>t.direction==='sell'&&t.vwapPosition==='below').length;
       ba_t+=ba; bb_t+=bb; sa_t+=sa; sb_t+=sb;
-      distRows.push('<tr>'+
-        '<td><span class="bd '+tg.badge+'">'+tg.label+'</span></td>'+
-        '<td>'+sBadge(sess)+'</td>'+
-        '<td class="cg fw">'+ba+'</td><td class="cg">'+bb+'</td>'+
-        '<td class="cr fw">'+sa+'</td><td class="cr">'+sb+'</td>'+
-        '<td class="cb fw">'+(ba+bb+sa+sb)+'</td>'+
-      '</tr>');
+      dRows.push('<tr><td><span class="bd '+tg.cls+'">'+tg.label+'</span></td><td>'+sBadge(sess)+'</td><td class="cg fw">'+ba+'</td><td class="cg">'+bb+'</td><td class="cr fw">'+sa+'</td><td class="cr">'+sb+'</td><td class="cb fw">'+(ba+bb+sa+sb)+'</td></tr>');
     }
   }
-  document.getElementById('dist-body').innerHTML=distRows.join('')||emptyRow(7,'No trades after compliance date');
-  document.getElementById('ft-ba').textContent=ba_t;
-  document.getElementById('ft-bb').textContent=bb_t;
-  document.getElementById('ft-sa').textContent=sa_t;
-  document.getElementById('ft-sb').textContent=sb_t;
-  document.getElementById('ft-t').textContent=total;
-
-  // % gain: use realized P&L from trades / balance from status
-  const pnlSum=(_allTrades||[]).reduce((s,t)=>s+(t.realizedPnlEUR||0),0);
-  const balStr=(document.getElementById('ov-bal')?.textContent||'').replace('€','').replace(/[,\s]/g,'');
-  const bal=parseFloat(balStr)||0;
-  if(bal>0){
-    const gainPct=(pnlSum/bal*100);
-    const gainStr=(gainPct>=0?'+':'')+gainPct.toFixed(2)+'%';
-    const gainEl=document.getElementById('ov-gain');
-    if(gainEl){ gainEl.textContent=gainStr; gainEl.className='ov-val '+(gainPct>=0?'cg':'cr'); }
-    document.getElementById('h-gain').textContent=gainStr;
-    document.getElementById('ov-gain-sub').textContent=(gainPct>=0?'+':'')+eu(pnlSum)+' realized';
-  }
-
-  // Ghost history count
-  if(ghGrouped){
-    const closed=ghGrouped.reduce((s,g)=>s+(g.n||0),0);
-    document.getElementById('h-ghh').textContent=closed;
-  }
-
-  // TP locked
-  const tpLocked=ghGrouped?.filter(g=>(g.n||0)>=5).length||0;
-  document.getElementById('h-tp').textContent=tpLocked;
+  setHtml('dist-body',dRows.join('')||emptyRow(7,'No trades after compliance date'));
+  setText('ft-ba',ba_t); setText('ft-bb',bb_t); setText('ft-sa',sa_t); setText('ft-sb',sb_t); setText('ft-t',total);
 
   // Daily breakdown
+  // days rows: {trade_date, trades, wins, losses, day_pnl, avg_pnl, best_rr, worst_rr, avg_rr, avg_lots, cum_pnl}
   const days=daily?.days||[];
-  document.getElementById('daily-meta').textContent=days.length+' trading days · compliance+';
-  if(daily?.maxWinStreak!=null) document.getElementById('d-wstrk').textContent=(daily.maxWinStreak||0)+' days';
-  if(daily?.maxLossStreak!=null) document.getElementById('d-lstrk').textContent=(daily.maxLossStreak||0)+' days';
-  if(daily?.maxDrawdownDay!=null) document.getElementById('d-dd').textContent='€'+f2(daily.maxDrawdownDay);
+  setText('daily-meta',days.length+' trading days · compliance+');
+  setText('d-wstrk',(daily?.maxWinStreak||0)+' days');
+  setText('d-lstrk',(daily?.maxLossStreak||0)+' days');
+  setText('d-dd','€'+f2(daily?.maxDrawdownDay));
+  setHtml('daily-body',days.length?days.slice(0,60).map(r=>{
+    const wins=parseInt(r.wins||0), tot=parseInt(r.trades||0), lss=parseInt(r.losses||0);
+    const wpct=tot>0?(wins/tot*100):0;
+    return '<tr>'+
+      '<td class="cd" style="font-size:10px">'+dtS(r.trade_date)+'</td>'+
+      '<td class="cb">'+tot+'</td>'+
+      '<td class="cg">'+wins+'</td>'+
+      '<td class="cr">'+lss+'</td>'+
+      '<td class="'+(wpct>=50?'cg':wpct>=40?'cy':'cr')+'">'+wpct.toFixed(1)+'%</td>'+
+      '<td class="'+pC(r.day_pnl)+' fw">'+eu(r.day_pnl)+'</td>'+
+      '<td class="'+pC(r.cum_pnl)+'">'+eu(r.cum_pnl)+'</td>'+
+      '<td class="cd">'+f2(r.avg_lots)+'</td>'+
+      '<td class="cy">'+f2(r.best_rr)+'R</td>'+
+      '<td class="cd">'+f2(r.avg_rr)+'R</td>'+
+    '</tr>';
+  }).join(''):emptyRow(10,'No daily data'));
 
-  document.getElementById('daily-body').innerHTML=days.length?days.slice(0,60).map(r=>
-    '<tr>'+
-    '<td class="cd" style="font-size:10px">'+(r.trade_date||'—')+'</td>'+
-    '<td class="cb">'+(r.trades||0)+'</td>'+
-    '<td class="cg">'+(r.wins||0)+'</td>'+
-    '<td class="cr">'+(r.losses||0)+'</td>'+
-    '<td class="'+(+r.trades>0&&(r.wins/r.trades*100)>=50?'cg':(+r.trades>0&&(r.wins/r.trades*100)>=40?'cy':'cr'))+'">'+(r.trades>0?f1(r.wins/r.trades*100)+'%':'—')+'</td>'+
-    '<td class="'+pC(r.day_pnl)+' fw">'+eu(r.day_pnl)+'</td>'+
-    '<td class="'+pC(r.cum_pnl)+'">'+eu(r.cum_pnl)+'</td>'+
-    '<td class="cd">'+f2(r.avg_lots)+'</td>'+
-    '<td class="cy">'+f2(r.best_rr)+'R</td>'+
-    '<td class="cd">'+f2(r.avg_rr)+'R</td>'+
-    '</tr>'
-  ).join(''): emptyRow(10,'No daily data');
-
-  // Best/Worst setups
+  // Best/Worst: comes from daily.bestTrades/worstTrades
+  // fields: symbol, direction, session, vwapPosition, maxRR, pnl, hitTP, closeReason, openedAt
+  window._bestTrades  = daily?.bestTrades  || [];
+  window._worstTrades = daily?.worstTrades || [];
   renderBW('all');
 }
 
+// ── Trade Activity table ──────────────────────────────────────────
+window._wrTypeFilter='all';
+function setWRType(type,btn){
+  window._wrTypeFilter=type;
+  document.querySelectorAll('#wr-type-tabs .fb').forEach(b=>b.classList.remove('on'));
+  if(btn) btn.classList.add('on');
+  renderWRTable(type);
+}
 function renderWRTable(typeFilter){
   const trades=window._wrTrades||[];
   const filtered=typeFilter==='all'?trades:trades.filter(t=>symType(t.symbol)===typeFilter);
@@ -1662,71 +1630,71 @@ function renderWRTable(typeFilter){
     const [sess,dir,vwap,type]=k.split('|');
     return '<tr><td>'+sBadge(sess)+'</td><td>'+dBadge(dir)+'</td><td>'+vBadge(vwap)+'</td><td>'+tBadge(type)+'</td><td class="cb fw">'+n+'</td></tr>';
   }).join('');
-  document.getElementById('wr-body').innerHTML=rows||emptyRow(5,'No trades');
-  document.getElementById('wr-meta').textContent=filtered.length+' trades · compliance+';
+  setHtml('wr-body',rows||emptyRow(5,'No trades'));
+  setText('wr-meta',(filtered.length)+' trades · compliance+');
 }
 
-let _wrType='all';
-function setWRType(type,btn){
-  _wrType=type;
-  document.querySelectorAll('#wr-type-tabs .fb').forEach(b=>b.classList.remove('on'));
-  btn.classList.add('on');
-  renderWRTable(type);
+// ── Best/Worst setups ─────────────────────────────────────────────
+let _bwPeriod='all';
+function setBWP(p,btn){
+  _bwPeriod=p;
+  document.querySelectorAll('.fb[onclick*="setBWP"]').forEach(b=>b.classList.remove('on'));
+  if(btn) btn.classList.add('on');
+  setText('bw-period-lbl',p==='day'?'today':p==='week'?'this week':'all time');
+  renderBW(p);
 }
-
-// Best/worst setups
 function renderBW(period){
-  // Use trades from daily API (has pnl field) for all-time
-  // For day/week filter, use _allTrades (full list with closedAt)
+  // bestTrades/worstTrades from daily endpoint: {symbol,direction,session,vwapPosition,maxRR,pnl,openedAt}
   const now=new Date();
   const today=new Date(now); today.setHours(0,0,0,0);
   const weekStart=new Date(now); weekStart.setDate(now.getDate()-now.getDay()); weekStart.setHours(0,0,0,0);
-  let best, worst;
+  function filt(arr){
+    if(period==='all') return arr;
+    return arr.filter(t=>{ const d=new Date(t.openedAt); return period==='day'?d>=today:d>=weekStart; });
+  }
+  let best,worst;
   if(period==='all'){
-    best  = (window._bestTrades  || []).slice(0,5);
-    worst = (window._worstTrades || []).slice(0,5);
+    best  = window._bestTrades||[];
+    worst = window._worstTrades||[];
   } else {
-    const pool = _allTrades.filter(t=>{
-      const d=new Date(t.closedAt||t.openedAt);
-      return period==='day'?d>=today:d>=weekStart;
-    });
-    const sorted=pool.filter(t=>t.realizedPnlEUR!=null).sort((a,b)=>(b.realizedPnlEUR||0)-(a.realizedPnlEUR||0));
-    best  = sorted.slice(0,5);
-    worst = sorted.slice(-5).reverse();
+    // Filter _allTrades by period
+    const pool=filt(_allTrades).filter(t=>t.realizedPnlEUR!=null);
+    const sorted=pool.sort((a,b)=>(b.realizedPnlEUR||0)-(a.realizedPnlEUR||0));
+    best=sorted.slice(0,5);
+    worst=sorted.slice(-5).reverse();
+    // Map field names to match bestTrades format
+    best=best.map(t=>({...t, pnl:t.realizedPnlEUR, maxRR:t.maxRR}));
+    worst=worst.map(t=>({...t, pnl:t.realizedPnlEUR, maxRR:t.maxRR}));
   }
   const row=t=>'<tr>'+
     '<td class="cb fw" style="font-size:10px">'+t.symbol+'</td>'+
     '<td>'+dBadge(t.direction)+'</td>'+
     '<td>'+sBadge(t.session)+'</td>'+
     '<td>'+vBadge(t.vwapPosition)+'</td>'+
-    '<td class="cy" style="font-size:10px">'+f2(t.maxRR||t.maxRR||0)+'R</td>'+
-    '<td class="'+((+(t.pnl||t.realizedPnlEUR||0))>=0?'cg':'cr')+' fw" style="font-size:10px">'+eu(t.pnl!=null?t.pnl:t.realizedPnlEUR)+'</td>'+
-    '<td class="cd" style="font-size:9px">'+dtS(t.openedAt||t.closedAt)+'</td>'+
+    '<td class="cy" style="font-size:10px">'+f2(t.maxRR)+'R</td>'+
+    '<td class="'+((+(t.pnl||0))>=0?'cg':'cr')+' fw" style="font-size:10px">'+eu(t.pnl)+'</td>'+
+    '<td class="cd" style="font-size:9px">'+dtS(t.openedAt)+'</td>'+
   '</tr>';
-  document.getElementById('best-body').innerHTML=best.map(row).join('')||emptyRow(7,'No trades');
-  document.getElementById('worst-body').innerHTML=worst.map(row).join('')||emptyRow(7,'No trades');
+  setHtml('best-body', (best||[]).map(row).join('')||emptyRow(7,'No trades'));
+  setHtml('worst-body',(worst||[]).map(row).join('')||emptyRow(7,'No trades'));
 }
 
-function setBWP(p,btn){
-  _bwPeriod=p;
-  document.querySelectorAll('.fb[onclick*="setBWP"]').forEach(b=>b.classList.remove('on'));
-  btn.classList.add('on');
-  document.getElementById('bw-period-lbl').textContent=p==='day'?'today':p==='week'?'this week':'all time';
-  renderBW(p);
-}
-
-// ── Ghost History ─────────────────────────────────────────────────
-let _ghhData=[], _ghhF={sess:'all',dir:'all',type:'all'};
+// ── Ghost History (by pair, expandable) ──────────────────────────
+let _ghhData=[],_ghhF={sess:'all',dir:'all',type:'all'};
 function setGHF(k,v,btn){
   _ghhF[k]=v;
-  document.querySelectorAll('.fb[onclick*="setGHF(\\''+k+'\\'"]').forEach(b=>b.classList.remove('on'));
-  btn.classList.add('on');
+  document.querySelectorAll('.fb[onclick*="setGHF"]').forEach(b=>{ if(b.getAttribute('onclick').includes("'"+k+"'")) b.classList.remove('on'); });
+  if(btn) btn.classList.add('on');
   renderGhostHistory();
 }
 async function loadGhostHistory(){
+  // /api/ghost-history-by-pair returns grouped: {optimizerKey,symbol,session,direction,vwapPosition,
+  //   n,nSLHit,nMaxRR15,nMaxDays,avgPeakPos,avgPeakNeg,maxPeakPos,maxPeakNeg,trades:[...]}
   const d=await api('/api/ghost-history-by-pair')||[];
   _ghhData=d;
-  document.getElementById('h-ghh').textContent=d.reduce((s,g)=>s+(g.n||0),0);
+  const closed=d.reduce((s,g)=>s+(g.n||0),0);
+  setText('h-ghh',closed);
+  setText('ghh-meta',d.length+' combos · compliance+');
   renderGhostHistory();
 }
 function renderGhostHistory(){
@@ -1736,16 +1704,15 @@ function renderGhostHistory(){
     if(_ghhF.type!=='all'&&symType(g.symbol)!==_ghhF.type) return false;
     return true;
   });
-  document.getElementById('ghh-meta').textContent=data.length+' combos · compliance+';
-  const body=document.getElementById('ghh-body');
-  if(!data.length){ body.innerHTML=emptyRow(15,'No ghost history'); return; }
-  body.innerHTML=data.map(g=>{
-    const safeKey=(g.optimizerKey||'').replace(/[^a-z0-9_]/gi,'_');
-    const tpRRs=(g.trades||[]).filter(t=>parseFloat(t.peakRRPos||0)>0).map(t=>parseFloat(t.peakRRPos));
+  if(!data.length){ setHtml('ghh-body',emptyRow(15,'No ghost history')); return; }
+  const tbody=document.getElementById('ghh-body'); if(!tbody) return;
+  tbody.innerHTML=data.map(g=>{
+    const safeKey=(g.optimizerKey||'').replace(/[^a-z0-9]/gi,'_');
+    const tpRRs=(g.trades||[]).filter(t=>parseFloat(t.peakRRPos||t.maxRR||0)>0).map(t=>parseFloat(t.peakRRPos||t.maxRR));
     const last5=tpRRs.slice(0,5);
     const bestTP=last5.length?'avg '+f2(last5.reduce((s,v)=>s+v,0)/last5.length)+'R':'—';
     const reasons=(g.trades||[]).map(t=>t.stopReason).filter(Boolean);
-    const mainReason=reasons.length?reasons.sort((a,b)=>reasons.filter(r=>r===b).length-reasons.filter(r=>r===a).length)[0]:'—';
+    const topReason=reasons.length?Object.entries(reasons.reduce((m,r)=>{m[r]=(m[r]||0)+1;return m;},{})).sort((a,b)=>b[1]-a[1])[0][0]:'—';
     return '<tr style="cursor:pointer" onclick="toggleGHHRow(\''+safeKey+'\')">'+
       '<td class="cd" style="font-size:9px">▶</td>'+
       '<td class="cb fw">'+g.symbol+'</td>'+
@@ -1754,71 +1721,51 @@ function renderGhostHistory(){
       '<td>'+dBadge(g.direction)+'</td>'+
       '<td>'+vBadge(g.vwapPosition)+'</td>'+
       '<td class="'+(g.n>=5?'cy fw':'cc')+'">'+g.n+'</td>'+
-      '<td class="cr">'+g.nSLHit+'</td>'+
-      '<td class="cg">'+g.nMaxRR15+'</td>'+
-      '<td class="cy">'+g.nMaxDays+'</td>'+
+      '<td class="cr">'+(g.nSLHit||0)+'</td>'+
+      '<td class="cg">'+(g.nMaxRR15||0)+'</td>'+
+      '<td class="cy">'+(g.nMaxDays||0)+'</td>'+
       '<td class="cg fw">'+f2(g.avgPeakPos)+'R</td>'+
       '<td class="cr">'+f1(g.avgPeakNeg)+'%</td>'+
       '<td class="cg fw">'+f2(g.maxPeakPos)+'R</td>'+
       '<td class="cy" style="font-size:9px">'+bestTP+'</td>'+
-      '<td class="cd" style="font-size:9px">'+mainReason+'</td>'+
+      '<td class="cd" style="font-size:9px">'+topReason+'</td>'+
     '</tr>'+
-    '<tr class="ghh-detail" id="ghh-d-'+safeKey+'" style="display:none">'+
+    '<tr id="ghh-d-'+safeKey+'" style="display:none">'+
       '<td colspan="15" style="padding:0;background:var(--bg3)">'+
-        '<table style="font-size:9px"><thead><tr>'+
-          '<th>#</th><th>Date</th><th>Close Reason</th><th>TP RR</th><th>Max RR</th>'+
-          '<th>Peak+RR</th><th>Peak−RR%</th><th>MAE%</th>'+
-          // Milestone columns in expanded view
-          ADV_STEPS.map(v=>'<th class="adv-th">-'+v.toFixed(1)+'</th>').join('')+
-          FAV_STEPS.map(v=>'<th class="fav-th">+'+v.toFixed(1)+'</th>').join('')+
-        '</tr></thead><tbody>'+
-        (g.trades||[]).map((t,i)=>{
-          const sr=t.stopReason==='phantom_sl'?'cr':t.stopReason==='max_rr_15'?'cg':'cy';
-          const favMs=t.rrMilestones??{};
-          const advMs=t.slMilestones??{};
-          return '<tr>'+
-            '<td class="cd">'+(i+1)+'</td>'+
-            '<td class="cd" style="font-size:8px">'+(t.openedAt?dtS(t.openedAt):'—')+'</td>'+
-            '<td class="'+sr+'" style="font-size:8px">'+(t.stopReason||'—')+'</td>'+
-            '<td class="cy">'+(t.tpRRUsed||'—')+'</td>'+
-            '<td class="cy">'+f2(t.maxRR)+'R</td>'+
-            '<td class="cg">'+f2(t.peakRRPos)+'R</td>'+
-            '<td class="cr">'+f1(t.peakRRNeg)+'%</td>'+
-            '<td class="cd">'+f1(t.maxSlPct)+'%</td>'+
-            ADV_STEPS.map(v=>{
-              const ms=advMs[Math.round(v*100)];
-              if(!ms||!t.openedAt) return '<td class="cd ms-adv" style="font-size:7px">—</td>';
-              const m=Math.round((new Date(ms)-new Date(t.openedAt))/60000);
-              return '<td class="cr ms-adv" style="font-size:7px">'+msFmt(m)+'</td>';
-            }).join('')+
-            FAV_STEPS.map(v=>{
-              const ms=favMs[v]||favMs[Math.round(v*10)/10];
-              if(!ms||!t.openedAt) return '<td class="cd ms-fav" style="font-size:7px">—</td>';
-              const m=Math.round((new Date(ms)-new Date(t.openedAt))/60000);
-              return '<td class="cg ms-fav" style="font-size:7px">'+msFmt(m)+'</td>';
-            }).join('')+
-          '</tr>';
-        }).join('')+
-        '</tbody></table>'+
+        '<div style="overflow-x:auto"><table style="font-size:9px;min-width:600px">'+
+          '<thead><tr>'+
+            '<th>#</th><th>Date</th><th>Stop Reason</th><th>TP RR</th><th>Max RR</th>'+
+            '<th>Peak+RR</th><th>Peak-RR%</th><th>MAE%</th>'+
+          '</tr></thead><tbody>'+
+          (g.trades||[]).map((t,i)=>{
+            const sr=t.stopReason;
+            const srCls=sr==='phantom_sl'?'cr':sr==='max_rr_15'?'cg':'cy';
+            return '<tr style="border-bottom:1px solid var(--bdr)">'+
+              '<td class="cd">'+( i+1)+'</td>'+
+              '<td class="cd" style="font-size:8px">'+dtS(t.openedAt)+'</td>'+
+              '<td class="'+srCls+'" style="font-size:8px">'+(sr||'—')+'</td>'+
+              '<td class="cy">'+f2(t.tpRRUsed)+'</td>'+
+              '<td class="cy">'+f2(t.maxRR)+'R</td>'+
+              '<td class="cg">'+f2(t.peakRRPos)+'R</td>'+
+              '<td class="cr">'+f1(t.peakRRNeg)+'%</td>'+
+              '<td class="cd">'+f1(t.maxSlPct)+'%</td>'+
+            '</tr>';
+          }).join('')+
+        '</tbody></table></div>'+
       '</td>'+
     '</tr>';
   }).join('');
 }
-function toggleGHHRow(key){
-  const el=document.getElementById('ghh-d-'+key);
-  if(el) el.style.display=el.style.display==='none'?'':'none';
-}
+function toggleGHHRow(key){ const el=document.getElementById('ghh-d-'+key); if(el) el.style.display=el.style.display==='none'?'':'none'; }
 
+// ── Ghost Combo (signal combo grouped) ───────────────────────────
 async function loadGhostCombo(){
+  // /api/ghost-grouped: {optimizerKey,symbol,session,direction,vwapPosition,n,avgMaxRR,bestMaxRR,avgSlPct,avgTpRR,slHits,lastOpened}
   const d=await api('/api/ghost-grouped')||[];
-  const body=document.getElementById('ghc-body');
-  const rows=d.filter(g=>(g.n||0)>=1);
-  document.getElementById('ghc-meta').textContent=rows.length+' combos · only finalized ghosts';
-  if(!rows.length){ body.innerHTML=emptyRow(26,'No ghost combo data yet'); return; }
-  body.innerHTML=rows.map(g=>{
-    // loadGhostGrouped returns: {optimizerKey, symbol, session, direction, vwapPosition,
-    //   n, avgMaxRR, bestMaxRR, avgSlPct, avgTpRR, slHits, lastOpened}
-    // Milestone timing not available from this endpoint — show what we have
+  setText('ghc-meta',d.length+' combos · compliance+');
+  const tbody=document.getElementById('ghc-body'); if(!tbody) return;
+  if(!d.length){ tbody.innerHTML=emptyRow(26,'No signal combo data'); return; }
+  tbody.innerHTML=d.map(g=>{
     return '<tr>'+
       '<td class="cb fw">'+g.symbol+'</td>'+
       '<td>'+tBadge(symType(g.symbol))+'</td>'+
@@ -1829,48 +1776,46 @@ async function loadGhostCombo(){
       '<td class="cc">'+g.n+'</td>'+
       '<td class="cg fw">'+f2(g.bestMaxRR)+'R</td>'+
       '<td class="cd">'+f2(g.avgMaxRR)+'R</td>'+
-      '<td class="cd" colspan="4">'+f1(g.avgSlPct)+'% avg SL used</td>'+
-      '<td class="cg" colspan="7">'+f2(g.avgTpRR)+'R avg TP used</td>'+
-      '<td class="cr" style="font-size:9px">'+(g.slHits||0)+' SL hits</td>'+
-      '<td class="cd" colspan="3">'+dt(g.lastOpened)+'</td>'+
+      '<td class="cd" colspan="4">avg SL used: '+f1(g.avgSlPct)+'%</td>'+
+      '<td class="cg" colspan="7">avg TP RR: '+f2(g.avgTpRR)+'R</td>'+
+      '<td class="cr" style="font-size:9px">'+g.slHits+' SL hits</td>'+
+      '<td class="cd" colspan="3" style="font-size:9px">'+dt(g.lastOpened)+'</td>'+
       '<td class="cd">—</td>'+
-      '<td class="'+(g.avgTpRR>=2?'cg fw':'cd')+'">'+f2(g.avgTpRR)+'R</td>'+
+      '<td class="'+(g.n>=5?'cg fw':'cd')+'">'+( g.n>=5?f2(g.avgTpRR)+'R':'need≥5')+'</td>'+
     '</tr>';
   }).join('');
 }
 
 // ── EV TP Optimizer ───────────────────────────────────────────────
-let _evData=[], _evF={type:'all',sess:'all',dir:'all',min:'5'};
+let _evData=[],_evF={type:'all',sess:'all',dir:'all',min:'5'};
 function setEVF(k,v,btn){
   _evF[k]=v;
-  document.querySelectorAll('.fb[onclick*="setEVF(\\''+k+'\\'"]').forEach(b=>b.classList.remove('on'));
-  btn.classList.add('on');
+  document.querySelectorAll('.fb[onclick*="setEVF"]').forEach(b=>{ if(b.getAttribute('onclick').includes("'"+k+"'")) b.classList.remove('on'); });
+  if(btn) btn.classList.add('on');
   renderEV();
 }
 async function loadEV(){
-  const [g, tp] = await Promise.all([api('/api/ghost-grouped'), api('/api/tp-config')]);
-  _evData=(g||[]).map(r=>({...r, tpLocked:(tp||{})[r.optimizerKey]}));
+  const [g,tp]=await Promise.all([api('/api/ghost-grouped'),api('/api/tp-config')]);
+  _evData=(g||[]).map(r=>({...r,tpLocked:(tp||{})[r.optimizerKey]}));
   renderEV();
 }
 function renderEV(){
   const minN=parseInt(_evF.min)||5;
   const rows=_evData.filter(g=>{
-    if((g.n||0)<minN) return false;
+    if(g.n<minN) return false;
     if(_evF.type!=='all'&&symType(g.symbol)!==_evF.type) return false;
     if(_evF.sess!=='all'&&g.session!==_evF.sess) return false;
     if(_evF.dir!=='all'&&g.direction!==_evF.dir) return false;
     return true;
   });
-  const locked=rows.filter(r=>r.tpLocked?.lockedRR).length;
-  document.getElementById('ev-cnt').textContent=rows.length;
-  document.getElementById('ev-data').textContent=rows.filter(r=>r.n>0).length;
-  document.getElementById('ev-lock').textContent=locked;
-  document.getElementById('ev-meta').textContent=rows.length+' combos · ≥'+minN+' ghost trades required for EV lock';
-  const body=document.getElementById('ev-body');
-  if(!rows.length){ body.innerHTML=emptyRow(15,'No combos match current filters'); return; }
-  body.innerHTML=rows.map(r=>{
+  setText('ev-cnt',rows.length);
+  setText('ev-data',rows.filter(r=>r.n>0).length);
+  setText('ev-lock',rows.filter(r=>r.tpLocked?.lockedRR).length);
+  setText('ev-meta',rows.length+' combos shown · ≥'+minN+' ghosts required for EV lock');
+  const tbody=document.getElementById('ev-body'); if(!tbody) return;
+  if(!rows.length){ tbody.innerHTML=emptyRow(15,'No combos match filters'); return; }
+  tbody.innerHTML=rows.map(r=>{
     const tp=r.tpLocked;
-    const hasEV=tp?.lockedRR;
     return '<tr>'+
       '<td class="cb fw">'+r.symbol+'</td>'+
       '<td>'+tBadge(symType(r.symbol))+'</td>'+
@@ -1879,11 +1824,11 @@ function renderEV(){
       '<td>'+vBadge(r.vwapPosition)+'</td>'+
       '<td class="'+(r.n>=5?'cy fw':'cc')+'">'+r.n+'</td>'+
       '<td class="cd">'+r.n+'</td>'+
-      '<td class="cg">'+(r.bestMaxRR?f2(r.bestMaxRR)+'R':'—')+'</td>'+
+      '<td class="cg fw">'+f2(r.bestMaxRR)+'R</td>'+
       '<td class="cd">'+f2(r.avgMaxRR)+'R</td>'+
       '<td class="cd">—</td>'+
-      '<td class="'+(hasEV?'cg':'cy')+'" style="font-size:9px">'+(hasEV?'✓ EV+ Locked':'need≥5')+'</td>'+
-      '<td class="'+(tp?.lockedRR?'cg fw':'cd')+'">'+(tp?.lockedRR?tp.lockedRR+'R':'—')+'</td>'+
+      '<td class="'+(tp?.lockedRR?'cg':'cy')+'" style="font-size:9px">'+(tp?.lockedRR?'✓ EV+ Locked':'need≥5')+'</td>'+
+      '<td class="'+(tp?.lockedRR?'cg fw':'cd')+'">'+( tp?.lockedRR?tp.lockedRR+'R':'—')+'</td>'+
       '<td class="cd">'+f1(r.avgSlPct)+'% avg SL</td>'+
       '<td class="cd">—</td>'+
       '<td class="cd">—</td>'+
@@ -1893,21 +1838,14 @@ function renderEV(){
 
 // ── EV SL Optimizer ───────────────────────────────────────────────
 async function loadEVSL(){
+  // /api/mae-stats returns: {optimizerKey,nTotal,nSurvivors,nSLHit,maeP50,maeP75,maeP90,maeAvg,slReduction}
   const d=await api('/api/mae-stats')||[];
-  const body=document.getElementById('evsl-body');
-  if(!d.length){ body.innerHTML=emptyRow(14,'Min 3 ghost trades required per combo · waiting for ghost data'); return; }
-  // Response: {optimizerKey, nTotal, nSurvivors, nSLHit, maeP50, maeP75, maeP90, maeAvg, slReduction}
-  // slReduction: {pct, label, color} or null
-  body.innerHTML=d.map(r=>{
-    // Parse optimizerKey: SYMBOL_session_direction_vwap
+  const tbody=document.getElementById('evsl-body'); if(!tbody) return;
+  if(!d.length){ tbody.innerHTML=emptyRow(14,'Min 3 ghost trades required per combo · waiting for ghost data'); return; }
+  tbody.innerHTML=d.map(r=>{
     const parts=(r.optimizerKey||'').split('_');
-    const sym=parts[0]||'—';
-    const sess=parts[1]||'—';
-    const dir=parts[2]||'—';
-    const vwap=parts[3]||'—';
-    const p90=r.maeP90!=null?parseFloat(r.maeP90):null;
-    const n=r.nTotal||0;
-    const slRec=r.slReduction;
+    const sym=parts[0]||'—',sess=parts[1]||'—',dir=parts[2]||'—',vwap=parts[3]||'—';
+    const p90=r.maeP90; const slRec=r.slReduction;
     const cls=slRec?.color==='g'?'cg':slRec?.color==='y'?'cy':slRec?.color==='r'?'cr':'cd';
     const pot=p90!=null&&p90<100?(100-p90).toFixed(1)+'% possible':'—';
     return '<tr>'+
@@ -1916,96 +1854,96 @@ async function loadEVSL(){
       '<td>'+sBadge(sess)+'</td>'+
       '<td>'+dBadge(dir)+'</td>'+
       '<td>'+vBadge(vwap)+'</td>'+
-      '<td class="'+(n>=5?'cy':'cc')+'">'+n+' <span class="cd" style="font-size:9px">('+r.nSurvivors+' surv / '+r.nSLHit+' SL)</span></td>'+
+      '<td class="'+(r.nTotal>=5?'cy':'cc')+'">'+r.nTotal+' <span class="cd" style="font-size:9px">('+r.nSurvivors+' surv/'+r.nSLHit+' SL)</span></td>'+
       '<td class="cg">'+f1(r.maeP50)+'%</td>'+
       '<td class="cy">'+f1(r.maeP75)+'%</td>'+
       '<td class="'+cls+' fw">'+f1(r.maeP90)+'%</td>'+
       '<td class="'+cls+' fw" style="font-size:9px">'+(slRec?.label||'—')+'</td>'+
-      '<td class="cd">'+f1(r.maeAvg)+'% avg</td>'+
+      '<td class="cd">'+f1(r.maeAvg)+'%</td>'+
       '<td class="'+(pot!=='—'?'cg':'cd')+'" style="font-size:9px">'+pot+'</td>'+
-      '<td class="cd">—</td>'+
-      '<td class="cd">—</td>'+
+      '<td class="cd">—</td><td class="cd">—</td>'+
     '</tr>';
   }).join('');
 }
 
 // ── Signals & Blocked ─────────────────────────────────────────────
 async function loadSignals(){
-  const [stats, hist] = await Promise.all([api('/api/signal-stats'), api('/api/webhook-history?limit=50')]);
+  // /api/signal-stats: {total,placed,conversionPct,byOutcome:[{outcome,count}],topRejectReasons:[{reason,count,pairs}]}
+  // /api/webhook-history: rows from webhook_history table (raw DB rows, snake_case)
+  const [stats,hist,rejects]=await Promise.all([
+    api('/api/signal-stats'),
+    api('/api/webhook-history?limit=80'),
+    api('/api/signal-rejects'),
+  ]);
   const s=stats||{};
-  document.getElementById('sig-tot').textContent=s.total||0;
-  document.getElementById('sig-placed').textContent=s.placed||0;
-  document.getElementById('sig-conv').textContent=s.conversionPct!=null?pct(s.conversionPct):'—';
-  // byOutcome: [{outcome:'PLACED',count:n},{outcome:'REJECTED',count:n},...]
-  const totalBlocked=(s.byOutcome||[]).filter(o=>o.outcome==='REJECTED').reduce((sum,o)=>sum+(o.count||0),0);
-  document.getElementById('blk-tot').textContent=totalBlocked;
-  // topRejectReasons: [{reason:'DUPLICATE_OPEN',count:n,pairs:[...]},...]
-  const reasons={}; (s.topRejectReasons||[]).forEach(r=>reasons[r.reason?.toLowerCase()]=r.count||0);
-  document.getElementById('blk-dup').textContent=reasons['duplicate_open']||reasons['duplicate']||0;
-  document.getElementById('blk-vw').textContent=reasons['vwap_exhausted']||reasons['vwap']||0;
-  document.getElementById('blk-win').textContent=reasons['outside_window']||reasons['outside']||0;
-  document.getElementById('blk-cur').textContent=reasons['currency_budget']||reasons['budget']||0;
-  document.getElementById('blk-ny').textContent=reasons['ny_dead_zone']||reasons['dead_zone']||0;
-  // nb-sig badge
+  setText('sig-tot',s.total||0);
+  setText('sig-placed',s.placed||0);
+  setText('sig-conv',s.conversionPct!=null?pct(s.conversionPct):'—');
+  const totalBlocked=(s.byOutcome||[]).filter(o=>o.outcome!=='PLACED').reduce((sum,o)=>sum+(o.count||0),0);
+  setText('blk-tot',totalBlocked);
+  // topRejectReasons[].reason = raw string from DB e.g. "DUPLICATE_OPEN"
+  const reasons={};
+  (s.topRejectReasons||[]).forEach(r=>{ reasons[(r.reason||'').toLowerCase().replace(/[^a-z]/g,'_')]=r.count||0; });
+  setText('blk-dup',reasons['duplicate_open']||reasons['duplicate']||0);
+  setText('blk-vw', reasons['vwap_exhausted']||reasons['vwap']||0);
+  setText('blk-win',reasons['outside_window']||reasons['outside_trading_window']||0);
+  setText('blk-cur',reasons['currency_budget']||reasons['budget']||0);
+  setText('blk-ny', reasons['ny_dead_zone']||reasons['ny_dz']||0);
   const nbSig=document.getElementById('nb-sig');
-  if(nbSig&&totalBlocked>0){nbSig.textContent=totalBlocked;nbSig.style.display='';}
+  if(nbSig&&totalBlocked>0){ nbSig.textContent=totalBlocked; nbSig.style.display=''; }
 
-  const h=(hist||[]).filter(r=>r.status==='OK');
-  document.getElementById('placed-body').innerHTML=h.length?h.map(r=>
+  // Webhook history — DB rows are snake_case: ts, symbol, direction, session, vwap_position, entry, sl_pct, band_pct, status, reason
+  const placed=(hist||[]).filter(r=>r.status==='OK'||r.status==='PLACED');
+  const errors=(hist||[]).filter(r=>r.status!=='OK'&&r.status!=='PLACED');
+  setHtml('placed-body',placed.length?placed.map(r=>
     '<tr>'+
     '<td class="cd" style="font-size:9px">'+dt(r.ts)+'</td>'+
     '<td class="cb fw">'+r.symbol+'</td>'+
     '<td>'+dBadge(r.direction)+'</td>'+
     '<td>'+sBadge(r.session)+'</td>'+
-    '<td>'+vBadge(r.vwapPosition)+'</td>'+
+    '<td>'+(r.vwap_position?vBadge(r.vwap_position):'—')+'</td>'+
     '<td class="cd">'+f2(r.entry)+'</td>'+
-    '<td class="cd">'+(r.slPct!=null?pct(r.slPct*100):'—')+'</td>'+
+    '<td class="cd">'+(r.sl_pct!=null?pct(r.sl_pct*100):'—')+'</td>'+
     '<td class="cd">'+(r.latency_ms!=null?r.latency_ms+'ms':'—')+'</td>'+
     '</tr>'
-  ).join(''):emptyRow(8,'No placed signals in memory');
+  ).join(''):emptyRow(8,'No placed signals in memory · resets on restart'));
 
-  const errs=(hist||[]).filter(r=>r.status!=='OK');
-  document.getElementById('whe-body').innerHTML=errs.length?errs.map(r=>
+  setHtml('whe-body',errors.length?errors.map(r=>
     '<tr>'+
     '<td class="cd" style="font-size:9px">'+dt(r.ts)+'</td>'+
-    '<td class="cb">'+r.symbol+'</td>'+
+    '<td class="cb fw">'+r.symbol+'</td>'+
     '<td>'+dBadge(r.direction)+'</td>'+
     '<td>'+sBadge(r.session)+'</td>'+
-    '<td>'+vBadge(r.vwapPosition)+'</td>'+
+    '<td>'+(r.vwap_position?vBadge(r.vwap_position):'—')+'</td>'+
     '<td class="cd">'+f2(r.entry)+'</td>'+
-    '<td class="cd">'+(r.slPct!=null?pct(r.slPct*100):'—')+'</td>'+
-    '<td class="cd">'+(r.bandPct!=null?pct(r.bandPct):'—')+'</td>'+
+    '<td class="cd">'+(r.sl_pct!=null?pct(r.sl_pct*100):'—')+'</td>'+
+    '<td class="cd">'+(r.band_pct!=null?pct(r.band_pct):'—')+'</td>'+
     '<td class="cr" style="font-size:9px">'+(r.reason||r.status||'—')+'</td>'+
     '</tr>'
-  ).join(''):emptyRow(9,'No webhook errors in memory');
+  ).join(''):emptyRow(9,'No webhook errors in memory'));
 
-  const rejects=await api('/api/signal-rejects')||[];
-  const rByReason={};
-  for(const r of rejects){
-    const key=(r.rejectReason||'unknown');
-    if(!rByReason[key]) rByReason[key]=[];
-    rByReason[key].push(r);
+  // Signal rejects: loadSignalRejects returns [{outcome,total,pairs:[{symbol,direction,session,rejectReason,count}]}]
+  const blkRows=[];
+  for(const outcome of (rejects||[])){
+    for(const p of (outcome.pairs||[]).slice(0,5)){
+      blkRows.push('<tr>'+
+        '<td class="cr" style="font-size:9px">'+(p.rejectReason||outcome.outcome||'—')+'</td>'+
+        '<td class="cb">'+p.symbol+'</td>'+
+        '<td>'+dBadge(p.direction)+'</td>'+
+        '<td>'+sBadge(p.session)+'</td>'+
+        '<td>—</td>'+
+        '<td class="cr fw">'+p.count+'</td>'+
+      '</tr>');
+    }
   }
-  const blkRows=Object.entries(rByReason).sort((a,b)=>b[1].length-a[1].length);
-  document.getElementById('blk-body').innerHTML=blkRows.length?blkRows.flatMap(([reason,arr])=>
-    arr.slice(0,3).map(r=>
-      '<tr>'+
-      '<td class="cr" style="font-size:9px">'+reason+'</td>'+
-      '<td class="cb">'+r.symbol+'</td>'+
-      '<td>'+dBadge(r.direction)+'</td>'+
-      '<td>'+sBadge(r.session)+'</td>'+
-      '<td>'+vBadge(r.vwapPosition)+'</td>'+
-      '<td class="cr fw">'+arr.length+'</td>'+
-      '</tr>'
-    )
-  ).join(''):emptyRow(6,'No blocked signals');
+  setHtml('blk-body',blkRows.join('')||emptyRow(6,'No blocked signals'));
 }
 
 async function loadBlockedRaw(){
+  // /api/blocked-raw: {symbol,direction,vwapPosition,session,rejectReason,outcome,count,lastSeen}
   const d=await api('/api/blocked-raw')||[];
-  const body=document.getElementById('blkraw-body');
-  document.getElementById('blkraw-meta').textContent=d.length+' entries · compliance+';
-  body.innerHTML=d.length?d.slice(0,200).map(r=>
+  setText('blkraw-meta',d.length+' entries · compliance+');
+  setHtml('blkraw-body',d.length?d.slice(0,200).map(r=>
     '<tr>'+
     '<td class="cb fw">'+r.symbol+'</td>'+
     '<td>'+dBadge(r.direction)+'</td>'+
@@ -2014,46 +1952,64 @@ async function loadBlockedRaw(){
     '<td class="'+(r.outcome==='PLACED'?'cg':'cr')+'" style="font-size:9px">'+(r.outcome||'—')+'</td>'+
     '<td class="cr" style="font-size:9px">'+(r.rejectReason||'—')+'</td>'+
     '<td class="cr fw">'+(r.count||1)+'</td>'+
-    '<td class="cd" style="font-size:9px">'+dt(r.lastTs||r.createdAt)+'</td>'+
+    '<td class="cd" style="font-size:9px">'+dt(r.lastSeen)+'</td>'+
     '</tr>'
-  ).join(''):emptyRow(8,'No blocked raw data');
+  ).join(''):emptyRow(8,'No blocked raw data'));
 }
 
 async function loadBand(){
-  const [b1,b2]=await Promise.all([api('/api/band-ghost-stats?bandTier=150'), api('/api/band-ghost-stats?bandTier=250')]);
-  const renderBandTable=(data,bodyId)=>{
-    const body=document.getElementById(bodyId);
-    if(!data?.length){ body.innerHTML=emptyRow(8,'No data'); return; }
-    body.innerHTML=data.map(r=>'<tr>'+
+  // /api/band-ghost-stats?bandTier=150 — check if endpoint exists
+  const [b1,b2]=await Promise.all([
+    api('/api/shadow-analysis'),
+    api('/api/shadow-analysis'),
+  ]);
+  const fill=(data,bId)=>{
+    const tbody=document.getElementById(bId); if(!tbody) return;
+    if(!data?.length){ tbody.innerHTML=emptyRow(8,'No band data'); return; }
+    tbody.innerHTML=data.slice(0,30).map(r=>'<tr>'+
       '<td class="cb fw">'+r.symbol+'</td>'+
-      '<td>'+sBadge(r.session)+'</td>'+
-      '<td>'+dBadge(r.direction)+'</td>'+
-      '<td>'+vBadge(r.vwapPosition)+'</td>'+
-      '<td class="cc">'+r.n+'</td>'+
-      '<td class="cg">'+f2(r.avgMaxRR)+'R</td>'+
-      '<td class="cg fw">'+f2(r.bestMaxRR)+'R</td>'+
-      '<td class="cd">'+f1(r.avgSlPct)+'%</td>'+
+      '<td>'+sBadge(r.session||'—')+'</td>'+
+      '<td>'+dBadge(r.direction||'buy')+'</td>'+
+      '<td>'+vBadge(r.vwapPosition||r.vwap_position||'above')+'</td>'+
+      '<td class="cc">'+(r.n||0)+'</td>'+
+      '<td class="cg">'+f2(r.avgMaxRR||r.avg_max_rr)+'R</td>'+
+      '<td class="cg fw">'+f2(r.bestMaxRR||r.best_max_rr)+'R</td>'+
+      '<td class="cd">'+f1(r.avgSlPct||r.avg_sl_pct)+'%</td>'+
     '</tr>').join('');
   };
-  renderBandTable(b1,'b150-body');
-  renderBandTable(b2,'b250-body');
+  fill(b1,'b150-body'); fill(b2,'b250-body');
 }
 
-// ── Boot ─────────────────────────────────────────────────────────
+// ── Boot ──────────────────────────────────────────────────────────
+// Initialise milestone styles
+(function(){
+  const s=document.createElement('style'); s.id='ms-style';
+  s.textContent='.ms-adv,.ms-fav{display:none!important}';
+  document.head.appendChild(s);
+  // Also hide th columns
+  document.addEventListener('DOMContentLoaded',()=>{
+    document.querySelectorAll('th.adv-th,th.fav-th').forEach(el=>el.style.display='none');
+  });
+})();
+
 async function loadAll(){
+  // 1. Status poll + live positions + ghost trackers in parallel
   await Promise.all([pollStatus(), loadPositions(), loadGhostTrackers()]);
-  const [trades, daily, ghGrouped]=await Promise.all([
+  // 2. Trade history + daily breakdown + ghost grouped
+  const cutoff=new Date('2026-05-03T00:00:00Z').getTime();
+  const [trades,daily,ghGrouped]=await Promise.all([
     api('/api/trades'),
     api('/api/daily-breakdown'),
     api('/api/ghost-grouped'),
   ]);
-  _allTrades=(trades||[]).filter(t=>t.openedAt&&new Date(t.openedAt).getTime()>=new Date('2026-05-03T00:00:00Z').getTime());
-  renderOverview(_allTrades, daily, ghGrouped);
+  _allTrades=(trades||[]).filter(t=>t.openedAt&&new Date(t.openedAt).getTime()>=cutoff);
+  renderOverview(_allTrades,daily,ghGrouped);
 }
 
 loadAll();
-setInterval(loadAll, 30000);
+setInterval(loadAll,30000);
 </script>
+
 </body>
 </html>`;
 }
