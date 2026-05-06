@@ -556,33 +556,31 @@ app.get("/health", (req, res) => {
 });
 
 app.get("/status", async (req, res) => {
+  // Always respond within 3s — never hang the dashboard
+  const base = {
+    version:        "12.7.0",
+    openPositions:  openPositions.size,
+    complianceDate: liveComplianceDate,
+    errorCount:     getErrorCount(),
+    ts:             new Date().toISOString(),
+  };
   try {
-    const acct = await getAccountInfo();
+    const acct = await Promise.race([
+      getAccountInfo(),
+      new Promise(r => setTimeout(() => r(null), 2500)),
+    ]);
     res.json({
-      version:        "12.7.0",
-      openPositions:  openPositions.size,
-      complianceDate: liveComplianceDate,  // FIX COMPLIANCE BANNER
-      errorCount:     getErrorCount(),      // FIX ERROR COUNTER
+      ...base,
       account: acct ? {
         balance:  acct.balance,
         equity:   acct.equity,
         margin:   acct.margin,
         currency: acct.currency,
       } : null,
-      ts: new Date().toISOString(),
     });
   } catch (e) {
     recordError(`/status: ${e.message}`);
-    // FIX EMPTY STATE: still return something useful
-    res.json({
-      version:        "12.7.0",
-      openPositions:  openPositions.size,
-      complianceDate: liveComplianceDate,
-      errorCount:     getErrorCount(),
-      account:        null,
-      error:          e.message,
-      ts:             new Date().toISOString(),
-    });
+    res.json({ ...base, account: null });
   }
 });
 
@@ -1302,374 +1300,470 @@ function buildDashboardHTML() {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PRONTO-AI v12.7.0 Dashboard</title>
+<title>PRONTO-AI v12.7.0</title>
 <style>
-  :root {
-    --bg: #0d1117; --surface: #161b22; --border: #30363d;
-    --text: #c9d1d9; --muted: #8b949e; --green: #3fb950;
-    --red: #f85149; --yellow: #d29922; --blue: #58a6ff;
-    --purple: #bc8cff;
-  }
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { background: var(--bg); color: var(--text); font-family: 'SF Mono', Consolas, monospace; font-size: 13px; }
-  header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 12px 20px; display: flex; align-items: center; gap: 16px; }
-  header h1 { font-size: 16px; color: var(--blue); }
-  .badge { background: var(--border); border-radius: 4px; padding: 2px 8px; font-size: 11px; }
-  .badge.red { background: var(--red); color: #fff; }
-  .badge.green { background: var(--green); color: #000; }
-  #compliance-banner { background: #1c2230; border-bottom: 1px solid var(--border); padding: 6px 20px; color: var(--muted); font-size: 11px; }
-  .tabs { display: flex; gap: 2px; padding: 12px 20px 0; border-bottom: 1px solid var(--border); }
-  .tab { padding: 6px 14px; cursor: pointer; border-radius: 4px 4px 0 0; color: var(--muted); }
-  .tab.active { color: var(--text); border-bottom: 2px solid var(--blue); }
-  .content { padding: 16px 20px; }
-  .panel { display: none; }
-  .panel.active { display: block; }
-  table { width: 100%; border-collapse: collapse; }
-  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border); }
-  th { color: var(--muted); font-weight: normal; font-size: 11px; text-transform: uppercase; }
-  .green { color: var(--green); } .red { color: var(--red); } .yellow { color: var(--yellow); } .blue { color: var(--blue); }
-  .kpi-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px,1fr)); gap: 12px; margin-bottom: 20px; }
-  .kpi { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 12px; }
-  .kpi-label { font-size: 10px; color: var(--muted); text-transform: uppercase; margin-bottom: 4px; }
-  .kpi-value { font-size: 22px; font-weight: bold; }
-  #error-badge { display: none; }
-  .loading { color: var(--muted); padding: 20px 0; }
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0d1117;--sur:#161b22;--bor:#30363d;
+  --tx:#c9d1d9;--mt:#8b949e;--gr:#3fb950;
+  --rd:#f85149;--yl:#d29922;--bl:#58a6ff;
+}
+body{background:var(--bg);color:var(--tx);font-family:'SF Mono',Consolas,monospace;font-size:13px;min-height:100vh}
+header{background:var(--sur);border-bottom:1px solid var(--bor);padding:10px 16px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+h1{font-size:15px;color:var(--bl);white-space:nowrap}
+.badge{background:var(--bor);border-radius:4px;padding:2px 8px;font-size:11px;white-space:nowrap}
+.badge.ok{background:#1a3a1a;color:var(--gr);border:1px solid var(--gr)}
+.badge.err{background:#3a1a1a;color:var(--rd);border:1px solid var(--rd)}
+.badge.warn{background:#3a2a00;color:var(--yl);border:1px solid var(--yl)}
+#clock{margin-left:auto;color:var(--mt);font-size:11px}
+#banner{background:#0d1a2d;border-bottom:1px solid var(--bor);padding:5px 16px;color:var(--mt);font-size:11px}
+.tabs{display:flex;gap:0;border-bottom:1px solid var(--bor);overflow-x:auto}
+.tab{padding:8px 14px;cursor:pointer;color:var(--mt);white-space:nowrap;border-bottom:2px solid transparent;transition:color .15s}
+.tab:hover{color:var(--tx)}
+.tab.active{color:var(--bl);border-bottom-color:var(--bl)}
+.content{padding:14px 16px}
+.panel{display:none}.panel.active{display:block}
+.kpi-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px;margin-bottom:18px}
+.kpi{background:var(--sur);border:1px solid var(--bor);border-radius:6px;padding:10px}
+.kpi-label{font-size:10px;color:var(--mt);text-transform:uppercase;letter-spacing:.5px;margin-bottom:3px}
+.kpi-value{font-size:20px;font-weight:700}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{color:var(--mt);font-weight:normal;font-size:10px;text-transform:uppercase;padding:5px 8px;border-bottom:1px solid var(--bor);text-align:left;white-space:nowrap}
+td{padding:5px 8px;border-bottom:1px solid #21262d;white-space:nowrap}
+tr:hover td{background:#1c2128}
+.gr{color:var(--gr)}.rd{color:var(--rd)}.yl{color:var(--yl)}.bl{color:var(--bl)}.mt{color:var(--mt)}
+h3{font-size:12px;color:var(--mt);text-transform:uppercase;letter-spacing:.5px;margin:14px 0 8px}
+.empty{color:var(--mt);padding:24px 0;text-align:center;font-size:12px}
+.spin{display:inline-block;animation:spin 1s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
 </style>
 </head>
 <body>
 <header>
   <h1>🤖 PRONTO-AI</h1>
-  <span class="badge" id="version-badge">v12.7.0</span>
-  <span class="badge" id="status-badge">connecting…</span>
-  <span class="badge red" id="error-badge">0 errors</span>
-  <span style="margin-left:auto;color:var(--muted);font-size:11px" id="clock"></span>
+  <span class="badge" id="vbadge">v12.7.0</span>
+  <span class="badge" id="sbadge"><span class="spin">⟳</span> verbinden…</span>
+  <span class="badge" id="ebadge" style="display:none"></span>
+  <span id="clock"></span>
 </header>
-<div id="compliance-banner">📅 Data from: loading…</div>
+<div id="banner">📅 Data van: laden…</div>
+
 <div class="tabs">
-  <div class="tab active" onclick="showTab('overview')">Overview</div>
-  <div class="tab" onclick="showTab('positions')">Positions</div>
-  <div class="tab" onclick="showTab('trades')">Trade History</div>
-  <div class="tab" onclick="showTab('ghost')">Ghost Tracker</div>
-  <div class="tab" onclick="showTab('ev')">EV Optimizer</div>
-  <div class="tab" onclick="showTab('signals')">Signals</div>
-  <div class="tab" onclick="showTab('spreads')">Spreads</div>
+  <div class="tab active" id="tab-overview"   onclick="showTab('overview',this)">Overview</div>
+  <div class="tab"        id="tab-positions"  onclick="showTab('positions',this)">Posities</div>
+  <div class="tab"        id="tab-trades"     onclick="showTab('trades',this)">Trades</div>
+  <div class="tab"        id="tab-ghost"      onclick="showTab('ghost',this)">Ghost</div>
+  <div class="tab"        id="tab-ev"         onclick="showTab('ev',this)">EV</div>
+  <div class="tab"        id="tab-signals"    onclick="showTab('signals',this)">Signalen</div>
+  <div class="tab"        id="tab-spreads"    onclick="showTab('spreads',this)">Spreads</div>
 </div>
+
 <div class="content">
 
+<!-- OVERVIEW -->
 <div class="panel active" id="panel-overview">
-  <div class="kpi-grid" id="kpi-grid"><div class="loading">Loading KPIs…</div></div>
-  <h3 style="margin-bottom:8px;color:var(--muted)">Daily P&L</h3>
-  <table id="daily-table"><tr><td class="loading">Loading…</td></tr></table>
+  <div class="kpi-grid" id="kpi-grid">
+    <div class="kpi"><div class="kpi-label">Status</div><div class="kpi-value mt"><span class="spin">⟳</span></div></div>
+  </div>
+  <h3>Dagelijkse P&amp;L</h3>
+  <div id="daily-wrap"><div class="empty"><span class="spin">⟳</span> Laden…</div></div>
 </div>
 
+<!-- POSITIES -->
 <div class="panel" id="panel-positions">
-  <table id="positions-table">
-    <thead><tr>
-      <th>#</th><th>Symbol</th><th>Dir</th><th>Entry</th><th>SL</th><th>TP</th>
-      <th>Lots</th><th>Risk €</th><th>MaxRR</th><th>SL%</th><th>Opened</th>
-    </tr></thead>
-    <tbody id="positions-body"><tr><td colspan="11" class="loading">Loading…</td></tr></tbody>
-  </table>
+  <div id="pos-wrap"><div class="empty"><span class="spin">⟳</span> Laden…</div></div>
 </div>
 
+<!-- TRADES -->
 <div class="panel" id="panel-trades">
-  <table id="trades-table">
-    <thead><tr>
-      <th>#</th><th>Symbol</th><th>Dir</th><th>Outcome</th><th>PnL €</th>
-      <th>MaxRR</th><th>Lots</th><th>Session</th><th>Closed</th>
-    </tr></thead>
-    <tbody id="trades-body"><tr><td colspan="9" class="loading">Loading…</td></tr></tbody>
-  </table>
+  <div id="trades-wrap"><div class="empty"><span class="spin">⟳</span> Laden…</div></div>
 </div>
 
+<!-- GHOST -->
 <div class="panel" id="panel-ghost">
-  <table id="ghost-table">
-    <thead><tr>
-      <th>Key</th><th>N</th><th>SL Hits</th><th>AvgMaxRR</th>
-      <th>BestMaxRR</th><th>AvgSL%</th><th>Last</th>
-    </tr></thead>
-    <tbody id="ghost-body"><tr><td colspan="7" class="loading">Loading…</td></tr></tbody>
-  </table>
+  <div id="ghost-wrap"><div class="empty"><span class="spin">⟳</span> Laden…</div></div>
 </div>
 
+<!-- EV -->
 <div class="panel" id="panel-ev">
-  <table id="ev-table">
-    <thead><tr>
-      <th>Key</th><th>Count</th><th>BestRR</th><th>BestEV</th>
-      <th>AvgRR</th><th>WinRate@TP</th><th>EvMult</th>
-    </tr></thead>
-    <tbody id="ev-body"><tr><td colspan="7" class="loading">Loading…</td></tr></tbody>
-  </table>
+  <div id="ev-wrap"><div class="empty"><span class="spin">⟳</span> Laden…</div></div>
 </div>
 
+<!-- SIGNALEN -->
 <div class="panel" id="panel-signals">
-  <div class="kpi-grid" id="signal-kpis"></div>
-  <h3 style="margin-bottom:8px;color:var(--muted)">Recent Webhook History</h3>
-  <table id="signals-table">
-    <thead><tr>
-      <th>Time</th><th>Symbol</th><th>Dir</th><th>Action</th>
-      <th>Status</th><th>Reason</th><th>Latency</th>
-    </tr></thead>
-    <tbody id="signals-body"><tr><td colspan="7" class="loading">Loading…</td></tr></tbody>
-  </table>
+  <div class="kpi-grid" id="sig-kpi"></div>
+  <h3>Webhook History</h3>
+  <div id="sig-wrap"><div class="empty"><span class="spin">⟳</span> Laden…</div></div>
 </div>
 
+<!-- SPREADS -->
 <div class="panel" id="panel-spreads">
-  <table id="spreads-table">
-    <thead><tr>
-      <th>Symbol</th><th>Session</th><th>Hour</th><th>Samples</th>
-      <th>Avg Spread</th><th>P50</th><th>P90</th><th>Max</th>
-    </tr></thead>
-    <tbody id="spreads-body"><tr><td colspan="8" class="loading">Loading…</td></tr></tbody>
-  </table>
+  <div id="spr-wrap"><div class="empty"><span class="spin">⟳</span> Laden…</div></div>
 </div>
 
-</div>
+</div><!-- /content -->
+
 <script>
-const fmt = (n, d=2) => n == null ? '—' : Number(n).toFixed(d);
-const fmtDate = s => s ? new Date(s).toLocaleString('nl-BE',{timeZone:'Europe/Brussels',hour12:false}) : '—';
-const fmtShort = s => s ? new Date(s).toLocaleString('nl-BE',{timeZone:'Europe/Brussels',hour12:false,month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}) : '—';
+'use strict';
 
-function showTab(name) {
-  document.querySelectorAll('.tab').forEach((t,i) => t.classList.remove('active'));
+// ── Helpers ──────────────────────────────────────────────────────
+const $ = id => document.getElementById(id);
+const f2 = n => n == null ? '—' : Number(n).toFixed(2);
+const f1 = n => n == null ? '—' : Number(n).toFixed(1);
+const f0 = n => n == null ? '—' : Number(n).toFixed(0);
+const f5 = n => n == null ? '—' : Number(n).toFixed(5);
+const pct = n => n == null ? '—' : Number(n).toFixed(1) + '%';
+const eur = n => n == null ? '—' : '€' + Number(n).toFixed(2);
+const clr = n => Number(n) >= 0 ? 'gr' : 'rd';
+
+function fmtDT(s) {
+  if (!s) return '—';
+  try {
+    return new Date(s).toLocaleString('nl-BE', {
+      timeZone: 'Europe/Brussels', hour12: false,
+      day:'2-digit', month:'2-digit', hour:'2-digit', minute:'2-digit'
+    });
+  } catch { return s; }
+}
+
+// Safe fetch with timeout — never hangs the dashboard
+async function apiFetch(url, timeoutMs = 8000) {
+  const ctrl = new AbortController();
+  const tid  = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { signal: ctrl.signal });
+    clearTimeout(tid);
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    return await res.json();
+  } catch (e) {
+    clearTimeout(tid);
+    console.warn('apiFetch failed:', url, e.message);
+    return null;
+  }
+}
+
+// ── Tab switching ────────────────────────────────────────────────
+function showTab(name, el) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
   document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
-  event.target.classList.add('active');
-  document.getElementById('panel-'+name).classList.add('active');
+  el.classList.add('active');
+  $('panel-' + name).classList.add('active');
+  // Lazy-load tab content
+  if (name === 'positions') loadPositions();
+  if (name === 'trades')    loadTrades();
+  if (name === 'ghost')     loadGhost();
+  if (name === 'ev')        loadEV();
+  if (name === 'signals')   loadSignals();
+  if (name === 'spreads')   loadSpreads();
 }
 
-// Clock
-setInterval(() => {
-  document.getElementById('clock').textContent = new Date().toLocaleString('nl-BE',{timeZone:'Europe/Brussels',hour12:false});
-}, 1000);
+// ── Clock ────────────────────────────────────────────────────────
+function updateClock() {
+  try {
+    $('clock').textContent = new Date().toLocaleString('nl-BE',
+      {timeZone:'Europe/Brussels',hour12:false});
+  } catch {}
+}
+updateClock();
+setInterval(updateClock, 1000);
 
-// Status poller
+// ── Status poller ────────────────────────────────────────────────
+let statusOK = false;
 async function pollStatus() {
-  try {
-    const s = await fetch('/status').then(r=>r.json());
-    document.getElementById('status-badge').textContent =
-      'Eq: ' + (s.account?.equity != null ? '€'+fmt(s.account.equity,0) : 'N/A') +
-      ' | ' + s.openPositions + ' pos';
-    document.getElementById('status-badge').className = 'badge green';
-    // Compliance banner
-    if (s.complianceDate) {
-      document.getElementById('compliance-banner').textContent =
-        '📅 Data from: ' + s.complianceDate + ' (UTC)  |  Compliance mode active';
-    }
-    // Error badge
-    const eb = document.getElementById('error-badge');
-    if (s.errorCount > 0) {
-      eb.style.display = '';
-      eb.textContent = s.errorCount + ' error' + (s.errorCount>1?'s':'') + ' /1h';
-    } else {
-      eb.style.display = 'none';
-    }
-  } catch (e) {
-    document.getElementById('status-badge').textContent = 'offline';
-    document.getElementById('status-badge').className = 'badge red';
+  const data = await apiFetch('/status', 5000);
+  const sb = $('sbadge');
+  const eb = $('ebadge');
+  if (!data) {
+    sb.textContent = '✖ offline';
+    sb.className = 'badge err';
+    statusOK = false;
+    return;
+  }
+  statusOK = true;
+  const eq = data.account?.equity;
+  sb.textContent = (eq != null ? '€' + f0(eq) + ' | ' : '') + data.openPositions + ' pos open';
+  sb.className = 'badge ok';
+
+  // Compliance banner
+  if (data.complianceDate) {
+    $('banner').textContent = '📅 Data vanaf: ' + data.complianceDate + ' UTC';
+  }
+
+  // Error badge
+  if (data.errorCount > 0) {
+    eb.textContent = '⚠ ' + data.errorCount + ' fout' + (data.errorCount > 1 ? 'en' : '') + ' /1u';
+    eb.className = 'badge warn';
+    eb.style.display = '';
+  } else {
+    eb.style.display = 'none';
   }
 }
 
-// Overview
+// ── Overview ─────────────────────────────────────────────────────
 async function loadOverview() {
-  try {
-    const [perf, daily] = await Promise.all([
-      fetch('/api/performance').then(r=>r.json()),
-      fetch('/api/daily-breakdown').then(r=>r.json()),
-    ]);
-    const p = perf ?? {};
-    document.getElementById('kpi-grid').innerHTML = [
-      ['Total Trades', p.total ?? 0, ''],
-      ['Win Rate', fmt(p.winRate,1)+'%', p.winRate>=50?'green':'red'],
-      ['Profit Factor', p.profitFactor != null ? fmt(p.profitFactor,2) : '—', p.profitFactor>=1?'green':'red'],
-      ['Total PnL', '€'+fmt(p.totalPnl,2), p.totalPnl>=0?'green':'red'],
-      ['Avg Winner', '€'+fmt(p.avgWinner,2), 'green'],
-      ['Avg Loser', '€'+fmt(p.avgLoser,2), 'red'],
-      ['Max Drawdown', '€'+fmt(p.maxDrawdown,2), 'red'],
-      ['TP Trades', p.tpCount??0, 'green'],
-      ['SL Trades', p.slCount??0, 'red'],
-    ].map(([l,v,c]) => \`<div class="kpi"><div class="kpi-label">\${l}</div><div class="kpi-value \${c}">\${v}</div></div>\`).join('');
+  const kg = $('kpi-grid');
+  const dw = $('daily-wrap');
 
-    const days = daily?.days ?? [];
-    if (!days.length) {
-      document.getElementById('daily-table').innerHTML = '<tr><td colspan="7" style="color:var(--muted);padding:20px">No daily data yet</td></tr>';
-      return;
-    }
-    document.getElementById('daily-table').innerHTML =
-      '<thead><tr><th>Date</th><th>Trades</th><th>W</th><th>L</th><th>PnL €</th><th>Cum PnL</th><th>Avg RR</th></tr></thead><tbody>' +
-      days.slice(0,30).map(d => \`<tr>
-        <td>\${d.trade_date}</td>
-        <td>\${d.trades}</td>
-        <td class="green">\${d.wins}</td>
-        <td class="red">\${d.losses}</td>
-        <td class="\${d.day_pnl>=0?'green':'red'}">\${fmt(d.day_pnl,2)}</td>
-        <td class="\${d.cum_pnl>=0?'green':'red'}">\${fmt(d.cum_pnl,2)}</td>
-        <td>\${fmt(d.avg_rr,2)}</td>
-      </tr>\`).join('') + '</tbody>';
-  } catch (e) {
-    document.getElementById('kpi-grid').innerHTML = '<div class="loading">Failed to load overview</div>';
+  const [perf, daily] = await Promise.all([
+    apiFetch('/api/performance'),
+    apiFetch('/api/daily-breakdown'),
+  ]);
+
+  const p = perf || {};
+  const kpis = [
+    ['Trades',        f0(p.total),                          ''],
+    ['Win Rate',      pct(p.winRate),                       p.winRate >= 50 ? 'gr' : 'rd'],
+    ['Profit Factor', p.profitFactor != null ? f2(p.profitFactor) : '—', (p.profitFactor||0) >= 1 ? 'gr' : 'rd'],
+    ['Totaal PnL',    eur(p.totalPnl),                      clr(p.totalPnl)],
+    ['Gem. Winner',   eur(p.avgWinner),                     'gr'],
+    ['Gem. Loser',    eur(p.avgLoser),                      'rd'],
+    ['Max Drawdown',  eur(p.maxDrawdown),                   'rd'],
+    ['TP Trades',     f0(p.tpCount),                        'gr'],
+    ['SL Trades',     f0(p.slCount),                        'rd'],
+  ];
+
+  if (!p.total && p.total !== 0) {
+    kg.innerHTML = '<div class="kpi"><div class="kpi-label">Status</div><div class="kpi-value rd">DB fout</div></div>';
+  } else if (p.total === 0) {
+    kg.innerHTML = '<div class="kpi" style="grid-column:1/-1"><div class="kpi-label">Status</div><div class="kpi-value mt">Geen trades nog</div></div>';
+  } else {
+    kg.innerHTML = kpis.map(([l, v, c]) =>
+      '<div class="kpi"><div class="kpi-label">' + l + '</div><div class="kpi-value ' + c + '">' + v + '</div></div>'
+    ).join('');
+  }
+
+  const days = daily?.days || [];
+  if (!days.length) {
+    dw.innerHTML = '<div class="empty">Geen dagdata beschikbaar</div>';
+  } else {
+    dw.innerHTML = '<table><thead><tr>' +
+      '<th>Datum</th><th>Trades</th><th>W</th><th>L</th><th>PnL €</th><th>Cum PnL</th><th>Gem RR</th>' +
+      '</tr></thead><tbody>' +
+      days.slice(0, 30).map(d =>
+        '<tr>' +
+        '<td class="mt">' + (d.trade_date || '—') + '</td>' +
+        '<td>' + (d.trades || 0) + '</td>' +
+        '<td class="gr">' + (d.wins || 0) + '</td>' +
+        '<td class="rd">' + (d.losses || 0) + '</td>' +
+        '<td class="' + clr(d.day_pnl) + '">' + eur(d.day_pnl) + '</td>' +
+        '<td class="' + clr(d.cum_pnl) + '">' + eur(d.cum_pnl) + '</td>' +
+        '<td>' + f2(d.avg_rr) + '</td>' +
+        '</tr>'
+      ).join('') +
+      '</tbody></table>';
   }
 }
 
-// Positions
+// ── Posities ─────────────────────────────────────────────────────
 async function loadPositions() {
-  try {
-    const data = await fetch('/api/open-positions').then(r=>r.json());
-    const tbody = document.getElementById('positions-body');
-    if (!data.length) { tbody.innerHTML = '<tr><td colspan="11" style="color:var(--muted);padding:20px">No open positions</td></tr>'; return; }
-    tbody.innerHTML = data.map(p => \`<tr>
-      <td>\${p.tradeNumber??'—'}</td>
-      <td class="blue">\${p.symbol}</td>
-      <td class="\${p.direction==='buy'?'green':'red'}">\${p.direction}</td>
-      <td>\${fmt(p.entry,5)}</td>
-      <td class="red">\${fmt(p.sl,5)}</td>
-      <td class="green">\${fmt(p.tp,5)}</td>
-      <td>\${fmt(p.lots,2)}</td>
-      <td>\${p.riskEUR!=null?'€'+fmt(p.riskEUR,2):'—'}</td>
-      <td class="\${(p.ghost?.maxRR??0)>0?'green':''}">\${fmt(p.ghost?.maxRR,2)}</td>
-      <td>\${fmt(p.ghost?.maxSlPctUsed,1)}%</td>
-      <td>\${fmtShort(p.openedAt)}</td>
-    </tr>\`).join('');
-  } catch(e) {
-    document.getElementById('positions-body').innerHTML = '<tr><td colspan="11">Error loading positions</td></tr>';
+  const wrap = $('pos-wrap');
+  wrap.innerHTML = '<div class="empty"><span class="spin">⟳</span> Laden…</div>';
+  const data = await apiFetch('/api/open-positions');
+  const rows = data || [];
+  if (!rows.length) {
+    wrap.innerHTML = '<div class="empty">Geen open posities</div>';
+    return;
   }
+  wrap.innerHTML = '<table><thead><tr>' +
+    '<th>#</th><th>Symbol</th><th>Dir</th><th>Entry</th><th>SL</th><th>TP</th>' +
+    '<th>Lots</th><th>Risk €</th><th>MaxRR</th><th>SL%</th><th>Geopend</th>' +
+    '</tr></thead><tbody>' +
+    rows.map(p =>
+      '<tr>' +
+      '<td class="mt">' + (p.tradeNumber || '—') + '</td>' +
+      '<td class="bl">' + (p.symbol || '—') + '</td>' +
+      '<td class="' + (p.direction === 'buy' ? 'gr' : 'rd') + '">' + (p.direction || '—') + '</td>' +
+      '<td>' + f5(p.entry) + '</td>' +
+      '<td class="rd">' + f5(p.sl) + '</td>' +
+      '<td class="gr">' + f5(p.tp) + '</td>' +
+      '<td>' + f2(p.lots) + '</td>' +
+      '<td>' + eur(p.riskEUR) + '</td>' +
+      '<td class="' + ((p.ghost?.maxRR || 0) > 0 ? 'gr' : '') + '">' + f2(p.ghost?.maxRR) + '</td>' +
+      '<td>' + f1(p.ghost?.maxSlPctUsed) + '%</td>' +
+      '<td class="mt">' + fmtDT(p.openedAt) + '</td>' +
+      '</tr>'
+    ).join('') +
+    '</tbody></table>';
 }
 
-// Trades
+// ── Trades ───────────────────────────────────────────────────────
 async function loadTrades() {
-  try {
-    const data = await fetch('/api/trades').then(r=>r.json());
-    const tbody = document.getElementById('trades-body');
-    if (!data.length) { tbody.innerHTML = '<tr><td colspan="9" style="color:var(--muted);padding:20px">No closed trades yet</td></tr>'; return; }
-    tbody.innerHTML = data.slice(0,200).map((t,i) => \`<tr>
-      <td>\${data.length-i}</td>
-      <td class="blue">\${t.symbol}</td>
-      <td class="\${t.direction==='buy'?'green':'red'}">\${t.direction}</td>
-      <td class="\${t.hitTP?'green':'red'}">\${t.hitTP?'TP':'SL'} (\${t.closeReason??'?'})</td>
-      <td class="\${(t.realizedPnlEUR??0)>=0?'green':'red'}">\${t.realizedPnlEUR!=null?'€'+fmt(t.realizedPnlEUR,2):'—'}</td>
-      <td>\${fmt(t.maxRR,2)}</td>
-      <td>\${fmt(t.lots,2)}</td>
-      <td>\${t.session??'—'}</td>
-      <td>\${fmtShort(t.closedAt)}</td>
-    </tr>\`).join('');
-  } catch(e) {
-    document.getElementById('trades-body').innerHTML = '<tr><td colspan="9">Error loading trades</td></tr>';
+  const wrap = $('trades-wrap');
+  wrap.innerHTML = '<div class="empty"><span class="spin">⟳</span> Laden…</div>';
+  const data = await apiFetch('/api/trades');
+  const rows = data || [];
+  if (!rows.length) {
+    wrap.innerHTML = '<div class="empty">Geen gesloten trades</div>';
+    return;
   }
+  wrap.innerHTML = '<table><thead><tr>' +
+    '<th>#</th><th>Symbol</th><th>Dir</th><th>Uitkomst</th><th>PnL €</th>' +
+    '<th>MaxRR</th><th>Lots</th><th>Sessie</th><th>Gesloten</th>' +
+    '</tr></thead><tbody>' +
+    rows.slice(0, 200).map((t, i) =>
+      '<tr>' +
+      '<td class="mt">' + (rows.length - i) + '</td>' +
+      '<td class="bl">' + (t.symbol || '—') + '</td>' +
+      '<td class="' + (t.direction === 'buy' ? 'gr' : 'rd') + '">' + (t.direction || '—') + '</td>' +
+      '<td class="' + (t.hitTP ? 'gr' : 'rd') + '">' + (t.hitTP ? 'TP' : 'SL') + ' <span class="mt">(' + (t.closeReason || '?') + ')</span></td>' +
+      '<td class="' + clr(t.realizedPnlEUR) + '">' + eur(t.realizedPnlEUR) + '</td>' +
+      '<td>' + f2(t.maxRR) + '</td>' +
+      '<td>' + f2(t.lots) + '</td>' +
+      '<td class="mt">' + (t.session || '—') + '</td>' +
+      '<td class="mt">' + fmtDT(t.closedAt) + '</td>' +
+      '</tr>'
+    ).join('') +
+    '</tbody></table>';
 }
 
-// Ghost grouped
+// ── Ghost ────────────────────────────────────────────────────────
 async function loadGhost() {
-  try {
-    const data = await fetch('/api/ghost-grouped').then(r=>r.json());
-    const tbody = document.getElementById('ghost-body');
-    if (!data.length) { tbody.innerHTML = '<tr><td colspan="7" style="color:var(--muted);padding:20px">No ghost data yet</td></tr>'; return; }
-    tbody.innerHTML = data.map(g => \`<tr>
-      <td class="blue">\${g.optimizerKey}</td>
-      <td>\${g.n}</td>
-      <td class="red">\${g.slHits}</td>
-      <td>\${fmt(g.avgMaxRR,2)}</td>
-      <td class="green">\${fmt(g.bestMaxRR,2)}</td>
-      <td>\${fmt(g.avgSlPct,1)}%</td>
-      <td>\${fmtShort(g.lastOpened)}</td>
-    </tr>\`).join('');
-  } catch(e) {
-    document.getElementById('ghost-body').innerHTML = '<tr><td colspan="7">Error loading ghosts</td></tr>';
+  const wrap = $('ghost-wrap');
+  wrap.innerHTML = '<div class="empty"><span class="spin">⟳</span> Laden…</div>';
+  const data = await apiFetch('/api/ghost-grouped');
+  const rows = data || [];
+  if (!rows.length) {
+    wrap.innerHTML = '<div class="empty">Nog geen ghost data (wacht op gesloten trades)</div>';
+    return;
   }
+  wrap.innerHTML = '<table><thead><tr>' +
+    '<th>Optimizer Key</th><th>N</th><th>SL Hits</th><th>Gem MaxRR</th><th>Best MaxRR</th><th>Gem SL%</th><th>Gem TP RR</th><th>Laatste</th>' +
+    '</tr></thead><tbody>' +
+    rows.map(g =>
+      '<tr>' +
+      '<td class="bl">' + (g.optimizerKey || '—') + '</td>' +
+      '<td>' + (g.n || 0) + '</td>' +
+      '<td class="rd">' + (g.slHits || 0) + '</td>' +
+      '<td>' + f2(g.avgMaxRR) + '</td>' +
+      '<td class="gr">' + f2(g.bestMaxRR) + '</td>' +
+      '<td>' + f1(g.avgSlPct) + '%</td>' +
+      '<td>' + f2(g.avgTpRR) + '</td>' +
+      '<td class="mt">' + fmtDT(g.lastOpened) + '</td>' +
+      '</tr>'
+    ).join('') +
+    '</tbody></table>';
 }
 
-// EV optimizer
+// ── EV Optimizer ─────────────────────────────────────────────────
 async function loadEV() {
-  try {
-    const [ghostData, tpData, kmData] = await Promise.all([
-      fetch('/api/ghost-grouped').then(r=>r.json()),
-      fetch('/api/tp-config').then(r=>r.json()),
-      fetch('/api/ghost-combo-analysis').then(r=>r.json()),
-    ]);
-    const tbody = document.getElementById('ev-body');
-    if (!ghostData.length) { tbody.innerHTML = '<tr><td colspan="7" style="color:var(--muted);padding:20px">No EV data yet (need ≥10 ghost trades per key)</td></tr>'; return; }
-    const comboMap = {};
-    (kmData??[]).forEach(k => comboMap[k.optimizerKey] = k);
-    tbody.innerHTML = ghostData.filter(g=>g.n>=5).map(g => {
-      const combo = comboMap[g.optimizerKey];
-      const tp    = tpData[g.optimizerKey];
-      return \`<tr>
-        <td class="blue">\${g.optimizerKey}</td>
-        <td>\${g.n}</td>
-        <td class="\${tp?.lockedRR>=2?'green':'yellow'}">\${tp?.lockedRR!=null?tp.lockedRR+'R':'—'}</td>
-        <td class="\${(combo?.evScore??0)>0?'green':'red'}">\${combo?.evScore!=null?fmt(combo.evScore,4):'—'}</td>
-        <td>\${fmt(g.avgMaxRR,2)}</td>
-        <td>\${combo?.winRate!=null?fmt(combo.winRate,1)+'%':'—'}</td>
-        <td>\${combo?.evScore!=null?(combo.evScore>0?'+':'')+(combo.evScore>0.2?'↑↑':combo.evScore>0?'↑':'↓'):'—'}</td>
-      </tr>\`;
-    }).join('');
-  } catch(e) {
-    document.getElementById('ev-body').innerHTML = '<tr><td colspan="7">Error loading EV data</td></tr>';
+  const wrap = $('ev-wrap');
+  wrap.innerHTML = '<div class="empty"><span class="spin">⟳</span> Laden…</div>';
+  const [ghost, tp, combo] = await Promise.all([
+    apiFetch('/api/ghost-grouped'),
+    apiFetch('/api/tp-config'),
+    apiFetch('/api/ghost-combo-analysis'),
+  ]);
+  const rows  = ghost  || [];
+  const tpMap = tp     || {};
+  const comboArr = combo || [];
+  const comboMap = {};
+  comboArr.forEach(k => { comboMap[k.optimizerKey] = k; });
+
+  const eligible = rows.filter(g => (g.n || 0) >= 5);
+  if (!eligible.length) {
+    wrap.innerHTML = '<div class="empty">Nog geen EV data (minimaal 5 ghost trades per key nodig)</div>';
+    return;
   }
+  wrap.innerHTML = '<table><thead><tr>' +
+    '<th>Key</th><th>N</th><th>Locked TP</th><th>Best EV</th><th>Win Rate</th><th>Gem RR</th><th>EV Mult</th>' +
+    '</tr></thead><tbody>' +
+    eligible.map(g => {
+      const c  = comboMap[g.optimizerKey];
+      const t  = tpMap[g.optimizerKey];
+      const ev = c?.evScore;
+      const wr = c?.winRate;
+      return '<tr>' +
+        '<td class="bl">' + (g.optimizerKey || '—') + '</td>' +
+        '<td>' + (g.n || 0) + '</td>' +
+        '<td class="' + ((t?.lockedRR || 0) >= 2 ? 'gr' : 'yl') + '">' + (t?.lockedRR != null ? t.lockedRR + 'R' : '—') + '</td>' +
+        '<td class="' + (ev > 0 ? 'gr' : 'rd') + '">' + (ev != null ? f2(ev) : '—') + '</td>' +
+        '<td>' + (wr != null ? pct(wr) : '—') + '</td>' +
+        '<td>' + f2(g.avgMaxRR) + '</td>' +
+        '<td class="' + (ev > 0 ? 'gr' : 'rd') + '">' + (ev != null ? (ev > 0 ? '↑' : '↓') + (Math.abs(ev) > 0.2 ? (ev > 0 ? '↑' : '↓') : '') : '—') + '</td>' +
+        '</tr>';
+    }).join('') +
+    '</tbody></table>';
 }
 
-// Signals
+// ── Signalen ─────────────────────────────────────────────────────
 async function loadSignals() {
-  try {
-    const [stats, history] = await Promise.all([
-      fetch('/api/signal-stats').then(r=>r.json()),
-      fetch('/api/webhook-history?limit=50').then(r=>r.json()),
-    ]);
-    const s = stats ?? {};
-    document.getElementById('signal-kpis').innerHTML = [
-      ['Total Signals', s.total??0, ''],
-      ['Placed', s.placed??0, 'green'],
-      ['Conversion', fmt(s.conversionPct,1)+'%', (s.conversionPct??0)>=20?'green':'yellow'],
-    ].map(([l,v,c]) => \`<div class="kpi"><div class="kpi-label">\${l}</div><div class="kpi-value \${c}">\${v}</div></div>\`).join('');
+  $('sig-wrap').innerHTML = '<div class="empty"><span class="spin">⟳</span> Laden…</div>';
+  const [stats, hist] = await Promise.all([
+    apiFetch('/api/signal-stats'),
+    apiFetch('/api/webhook-history?limit=50'),
+  ]);
+  const s = stats || {};
+  const kpis = [
+    ['Signalen', f0(s.total), ''],
+    ['Geplaatst', f0(s.placed), 'gr'],
+    ['Conversie', pct(s.conversionPct), (s.conversionPct || 0) >= 15 ? 'gr' : 'yl'],
+  ];
+  $('sig-kpi').innerHTML = kpis.map(([l,v,c]) =>
+    '<div class="kpi"><div class="kpi-label">'+l+'</div><div class="kpi-value '+c+'">'+v+'</div></div>'
+  ).join('');
 
-    const tbody = document.getElementById('signals-body');
-    if (!history.length) { tbody.innerHTML = '<tr><td colspan="7" style="color:var(--muted);padding:20px">No webhook history yet</td></tr>'; return; }
-    tbody.innerHTML = history.map(h => \`<tr>
-      <td>\${fmtShort(h.ts)}</td>
-      <td class="blue">\${h.symbol??'—'}</td>
-      <td class="\${h.direction==='buy'?'green':'red'}">\${h.direction??'—'}</td>
-      <td>\${h.action??'—'}</td>
-      <td class="\${h.status==='OK'?'green':'red'}">\${h.status??'—'}</td>
-      <td style="color:var(--muted)">\${h.reason??''}</td>
-      <td>\${h.latency_ms!=null?h.latency_ms+'ms':'—'}</td>
-    </tr>\`).join('');
-  } catch(e) {
-    document.getElementById('signals-body').innerHTML = '<tr><td colspan="7">Error loading signals</td></tr>';
+  const rows = hist || [];
+  if (!rows.length) {
+    $('sig-wrap').innerHTML = '<div class="empty">Geen webhook history</div>';
+    return;
   }
+  $('sig-wrap').innerHTML = '<table><thead><tr>' +
+    '<th>Tijd</th><th>Symbol</th><th>Dir</th><th>Actie</th><th>Status</th><th>Reden</th><th>Latency</th>' +
+    '</tr></thead><tbody>' +
+    rows.map(h =>
+      '<tr>' +
+      '<td class="mt">' + fmtDT(h.ts) + '</td>' +
+      '<td class="bl">' + (h.symbol || '—') + '</td>' +
+      '<td class="' + (h.direction === 'buy' ? 'gr' : 'rd') + '">' + (h.direction || '—') + '</td>' +
+      '<td>' + (h.action || '—') + '</td>' +
+      '<td class="' + (h.status === 'OK' ? 'gr' : 'rd') + '">' + (h.status || '—') + '</td>' +
+      '<td class="mt">' + (h.reason || '') + '</td>' +
+      '<td>' + (h.latency_ms != null ? h.latency_ms + 'ms' : '—') + '</td>' +
+      '</tr>'
+    ).join('') +
+    '</tbody></table>';
 }
 
-// Spreads
+// ── Spreads ──────────────────────────────────────────────────────
 async function loadSpreads() {
-  try {
-    const data = await fetch('/api/spread-stats').then(r=>r.json());
-    const tbody = document.getElementById('spreads-body');
-    if (!data.length) { tbody.innerHTML = '<tr><td colspan="8" style="color:var(--muted);padding:20px">No spread data yet</td></tr>'; return; }
-    tbody.innerHTML = data.slice(0,100).map(r => \`<tr>
-      <td class="blue">\${r.symbol}</td>
-      <td>\${r.session}</td>
-      <td>\${r.hour_brussels}:00</td>
-      <td>\${r.samples}</td>
-      <td>\${fmt(r.avg_spread_abs,6)}</td>
-      <td>\${fmt(r.p50_spread,6)}</td>
-      <td>\${fmt(r.p90_spread,6)}</td>
-      <td class="red">\${fmt(r.max_spread,6)}</td>
-    </tr>\`).join('');
-  } catch(e) {
-    document.getElementById('spreads-body').innerHTML = '<tr><td colspan="8">Error loading spreads</td></tr>';
+  const wrap = $('spr-wrap');
+  wrap.innerHTML = '<div class="empty"><span class="spin">⟳</span> Laden…</div>';
+  const data = await apiFetch('/api/spread-stats');
+  const rows = data || [];
+  if (!rows.length) {
+    wrap.innerHTML = '<div class="empty">Geen spread data beschikbaar</div>';
+    return;
   }
+  wrap.innerHTML = '<table><thead><tr>' +
+    '<th>Symbol</th><th>Sessie</th><th>Uur</th><th>Samples</th>' +
+    '<th>Gem Spread</th><th>P50</th><th>P90</th><th>Max</th>' +
+    '</tr></thead><tbody>' +
+    rows.slice(0, 100).map(r =>
+      '<tr>' +
+      '<td class="bl">' + (r.symbol || '—') + '</td>' +
+      '<td>' + (r.session || '—') + '</td>' +
+      '<td>' + (r.hour_brussels != null ? r.hour_brussels + ':00' : '—') + '</td>' +
+      '<td class="mt">' + (r.samples || 0) + '</td>' +
+      '<td>' + (r.avg_spread_abs != null ? Number(r.avg_spread_abs).toFixed(6) : '—') + '</td>' +
+      '<td>' + (r.p50_spread != null ? Number(r.p50_spread).toFixed(6) : '—') + '</td>' +
+      '<td>' + (r.p90_spread != null ? Number(r.p90_spread).toFixed(6) : '—') + '</td>' +
+      '<td class="rd">' + (r.max_spread != null ? Number(r.max_spread).toFixed(6) : '—') + '</td>' +
+      '</tr>'
+    ).join('') +
+    '</tbody></table>';
 }
 
-// Init
-pollStatus();
-loadOverview();
-loadPositions();
-loadTrades();
-loadGhost();
-loadEV();
-loadSignals();
-loadSpreads();
+// ── Init ─────────────────────────────────────────────────────────
+// Load status + overview immediately on page load
+(async () => {
+  await pollStatus();
+  await loadOverview();
+})();
 
-setInterval(pollStatus, 15000);
-setInterval(loadPositions, 30000);
-setInterval(loadOverview, 60000);
+// Refresh intervals
+setInterval(pollStatus,  15000);   // status every 15s
+setInterval(loadOverview, 60000);  // overview every 60s
+
 </script>
 </body>
 </html>`;
