@@ -1,29 +1,9 @@
-// ===============================================================
-// server.js  v12.7.0  |  PRONTO-AI
-//
-// Changes v12.7.0:
-//  - FIX DASHBOARD EMPTY STATE: API endpoints now return [] / {} instead
-//    of crashing when DB tables are empty or data is missing.
-//  - FIX SECRET SECURITY: WEBHOOK_SECRET check tightened — rejects empty
-//    string secrets and logs failed attempts with IP.
-//  - FIX EV RETRY: computeEVStats() retry logic on transient DB errors
-//    (3 attempts, 500ms backoff). Ghost EV now survives brief DB hiccups.
-//  - COMPLIANCE BANNER: GET /status now includes complianceDate field so
-//    the dashboard can display a "data from {date}" banner.
-//  - ERROR COUNTER: /status endpoint exposes errorCount (rolling 1h window)
-//    so the dashboard can show a red badge when errors spike.
-//
-// Changes v12.6:
-//  - loadDailyBreakdown, loadGhostHistoryByPair, loadBlockedRaw endpoints.
-//  - Ghost combo analysis auto-recomputes on ghost finalize.
-//
-// Changes v12.5:
-//  - loadPerformanceSummary, loadMAEStats, loadGhostGrouped endpoints.
-//  - SL milestone timing exposed.
-//  - Compliance date manageable via POST /compliance-date.
-// ===============================================================
-
 "use strict";
+// ═══════════════════════════════════════════════════════════════
+//  PRONTO-AI  v12.7.1  server.js
+//  KEY FIX: app.listen() fires BEFORE any DB/MetaAPI call.
+//  The server is always reachable. DB init runs in background.
+// ═══════════════════════════════════════════════════════════════
 
 const express = require("express");
 const helmet  = require("helmet");
@@ -31,247 +11,150 @@ const cron    = require("node-cron");
 
 const db = require("./db");
 const {
-  COMPLIANCE_DATE,
-  COMPLIANCE_DATE_MS,
-  SYMBOL_CATALOG,
-  SYMBOL_ALIASES,
-  DEFAULT_RISK_BY_TYPE,
-  SL_BUFFER_MULT,
-  STOCK_SL_BUFFER_MULT,
-  NY_DEAD_ZONE_START,
-  NY_DEAD_ZONE_END,
-  getBrusselsComponents,
-  getBrusselsDateStr,
-  getBrusselsDateOnly,
-  getSession,
-  isMarketOpen,
-  canOpenNewTrade,
-  isMonitoringActive,
-  isGhostActive,
-  isShadowActive,
-  normalizeSymbol,
-  getSymbolInfo,
-  getVwapPosition,
-  buildOptimizerKey,
+  COMPLIANCE_DATE, COMPLIANCE_DATE_MS,
+  DEFAULT_RISK_BY_TYPE, SL_BUFFER_MULT, STOCK_SL_BUFFER_MULT,
+  getBrusselsComponents, getBrusselsDateStr, getBrusselsDateOnly,
+  getSession, isMarketOpen, canOpenNewTrade,
+  isMonitoringActive, isGhostActive, isShadowActive,
+  normalizeSymbol, getSymbolInfo, getVwapPosition, buildOptimizerKey,
 } = require("./session");
 
-// ── Config ────────────────────────────────────────────────────────
+// ── Config ───────────────────────────────────────────────────────
 const PORT           = process.env.PORT           || 3000;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
 const META_API_TOKEN = process.env.META_API_TOKEN || "";
 const META_ACCOUNT   = process.env.META_ACCOUNT   || "";
 const META_BASE      = "https://mt-client-api-v1.agiliumtrade.agiliumtrade.ai";
 
-// ── Error counter (rolling 1h) ────────────────────────────────────
-let errorLog = [];   // [{ ts: Date, msg: string }]
+// ── App state ────────────────────────────────────────────────────
+let dbReady          = false;   // true once initDB() succeeds
+let openPositions    = new Map();
+let tpConfigs        = {};
+let symbolRiskMap    = {};
+let keyRiskMults     = {};
+let liveComplianceDate = COMPLIANCE_DATE;
+
+// Rolling error log (1 h window)
+let errorLog = [];
 function recordError(msg) {
   const now = Date.now();
-  errorLog.push({ ts: now, msg });
-  // Keep only last 1h
-  errorLog = errorLog.filter(e => now - e.ts < 3600_000);
+  errorLog.push({ ts: now, msg: String(msg) });
+  errorLog = errorLog.filter(e => now - e.ts < 3_600_000);
+  console.error("[ERR]", msg);
 }
 function getErrorCount() {
   const now = Date.now();
-  return errorLog.filter(e => now - e.ts < 3600_000).length;
+  return errorLog.filter(e => now - e.ts < 3_600_000).length;
 }
 
-// ── In-memory state ────────────────────────────────────────────────
-// Open positions tracked in memory, persisted to ghost_state in DB.
-const openPositions = new Map();  // positionId → position object
+// ── Express — start listening IMMEDIATELY ────────────────────────
+const app = express();
+app.use(helmet({ contentSecurityPolicy: false }));
+app.use(express.json({ limit: "1mb" }));
 
-// TP configs loaded from DB at startup
-let tpConfigs = {};   // optimizerKey → { lockedRR, ... }
+const server = app.listen(PORT, () => {
+  console.log(`[PRONTO-AI] Listening on port ${PORT} — DB init starting…`);
+});
 
-// Symbol risk overrides (from DB)
-let symbolRiskMap = {};  // symbol → riskPct
-
-// Key risk multipliers (evMult × dayMult per optimizer_key)
-let keyRiskMults = {};   // optimizerKey → { streak, evMult, dayMult }
-
-// Shadow SL analysis cache (from DB)
-let shadowAnalysisCache = {};  // optimizerKey → analysis object
-
-// Global compliance date (can be updated via POST /compliance-date)
-let liveComplianceDate = COMPLIANCE_DATE;
-
-// ── MetaAPI helpers ───────────────────────────────────────────────
-async function metaFetch(path, method = "GET", body = null) {
-  const url  = `${META_BASE}${path}`;
-  const opts = {
-    method,
-    headers: {
-      "auth-token":   META_API_TOKEN,
-      "Content-Type": "application/json",
-    },
-  };
-  if (body) opts.body = JSON.stringify(body);
-  const res = await fetch(url, opts);
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`MetaAPI ${method} ${path} → ${res.status}: ${text}`);
-  }
-  return res.json().catch(() => null);
-}
-
-async function getPositions() {
-  try {
-    return await metaFetch(`/users/current/accounts/${META_ACCOUNT}/positions`);
-  } catch (e) {
-    recordError(`getPositions: ${e.message}`);
-    return [];
-  }
-}
-
-async function getAccountInfo() {
-  try {
-    return await metaFetch(`/users/current/accounts/${META_ACCOUNT}/account-information`);
-  } catch (e) {
-    recordError(`getAccountInfo: ${e.message}`);
-    return null;
-  }
-}
-
-async function placeOrder(order) {
-  return metaFetch(
-    `/users/current/accounts/${META_ACCOUNT}/trade`,
-    "POST",
-    order
-  );
-}
-
-async function closePosition(positionId) {
-  return metaFetch(
-    `/users/current/accounts/${META_ACCOUNT}/positions/${positionId}/close`,
-    "POST",
-    {}
-  );
-}
-
-async function fetchHistoryDeals(positionId) {
-  try {
-    // Fetch deals from the last 30 days
-    const to   = new Date().toISOString();
-    const from = new Date(Date.now() - 30 * 86400_000).toISOString();
-    const data = await metaFetch(
-      `/users/current/accounts/${META_ACCOUNT}/history-deals/position/${positionId}?from=${from}&to=${to}`
-    );
-    return Array.isArray(data) ? data : (data?.deals ?? []);
-  } catch (e) {
-    return [];
-  }
-}
-
-// ── Risk / lot calculation ────────────────────────────────────────
-function getRiskPct(symbol, assetType) {
-  if (symbolRiskMap[symbol]) return symbolRiskMap[symbol];
-  return DEFAULT_RISK_BY_TYPE[assetType] ?? DEFAULT_RISK_BY_TYPE.forex;
-}
-
-function calcLots(accountEquity, riskPct, slDistPct, slBufferMult, symbolInfo) {
-  // Lot size logic depends on asset type
-  const type = symbolInfo?.type ?? "forex";
-  const mt5  = symbolInfo?.mt5  ?? "";
-  const riskEUR = accountEquity * riskPct;
-
-  // Lot value per pip / per % movement varies by instrument
-  // For simplicity: use 1 lot = contractSize units
-  // slDistPct = distance from entry to SL as % of entry price
-  // riskEUR = lots × (contractSize × slDistPct × price) — varies by asset
-
-  // Generic formula — each asset type has different contract sizes
-  // This is a simplified version; actual implementation should query MetaAPI
-  // for instrument specs. Using approximate values here.
-  let contractSize = 100000; // forex default (1 lot = 100k units)
-  if (type === "index")     contractSize = 1;
-  if (type === "stock")     contractSize = 1;
-  if (type === "commodity" && mt5 === "XAUUSD") contractSize = 100;
-
-  const effectiveSLPct = slDistPct * slBufferMult;
-  if (effectiveSLPct <= 0 || contractSize <= 0) return 0.01;
-
-  // riskEUR = lots × contractSize × (effectiveSLPct/100) × price
-  // → lots = riskEUR / (contractSize × effectiveSLPct/100 × price)
-  // We don't have price here, so lots is computed by server on actual signal
-  // Return riskEUR for the caller to use with actual price
-  return riskEUR;
-}
-
-// ── EV retry logic (FIX EV RETRY) ────────────────────────────────
-async function computeEVStatsWithRetry(optimizerKey, maxRetries = 3) {
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      const result = await db.computeEVStats(optimizerKey);
-      return result;
-    } catch (e) {
-      if (attempt < maxRetries) {
-        await new Promise(r => setTimeout(r, 500 * attempt));
-      } else {
-        recordError(`computeEVStats(${optimizerKey}): ${e.message}`);
-        return { key: optimizerKey, count: 0, rrLevels: [], bestRR: null, bestEV: null };
-      }
-    }
-  }
-}
-
-// ── Webhook secret check (FIX SECRET SECURITY) ───────────────────
+// ── Webhook secret check ──────────────────────────────────────────
 function checkSecret(req, res) {
-  // FIX: reject if WEBHOOK_SECRET is not configured
-  if (!WEBHOOK_SECRET || WEBHOOK_SECRET.trim() === "") {
-    console.error("[SECURITY] WEBHOOK_SECRET is not set — rejecting all webhook requests");
-    res.status(503).json({ error: "WEBHOOK_SECRET not configured on server" });
+  if (!WEBHOOK_SECRET) {
+    res.status(503).json({ error: "WEBHOOK_SECRET not configured" });
     return false;
   }
-  const provided = req.headers["x-webhook-secret"]
-    || req.body?.secret
-    || req.query?.secret;
-  if (!provided || provided !== WEBHOOK_SECRET) {
-    const ip = req.ip || req.socket?.remoteAddress || "unknown";
-    console.warn(`[SECURITY] Invalid webhook secret from IP ${ip}`);
-    recordError(`Invalid webhook secret from ${ip}`);
+  const provided = req.headers["x-webhook-secret"] || req.body?.secret || req.query?.secret;
+  if (provided !== WEBHOOK_SECRET) {
+    const ip = req.ip || "?";
+    recordError(`Bad webhook secret from ${ip}`);
     res.status(401).json({ error: "Unauthorized" });
     return false;
   }
   return true;
 }
 
-// ── Ghost position tracker ────────────────────────────────────────
-// Ghost tracks a real open position through its lifecycle, recording
-// SL usage milestones and peak RR for the optimizer.
-
-function buildGhostKey(positionId) {
-  return positionId;
+// ── MetaAPI helpers ───────────────────────────────────────────────
+async function metaFetch(path, method = "GET", body = null) {
+  const url = `${META_BASE}${path}`;
+  const opts = {
+    method,
+    headers: { "auth-token": META_API_TOKEN, "Content-Type": "application/json" },
+    signal: AbortSignal.timeout(8000),
+  };
+  if (body) opts.body = JSON.stringify(body);
+  const res = await fetch(url, opts);
+  if (!res.ok) throw new Error(`MetaAPI ${method} ${path} → ${res.status}`);
+  return res.json().catch(() => null);
 }
 
-function initGhostForPosition(pos) {
-  const { positionId, symbol, session, direction, vwapPosition,
-          optimizerKey, entry, sl, slPct, tpRRUsed, openedAt,
-          riskPct, riskEUR, evMult, dayMult, tradeNumber } = pos;
+async function getAccountInfo() {
+  if (!META_API_TOKEN || !META_ACCOUNT) return null;
+  try {
+    return await metaFetch(`/users/current/accounts/${META_ACCOUNT}/account-information`);
+  } catch (e) { return null; }
+}
+
+async function getPositions() {
+  if (!META_API_TOKEN || !META_ACCOUNT) return [];
+  try {
+    const d = await metaFetch(`/users/current/accounts/${META_ACCOUNT}/positions`);
+    return Array.isArray(d) ? d : [];
+  } catch { return []; }
+}
+
+async function placeOrder(order) {
+  return metaFetch(`/users/current/accounts/${META_ACCOUNT}/trade`, "POST", order);
+}
+
+async function closePositionMeta(positionId) {
+  return metaFetch(`/users/current/accounts/${META_ACCOUNT}/positions/${positionId}/close`, "POST", {});
+}
+
+async function fetchHistoryDeals(positionId) {
+  try {
+    const to   = new Date().toISOString();
+    const from = new Date(Date.now() - 30 * 86_400_000).toISOString();
+    const d    = await metaFetch(
+      `/users/current/accounts/${META_ACCOUNT}/history-deals/position/${positionId}?from=${from}&to=${to}`
+    );
+    return Array.isArray(d) ? d : (d?.deals ?? []);
+  } catch { return []; }
+}
+
+// ── DB timeout wrapper ───────────────────────────────────────────
+function dbCall(promise, fallback, ms = 7000) {
+  return Promise.race([
+    promise.catch(e => { recordError(e.message); return fallback; }),
+    new Promise(r => setTimeout(() => r(fallback), ms)),
+  ]);
+}
+
+// ── Ghost helpers ────────────────────────────────────────────────
+function initGhost(pos) {
   return {
-    positionId,
-    optimizerKey,
-    symbol,
-    mt5Symbol: pos.mt5Symbol ?? symbol,
-    session,
-    direction,
-    vwapPosition: vwapPosition ?? "unknown",
-    entry:  parseFloat(entry),
-    sl:     parseFloat(sl),
-    slPct:  slPct  ?? null,
-    tpRRUsed: tpRRUsed ?? null,
-    maxPrice:     parseFloat(entry),
+    positionId:   pos.positionId,
+    optimizerKey: pos.optimizerKey,
+    symbol:       pos.symbol,
+    mt5Symbol:    pos.mt5Symbol,
+    session:      pos.session,
+    direction:    pos.direction,
+    vwapPosition: pos.vwapPosition,
+    entry:        parseFloat(pos.entry),
+    sl:           parseFloat(pos.sl),
+    slPct:        pos.slPct,
+    tpRRUsed:     pos.tpRRUsed,
+    maxPrice:     parseFloat(pos.entry),
     maxRR:        0,
     maxSlPctUsed: 0,
-    openedAt:     openedAt ?? new Date().toISOString(),
-    riskPct:  riskPct  ?? null,
-    riskEUR:  riskEUR  ?? null,
-    evMult:   evMult   ?? 1.0,
-    dayMult:  dayMult  ?? 1.0,
-    tradeNumber: tradeNumber ?? null,
-    peakRRPos:  0,
-    peakRRNeg:  0,
+    openedAt:     pos.openedAt,
+    riskPct:      pos.riskPct,
+    riskEUR:      pos.riskEUR,
+    evMult:       pos.evMult ?? 1.0,
+    dayMult:      pos.dayMult ?? 1.0,
+    tradeNumber:  pos.tradeNumber,
+    peakRRPos:    0,
+    peakRRNeg:    0,
     slMilestones: {},
     rrMilestones: {},
-    phantomSL:    sl,    // phantom SL = real SL by default
     phantomSLHit: false,
     stopReason:   null,
     timeToSLMin:  null,
@@ -279,1578 +162,866 @@ function initGhostForPosition(pos) {
   };
 }
 
-function updateGhostPrice(ghost, currentPrice) {
-  const price   = parseFloat(currentPrice);
+function updateGhost(ghost, price) {
+  price = parseFloat(price);
   const entry   = ghost.entry;
   const sl      = ghost.sl;
   const slRange = Math.abs(entry - sl);
   if (slRange <= 0) return;
-
   const isBuy = ghost.direction === "buy";
-
-  // Max favorable price (for RR calculation)
-  if (isBuy  && price > ghost.maxPrice) ghost.maxPrice = price;
-  if (!isBuy && price < ghost.maxPrice) ghost.maxPrice = price;
-
-  // Current RR
-  const favMove = isBuy ? (price - entry) : (entry - price);
-  const currentRR = parseFloat((favMove / slRange).toFixed(4));
-  if (currentRR > ghost.maxRR) ghost.maxRR = currentRR;
-  if (currentRR > ghost.peakRRPos) ghost.peakRRPos = currentRR;
-
-  // Adverse excursion (SL usage)
-  const advMove = isBuy ? (entry - price) : (price - entry);
-  const slUsed  = parseFloat(((advMove / slRange) * 100).toFixed(2));
+  if (isBuy ? price > ghost.maxPrice : price < ghost.maxPrice) ghost.maxPrice = price;
+  const fav  = isBuy ? price - entry : entry - price;
+  const rr   = parseFloat((fav / slRange).toFixed(4));
+  if (rr > ghost.maxRR) ghost.maxRR = rr;
+  if (rr > ghost.peakRRPos) ghost.peakRRPos = rr;
+  const adv    = isBuy ? entry - price : price - entry;
+  const slUsed = parseFloat(((adv / slRange) * 100).toFixed(2));
   if (slUsed > ghost.maxSlPctUsed) ghost.maxSlPctUsed = slUsed;
   if (slUsed > ghost.peakRRNeg)    ghost.peakRRNeg    = slUsed;
-
-  // SL milestone recording (every 10%)
-  const milestoneKeys = [25, 50, 75, 90, 100];
-  for (const pct of milestoneKeys) {
-    if (slUsed >= pct && !ghost.slMilestones[pct]) {
-      ghost.slMilestones[pct] = new Date().toISOString();
-    }
-  }
-
-  // RR milestones (1R, 2R, 3R, 5R)
-  const rrMilestones = [1, 2, 3, 5, 10];
-  for (const rr of rrMilestones) {
-    if (currentRR >= rr && !ghost.rrMilestones[rr]) {
-      ghost.rrMilestones[rr] = new Date().toISOString();
-    }
-  }
-
-  // Check phantom SL hit (real SL = sl)
-  const hitSL = isBuy ? (price <= sl) : (price >= sl);
+  for (const p of [25, 50, 75, 90, 100])
+    if (slUsed >= p && !ghost.slMilestones[p]) ghost.slMilestones[p] = new Date().toISOString();
+  for (const r of [1, 2, 3, 5, 10])
+    if (rr >= r && !ghost.rrMilestones[r]) ghost.rrMilestones[r] = new Date().toISOString();
+  const hitSL = isBuy ? price <= sl : price >= sl;
   if (hitSL && !ghost.phantomSLHit) {
     ghost.phantomSLHit = true;
     ghost.stopReason   = "phantom_sl";
-    if (ghost.openedAt) {
-      ghost.timeToSLMin = Math.round(
-        (Date.now() - new Date(ghost.openedAt).getTime()) / 60000
-      );
-    }
+    ghost.timeToSLMin  = Math.round((Date.now() - new Date(ghost.openedAt).getTime()) / 60000);
   }
-
-  // Cap RR at 15 (max_rr_15 stop reason)
-  if (currentRR >= 15 && !ghost.stopReason) {
-    ghost.stopReason = "max_rr_15";
-  }
+  if (rr >= 15 && !ghost.stopReason) ghost.stopReason = "max_rr_15";
 }
 
-// ── Handle position closed ────────────────────────────────────────
-async function handlePositionClosed(positionId, closeReason = "manual", closedPnl = null) {
+async function closePosition(positionId, reason = "manual", pnl = null) {
   const pos = openPositions.get(positionId);
   if (!pos) return;
-
   openPositions.delete(positionId);
+  const ghost = pos.ghost;
+  const now   = new Date().toISOString();
+  let realPnl = pnl;
 
-  const ghost   = pos.ghost;
-  const now     = new Date().toISOString();
-  const hitTP   = closeReason === "tp";
-
-  // Fetch realized P&L from deals table first (FIX v12.4)
-  let realizedPnl = null;
-  try {
-    const deals = await fetchHistoryDeals(positionId);
-    for (const deal of deals) {
-      await db.saveDeal({
-        positionId,
-        dealId:     deal.id ?? deal.dealId,
-        symbol:     deal.symbol,
-        type:       deal.type,
-        profit:     deal.profit ?? 0,
-        commission: deal.commission ?? 0,
-        swap:       deal.swap ?? 0,
-        volume:     deal.volume,
-        price:      deal.price,
-        time:       deal.time,
-      });
-    }
-    realizedPnl = await db.fetchRealizedPnl(positionId);
-  } catch (e) {
-    recordError(`handlePositionClosed deals: ${e.message}`);
-  }
-
-  if (realizedPnl == null) realizedPnl = closedPnl;
-
-  // Finalize ghost
-  if (ghost) {
-    ghost.closedAt   = now;
-    ghost.stopReason = ghost.stopReason ?? closeReason;
-
-    await db.saveGhostTrade({
-      ...ghost,
-      maxRRBeforeSL: ghost.maxRR,
-    });
-
-    // Recompute ghost combo analysis for this optimizer key
+  // Fetch deals
+  if (dbReady) {
     try {
-      await db.computeAndSaveGhostComboAnalysis(ghost.optimizerKey);
-    } catch (e) {
-      recordError(`computeGhostCombo: ${e.message}`);
-    }
+      const deals = await fetchHistoryDeals(positionId);
+      for (const d of deals) {
+        await db.saveDeal({ positionId, dealId: d.id ?? d.dealId, symbol: d.symbol,
+          type: d.type, profit: d.profit ?? 0, commission: d.commission ?? 0,
+          swap: d.swap ?? 0, volume: d.volume, price: d.price, time: d.time });
+      }
+      realPnl = await db.fetchRealizedPnl(positionId) ?? pnl;
+    } catch (e) { recordError(`closePos deals: ${e.message}`); }
   }
 
-  // Save closed trade
-  await db.saveTrade({
-    positionId,
-    symbol:      pos.symbol,
-    mt5Symbol:   pos.mt5Symbol,
-    direction:   pos.direction,
-    vwapPosition: pos.vwapPosition ?? "unknown",
-    entry:       pos.entry,
-    sl:          pos.sl,
-    tp:          pos.tp,
-    lots:        pos.lots,
-    riskPct:     pos.riskPct,
-    riskEUR:     pos.riskEUR,
-    maxPrice:    ghost?.maxPrice ?? pos.entry,
-    maxRR:       ghost?.maxRR   ?? 0,
-    trueMaxRR:   ghost?.maxRR   ?? 0,
-    trueMaxPrice: ghost?.maxPrice ?? pos.entry,
-    ghostStopReason:  ghost?.stopReason,
-    ghostFinalizedAt: now,
-    session:     pos.session,
-    vwapAtEntry: pos.vwapAtEntry,
-    openedAt:    pos.openedAt,
-    closedAt:    now,
-    slMultiplier: pos.slMultiplier ?? 1.0,
-    realizedPnlEUR: realizedPnl,
-    hitTP,
-    closeReason,
-    spreadAtEntry:  pos.spreadAtEntry,
-    vwapBandPct:    pos.vwapBandPct,
-    executionPrice: pos.executionPrice,
-    tvEntry:        pos.tvEntry,
-    slippage:       pos.slippage,
-    excludeFromEV:  pos.excludeFromEV ?? false,
-  });
-
-  // Delete ghost state from DB
-  await db.deleteGhostState(positionId);
-
-  // Log PnL
-  await db.savePnlLog(
-    pos.symbol, pos.session, pos.direction,
-    pos.vwapPosition ?? "unknown",
-    ghost?.maxRR ?? 0,
-    hitTP,
-    realizedPnl ?? 0
-  );
-
-  console.log(`[Position] Closed ${positionId} (${pos.symbol} ${pos.direction}) reason=${closeReason} pnl=${realizedPnl}`);
-}
-
-// ── Restore positions from DB on startup ─────────────────────────
-async function restorePositionsFromMT5() {
-  try {
-    const ghostStates = await db.loadAllGhostStates();
-    let restored = 0;
-    for (const gs of ghostStates) {
-      if (openPositions.has(gs.positionId)) continue;
-      const ghost = {
-        positionId:   gs.positionId,
-        optimizerKey: gs.optimizerKey,
-        symbol:       gs.symbol,
-        mt5Symbol:    gs.mt5Symbol ?? gs.symbol,
-        session:      gs.session,
-        direction:    gs.direction,
-        vwapPosition: gs.vwapPosition ?? "unknown",
-        entry:        gs.entry,
-        sl:           gs.sl,
-        slPct:        gs.slPct,
-        tpRRUsed:     gs.tpRRUsed,
-        maxPrice:     gs.maxPrice ?? gs.entry,
-        maxRR:        gs.maxRR  ?? 0,
-        maxSlPctUsed: gs.maxSlPctUsed ?? 0,
-        openedAt:     gs.openedAt,
-        riskPct:      gs.riskPct,
-        riskEUR:      gs.riskEUR,
-        evMult:       gs.evMult  ?? 1.0,
-        dayMult:      gs.dayMult ?? 1.0,
-        tradeNumber:  gs.tradeNumber,
-        peakRRPos:    gs.peakRRPos ?? 0,
-        peakRRNeg:    gs.peakRRNeg ?? 0,
-        slMilestones: gs.slMilestones ?? {},
-        rrMilestones: gs.rrMilestones ?? {},
-        phantomSL:    gs.sl,
-        phantomSLHit: false,
-        stopReason:   null,
-        timeToSLMin:  null,
-        closedAt:     null,
-      };
-      openPositions.set(gs.positionId, {
-        positionId:   gs.positionId,
-        symbol:       gs.symbol,
-        mt5Symbol:    gs.mt5Symbol ?? gs.symbol,
-        direction:    gs.direction,
-        vwapPosition: gs.vwapPosition ?? "unknown",
-        session:      gs.session,
-        entry:        gs.entry,
-        sl:           gs.sl,
-        tp:           null,
-        lots:         null,
-        riskPct:      gs.riskPct,
-        riskEUR:      gs.riskEUR,
-        openedAt:     gs.openedAt,
-        optimizerKey: gs.optimizerKey,
-        ghost,
-      });
-      restored++;
-    }
-    console.log(`[Startup] Restored ${restored} open positions from ghost_state`);
-  } catch (e) {
-    recordError(`restorePositionsFromMT5: ${e.message}`);
-    console.error("[Startup] restorePositionsFromMT5 failed:", e.message);
+  if (ghost && dbReady) {
+    ghost.closedAt   = now;
+    ghost.stopReason = ghost.stopReason ?? reason;
+    await db.saveGhostTrade({ ...ghost, maxRRBeforeSL: ghost.maxRR }).catch(e => recordError(e.message));
+    db.computeAndSaveGhostComboAnalysis(ghost.optimizerKey).catch(() => {});
   }
+
+  if (dbReady) {
+    await db.saveTrade({
+      positionId, symbol: pos.symbol, mt5Symbol: pos.mt5Symbol,
+      direction: pos.direction, vwapPosition: pos.vwapPosition,
+      entry: pos.entry, sl: pos.sl, tp: pos.tp, lots: pos.lots,
+      riskPct: pos.riskPct, riskEUR: pos.riskEUR,
+      maxPrice: ghost?.maxPrice ?? pos.entry, maxRR: ghost?.maxRR ?? 0,
+      trueMaxRR: ghost?.maxRR ?? 0, trueMaxPrice: ghost?.maxPrice ?? pos.entry,
+      ghostStopReason: ghost?.stopReason, ghostFinalizedAt: now,
+      session: pos.session, vwapAtEntry: pos.vwapAtEntry,
+      openedAt: pos.openedAt, closedAt: now,
+      slMultiplier: pos.slMultiplier ?? 1.0,
+      realizedPnlEUR: realPnl, hitTP: reason === "tp", closeReason: reason,
+      spreadAtEntry: pos.spreadAtEntry, vwapBandPct: pos.vwapBandPct,
+      executionPrice: pos.executionPrice, tvEntry: pos.tvEntry, slippage: pos.slippage,
+    }).catch(e => recordError(e.message));
+    db.deleteGhostState(positionId).catch(() => {});
+  }
+  console.log(`[Pos] Closed ${positionId} ${pos.symbol} ${pos.direction} reason=${reason} pnl=${realPnl}`);
 }
 
-// ── MetaAPI position sync (cron every 30s) ────────────────────────
+// ── Position sync (cron) ─────────────────────────────────────────
 async function syncPositions() {
-  if (!isMonitoringActive()) return;
-  try {
-    const livePositions = await getPositions();
-    if (!Array.isArray(livePositions)) return;
-
-    const liveIds = new Set(livePositions.map(p => String(p.id)));
-
-    // Detect newly closed positions
-    for (const [posId, pos] of openPositions.entries()) {
-      if (!liveIds.has(posId)) {
-        // Position no longer open — it was closed
-        await handlePositionClosed(posId, "manual", null);
-      }
+  if (!isMonitoringActive() || !dbReady) return;
+  const live = await getPositions();
+  const liveIds = new Set(live.map(p => String(p.id)));
+  for (const [id] of openPositions) {
+    if (!liveIds.has(id)) await closePosition(id, "manual", null);
+  }
+  for (const lp of live) {
+    const pos = openPositions.get(String(lp.id));
+    if (pos?.ghost && lp.currentPrice) {
+      updateGhost(pos.ghost, lp.currentPrice);
+      if (dbReady) db.saveGhostState(pos.ghost).catch(() => {});
     }
-
-    // Update ghost prices for still-open positions
-    for (const lp of livePositions) {
-      const posId = String(lp.id);
-      const pos   = openPositions.get(posId);
-      if (pos?.ghost && lp.currentPrice) {
-        updateGhostPrice(pos.ghost, lp.currentPrice);
-        // Persist ghost state periodically
-        await db.saveGhostState(pos.ghost);
-      }
-    }
-  } catch (e) {
-    recordError(`syncPositions: ${e.message}`);
   }
 }
 
-// ── Express app ───────────────────────────────────────────────────
-const app = express();
-app.use(helmet());
-app.use(express.json({ limit: "1mb" }));
+// ── Shadow snapshots (cron) ───────────────────────────────────────
+async function runShadowSnapshots() {
+  if (!isShadowActive() || !dbReady || openPositions.size === 0) return;
+  const live     = await getPositions();
+  const priceMap = new Map(live.map(p => [String(p.id), p.currentPrice]));
+  for (const [id, pos] of openPositions) {
+    const price   = priceMap.get(id);
+    if (!price) continue;
+    const slDist  = Math.abs(pos.entry - pos.sl);
+    if (slDist <= 0) continue;
+    const adv     = pos.direction === "buy" ? pos.entry - price : price - pos.entry;
+    const pctUsed = Math.max(0, parseFloat(((adv / slDist) * 100).toFixed(2)));
+    db.saveShadowSnapshot({ positionId: id, optimizerKey: pos.optimizerKey,
+      symbol: pos.symbol, session: pos.session, direction: pos.direction,
+      vwapPosition: pos.vwapPosition, entry: pos.entry, sl: pos.sl,
+      currentPrice: price, pctSlUsed: pctUsed }).catch(() => {});
+  }
+}
 
-// ── Dashboard HTML ────────────────────────────────────────────────
+// ── TP Optimizer (cron) ───────────────────────────────────────────
+async function runTPOptimizer() {
+  if (!isMonitoringActive() || !dbReady) return;
+  try {
+    tpConfigs = await db.loadTPConfig();
+    const grouped = await db.loadGhostGrouped();
+    for (const g of grouped) {
+      if ((g.n || 0) < 10) continue;
+      const ev = await db.computeEVStats(g.optimizerKey).catch(() => null);
+      if (!ev || ev.count < 10 || !ev.bestRR) continue;
+      const km  = keyRiskMults[g.optimizerKey] ?? { streak: 0, evMult: 1.0, dayMult: 1.0 };
+      const mul = ev.bestEV > 0 ? Math.min(1.5, 1 + ev.bestEV) : Math.max(0.5, 1 + ev.bestEV);
+      keyRiskMults[g.optimizerKey] = { streak: km.streak, evMult: parseFloat(mul.toFixed(4)), dayMult: km.dayMult ?? 1.0 };
+      db.saveKeyRiskMult(g.optimizerKey, keyRiskMults[g.optimizerKey]).catch(() => {});
+      const existing = tpConfigs[g.optimizerKey];
+      if (!existing || g.n >= (existing.lockedGhosts ?? 0) * 2) {
+        await db.saveTPConfig(g.optimizerKey, g.symbol, g.session, g.direction,
+          g.vwapPosition, ev.bestRR, g.n, ev.bestEV, existing?.lockedRR ?? null).catch(() => {});
+        tpConfigs[g.optimizerKey] = { ...existing, lockedRR: ev.bestRR, lockedGhosts: g.n };
+      }
+    }
+  } catch (e) { recordError(`TPOptimizer: ${e.message}`); }
+}
+
+// ══════════════════════════════════════════════════════════════════
+//  ROUTES
+// ══════════════════════════════════════════════════════════════════
+
+// ── Dashboard ─────────────────────────────────────────────────────
 app.get("/", (req, res) => {
-  const html = buildDashboardHTML();
   res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.send(html);
+  res.send(dashboardHTML());
 });
 
-// ── Health / status ────────────────────────────────────────────────
+// ── Health ────────────────────────────────────────────────────────
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", version: "12.7.0", ts: new Date().toISOString() });
+  res.json({ ok: true, version: "12.7.1", dbReady, ts: new Date().toISOString() });
 });
 
+// ── Status (always fast) ──────────────────────────────────────────
 app.get("/status", async (req, res) => {
-  // Always respond within 3s — never hang the dashboard
   const base = {
-    version:        "12.7.0",
+    version:        "12.7.1",
+    dbReady,
     openPositions:  openPositions.size,
     complianceDate: liveComplianceDate,
     errorCount:     getErrorCount(),
     ts:             new Date().toISOString(),
   };
-  try {
-    const acct = await Promise.race([
-      getAccountInfo(),
-      new Promise(r => setTimeout(() => r(null), 2500)),
-    ]);
-    res.json({
-      ...base,
-      account: acct ? {
-        balance:  acct.balance,
-        equity:   acct.equity,
-        margin:   acct.margin,
-        currency: acct.currency,
-      } : null,
-    });
-  } catch (e) {
-    recordError(`/status: ${e.message}`);
-    res.json({ ...base, account: null });
-  }
+  // Account info: try with 2.5 s timeout — never block
+  const acct = await Promise.race([
+    getAccountInfo(),
+    new Promise(r => setTimeout(() => r(null), 2500)),
+  ]);
+  res.json({
+    ...base,
+    account: acct ? { balance: acct.balance, equity: acct.equity,
+                      margin: acct.margin, currency: acct.currency } : null,
+  });
 });
 
-// ── Compliance date management ────────────────────────────────────
+// ── Compliance date ───────────────────────────────────────────────
+app.get("/compliance-date", (req, res) => res.json({ complianceDate: liveComplianceDate }));
+
 app.post("/compliance-date", async (req, res) => {
   if (!checkSecret(req, res)) return;
   const { date } = req.body ?? {};
-  if (!date || !/^\d{4}-\d{2}-\d{2}/.test(date)) {
-    return res.status(400).json({ error: "date must be ISO format YYYY-MM-DD" });
-  }
-  const isoStr = date.length === 10 ? `${date} 00:00:00` : date;
-  liveComplianceDate = isoStr;
-  db.setComplianceDateLive(isoStr);
-  await db.saveComplianceDate(isoStr);
-  console.log(`[ComplianceDate] Set to ${isoStr}`);
-  res.json({ ok: true, complianceDate: isoStr });
+  if (!date || !/^\d{4}-\d{2}-\d{2}/.test(date)) return res.status(400).json({ error: "date must be YYYY-MM-DD" });
+  const iso = date.length === 10 ? `${date} 00:00:00` : date;
+  liveComplianceDate = iso;
+  db.setComplianceDateLive(iso);
+  if (dbReady) await db.saveComplianceDate(iso).catch(() => {});
+  res.json({ ok: true, complianceDate: iso });
 });
 
-app.get("/compliance-date", async (req, res) => {
-  res.json({ complianceDate: liveComplianceDate });
-});
-
-// ── TradingView Webhook ───────────────────────────────────────────
+// ── Webhook ───────────────────────────────────────────────────────
 app.post("/webhook", async (req, res) => {
   const t0 = Date.now();
   if (!checkSecret(req, res)) return;
+  if (!dbReady) return res.status(503).json({ error: "DB not ready yet, retry in a moment" });
 
-  const body = req.body;
-  const { symbol: rawSymbol, direction, sl_pct: slPctRaw,
-          vwap, vwap_upper, vwap_upper2, vwap_lower, vwap_lower2,
-          close: tvClose } = body ?? {};
+  const { symbol: rawSym, direction, sl_pct, vwap, vwap_upper, vwap_upper2,
+          vwap_lower, vwap_lower2, close: tvClose } = req.body ?? {};
 
-  // Normalize symbol
-  const symbol = normalizeSymbol(rawSymbol);
-  if (!symbol) {
-    await db.logSignal({
-      symbol: rawSymbol, direction, outcome: "REJECTED",
-      rejectReason: `UNKNOWN_SYMBOL: ${rawSymbol}`,
-      latencyMs: Date.now() - t0,
-    });
-    return res.status(400).json({ error: `Unknown symbol: ${rawSymbol}` });
-  }
+  const symbol = normalizeSymbol(rawSym);
+  if (!symbol) return res.status(400).json({ error: `Unknown symbol: ${rawSym}` });
 
-  const symInfo  = getSymbolInfo(symbol);
-  const mt5Sym   = symInfo?.mt5 ?? symbol;
+  const symInfo   = getSymbolInfo(symbol);
+  const mt5Sym    = symInfo?.mt5 ?? symbol;
   const assetType = symInfo?.type ?? "forex";
 
-  // Market open check
-  const { allowed, reason: marketReason } = canOpenNewTrade(symbol);
+  const { allowed, reason: mktReason } = canOpenNewTrade(symbol);
   if (!allowed) {
-    await db.logSignal({
-      symbol, direction, session: getSession(), vwapPosition: null,
-      optimizerKey: null,
-      tvEntry: tvClose ? parseFloat(tvClose) : null,
-      slPct: slPctRaw ? parseFloat(slPctRaw) : null,
-      outcome: "REJECTED",
-      rejectReason: marketReason,
-      latencyMs: Date.now() - t0,
-    });
-    return res.json({ ok: false, reason: marketReason });
+    db.logSignal({ symbol, direction, outcome: "REJECTED", rejectReason: mktReason,
+      session: getSession(), latencyMs: Date.now() - t0 }).catch(() => {});
+    return res.json({ ok: false, reason: mktReason });
   }
 
-  // VWAP position
-  const tvEntry    = tvClose ? parseFloat(tvClose) : null;
-  const vwapMid    = vwap    ? parseFloat(vwap)    : null;
-  const vwapUp     = vwap_upper  ? parseFloat(vwap_upper)  : null;
-  const vwapUp2    = vwap_upper2 ? parseFloat(vwap_upper2) : null;
-  const vwapLow    = vwap_lower  ? parseFloat(vwap_lower)  : null;
-  const vwapLow2   = vwap_lower2 ? parseFloat(vwap_lower2) : null;
+  const tvEntry  = tvClose ? parseFloat(tvClose) : null;
+  const vwapMid  = vwap    ? parseFloat(vwap)    : null;
+  const session  = getSession();
+  const vwapPos  = getVwapPosition(tvEntry, vwapMid);
+  const optKey   = buildOptimizerKey(symbol, session, direction, vwapPos);
+  const slPct    = sl_pct ? parseFloat(sl_pct) : 0.003;
 
-  const vwapPos    = getVwapPosition(tvEntry, vwapMid);
-  const session    = getSession();
-  const optKey     = buildOptimizerKey(symbol, session, direction, vwapPos);
+  let equity = 10000;
+  const acct = await Promise.race([getAccountInfo(), new Promise(r => setTimeout(() => r(null), 3000))]);
+  if (acct?.equity) equity = parseFloat(acct.equity);
 
-  // VWAP band % (distance from midline as % of midline)
-  let vwapBandPct = null;
-  if (tvEntry && vwapMid && vwapMid > 0) {
-    vwapBandPct = parseFloat((Math.abs(tvEntry - vwapMid) / vwapMid * 100).toFixed(4));
-  }
+  const baseRisk = symbolRiskMap[symbol] ?? DEFAULT_RISK_BY_TYPE[assetType] ?? DEFAULT_RISK_BY_TYPE.forex;
+  const km       = keyRiskMults[optKey] ?? { evMult: 1.0, dayMult: 1.0 };
+  const riskPct  = baseRisk * (km.evMult ?? 1) * (km.dayMult ?? 1);
+  const riskEUR  = parseFloat((equity * riskPct).toFixed(2));
 
-  // VWAP band exhaustion check (>150% → reject)
-  const vwapBandRange = vwapPos === "above"
-    ? (vwapUp2 ?? vwapUp ?? null)
-    : (vwapLow2 ?? vwapLow ?? null);
-
-  const slPct = slPctRaw ? parseFloat(slPctRaw) : null;
-
-  // Get account equity for lot calc
-  let equity = 10000;  // fallback
+  // Live quote
+  let execPrice = tvEntry, spreadAtEntry = null, bid = null, ask = null;
   try {
-    const acct = await getAccountInfo();
-    if (acct?.equity) equity = parseFloat(acct.equity);
-  } catch (e) { /* use fallback */ }
+    const q = await metaFetch(`/users/current/accounts/${META_ACCOUNT}/symbols/${mt5Sym}/current-price`);
+    bid = q?.bid ? parseFloat(q.bid) : null;
+    ask = q?.ask ? parseFloat(q.ask) : null;
+    if (bid && ask) { spreadAtEntry = parseFloat((ask - bid).toFixed(6)); execPrice = direction === "buy" ? ask : bid; }
+  } catch {}
 
-  // Risk calculation
-  const baseRiskPct = getRiskPct(symbol, assetType);
-  const km          = keyRiskMults[optKey] ?? { evMult: 1.0, dayMult: 1.0 };
-  const finalRiskPct = baseRiskPct * (km.evMult ?? 1.0) * (km.dayMult ?? 1.0);
-  const riskEUR      = parseFloat((equity * finalRiskPct).toFixed(2));
+  const slippage    = tvEntry && execPrice ? parseFloat(Math.abs(execPrice - tvEntry).toFixed(6)) : null;
+  const slBuf       = assetType === "stock" ? STOCK_SL_BUFFER_MULT : SL_BUFFER_MULT;
+  const slDist      = (slPct * slBuf) * execPrice;
+  const slPrice     = direction === "buy"
+    ? parseFloat((execPrice - slDist).toFixed(6))
+    : parseFloat((execPrice + slDist).toFixed(6));
+  const tpRR        = tpConfigs[optKey]?.lockedRR ?? 2.0;
+  const tpPrice     = direction === "buy"
+    ? parseFloat((execPrice + slDist * tpRR).toFixed(6))
+    : parseFloat((execPrice - slDist * tpRR).toFixed(6));
 
-  // Fetch MetaAPI quote for execution
-  let executionPrice = tvEntry;
-  let spreadAtEntry  = null;
-  let bid = null, ask = null;
-  try {
-    const quote = await metaFetch(
-      `/users/current/accounts/${META_ACCOUNT}/symbols/${mt5Sym}/current-price`
-    );
-    bid = quote?.bid ? parseFloat(quote.bid) : null;
-    ask = quote?.ask ? parseFloat(quote.ask) : null;
-    if (bid && ask) {
-      spreadAtEntry  = parseFloat((ask - bid).toFixed(6));
-      executionPrice = direction === "buy" ? ask : bid;
-    }
-  } catch (e) { /* use TV entry */ }
-
-  const slippage = tvEntry && executionPrice
-    ? parseFloat((Math.abs(executionPrice - tvEntry)).toFixed(6))
-    : null;
-
-  // SL price calculation
-  const slBuffMult = assetType === "stock" ? STOCK_SL_BUFFER_MULT : SL_BUFFER_MULT;
-  const slDistFrac = (slPct ?? 0.003) * slBuffMult;  // default 0.3% SL
-  const slPrice    = direction === "buy"
-    ? parseFloat((executionPrice * (1 - slDistFrac)).toFixed(6))
-    : parseFloat((executionPrice * (1 + slDistFrac)).toFixed(6));
-
-  // TP price from optimizer
-  const tpConfig = tpConfigs[optKey];
-  const tpRR     = tpConfig?.lockedRR ?? 2.0;  // default 2R
-  const slDist   = Math.abs(executionPrice - slPrice);
-  const tpPrice  = direction === "buy"
-    ? parseFloat((executionPrice + slDist * tpRR).toFixed(6))
-    : parseFloat((executionPrice - slDist * tpRR).toFixed(6));
-
-  // Lot calculation
-  const lotNominal = slDist > 0 ? riskEUR / slDist : 0.01;
   let lots;
-  if (assetType === "forex")     lots = parseFloat((lotNominal / 100000).toFixed(2));
-  else if (assetType === "index") lots = parseFloat((lotNominal / 1).toFixed(2));
-  else if (assetType === "stock") lots = parseFloat((lotNominal / executionPrice).toFixed(2));
-  else lots = parseFloat((lotNominal / 100).toFixed(2)); // commodity (gold)
-  lots = Math.max(lots, 0.01);
+  const lotNom = slDist > 0 ? riskEUR / slDist : 0.01;
+  if (assetType === "forex")     lots = Math.max(0.01, parseFloat((lotNom / 100000).toFixed(2)));
+  else if (assetType === "index") lots = Math.max(0.01, parseFloat(lotNom.toFixed(2)));
+  else if (assetType === "stock") lots = Math.max(0.01, parseFloat((lotNom / execPrice).toFixed(2)));
+  else lots = Math.max(0.01, parseFloat((lotNom / 100).toFixed(2)));
 
-  // Get next trade number
   let tradeNumber = null;
-  try {
-    tradeNumber = await db.getNextTradeNumber();
-  } catch (e) { /* non-critical */ }
+  if (dbReady) tradeNumber = await db.getNextTradeNumber().catch(() => null);
 
-  // Place order on MetaAPI
-  let positionId = null;
-  let placed     = false;
+  // Place order
+  let positionId;
   try {
-    const order = {
-      symbol:          mt5Sym,
-      actionType:      direction === "buy" ? "ORDER_TYPE_BUY" : "ORDER_TYPE_SELL",
-      volume:          lots,
-      stopLoss:        slPrice,
-      takeProfit:      tpPrice,
-      comment:         `PRONTO-AI #${tradeNumber ?? "?"}`,
-    };
-    const result = await placeOrder(order);
-    positionId   = result?.positionId ?? result?.orderId ?? String(Date.now());
-    placed       = true;
-    console.log(`[Webhook] Placed ${symbol} ${direction} lot=${lots} sl=${slPrice} tp=${tpPrice} pos=${positionId}`);
+    const r  = await placeOrder({
+      symbol: mt5Sym,
+      actionType: direction === "buy" ? "ORDER_TYPE_BUY" : "ORDER_TYPE_SELL",
+      volume: lots, stopLoss: slPrice, takeProfit: tpPrice,
+      comment: `PRONTO-AI #${tradeNumber ?? "?"}`,
+    });
+    positionId = r?.positionId ?? r?.orderId ?? String(Date.now());
   } catch (e) {
     recordError(`placeOrder: ${e.message}`);
-    await db.logSignal({
-      symbol, direction, session, vwapPosition: vwapPos, optimizerKey: optKey,
-      tvEntry, slPct, vwap: vwapMid, vwapUpper: vwapUp, vwapLower: vwapLow, vwapBandPct,
-      outcome: "ERROR", rejectReason: e.message, latencyMs: Date.now() - t0,
-    });
-    await db.logWebhook({
-      symbol, direction, session, vwapPos, action: "place", status: "ERROR",
-      reason: e.message, entry: executionPrice, sl: slPrice, tp: tpPrice,
-      lots, riskPct: finalRiskPct, optimizerKey: optKey,
-      latencyMs: Date.now() - t0, tvEntry, executionPrice, slippage, vwapBandPct,
-    });
+    db.logSignal({ symbol, direction, session, vwapPosition: vwapPos, optimizerKey: optKey,
+      tvEntry, slPct, outcome: "ERROR", rejectReason: e.message, latencyMs: Date.now() - t0 }).catch(() => {});
     return res.status(500).json({ error: e.message });
   }
 
-  // Track position in memory
-  const pos = {
-    positionId,
-    symbol,
-    mt5Symbol:      mt5Sym,
-    direction,
-    vwapPosition:   vwapPos,
-    session,
-    entry:          executionPrice,
-    sl:             slPrice,
-    tp:             tpPrice,
-    lots,
-    riskPct:        finalRiskPct,
-    riskEUR,
-    openedAt:       new Date().toISOString(),
-    optimizerKey:   optKey,
-    tpRRUsed:       tpRR,
-    slMultiplier:   slBuffMult,
-    vwapAtEntry:    vwapMid,
-    tvEntry,
-    executionPrice,
-    slippage,
-    spreadAtEntry,
-    vwapBandPct,
-    tradeNumber,
-    excludeFromEV:  false,
-    ghost:          null,
-  };
-  pos.ghost = initGhostForPosition({
-    ...pos,
-    slPct:      slPct ?? slDistFrac,
-    evMult:     km.evMult  ?? 1.0,
-    dayMult:    km.dayMult ?? 1.0,
-  });
-
+  const pos = { positionId, symbol, mt5Symbol: mt5Sym, direction,
+    vwapPosition: vwapPos, session, entry: execPrice, sl: slPrice, tp: tpPrice, lots,
+    riskPct, riskEUR, openedAt: new Date().toISOString(), optimizerKey: optKey,
+    tpRRUsed: tpRR, slMultiplier: slBuf, vwapAtEntry: vwapMid, tvEntry, executionPrice: execPrice,
+    slippage, spreadAtEntry, vwapBandPct: null, tradeNumber, ghost: null };
+  pos.ghost = initGhost({ ...pos, slPct, evMult: km.evMult, dayMult: km.dayMult });
   openPositions.set(positionId, pos);
 
-  // Save ghost state to DB
-  await db.saveGhostState(pos.ghost);
-
-  // Save spread log
-  if (bid && ask) {
-    const { hour, minute } = getBrusselsComponents();
-    const day = getBrusselsComponents().day;
-    await db.saveSpreadLog({
-      symbol, mt5Symbol: mt5Sym, session,
-      hourBrussels: hour, minuteBrussels: minute, dayOfWeek: day,
+  if (dbReady) {
+    db.saveGhostState(pos.ghost).catch(() => {});
+    db.logSignal({ symbol, direction, session, vwapPosition: vwapPos, optimizerKey: optKey,
+      tvEntry, slPct, outcome: "PLACED", latencyMs: Date.now() - t0, positionId }).catch(() => {});
+    db.logWebhook({ symbol, direction, session, vwapPos, action: "place", status: "OK",
+      positionId, entry: execPrice, sl: slPrice, tp: tpPrice, lots, riskPct, optimizerKey: optKey,
+      latencyMs: Date.now() - t0, tvEntry, executionPrice: execPrice, slippage }).catch(() => {});
+    if (bid && ask) db.saveSpreadLog({ symbol, mt5Symbol: mt5Sym, session,
+      hourBrussels: getBrusselsComponents().hour, minuteBrussels: getBrusselsComponents().minute,
+      dayOfWeek: getBrusselsComponents().day,
       bid, ask, spreadAbs: spreadAtEntry,
-      spreadPct: spreadAtEntry && executionPrice > 0
-        ? parseFloat((spreadAtEntry / executionPrice * 100).toFixed(4))
-        : null,
-      assetType, positionId,
-    });
+      spreadPct: spreadAtEntry && execPrice > 0 ? parseFloat((spreadAtEntry / execPrice * 100).toFixed(4)) : null,
+      assetType, positionId }).catch(() => {});
   }
 
-  const latencyMs = Date.now() - t0;
-
-  // Log signal
-  await db.logSignal({
-    symbol, direction, session, vwapPosition: vwapPos,
-    optimizerKey: optKey,
-    tvEntry, slPct,
-    slPctHuman: slPct ? `${(slPct * 100).toFixed(3)}%` : null,
-    vwap: vwapMid, vwapUpper: vwapUp, vwapLower: vwapLow, vwapBandPct,
-    outcome: "PLACED", rejectReason: null, latencyMs, positionId,
-  });
-
-  // Log webhook history
-  await db.logWebhook({
-    symbol, direction, session, vwapPos, action: "place", status: "OK",
-    reason: null, positionId, entry: executionPrice,
-    sl: slPrice, tp: tpPrice, lots, riskPct: finalRiskPct,
-    optimizerKey: optKey, latencyMs, tvEntry, executionPrice, slippage, vwapBandPct,
-  });
-
-  res.json({
-    ok:         true,
-    positionId,
-    symbol,
-    direction,
-    lots,
-    entry:      executionPrice,
-    sl:         slPrice,
-    tp:         tpPrice,
-    riskEUR,
-    tpRR,
-    tradeNumber,
-    latencyMs,
-  });
+  res.json({ ok: true, positionId, symbol, direction, lots,
+    entry: execPrice, sl: slPrice, tp: tpPrice, riskEUR, tpRR, tradeNumber,
+    latencyMs: Date.now() - t0 });
 });
 
 // ── Manual close ──────────────────────────────────────────────────
-app.post("/close/:positionId", async (req, res) => {
+app.post("/close/:id", async (req, res) => {
   if (!checkSecret(req, res)) return;
-  const { positionId } = req.params;
   try {
-    await closePosition(positionId);
-    await handlePositionClosed(positionId, "manual", null);
-    res.json({ ok: true, positionId });
-  } catch (e) {
-    recordError(`/close: ${e.message}`);
-    res.status(500).json({ error: e.message });
-  }
+    await closePositionMeta(req.params.id);
+    await closePosition(req.params.id, "manual", null);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── History deals (called by TradingView or external) ────────────
+// ── History deals ─────────────────────────────────────────────────
 app.post("/history-deals", async (req, res) => {
   if (!checkSecret(req, res)) return;
   const { positionId } = req.body ?? {};
   if (!positionId) return res.status(400).json({ error: "positionId required" });
   try {
     const deals = await fetchHistoryDeals(positionId);
-    for (const deal of deals) {
-      await db.saveDeal({
-        positionId,
-        dealId:     deal.id ?? deal.dealId,
-        symbol:     deal.symbol,
-        type:       deal.type,
-        profit:     deal.profit ?? 0,
-        commission: deal.commission ?? 0,
-        swap:       deal.swap ?? 0,
-        volume:     deal.volume,
-        price:      deal.price,
-        time:       deal.time,
-      });
-    }
+    for (const d of deals)
+      await db.saveDeal({ positionId, dealId: d.id ?? d.dealId, symbol: d.symbol,
+        type: d.type, profit: d.profit ?? 0, commission: d.commission ?? 0,
+        swap: d.swap ?? 0, volume: d.volume, price: d.price, time: d.time });
     const pnl = await db.fetchRealizedPnl(positionId);
     res.json({ ok: true, deals: deals.length, realizedPnl: pnl });
-  } catch (e) {
-    recordError(`/history-deals: ${e.message}`);
-    res.status(500).json({ error: e.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── Dashboard API endpoints ────────────────────────────────────────
-// FIX EMPTY STATE: all endpoints return safe defaults when data is missing.
+// ── API endpoints (all safe — return empty on error/not ready) ───
 
-app.get("/api/open-positions", async (req, res) => {
-  try {
-    const positions = [];
-    for (const [posId, pos] of openPositions.entries()) {
-      const ghost = pos.ghost;
-      positions.push({
-        positionId:   posId,
-        symbol:       pos.symbol,
-        direction:    pos.direction,
-        session:      pos.session,
-        vwapPosition: pos.vwapPosition,
-        optimizerKey: pos.optimizerKey,
-        entry:        pos.entry,
-        sl:           pos.sl,
-        tp:           pos.tp,
-        lots:         pos.lots,
-        riskPct:      pos.riskPct,
-        riskEUR:      pos.riskEUR,
-        openedAt:     pos.openedAt,
-        tradeNumber:  pos.tradeNumber,
-        ghost: ghost ? {
-          maxRR:        ghost.maxRR,
-          maxSlPctUsed: ghost.maxSlPctUsed,
-          peakRRPos:    ghost.peakRRPos,
-          peakRRNeg:    ghost.peakRRNeg,
-          slMilestones: ghost.slMilestones,
-          rrMilestones: ghost.rrMilestones,
-        } : null,
-      });
-    }
-    res.json(positions);
-  } catch (e) {
-    recordError(`/api/open-positions: ${e.message}`);
-    res.json([]);  // FIX EMPTY STATE
-  }
-});
-
-app.get("/api/trades", async (req, res) => {
-  try {
-    const trades = await db.loadAllTrades();
-    res.json(trades ?? []);
-  } catch (e) {
-    recordError(`/api/trades: ${e.message}`);
-    res.json([]);
-  }
-});
-
-app.get("/api/ghost-trades", async (req, res) => {
-  try {
-    const { key, limit } = req.query;
-    const trades = await db.loadGhostTrades(key ?? null, parseInt(limit) || 200);
-    res.json(trades ?? []);
-  } catch (e) {
-    recordError(`/api/ghost-trades: ${e.message}`);
-    res.json([]);
-  }
-});
-
-app.get("/api/ghost-grouped", async (req, res) => {
-  try {
-    const data = await db.loadGhostGrouped();
-    res.json(data ?? []);
-  } catch (e) {
-    recordError(`/api/ghost-grouped: ${e.message}`);
-    res.json([]);
-  }
-});
-
-app.get("/api/ghost-history-by-pair", async (req, res) => {
-  try {
-    const data = await db.loadGhostHistoryByPair();
-    res.json(data ?? []);
-  } catch (e) {
-    recordError(`/api/ghost-history-by-pair: ${e.message}`);
-    res.json([]);
-  }
-});
-
-app.get("/api/ghost-combo-analysis", async (req, res) => {
-  try {
-    const data = await db.loadGhostComboAnalysis(req.query.key ?? null);
-    res.json(data ?? []);
-  } catch (e) {
-    recordError(`/api/ghost-combo-analysis: ${e.message}`);
-    res.json([]);
-  }
-});
-
-app.get("/api/ev-stats", async (req, res) => {
-  try {
-    const { key } = req.query;
-    if (!key) return res.status(400).json({ error: "key required" });
-    const stats = await computeEVStatsWithRetry(key);  // FIX EV RETRY
-    res.json(stats ?? { count: 0, rrLevels: [] });
-  } catch (e) {
-    recordError(`/api/ev-stats: ${e.message}`);
-    res.json({ count: 0, rrLevels: [] });
-  }
-});
-
-app.get("/api/tp-config", async (req, res) => {
-  try {
-    const configs = await db.loadTPConfig();
-    res.json(configs ?? {});
-  } catch (e) {
-    recordError(`/api/tp-config: ${e.message}`);
-    res.json({});
-  }
-});
-
-app.get("/api/shadow-analysis", async (req, res) => {
-  try {
-    const data = await db.loadAllShadowAnalysis();
-    res.json(data ?? []);
-  } catch (e) {
-    recordError(`/api/shadow-analysis: ${e.message}`);
-    res.json([]);
-  }
-});
-
-app.get("/api/shadow-winners", async (req, res) => {
-  try {
-    const data = await db.loadShadowWinners();
-    res.json(data ?? {});
-  } catch (e) {
-    recordError(`/api/shadow-winners: ${e.message}`);
-    res.json({});
-  }
-});
-
-app.get("/api/mae-stats", async (req, res) => {
-  try {
-    const data = await db.loadMAEStats(req.query.since ?? null);
-    res.json(data ?? []);
-  } catch (e) {
-    recordError(`/api/mae-stats: ${e.message}`);
-    res.json([]);
-  }
-});
-
-// Helper: wrap any DB call with a timeout
-function withTimeout(promise, ms, fallback) {
-  return Promise.race([
-    promise,
-    new Promise(resolve => setTimeout(() => resolve(fallback), ms))
-  ]);
+function apiGet(path, fn, empty = []) {
+  app.get(path, async (req, res) => {
+    if (!dbReady) return res.json(empty);
+    try { res.json(await dbCall(fn(req), empty)); }
+    catch (e) { recordError(`${path}: ${e.message}`); res.json(empty); }
+  });
 }
 
-app.get("/api/performance", async (req, res) => {
-  const empty = { total: 0, tpCount: 0, slCount: 0, winRate: 0,
-    avgWinner: 0, avgLoser: 0, grossWins: 0, grossLosses: 0,
-    profitFactor: null, totalPnl: 0, avgPnlPerTrade: 0,
-    maxDrawdown: 0, pnlCurve: [] };
-  try {
-    const data = await withTimeout(db.loadPerformanceSummary(), 7000, empty);
-    res.json(data ?? empty);
-  } catch (e) {
-    recordError(`/api/performance: ${e.message}`);
-    res.json(empty);
+apiGet("/api/trades",              () => db.loadAllTrades(),                   []);
+apiGet("/api/ghost-trades",        r  => db.loadGhostTrades(r.query.key??null, parseInt(r.query.limit)||200), []);
+apiGet("/api/ghost-grouped",       () => db.loadGhostGrouped(),                []);
+apiGet("/api/ghost-history-by-pair",() => db.loadGhostHistoryByPair(),         []);
+apiGet("/api/ghost-combo-analysis",r  => db.loadGhostComboAnalysis(r.query.key??null), []);
+apiGet("/api/shadow-analysis",     () => db.loadAllShadowAnalysis(),           []);
+apiGet("/api/shadow-winners",      () => db.loadShadowWinners(),               {});
+apiGet("/api/mae-stats",           r  => db.loadMAEStats(r.query.since??null), []);
+apiGet("/api/signal-stats",        () => db.loadSignalStats(),                 { total:0, placed:0, conversionPct:0 });
+apiGet("/api/signal-rejects",      r  => db.loadSignalRejects({ since: r.query.since }), []);
+apiGet("/api/blocked-raw",         r  => db.loadBlockedRaw(r.query.since??null), []);
+apiGet("/api/webhook-history",     r  => db.loadWebhookHistory(parseInt(r.query.limit)||100), []);
+apiGet("/api/spread-stats",        r  => db.loadSpreadStats(r.query),          []);
+apiGet("/api/spread-log",          r  => db.loadSpreadLog({ symbol: r.query.symbol, session: r.query.session, limit: parseInt(r.query.limit)||500 }), []);
+apiGet("/api/band-ghosts",         r  => db.loadBandGhosts(r.query),           []);
+apiGet("/api/symbol-risk",         () => db.loadSymbolRiskConfig(),            {});
+
+app.get("/api/open-positions", (req, res) => {
+  const out = [];
+  for (const [id, pos] of openPositions) {
+    out.push({ positionId: id, symbol: pos.symbol, direction: pos.direction,
+      session: pos.session, vwapPosition: pos.vwapPosition, optimizerKey: pos.optimizerKey,
+      entry: pos.entry, sl: pos.sl, tp: pos.tp, lots: pos.lots,
+      riskPct: pos.riskPct, riskEUR: pos.riskEUR, openedAt: pos.openedAt,
+      tradeNumber: pos.tradeNumber,
+      ghost: pos.ghost ? { maxRR: pos.ghost.maxRR, maxSlPctUsed: pos.ghost.maxSlPctUsed,
+        peakRRPos: pos.ghost.peakRRPos, peakRRNeg: pos.ghost.peakRRNeg,
+        slMilestones: pos.ghost.slMilestones, rrMilestones: pos.ghost.rrMilestones } : null });
   }
+  res.json(out);
+});
+
+app.get("/api/tp-config", (req, res) => res.json(tpConfigs));
+
+app.get("/api/performance", async (req, res) => {
+  const empty = { total: 0, tpCount: 0, slCount: 0, winRate: 0, avgWinner: 0,
+    avgLoser: 0, grossWins: 0, grossLosses: 0, profitFactor: null,
+    totalPnl: 0, avgPnlPerTrade: 0, maxDrawdown: 0, pnlCurve: [] };
+  if (!dbReady) return res.json(empty);
+  res.json(await dbCall(db.loadPerformanceSummary(), empty));
 });
 
 app.get("/api/daily-breakdown", async (req, res) => {
-  const empty = { days: [], maxWinStreak: 0, maxLossStreak: 0, maxDrawdownDay: 0, bestTrades: [], worstTrades: [] };
-  try {
-    const data = await withTimeout(db.loadDailyBreakdown(), 7000, empty);
-    res.json(data ?? empty);
-  } catch (e) {
-    recordError(`/api/daily-breakdown: ${e.message}`);
-    res.json(empty);
-  }
+  const empty = { days: [], maxWinStreak: 0, maxLossStreak: 0, maxDrawdownDay: 0 };
+  if (!dbReady) return res.json(empty);
+  res.json(await dbCall(db.loadDailyBreakdown(), empty));
 });
 
-app.get("/api/signal-stats", async (req, res) => {
-  try {
-    const data = await db.loadSignalStats();
-    res.json(data ?? { total: 0, placed: 0, conversionPct: 0, byOutcome: [], topRejectReasons: [] });
-  } catch (e) {
-    recordError(`/api/signal-stats: ${e.message}`);
-    res.json({ total: 0, placed: 0, conversionPct: 0, byOutcome: [], topRejectReasons: [] });
-  }
-});
-
-app.get("/api/signal-rejects", async (req, res) => {
-  try {
-    const data = await db.loadSignalRejects({ since: req.query.since });
-    res.json(data ?? []);
-  } catch (e) {
-    recordError(`/api/signal-rejects: ${e.message}`);
-    res.json([]);
-  }
-});
-
-app.get("/api/blocked-raw", async (req, res) => {
-  try {
-    const data = await db.loadBlockedRaw(req.query.since ?? null);
-    res.json(data ?? []);
-  } catch (e) {
-    recordError(`/api/blocked-raw: ${e.message}`);
-    res.json([]);
-  }
-});
-
-app.get("/api/webhook-history", async (req, res) => {
-  try {
-    const data = await db.loadWebhookHistory(parseInt(req.query.limit) || 100);
-    res.json(data ?? []);
-  } catch (e) {
-    recordError(`/api/webhook-history: ${e.message}`);
-    res.json([]);
-  }
-});
-
-app.get("/api/spread-stats", async (req, res) => {
-  try {
-    const { symbol, session, hourMin, hourMax, dayOfWeek } = req.query;
-    const data = await db.loadSpreadStats({
-      symbol, session,
-      hourMin:    hourMin    ? parseInt(hourMin)    : undefined,
-      hourMax:    hourMax    ? parseInt(hourMax)    : undefined,
-      dayOfWeek:  dayOfWeek  ? parseInt(dayOfWeek)  : undefined,
-    });
-    res.json(data ?? []);
-  } catch (e) {
-    recordError(`/api/spread-stats: ${e.message}`);
-    res.json([]);
-  }
-});
-
-app.get("/api/spread-log", async (req, res) => {
-  try {
-    const { symbol, session, limit } = req.query;
-    const data = await db.loadSpreadLog({ symbol, session, limit: parseInt(limit) || 500 });
-    res.json(data ?? []);
-  } catch (e) {
-    recordError(`/api/spread-log: ${e.message}`);
-    res.json([]);
-  }
-});
-
-app.get("/api/band-ghosts", async (req, res) => {
-  try {
-    const { bandTier, symbol, optimizerKey, limit } = req.query;
-    const data = await db.loadBandGhosts({ bandTier, symbol, optimizerKey, limit: parseInt(limit) || 500 });
-    res.json(data ?? []);
-  } catch (e) {
-    recordError(`/api/band-ghosts: ${e.message}`);
-    res.json([]);
-  }
+app.get("/api/ev-stats", async (req, res) => {
+  const { key } = req.query;
+  if (!key) return res.status(400).json({ error: "key required" });
+  if (!dbReady) return res.json({ count: 0, rrLevels: [] });
+  res.json(await dbCall(db.computeEVStats(key), { count: 0, rrLevels: [] }));
 });
 
 app.get("/api/band-ghost-stats", async (req, res) => {
-  try {
-    const { bandTier } = req.query;
-    if (!bandTier) return res.status(400).json({ error: "bandTier required" });
-    const data = await db.loadBandGhostStats(bandTier);
-    res.json(data ?? []);
-  } catch (e) {
-    recordError(`/api/band-ghost-stats: ${e.message}`);
-    res.json([]);
-  }
-});
-
-// ── Symbol risk config ─────────────────────────────────────────────
-app.get("/api/symbol-risk", async (req, res) => {
-  try {
-    const data = await db.loadSymbolRiskConfig();
-    res.json(data ?? {});
-  } catch (e) {
-    recordError(`/api/symbol-risk: ${e.message}`);
-    res.json({});
-  }
+  const { bandTier } = req.query;
+  if (!bandTier) return res.status(400).json({ error: "bandTier required" });
+  if (!dbReady) return res.json([]);
+  res.json(await dbCall(db.loadBandGhostStats(bandTier), []));
 });
 
 app.post("/api/symbol-risk", async (req, res) => {
   if (!checkSecret(req, res)) return;
   const { symbol, riskPct } = req.body ?? {};
   if (!symbol || riskPct == null) return res.status(400).json({ error: "symbol + riskPct required" });
-  try {
-    await db.upsertSymbolRisk(symbol, riskPct);
-    symbolRiskMap[symbol] = parseFloat(riskPct);
-    res.json({ ok: true, symbol, riskPct });
-  } catch (e) {
-    recordError(`/api/symbol-risk POST: ${e.message}`);
-    res.status(500).json({ error: e.message });
-  }
+  if (dbReady) await db.upsertSymbolRisk(symbol, riskPct).catch(e => recordError(e.message));
+  symbolRiskMap[symbol] = parseFloat(riskPct);
+  res.json({ ok: true, symbol, riskPct });
 });
 
-// ── Shadow SL optimizer (cron: every 6h) ─────────────────────────
-async function runShadowOptimizer() {
-  if (!isMonitoringActive()) return;
-  try {
-    const allAnalysis = await db.loadAllShadowAnalysis();
-    for (const a of allAnalysis) {
-      const snaps = await db.loadShadowSnapshots(a.optimizerKey, 5000);
-      if (snaps.length < 30) continue;
-      const pcts = snaps.map(s => s.pctSlUsed).filter(v => v != null).sort((a,b) => a-b);
-      const n = pcts.length;
-      const p = (q) => pcts[Math.min(n-1, Math.floor(q * n))];
-      const p50 = p(0.50), p90 = p(0.90), p99 = p(0.99);
-      const maxUsed = pcts[n-1];
-      const recPct  = p90 < 80 ? parseFloat((p90 * 1.1).toFixed(1)) : 100;
-      await db.saveShadowAnalysis({
-        optimizerKey:   a.optimizerKey,
-        symbol:         a.symbol,
-        session:        a.session,
-        direction:      a.direction,
-        vwapPosition:   a.vwapPosition,
-        snapshotsCount: n,
-        positionsCount: new Set(snaps.map(s => s.positionId)).size,
-        p50, p90, p99, maxUsed,
-        recommendation: {
-          reduceTo: recPct,
-          saving:   parseFloat((100 - recPct).toFixed(1)),
-        },
-        currentSlTooWide: recPct < 100,
-      });
-    }
-    console.log(`[ShadowOptimizer] Ran for ${allAnalysis.length} keys`);
-  } catch (e) {
-    recordError(`runShadowOptimizer: ${e.message}`);
-  }
-}
-
-// ── TP Optimizer (cron: every 1h) ────────────────────────────────
-async function runTPOptimizer() {
-  if (!isMonitoringActive()) return;
-  try {
-    const configs = await db.loadTPConfig();
-    tpConfigs     = configs;
-
-    // Recompute EV for all keys with enough data
-    const ghostGrouped = await db.loadGhostGrouped();
-    for (const group of ghostGrouped) {
-      if (group.n < 10) continue;
-      const ev = await computeEVStatsWithRetry(group.optimizerKey);
-      if (!ev || ev.count < 10 || !ev.bestRR) continue;
-      const km     = keyRiskMults[group.optimizerKey] ?? { streak: 0, evMult: 1.0, dayMult: 1.0 };
-      const evMult = ev.bestEV > 0 ? Math.min(1.5, 1.0 + ev.bestEV) : Math.max(0.5, 1.0 + ev.bestEV);
-      const newKm  = { streak: km.streak, evMult: parseFloat(evMult.toFixed(4)), dayMult: km.dayMult ?? 1.0 };
-      keyRiskMults[group.optimizerKey] = newKm;
-      await db.saveKeyRiskMult(group.optimizerKey, newKm);
-
-      // Lock TP if not already set or if ghost count doubled
-      const existing = tpConfigs[group.optimizerKey];
-      if (!existing || (group.n >= (existing.lockedGhosts ?? 0) * 2)) {
-        await db.saveTPConfig(
-          group.optimizerKey, group.symbol, group.session,
-          group.direction, group.vwapPosition,
-          ev.bestRR, group.n, ev.bestEV,
-          existing?.lockedRR ?? null
-        );
-        tpConfigs[group.optimizerKey] = {
-          ...existing,
-          lockedRR:     ev.bestRR,
-          lockedGhosts: group.n,
-        };
-      }
-    }
-    console.log(`[TPOptimizer] Updated ${ghostGrouped.length} keys`);
-  } catch (e) {
-    recordError(`runTPOptimizer: ${e.message}`);
-  }
-}
-
-// ── Shadow snapshot cron (every 5min for open positions) ──────────
-async function runShadowSnapshots() {
-  if (!isShadowActive()) return;
-  if (openPositions.size === 0) return;
-  try {
-    const livePositions = await getPositions();
-    if (!Array.isArray(livePositions)) return;
-    const priceMap = new Map(livePositions.map(p => [String(p.id), p.currentPrice]));
-    for (const [posId, pos] of openPositions.entries()) {
-      const price = priceMap.get(posId);
-      if (!price) continue;
-      const entry  = pos.entry;
-      const sl     = pos.sl;
-      const slDist = Math.abs(entry - sl);
-      if (slDist <= 0) continue;
-      const isBuy  = pos.direction === "buy";
-      const adverse = isBuy ? (entry - price) : (price - entry);
-      const pctSlUsed = parseFloat(((adverse / slDist) * 100).toFixed(2));
-      await db.saveShadowSnapshot({
-        positionId:   posId,
-        optimizerKey: pos.optimizerKey,
-        symbol:       pos.symbol,
-        session:      pos.session,
-        direction:    pos.direction,
-        vwapPosition: pos.vwapPosition ?? "unknown",
-        entry,
-        sl,
-        currentPrice: price,
-        pctSlUsed:    Math.max(0, pctSlUsed),
-      });
-    }
-  } catch (e) {
-    recordError(`runShadowSnapshots: ${e.message}`);
-  }
-}
-
-// ── Dashboard HTML builder ────────────────────────────────────────
-function buildDashboardHTML() {
-  return `<!DOCTYPE html>
-<html lang="en">
+// ══════════════════════════════════════════════════════════════════
+//  DASHBOARD HTML  (self-contained — all JS inline)
+// ══════════════════════════════════════════════════════════════════
+function dashboardHTML() {
+return `<!DOCTYPE html>
+<html lang="nl">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PRONTO-AI v12.7.0</title>
+<title>PRONTO-AI v12.7.1</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-:root{
-  --bg:#0d1117;--sur:#161b22;--bor:#30363d;
-  --tx:#c9d1d9;--mt:#8b949e;--gr:#3fb950;
-  --rd:#f85149;--yl:#d29922;--bl:#58a6ff;
-}
-body{background:var(--bg);color:var(--tx);font-family:'SF Mono',Consolas,monospace;font-size:13px;min-height:100vh}
-header{background:var(--sur);border-bottom:1px solid var(--bor);padding:10px 16px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
-h1{font-size:15px;color:var(--bl);white-space:nowrap}
-.badge{background:var(--bor);border-radius:4px;padding:2px 8px;font-size:11px;white-space:nowrap}
-.badge.ok{background:#1a3a1a;color:var(--gr);border:1px solid var(--gr)}
-.badge.err{background:#3a1a1a;color:var(--rd);border:1px solid var(--rd)}
-.badge.warn{background:#3a2a00;color:var(--yl);border:1px solid var(--yl)}
+:root{--bg:#0d1117;--sur:#161b22;--bor:#30363d;--tx:#c9d1d9;--mt:#8b949e;
+  --gr:#3fb950;--rd:#f85149;--yl:#d29922;--bl:#58a6ff}
+body{background:var(--bg);color:var(--tx);font:13px/1.5 'SF Mono',Consolas,monospace;min-height:100vh}
+a{color:var(--bl)}
+/* header */
+header{background:var(--sur);border-bottom:1px solid var(--bor);
+  padding:8px 14px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+header h1{font-size:14px;color:var(--bl)}
+.chip{padding:2px 8px;border-radius:4px;font-size:11px;background:var(--bor);white-space:nowrap}
+.chip.ok {background:#0f2d0f;color:var(--gr);border:1px solid #2a5a2a}
+.chip.err{background:#2d0f0f;color:var(--rd);border:1px solid #5a2a2a}
+.chip.yl {background:#2d200f;color:var(--yl);border:1px solid #5a4a1a}
 #clock{margin-left:auto;color:var(--mt);font-size:11px}
-#banner{background:#0d1a2d;border-bottom:1px solid var(--bor);padding:5px 16px;color:var(--mt);font-size:11px}
-.tabs{display:flex;gap:0;border-bottom:1px solid var(--bor);overflow-x:auto}
-.tab{padding:8px 14px;cursor:pointer;color:var(--mt);white-space:nowrap;border-bottom:2px solid transparent;transition:color .15s}
+/* banner */
+#banner{background:#0d1830;border-bottom:1px solid var(--bor);
+  padding:4px 14px;color:var(--mt);font-size:11px}
+/* tabs */
+nav{display:flex;border-bottom:1px solid var(--bor);overflow-x:auto}
+.tab{padding:8px 13px;cursor:pointer;color:var(--mt);white-space:nowrap;
+  border-bottom:2px solid transparent;font-size:13px;transition:color .1s}
 .tab:hover{color:var(--tx)}
-.tab.active{color:var(--bl);border-bottom-color:var(--bl)}
-.content{padding:14px 16px}
-.panel{display:none}.panel.active{display:block}
-.kpi-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px;margin-bottom:18px}
+.tab.on{color:var(--bl);border-bottom-color:var(--bl)}
+/* panels */
+.panel{display:none;padding:14px}
+.panel.on{display:block}
+/* kpi grid */
+.kgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:8px;margin-bottom:16px}
 .kpi{background:var(--sur);border:1px solid var(--bor);border-radius:6px;padding:10px}
-.kpi-label{font-size:10px;color:var(--mt);text-transform:uppercase;letter-spacing:.5px;margin-bottom:3px}
-.kpi-value{font-size:20px;font-weight:700}
-table{width:100%;border-collapse:collapse;font-size:12px}
-th{color:var(--mt);font-weight:normal;font-size:10px;text-transform:uppercase;padding:5px 8px;border-bottom:1px solid var(--bor);text-align:left;white-space:nowrap}
-td{padding:5px 8px;border-bottom:1px solid #21262d;white-space:nowrap}
+.kl{font-size:10px;color:var(--mt);text-transform:uppercase;letter-spacing:.4px;margin-bottom:2px}
+.kv{font-size:20px;font-weight:700}
+/* table */
+.tbl-wrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:12px;min-width:500px}
+th{color:var(--mt);font-weight:400;font-size:10px;text-transform:uppercase;
+  padding:5px 8px;border-bottom:1px solid var(--bor);text-align:left;white-space:nowrap}
+td{padding:5px 8px;border-bottom:1px solid #1c2128;white-space:nowrap}
 tr:hover td{background:#1c2128}
+/* colors */
 .gr{color:var(--gr)}.rd{color:var(--rd)}.yl{color:var(--yl)}.bl{color:var(--bl)}.mt{color:var(--mt)}
-h3{font-size:12px;color:var(--mt);text-transform:uppercase;letter-spacing:.5px;margin:14px 0 8px}
-.empty{color:var(--mt);padding:24px 0;text-align:center;font-size:12px}
-.spin{display:inline-block;animation:spin 1s linear infinite}
-@keyframes spin{to{transform:rotate(360deg)}}
+/* misc */
+h3{font-size:11px;color:var(--mt);text-transform:uppercase;letter-spacing:.4px;margin:14px 0 7px}
+.empty{color:var(--mt);padding:30px 0;text-align:center}
+.spin{display:inline-block;animation:sp 1s linear infinite}
+@keyframes sp{to{transform:rotate(360deg)}}
 </style>
 </head>
 <body>
+
 <header>
   <h1>🤖 PRONTO-AI</h1>
-  <span class="badge" id="vbadge">v12.7.0</span>
-  <span class="badge" id="sbadge"><span class="spin">⟳</span> verbinden…</span>
-  <span class="badge" id="ebadge" style="display:none"></span>
+  <span class="chip" id="ver">v12.7.1</span>
+  <span class="chip" id="sb"><span class="spin">⟳</span>&nbsp;verbinden…</span>
+  <span class="chip yl" id="db-chip" style="display:none">⚠ DB init…</span>
+  <span class="chip err" id="err-chip" style="display:none"></span>
   <span id="clock"></span>
 </header>
 <div id="banner">📅 Data van: laden…</div>
 
-<div class="tabs">
-  <div class="tab active" id="tab-overview"   onclick="showTab('overview',this)">Overview</div>
-  <div class="tab"        id="tab-positions"  onclick="showTab('positions',this)">Posities</div>
-  <div class="tab"        id="tab-trades"     onclick="showTab('trades',this)">Trades</div>
-  <div class="tab"        id="tab-ghost"      onclick="showTab('ghost',this)">Ghost</div>
-  <div class="tab"        id="tab-ev"         onclick="showTab('ev',this)">EV</div>
-  <div class="tab"        id="tab-signals"    onclick="showTab('signals',this)">Signalen</div>
-  <div class="tab"        id="tab-spreads"    onclick="showTab('spreads',this)">Spreads</div>
-</div>
-
-<div class="content">
+<nav>
+  <div class="tab on"  onclick="tab('ov',this)">Overview</div>
+  <div class="tab"     onclick="tab('pos',this)">Posities</div>
+  <div class="tab"     onclick="tab('tr',this)">Trades</div>
+  <div class="tab"     onclick="tab('gh',this)">Ghost</div>
+  <div class="tab"     onclick="tab('ev',this)">EV</div>
+  <div class="tab"     onclick="tab('sig',this)">Signalen</div>
+  <div class="tab"     onclick="tab('spr',this)">Spreads</div>
+</nav>
 
 <!-- OVERVIEW -->
-<div class="panel active" id="panel-overview">
-  <div class="kpi-grid" id="kpi-grid">
-    <div class="kpi"><div class="kpi-label">Status</div><div class="kpi-value mt"><span class="spin">⟳</span></div></div>
-  </div>
+<div class="panel on" id="pov">
+  <div class="kgrid" id="kg"></div>
   <h3>Dagelijkse P&amp;L</h3>
-  <div id="daily-wrap"><div class="empty"><span class="spin">⟳</span> Laden…</div></div>
+  <div id="dw" class="tbl-wrap"><div class="empty"><span class="spin">⟳</span></div></div>
 </div>
 
 <!-- POSITIES -->
-<div class="panel" id="panel-positions">
-  <div id="pos-wrap"><div class="empty"><span class="spin">⟳</span> Laden…</div></div>
+<div class="panel" id="ppos">
+  <div id="posw" class="tbl-wrap"><div class="empty"><span class="spin">⟳</span></div></div>
 </div>
 
 <!-- TRADES -->
-<div class="panel" id="panel-trades">
-  <div id="trades-wrap"><div class="empty"><span class="spin">⟳</span> Laden…</div></div>
+<div class="panel" id="ptr">
+  <div id="trw" class="tbl-wrap"><div class="empty"><span class="spin">⟳</span></div></div>
 </div>
 
 <!-- GHOST -->
-<div class="panel" id="panel-ghost">
-  <div id="ghost-wrap"><div class="empty"><span class="spin">⟳</span> Laden…</div></div>
+<div class="panel" id="pgh">
+  <div id="ghw" class="tbl-wrap"><div class="empty"><span class="spin">⟳</span></div></div>
 </div>
 
 <!-- EV -->
-<div class="panel" id="panel-ev">
-  <div id="ev-wrap"><div class="empty"><span class="spin">⟳</span> Laden…</div></div>
+<div class="panel" id="pev">
+  <div id="evw" class="tbl-wrap"><div class="empty"><span class="spin">⟳</span></div></div>
 </div>
 
 <!-- SIGNALEN -->
-<div class="panel" id="panel-signals">
-  <div class="kpi-grid" id="sig-kpi"></div>
+<div class="panel" id="psig">
+  <div class="kgrid" id="sigkg"></div>
   <h3>Webhook History</h3>
-  <div id="sig-wrap"><div class="empty"><span class="spin">⟳</span> Laden…</div></div>
+  <div id="sigw" class="tbl-wrap"><div class="empty"><span class="spin">⟳</span></div></div>
 </div>
 
 <!-- SPREADS -->
-<div class="panel" id="panel-spreads">
-  <div id="spr-wrap"><div class="empty"><span class="spin">⟳</span> Laden…</div></div>
+<div class="panel" id="pspr">
+  <div id="sprw" class="tbl-wrap"><div class="empty"><span class="spin">⟳</span></div></div>
 </div>
-
-</div><!-- /content -->
 
 <script>
 'use strict';
+// ── utils ────────────────────────────────────────────────────────
+const $  = id => document.getElementById(id);
+const n2 = v => v == null ? '—' : (+v).toFixed(2);
+const n1 = v => v == null ? '—' : (+v).toFixed(1);
+const n0 = v => v == null ? '—' : (+v).toFixed(0);
+const eu = v => v == null ? '—' : '€' + (+v).toFixed(2);
+const pc = v => v == null ? '—' : (+v).toFixed(1) + '%';
+const cc = v => +v >= 0 ? 'gr' : 'rd';
+const dt = s => { try { return new Date(s).toLocaleString('nl-BE',{timeZone:'Europe/Brussels',hour12:false,day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}); } catch { return s||'—'; }};
 
-// ── Helpers ──────────────────────────────────────────────────────
-const $ = id => document.getElementById(id);
-const f2 = n => n == null ? '—' : Number(n).toFixed(2);
-const f1 = n => n == null ? '—' : Number(n).toFixed(1);
-const f0 = n => n == null ? '—' : Number(n).toFixed(0);
-const f5 = n => n == null ? '—' : Number(n).toFixed(5);
-const pct = n => n == null ? '—' : Number(n).toFixed(1) + '%';
-const eur = n => n == null ? '—' : '€' + Number(n).toFixed(2);
-const clr = n => Number(n) >= 0 ? 'gr' : 'rd';
-
-function fmtDT(s) {
-  if (!s) return '—';
-  try {
-    return new Date(s).toLocaleString('nl-BE', {
-      timeZone: 'Europe/Brussels', hour12: false,
-      day:'2-digit', month:'2-digit', hour:'2-digit', minute:'2-digit'
-    });
-  } catch { return s; }
-}
-
-// Safe fetch with timeout — never hangs the dashboard
-async function apiFetch(url, timeoutMs = 8000) {
+// ── safe fetch (never throws, always returns null on error) ───────
+async function api(url, ms=9000) {
   const ctrl = new AbortController();
-  const tid  = setTimeout(() => ctrl.abort(), timeoutMs);
+  const tid  = setTimeout(() => ctrl.abort(), ms);
   try {
-    const res = await fetch(url, { signal: ctrl.signal });
+    const r = await fetch(url, { signal: ctrl.signal });
     clearTimeout(tid);
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    return await res.json();
-  } catch (e) {
-    clearTimeout(tid);
-    console.warn('apiFetch failed:', url, e.message);
-    return null;
-  }
+    if (!r.ok) throw 0;
+    return await r.json();
+  } catch { clearTimeout(tid); return null; }
 }
 
-// ── Tab switching ────────────────────────────────────────────────
-function showTab(name, el) {
-  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
-  el.classList.add('active');
-  $('panel-' + name).classList.add('active');
-  // Lazy-load tab content
-  if (name === 'positions') loadPositions();
-  if (name === 'trades')    loadTrades();
-  if (name === 'ghost')     loadGhost();
-  if (name === 'ev')        loadEV();
-  if (name === 'signals')   loadSignals();
-  if (name === 'spreads')   loadSpreads();
+// ── tab switching ────────────────────────────────────────────────
+const panels = ['ov','pos','tr','gh','ev','sig','spr'];
+function tab(name, el) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('on'));
+  panels.forEach(p => $('p'+p).classList.remove('on'));
+  el.classList.add('on');
+  $('p'+name).classList.add('on');
+  if (name==='pos') loadPos();
+  if (name==='tr')  loadTr();
+  if (name==='gh')  loadGh();
+  if (name==='ev')  loadEV();
+  if (name==='sig') loadSig();
+  if (name==='spr') loadSpr();
 }
 
-// ── Clock ────────────────────────────────────────────────────────
-function updateClock() {
-  try {
-    $('clock').textContent = new Date().toLocaleString('nl-BE',
-      {timeZone:'Europe/Brussels',hour12:false});
-  } catch {}
-}
-updateClock();
-setInterval(updateClock, 1000);
+// ── clock ────────────────────────────────────────────────────────
+setInterval(() => {
+  try { $('clock').textContent = new Date().toLocaleString('nl-BE',{timeZone:'Europe/Brussels',hour12:false}); } catch{}
+}, 1000);
 
-// ── Status poller ────────────────────────────────────────────────
-let statusOK = false;
+// ── status ───────────────────────────────────────────────────────
 async function pollStatus() {
-  const sb = $('sbadge');
-  const eb = $('ebadge');
-  // Use short timeout — /status should always respond in <3s
-  const data = await apiFetch('/status', 4000);
-  if (!data) {
-    sb.textContent = '✖ offline';
-    sb.className = 'badge err';
-    statusOK = false;
-    return;
-  }
-  statusOK = true;
-  const eq = data.account?.equity;
-  sb.textContent = (eq != null ? '€' + f0(eq) + ' | ' : '') +
-                   (data.openPositions || 0) + ' pos open';
-  sb.className = 'badge ok';
-  if (data.complianceDate) {
-    $('banner').textContent = '📅 Data vanaf: ' + data.complianceDate + ' UTC';
-  }
-  if ((data.errorCount || 0) > 0) {
-    eb.textContent = '⚠ ' + data.errorCount + ' fout' + (data.errorCount > 1 ? 'en' : '') + ' /1u';
-    eb.className = 'badge warn';
-    eb.style.display = '';
+  const d = await api('/status', 5000);
+  const sb = $('sb');
+  if (!d) { sb.textContent = '✖ offline'; sb.className = 'chip err'; return; }
+  const eq = d.account?.equity;
+  sb.textContent = (eq != null ? '€'+n0(eq)+' | ' : '') + (d.openPositions||0) + ' pos';
+  sb.className = 'chip ok';
+  if (d.complianceDate) $('banner').textContent = '📅 Data vanaf: ' + d.complianceDate + ' UTC';
+  // DB status chip
+  const dc = $('db-chip');
+  dc.style.display = d.dbReady ? 'none' : '';
+  // Error chip
+  const ec = $('err-chip');
+  if ((d.errorCount||0) > 0) { ec.textContent = '⚠ ' + d.errorCount + ' fout(en)/1u'; ec.style.display=''; }
+  else ec.style.display = 'none';
+}
+
+// ── kpi box ──────────────────────────────────────────────────────
+const kpi = (l,v,c='') => '<div class="kpi"><div class="kl">'+l+'</div><div class="kv '+c+'">'+v+'</div></div>';
+
+// ── overview ─────────────────────────────────────────────────────
+async function loadOv() {
+  // Show skeleton immediately
+  $('kg').innerHTML = ['Trades','Win Rate','Profit Factor','Totaal PnL',
+    'Gem. Winner','Gem. Loser','Max DD','TP','SL'].map(l=>kpi(l,'…','mt')).join('');
+
+  const [p, d] = await Promise.all([api('/api/performance'), api('/api/daily-breakdown')]);
+
+  // KPIs
+  const perf = p || {};
+  const tot  = parseInt(perf.total)||0;
+  if (!tot) {
+    $('kg').innerHTML = kpi('Systeem','✓ Online','gr') + kpi('Trades','0 nog','mt');
   } else {
-    eb.style.display = 'none';
-  }
-}
-
-// ── Overview ─────────────────────────────────────────────────────
-function renderKPIs(p) {
-  const kg = $('kpi-grid');
-  if (!p || p === null) {
-    kg.innerHTML = kpiBox('DB Fout','—','rd') + kpiBox('Herlaad','pagina','yl');
-    return;
-  }
-  const total = parseInt(p.total) || 0;
-  if (total === 0) {
-    kg.innerHTML = '<div class="kpi" style="grid-column:1/-1">' +
-      '<div class="kpi-label">Systeem Status</div>' +
-      '<div class="kpi-value gr">✓ Online</div>' +
-      '<div class="kpi-label" style="margin-top:6px">Wacht op eerste trades…</div></div>';
-    return;
-  }
-  kg.innerHTML = [
-    kpiBox('Trades',        f0(total),                                    ''),
-    kpiBox('Win Rate',      pct(p.winRate),                               (p.winRate||0)>=50?'gr':'rd'),
-    kpiBox('Profit Factor', p.profitFactor!=null?f2(p.profitFactor):'—', (p.profitFactor||0)>=1?'gr':'rd'),
-    kpiBox('Totaal PnL',    eur(p.totalPnl),                              clr(p.totalPnl||0)),
-    kpiBox('Gem. Winner',   eur(p.avgWinner),                             'gr'),
-    kpiBox('Gem. Loser',    eur(p.avgLoser),                              'rd'),
-    kpiBox('Max Drawdown',  eur(p.maxDrawdown),                           'rd'),
-    kpiBox('TP',            f0(p.tpCount),                                'gr'),
-    kpiBox('SL',            f0(p.slCount),                                'rd'),
-  ].join('');
-}
-
-function kpiBox(label, value, cls) {
-  return '<div class="kpi"><div class="kpi-label">'+label+'</div><div class="kpi-value '+cls+'">'+value+'</div></div>';
-}
-
-function renderDaily(daily) {
-  const dw  = $('daily-wrap');
-  const days = daily?.days || [];
-  if (!days.length) {
-    dw.innerHTML = '<div class="empty">Nog geen dagdata</div>';
-    return;
-  }
-  dw.innerHTML = '<div style="overflow-x:auto"><table><thead><tr>' +
-    '<th>Datum</th><th>Trades</th><th>W</th><th>L</th>' +
-    '<th>PnL €</th><th>Cum €</th><th>Gem RR</th>' +
-    '</tr></thead><tbody>' +
-    days.slice(0,30).map(d =>
-      '<tr>' +
-      '<td class="mt">'+  (d.trade_date||'—')              +'</td>'+
-      '<td>'+             (d.trades||0)                     +'</td>'+
-      '<td class="gr">'+  (d.wins||0)                       +'</td>'+
-      '<td class="rd">'+  (d.losses||0)                     +'</td>'+
-      '<td class="'+clr(d.day_pnl||0)+'">'+eur(d.day_pnl)  +'</td>'+
-      '<td class="'+clr(d.cum_pnl||0)+'">'+eur(d.cum_pnl)  +'</td>'+
-      '<td>'+             f2(d.avg_rr)                      +'</td>'+
-      '</tr>'
-    ).join('') +
-    '</tbody></table></div>';
-}
-
-async function loadOverview() {
-  // Show placeholder KPIs immediately so page never looks broken
-  const kg = $('kpi-grid');
-  if (kg.children.length <= 1) {
-    kg.innerHTML = [
-      kpiBox('Trades','…','mt'), kpiBox('Win Rate','…','mt'),
-      kpiBox('Profit Factor','…','mt'), kpiBox('Totaal PnL','…','mt'),
-      kpiBox('Gem. Winner','…','mt'), kpiBox('Gem. Loser','…','mt'),
-      kpiBox('Max Drawdown','…','mt'), kpiBox('TP','…','mt'), kpiBox('SL','…','mt'),
+    $('kg').innerHTML = [
+      kpi('Trades',       n0(perf.total),                                  ''),
+      kpi('Win Rate',     pc(perf.winRate),                                (perf.winRate||0)>=50?'gr':'rd'),
+      kpi('Profit Factor',perf.profitFactor!=null?n2(perf.profitFactor):'—',(perf.profitFactor||0)>=1?'gr':'rd'),
+      kpi('Totaal PnL',   eu(perf.totalPnl),                               cc(perf.totalPnl||0)),
+      kpi('Gem. Winner',  eu(perf.avgWinner),                              'gr'),
+      kpi('Gem. Loser',   eu(perf.avgLoser),                               'rd'),
+      kpi('Max Drawdown', eu(perf.maxDrawdown),                            'rd'),
+      kpi('TP',           n0(perf.tpCount),                                'gr'),
+      kpi('SL',           n0(perf.slCount),                                'rd'),
     ].join('');
   }
 
-  // Fetch both in parallel with individual timeouts
-  const [perf, daily] = await Promise.all([
-    apiFetch('/api/performance',     10000),
-    apiFetch('/api/daily-breakdown', 10000),
-  ]);
-
-  renderKPIs(perf);
-  renderDaily(daily);
-}
-
-// ── Posities ─────────────────────────────────────────────────────
-async function loadPositions() {
-  const wrap = $('pos-wrap');
-  wrap.innerHTML = '<div class="empty"><span class="spin">⟳</span> Laden…</div>';
-  const data = await apiFetch('/api/open-positions');
-  const rows = data || [];
-  if (!rows.length) {
-    wrap.innerHTML = '<div class="empty">Geen open posities</div>';
-    return;
-  }
-  wrap.innerHTML = '<table><thead><tr>' +
-    '<th>#</th><th>Symbol</th><th>Dir</th><th>Entry</th><th>SL</th><th>TP</th>' +
-    '<th>Lots</th><th>Risk €</th><th>MaxRR</th><th>SL%</th><th>Geopend</th>' +
-    '</tr></thead><tbody>' +
-    rows.map(p =>
-      '<tr>' +
-      '<td class="mt">' + (p.tradeNumber || '—') + '</td>' +
-      '<td class="bl">' + (p.symbol || '—') + '</td>' +
-      '<td class="' + (p.direction === 'buy' ? 'gr' : 'rd') + '">' + (p.direction || '—') + '</td>' +
-      '<td>' + f5(p.entry) + '</td>' +
-      '<td class="rd">' + f5(p.sl) + '</td>' +
-      '<td class="gr">' + f5(p.tp) + '</td>' +
-      '<td>' + f2(p.lots) + '</td>' +
-      '<td>' + eur(p.riskEUR) + '</td>' +
-      '<td class="' + ((p.ghost?.maxRR || 0) > 0 ? 'gr' : '') + '">' + f2(p.ghost?.maxRR) + '</td>' +
-      '<td>' + f1(p.ghost?.maxSlPctUsed) + '%</td>' +
-      '<td class="mt">' + fmtDT(p.openedAt) + '</td>' +
+  // Daily table
+  const days = d?.days || [];
+  if (!days.length) { $('dw').innerHTML = '<div class="empty">Geen dagdata</div>'; return; }
+  $('dw').innerHTML = '<table><thead><tr>'+
+    '<th>Datum</th><th>Trades</th><th>W</th><th>L</th><th>PnL</th><th>Cum</th><th>Gem RR</th>'+
+    '</tr></thead><tbody>'+
+    days.slice(0,30).map(r =>
+      '<tr>'+
+      '<td class="mt">'+(r.trade_date||'—')+'</td>'+
+      '<td>'+(r.trades||0)+'</td>'+
+      '<td class="gr">'+(r.wins||0)+'</td>'+
+      '<td class="rd">'+(r.losses||0)+'</td>'+
+      '<td class="'+cc(r.day_pnl||0)+'">'+eu(r.day_pnl)+'</td>'+
+      '<td class="'+cc(r.cum_pnl||0)+'">'+eu(r.cum_pnl)+'</td>'+
+      '<td>'+n2(r.avg_rr)+'</td>'+
       '</tr>'
-    ).join('') +
-    '</tbody></table>';
+    ).join('') + '</tbody></table>';
 }
 
-// ── Trades ───────────────────────────────────────────────────────
-async function loadTrades() {
-  const wrap = $('trades-wrap');
-  wrap.innerHTML = '<div class="empty"><span class="spin">⟳</span> Laden…</div>';
-  const data = await apiFetch('/api/trades');
-  const rows = data || [];
-  if (!rows.length) {
-    wrap.innerHTML = '<div class="empty">Geen gesloten trades</div>';
-    return;
-  }
-  wrap.innerHTML = '<table><thead><tr>' +
-    '<th>#</th><th>Symbol</th><th>Dir</th><th>Uitkomst</th><th>PnL €</th>' +
-    '<th>MaxRR</th><th>Lots</th><th>Sessie</th><th>Gesloten</th>' +
-    '</tr></thead><tbody>' +
-    rows.slice(0, 200).map((t, i) =>
-      '<tr>' +
-      '<td class="mt">' + (rows.length - i) + '</td>' +
-      '<td class="bl">' + (t.symbol || '—') + '</td>' +
-      '<td class="' + (t.direction === 'buy' ? 'gr' : 'rd') + '">' + (t.direction || '—') + '</td>' +
-      '<td class="' + (t.hitTP ? 'gr' : 'rd') + '">' + (t.hitTP ? 'TP' : 'SL') + ' <span class="mt">(' + (t.closeReason || '?') + ')</span></td>' +
-      '<td class="' + clr(t.realizedPnlEUR) + '">' + eur(t.realizedPnlEUR) + '</td>' +
-      '<td>' + f2(t.maxRR) + '</td>' +
-      '<td>' + f2(t.lots) + '</td>' +
-      '<td class="mt">' + (t.session || '—') + '</td>' +
-      '<td class="mt">' + fmtDT(t.closedAt) + '</td>' +
+// ── posities ─────────────────────────────────────────────────────
+async function loadPos() {
+  $('posw').innerHTML = '<div class="empty"><span class="spin">⟳</span></div>';
+  const d = await api('/api/open-positions') || [];
+  if (!d.length) { $('posw').innerHTML = '<div class="empty">Geen open posities</div>'; return; }
+  $('posw').innerHTML = '<table><thead><tr>'+
+    '<th>#</th><th>Symbol</th><th>Dir</th><th>Entry</th><th>SL</th><th>TP</th>'+
+    '<th>Lots</th><th>Risk</th><th>MaxRR</th><th>SL%</th><th>Open</th>'+
+    '</tr></thead><tbody>'+
+    d.map(p => '<tr>'+
+      '<td class="mt">'+(p.tradeNumber||'—')+'</td>'+
+      '<td class="bl">'+p.symbol+'</td>'+
+      '<td class="'+(p.direction==='buy'?'gr':'rd')+'">'+p.direction+'</td>'+
+      '<td>'+n2(p.entry)+'</td>'+
+      '<td class="rd">'+n2(p.sl)+'</td>'+
+      '<td class="gr">'+n2(p.tp)+'</td>'+
+      '<td>'+n2(p.lots)+'</td>'+
+      '<td>'+eu(p.riskEUR)+'</td>'+
+      '<td class="'+(+(p.ghost?.maxRR||0)>0?'gr':'')+'">'+n2(p.ghost?.maxRR)+'</td>'+
+      '<td>'+n1(p.ghost?.maxSlPctUsed)+'%</td>'+
+      '<td class="mt">'+dt(p.openedAt)+'</td>'+
       '</tr>'
-    ).join('') +
-    '</tbody></table>';
+    ).join('') + '</tbody></table>';
 }
 
-// ── Ghost ────────────────────────────────────────────────────────
-async function loadGhost() {
-  const wrap = $('ghost-wrap');
-  wrap.innerHTML = '<div class="empty"><span class="spin">⟳</span> Laden…</div>';
-  const data = await apiFetch('/api/ghost-grouped');
-  const rows = data || [];
-  if (!rows.length) {
-    wrap.innerHTML = '<div class="empty">Nog geen ghost data (wacht op gesloten trades)</div>';
-    return;
-  }
-  wrap.innerHTML = '<table><thead><tr>' +
-    '<th>Optimizer Key</th><th>N</th><th>SL Hits</th><th>Gem MaxRR</th><th>Best MaxRR</th><th>Gem SL%</th><th>Gem TP RR</th><th>Laatste</th>' +
-    '</tr></thead><tbody>' +
-    rows.map(g =>
-      '<tr>' +
-      '<td class="bl">' + (g.optimizerKey || '—') + '</td>' +
-      '<td>' + (g.n || 0) + '</td>' +
-      '<td class="rd">' + (g.slHits || 0) + '</td>' +
-      '<td>' + f2(g.avgMaxRR) + '</td>' +
-      '<td class="gr">' + f2(g.bestMaxRR) + '</td>' +
-      '<td>' + f1(g.avgSlPct) + '%</td>' +
-      '<td>' + f2(g.avgTpRR) + '</td>' +
-      '<td class="mt">' + fmtDT(g.lastOpened) + '</td>' +
+// ── trades ───────────────────────────────────────────────────────
+async function loadTr() {
+  $('trw').innerHTML = '<div class="empty"><span class="spin">⟳</span></div>';
+  const d = await api('/api/trades') || [];
+  if (!d.length) { $('trw').innerHTML = '<div class="empty">Geen gesloten trades</div>'; return; }
+  $('trw').innerHTML = '<table><thead><tr>'+
+    '<th>#</th><th>Symbol</th><th>Dir</th><th>Uitkomst</th><th>PnL</th>'+
+    '<th>MaxRR</th><th>Lots</th><th>Sessie</th><th>Gesloten</th>'+
+    '</tr></thead><tbody>'+
+    d.slice(0,200).map((t,i) => '<tr>'+
+      '<td class="mt">'+(d.length-i)+'</td>'+
+      '<td class="bl">'+t.symbol+'</td>'+
+      '<td class="'+(t.direction==='buy'?'gr':'rd')+'">'+t.direction+'</td>'+
+      '<td class="'+(t.hitTP?'gr':'rd')+'">'+(t.hitTP?'TP':'SL')+' <span class="mt">('+( t.closeReason||'?')+')</span></td>'+
+      '<td class="'+cc(t.realizedPnlEUR||0)+'">'+eu(t.realizedPnlEUR)+'</td>'+
+      '<td>'+n2(t.maxRR)+'</td>'+
+      '<td>'+n2(t.lots)+'</td>'+
+      '<td class="mt">'+(t.session||'—')+'</td>'+
+      '<td class="mt">'+dt(t.closedAt)+'</td>'+
       '</tr>'
-    ).join('') +
-    '</tbody></table>';
+    ).join('') + '</tbody></table>';
 }
 
-// ── EV Optimizer ─────────────────────────────────────────────────
+// ── ghost ────────────────────────────────────────────────────────
+async function loadGh() {
+  $('ghw').innerHTML = '<div class="empty"><span class="spin">⟳</span></div>';
+  const d = await api('/api/ghost-grouped') || [];
+  if (!d.length) { $('ghw').innerHTML = '<div class="empty">Nog geen ghost data</div>'; return; }
+  $('ghw').innerHTML = '<table><thead><tr>'+
+    '<th>Key</th><th>N</th><th>SL Hits</th><th>Gem MaxRR</th><th>Best MaxRR</th><th>Gem SL%</th><th>Laatste</th>'+
+    '</tr></thead><tbody>'+
+    d.map(g => '<tr>'+
+      '<td class="bl">'+(g.optimizerKey||'—')+'</td>'+
+      '<td>'+(g.n||0)+'</td>'+
+      '<td class="rd">'+(g.slHits||0)+'</td>'+
+      '<td>'+n2(g.avgMaxRR)+'</td>'+
+      '<td class="gr">'+n2(g.bestMaxRR)+'</td>'+
+      '<td>'+n1(g.avgSlPct)+'%</td>'+
+      '<td class="mt">'+dt(g.lastOpened)+'</td>'+
+      '</tr>'
+    ).join('') + '</tbody></table>';
+}
+
+// ── ev optimizer ─────────────────────────────────────────────────
 async function loadEV() {
-  const wrap = $('ev-wrap');
-  wrap.innerHTML = '<div class="empty"><span class="spin">⟳</span> Laden…</div>';
-  const [ghost, tp, combo] = await Promise.all([
-    apiFetch('/api/ghost-grouped'),
-    apiFetch('/api/tp-config'),
-    apiFetch('/api/ghost-combo-analysis'),
+  $('evw').innerHTML = '<div class="empty"><span class="spin">⟳</span></div>';
+  const [g, tp, combo] = await Promise.all([
+    api('/api/ghost-grouped'), api('/api/tp-config'), api('/api/ghost-combo-analysis')
   ]);
-  const rows  = ghost  || [];
-  const tpMap = tp     || {};
-  const comboArr = combo || [];
-  const comboMap = {};
-  comboArr.forEach(k => { comboMap[k.optimizerKey] = k; });
-
-  const eligible = rows.filter(g => (g.n || 0) >= 5);
-  if (!eligible.length) {
-    wrap.innerHTML = '<div class="empty">Nog geen EV data (minimaal 5 ghost trades per key nodig)</div>';
-    return;
-  }
-  wrap.innerHTML = '<table><thead><tr>' +
-    '<th>Key</th><th>N</th><th>Locked TP</th><th>Best EV</th><th>Win Rate</th><th>Gem RR</th><th>EV Mult</th>' +
-    '</tr></thead><tbody>' +
-    eligible.map(g => {
-      const c  = comboMap[g.optimizerKey];
-      const t  = tpMap[g.optimizerKey];
-      const ev = c?.evScore;
-      const wr = c?.winRate;
-      return '<tr>' +
-        '<td class="bl">' + (g.optimizerKey || '—') + '</td>' +
-        '<td>' + (g.n || 0) + '</td>' +
-        '<td class="' + ((t?.lockedRR || 0) >= 2 ? 'gr' : 'yl') + '">' + (t?.lockedRR != null ? t.lockedRR + 'R' : '—') + '</td>' +
-        '<td class="' + (ev > 0 ? 'gr' : 'rd') + '">' + (ev != null ? f2(ev) : '—') + '</td>' +
-        '<td>' + (wr != null ? pct(wr) : '—') + '</td>' +
-        '<td>' + f2(g.avgMaxRR) + '</td>' +
-        '<td class="' + (ev > 0 ? 'gr' : 'rd') + '">' + (ev != null ? (ev > 0 ? '↑' : '↓') + (Math.abs(ev) > 0.2 ? (ev > 0 ? '↑' : '↓') : '') : '—') + '</td>' +
+  const rows  = (g||[]).filter(r => (r.n||0)>=5);
+  const tpMap = tp || {};
+  const cmap  = {};
+  (combo||[]).forEach(c => cmap[c.optimizerKey]=c);
+  if (!rows.length) { $('evw').innerHTML = '<div class="empty">Nog geen EV data (min. 5 ghost trades)</div>'; return; }
+  $('evw').innerHTML = '<table><thead><tr>'+
+    '<th>Key</th><th>N</th><th>Locked TP</th><th>Best EV</th><th>Win Rate</th><th>Gem RR</th>'+
+    '</tr></thead><tbody>'+
+    rows.map(r => {
+      const c = cmap[r.optimizerKey]; const t = tpMap[r.optimizerKey];
+      return '<tr>'+
+        '<td class="bl">'+(r.optimizerKey||'—')+'</td>'+
+        '<td>'+(r.n||0)+'</td>'+
+        '<td class="'+((t?.lockedRR||0)>=2?'gr':'yl')+'">'+(t?.lockedRR!=null?t.lockedRR+'R':'—')+'</td>'+
+        '<td class="'+((c?.evScore||0)>0?'gr':'rd')+'">'+(c?.evScore!=null?n2(c.evScore):'—')+'</td>'+
+        '<td>'+(c?.winRate!=null?pc(c.winRate):'—')+'</td>'+
+        '<td>'+n2(r.avgMaxRR)+'</td>'+
         '</tr>';
-    }).join('') +
-    '</tbody></table>';
+    }).join('') + '</tbody></table>';
 }
 
-// ── Signalen ─────────────────────────────────────────────────────
-async function loadSignals() {
-  $('sig-wrap').innerHTML = '<div class="empty"><span class="spin">⟳</span> Laden…</div>';
+// ── signalen ─────────────────────────────────────────────────────
+async function loadSig() {
+  $('sigw').innerHTML = '<div class="empty"><span class="spin">⟳</span></div>';
   const [stats, hist] = await Promise.all([
-    apiFetch('/api/signal-stats'),
-    apiFetch('/api/webhook-history?limit=50'),
+    api('/api/signal-stats'), api('/api/webhook-history?limit=50')
   ]);
-  const s = stats || {};
-  const kpis = [
-    ['Signalen', f0(s.total), ''],
-    ['Geplaatst', f0(s.placed), 'gr'],
-    ['Conversie', pct(s.conversionPct), (s.conversionPct || 0) >= 15 ? 'gr' : 'yl'],
-  ];
-  $('sig-kpi').innerHTML = kpis.map(([l,v,c]) =>
-    '<div class="kpi"><div class="kpi-label">'+l+'</div><div class="kpi-value '+c+'">'+v+'</div></div>'
-  ).join('');
-
-  const rows = hist || [];
-  if (!rows.length) {
-    $('sig-wrap').innerHTML = '<div class="empty">Geen webhook history</div>';
-    return;
-  }
-  $('sig-wrap').innerHTML = '<table><thead><tr>' +
-    '<th>Tijd</th><th>Symbol</th><th>Dir</th><th>Actie</th><th>Status</th><th>Reden</th><th>Latency</th>' +
-    '</tr></thead><tbody>' +
-    rows.map(h =>
-      '<tr>' +
-      '<td class="mt">' + fmtDT(h.ts) + '</td>' +
-      '<td class="bl">' + (h.symbol || '—') + '</td>' +
-      '<td class="' + (h.direction === 'buy' ? 'gr' : 'rd') + '">' + (h.direction || '—') + '</td>' +
-      '<td>' + (h.action || '—') + '</td>' +
-      '<td class="' + (h.status === 'OK' ? 'gr' : 'rd') + '">' + (h.status || '—') + '</td>' +
-      '<td class="mt">' + (h.reason || '') + '</td>' +
-      '<td>' + (h.latency_ms != null ? h.latency_ms + 'ms' : '—') + '</td>' +
+  const s = stats||{};
+  $('sigkg').innerHTML = [
+    kpi('Signalen',  n0(s.total),          ''),
+    kpi('Geplaatst', n0(s.placed),         'gr'),
+    kpi('Conversie', pc(s.conversionPct),  (s.conversionPct||0)>=15?'gr':'yl'),
+  ].join('');
+  const h = hist||[];
+  if (!h.length) { $('sigw').innerHTML = '<div class="empty">Geen webhook history</div>'; return; }
+  $('sigw').innerHTML = '<table><thead><tr>'+
+    '<th>Tijd</th><th>Symbol</th><th>Dir</th><th>Status</th><th>Reden</th><th>Latency</th>'+
+    '</tr></thead><tbody>'+
+    h.map(r => '<tr>'+
+      '<td class="mt">'+dt(r.ts)+'</td>'+
+      '<td class="bl">'+(r.symbol||'—')+'</td>'+
+      '<td class="'+(r.direction==='buy'?'gr':'rd')+'">'+(r.direction||'—')+'</td>'+
+      '<td class="'+(r.status==='OK'?'gr':'rd')+'">'+(r.status||'—')+'</td>'+
+      '<td class="mt">'+(r.reason||'')+'</td>'+
+      '<td>'+(r.latency_ms!=null?r.latency_ms+'ms':'—')+'</td>'+
       '</tr>'
-    ).join('') +
-    '</tbody></table>';
+    ).join('') + '</tbody></table>';
 }
 
-// ── Spreads ──────────────────────────────────────────────────────
-async function loadSpreads() {
-  const wrap = $('spr-wrap');
-  wrap.innerHTML = '<div class="empty"><span class="spin">⟳</span> Laden…</div>';
-  const data = await apiFetch('/api/spread-stats');
-  const rows = data || [];
-  if (!rows.length) {
-    wrap.innerHTML = '<div class="empty">Geen spread data beschikbaar</div>';
-    return;
-  }
-  wrap.innerHTML = '<table><thead><tr>' +
-    '<th>Symbol</th><th>Sessie</th><th>Uur</th><th>Samples</th>' +
-    '<th>Gem Spread</th><th>P50</th><th>P90</th><th>Max</th>' +
-    '</tr></thead><tbody>' +
-    rows.slice(0, 100).map(r =>
-      '<tr>' +
-      '<td class="bl">' + (r.symbol || '—') + '</td>' +
-      '<td>' + (r.session || '—') + '</td>' +
-      '<td>' + (r.hour_brussels != null ? r.hour_brussels + ':00' : '—') + '</td>' +
-      '<td class="mt">' + (r.samples || 0) + '</td>' +
-      '<td>' + (r.avg_spread_abs != null ? Number(r.avg_spread_abs).toFixed(6) : '—') + '</td>' +
-      '<td>' + (r.p50_spread != null ? Number(r.p50_spread).toFixed(6) : '—') + '</td>' +
-      '<td>' + (r.p90_spread != null ? Number(r.p90_spread).toFixed(6) : '—') + '</td>' +
-      '<td class="rd">' + (r.max_spread != null ? Number(r.max_spread).toFixed(6) : '—') + '</td>' +
+// ── spreads ──────────────────────────────────────────────────────
+async function loadSpr() {
+  $('sprw').innerHTML = '<div class="empty"><span class="spin">⟳</span></div>';
+  const d = await api('/api/spread-stats') || [];
+  if (!d.length) { $('sprw').innerHTML = '<div class="empty">Geen spread data</div>'; return; }
+  $('sprw').innerHTML = '<table><thead><tr>'+
+    '<th>Symbol</th><th>Sessie</th><th>Uur</th><th>N</th><th>Gem</th><th>P50</th><th>P90</th><th>Max</th>'+
+    '</tr></thead><tbody>'+
+    d.slice(0,100).map(r => '<tr>'+
+      '<td class="bl">'+(r.symbol||'—')+'</td>'+
+      '<td>'+(r.session||'—')+'</td>'+
+      '<td>'+(r.hour_brussels!=null?r.hour_brussels+':00':'—')+'</td>'+
+      '<td class="mt">'+(r.samples||0)+'</td>'+
+      '<td>'+(r.avg_spread_abs!=null?(+r.avg_spread_abs).toFixed(6):'—')+'</td>'+
+      '<td>'+(r.p50_spread!=null?(+r.p50_spread).toFixed(6):'—')+'</td>'+
+      '<td>'+(r.p90_spread!=null?(+r.p90_spread).toFixed(6):'—')+'</td>'+
+      '<td class="rd">'+(r.max_spread!=null?(+r.max_spread).toFixed(6):'—')+'</td>'+
       '</tr>'
-    ).join('') +
-    '</tbody></table>';
+    ).join('') + '</tbody></table>';
 }
 
-// ── Init ─────────────────────────────────────────────────────────
-// Fire ALL in parallel — never await sequentially
+// ── boot ────────────────────────────────────────────────────────
+// Fire everything in parallel — no sequential awaits
 pollStatus();
-loadOverview();
+loadOv();
 
-// Refresh intervals
-setInterval(pollStatus,   15000);
-setInterval(loadOverview, 60000);
-
+setInterval(pollStatus, 15000);
+setInterval(loadOv,     60000);
 </script>
 </body>
 </html>`;
 }
 
-// ── Startup ────────────────────────────────────────────────────────
-async function startup() {
-  console.log("[Startup] PRONTO-AI v12.7.0 starting...");
-
-  // Init DB schema
-  await db.initDB();
-
-  // Load saved compliance date from DB (may differ from session.js default)
-  try {
-    const savedDate = await db.loadComplianceDate();
-    if (savedDate) {
-      liveComplianceDate = savedDate;
-      db.setComplianceDateLive(savedDate);
-      console.log(`[Startup] Compliance date loaded from DB: ${savedDate}`);
-    } else {
-      console.log(`[Startup] Compliance date using default: ${COMPLIANCE_DATE}`);
+// ══════════════════════════════════════════════════════════════════
+//  BACKGROUND DB INIT  (runs after server is already listening)
+// ══════════════════════════════════════════════════════════════════
+async function initBackground() {
+  // Retry DB init up to 5 times with backoff
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    try {
+      await db.initDB();
+      console.log("[DB] initDB() success");
+      break;
+    } catch (e) {
+      console.error(`[DB] initDB attempt ${attempt}/5 failed: ${e.message}`);
+      if (attempt < 5) await new Promise(r => setTimeout(r, 3000 * attempt));
+      else { recordError(`initDB failed permanently: ${e.message}`); return; }
     }
-  } catch (e) {
-    recordError(`loadComplianceDate: ${e.message}`);
   }
 
-  // Load cached data
+  // Load compliance date
   try {
-    tpConfigs      = await db.loadTPConfig();
-    symbolRiskMap  = await db.loadSymbolRiskConfig();
-    keyRiskMults   = await db.loadKeyRiskMults();
-    console.log(`[Startup] Loaded ${Object.keys(tpConfigs).length} TP configs, ${Object.keys(symbolRiskMap).length} symbol risks`);
-  } catch (e) {
-    recordError(`startup load: ${e.message}`);
-  }
+    const saved = await db.loadComplianceDate();
+    if (saved) { liveComplianceDate = saved; db.setComplianceDateLive(saved); }
+  } catch {}
+
+  // Load cached config
+  try {
+    [tpConfigs, symbolRiskMap, keyRiskMults] = await Promise.all([
+      db.loadTPConfig().catch(() => ({})),
+      db.loadSymbolRiskConfig().catch(() => ({})),
+      db.loadKeyRiskMults().catch(() => ({})),
+    ]);
+    console.log(`[DB] Loaded: ${Object.keys(tpConfigs).length} TP, ${Object.keys(symbolRiskMap).length} risk, ${Object.keys(keyRiskMults).length} mults`);
+  } catch {}
+
+  // Restore open positions
+  try {
+    const states = await db.loadAllGhostStates();
+    for (const gs of states) {
+      if (openPositions.has(gs.positionId)) continue;
+      const ghost = { ...gs, maxPrice: gs.maxPrice??gs.entry, maxRR: gs.maxRR??0,
+        maxSlPctUsed: gs.maxSlPctUsed??0, slMilestones: gs.slMilestones??{},
+        rrMilestones: gs.rrMilestones??{}, phantomSLHit: false, stopReason: null, closedAt: null };
+      openPositions.set(gs.positionId, {
+        positionId: gs.positionId, symbol: gs.symbol, mt5Symbol: gs.mt5Symbol??gs.symbol,
+        direction: gs.direction, vwapPosition: gs.vwapPosition,
+        session: gs.session, entry: gs.entry, sl: gs.sl, tp: null, lots: null,
+        riskPct: gs.riskPct, riskEUR: gs.riskEUR, openedAt: gs.openedAt,
+        optimizerKey: gs.optimizerKey, ghost });
+    }
+    console.log(`[DB] Restored ${openPositions.size} open positions`);
+  } catch (e) { console.error("[DB] restorePositions failed:", e.message); }
 
   // Sync trade number sequence
-  try {
-    await db.syncTradeNumberSequence();
-  } catch (e) { /* non-critical */ }
+  db.syncTradeNumberSequence().catch(() => {});
 
-  // Restore open positions from ghost_state
-  await restorePositionsFromMT5();
+  // Mark DB as ready
+  dbReady = true;
+  console.log("[PRONTO-AI] ✅ DB ready — all systems operational");
 
-  // Start express server
-  app.listen(PORT, () => {
-    console.log(`[Startup] Server listening on port ${PORT}`);
-  });
-
-  // Cron jobs
-  cron.schedule("*/30 * * * * *", syncPositions);        // every 30s: sync positions
-  cron.schedule("*/5 * * * *",    runShadowSnapshots);   // every 5min: shadow snapshots
-  cron.schedule("0 * * * *",      runTPOptimizer);       // every 1h:  TP optimizer
-  cron.schedule("0 */6 * * *",    runShadowOptimizer);   // every 6h:  shadow SL optimizer
-
-  console.log("[Startup] All cron jobs scheduled");
+  // Start cron jobs
+  cron.schedule("*/30 * * * * *", syncPositions);
+  cron.schedule("*/5 * * * *",    runShadowSnapshots);
+  cron.schedule("0 * * * *",      runTPOptimizer);
+  console.log("[PRONTO-AI] Cron jobs active");
 }
 
-startup().catch(e => {
-  console.error("[FATAL] startup failed:", e);
-  process.exit(1);
-});
+// Start background init (non-blocking)
+initBackground().catch(e => console.error("[FATAL] initBackground:", e.message));
