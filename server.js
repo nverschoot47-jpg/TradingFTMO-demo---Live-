@@ -1982,4 +1982,4 @@ async function loadEVSL(){
   const tbody=document.getElementById('evsl-body'); if(!tbody) return;
   if(!d.length){ tbody.innerHTML=emptyRow(14,'Min 3 ghost trades required per combo · waiting for ghost data'); return; }
   tbody.innerHTML=d.map(r=>{
-    const
+    const 
