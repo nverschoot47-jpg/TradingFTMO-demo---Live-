@@ -1,7 +1,7 @@
 {
   "name": "nv-tradingview-webhook",
-  "version": "13.4.0",
-  "description": "TradingView -> MetaApi REST -> FTMO MT5 | PRONTO-AI v13.4.0",
+  "version": "13.5.1",
+  "description": "TradingView -> MetaApi REST -> FTMO MT5 | PRONTO-AI v13.5.1",
   "main": "server.js",
   "packageManager": "npm@10.9.2",
   "scripts": {
