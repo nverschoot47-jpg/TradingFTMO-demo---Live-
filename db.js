@@ -2261,4 +2261,9 @@ module.exports = {
   // v12.5: nieuwe functies
   loadPerformanceSummary,
   loadMAEStats,
-  l
+  loadGhostGrouped,
+  // v12.6: daily breakdown, ghost history per pair, blocked raw
+  loadDailyBreakdown,
+  loadGhostHistoryByPair,
+  loadBlockedRaw,
+}; 
