@@ -2089,18 +2089,18 @@ async function recoverPositions(){
     });
     const d = await r.json();
     if(d.ok){
-      const adopted  = (d.results||[]).filter(x=>x.status==='adopted');
-      const tracked  = (d.results||[]).filter(x=>x.status==='already_tracked');
-      alert('✅ Recovery klaar\n\n'+
-        'Live MT5 posities: '+d.livePositions+'\n'+
-        'Nieuw hersteld: '+adopted.length+(adopted.length?'\n  '+adopted.map(x=>x.symbol+' ('+x.id+')').join('\n  '):'')+'\n'+
-        'Al getrackt: '+tracked.length);
+      const adopted = (d.results||[]).filter(x=>x.status==='adopted');
+      const tracked = (d.results||[]).filter(x=>x.status==='already_tracked');
+      const adoptedList = adopted.map(function(x){return x.symbol+' ('+x.id+')';}).join(', ');
+      const NL = String.fromCharCode(10);
+      const msg = 'Recovery klaar'+NL+'Live MT5: '+d.livePositions+NL+'Nieuw hersteld: '+adopted.length+(adoptedList?' - '+adoptedList:'')+NL+'Al getrackt: '+tracked.length;
+      alert(msg);
       await loadAll();
     } else {
-      alert('❌ Recovery mislukt: '+(d.error||JSON.stringify(d)));
+      alert('Recovery mislukt: '+(d.error||JSON.stringify(d)));
     }
   } catch(e){
-    alert('❌ Fout: '+e.message);
+    alert('Fout: '+e.message);
   } finally {
     if(btn){ btn.textContent='⚡ Recover'; btn.disabled=false; }
   }
