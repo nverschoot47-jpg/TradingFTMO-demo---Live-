@@ -388,4 +388,4 @@ module.exports = {
   getSymbolInfo,
   getVwapPosition,
   buildOptimizerKey,
-}; 
+};  
