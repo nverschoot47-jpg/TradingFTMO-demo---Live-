@@ -47,7 +47,7 @@ const {
 } = require("./session");
 
 // ── Version ──────────────────────────────────────────────────────
-const VERSION = "13.5.0";
+const VERSION = "13.5.1";
 
 // ── Config ───────────────────────────────────────────────────────
 const PORT           = process.env.PORT           || 3000;
@@ -391,9 +391,36 @@ async function syncPositions() {
   const live = await getPositions();
   const liveIds = new Set(live.map(p => String(p.id)));
 
-  // Sluit posities die niet meer in MT5 zitten
+  // Sluit posities die niet meer in MT5 zitten — detecteer SL/TP via deals
   for (const [id] of openPositions) {
-    if (!liveIds.has(id)) await closePosition(id, "manual", null);
+    if (!liveIds.has(id)) {
+      // v13.5.1: probeer close reason te detecteren via history deals
+      let closeReason = "manual";
+      try {
+        const deals = await fetchHistoryDeals(id);
+        // Zoek de sluitende deal (laatste deal voor deze positie)
+        const closingDeal = deals
+          .filter(d => d.entryType === 'DEAL_ENTRY_OUT' || d.entryType === 'out' || (d.type && d.type.includes('OUT')))
+          .sort((a,b) => new Date(b.time||b.createdAt||0) - new Date(a.time||a.createdAt||0))[0]
+          ?? deals[deals.length - 1];
+        if (closingDeal) {
+          const r = (closingDeal.reason ?? closingDeal.closeReason ?? '').toString().toUpperCase();
+          const t = (closingDeal.type ?? '').toString().toUpperCase();
+          if (r.includes('SL') || r.includes('STOP_LOSS') || t.includes('SL')) closeReason = 'sl';
+          else if (r.includes('TP') || r.includes('TAKE_PROFIT') || t.includes('TP')) closeReason = 'tp';
+          // Profit-based fallback: als SL prijs bereikt is
+          const pos = openPositions.get(id);
+          if (closeReason === 'manual' && pos && closingDeal.profit != null) {
+            const profit = parseFloat(closingDeal.profit);
+            // Negatief profit + ghost hit phantom SL = SL
+            if (profit < 0 && pos.ghost?.phantomSLHit) closeReason = 'sl';
+            // Positief profit + ghost stopReason max_rr_15 = TP area
+            else if (profit > 0 && pos.ghost?.stopReason === 'max_rr_15') closeReason = 'tp';
+          }
+        }
+      } catch (e) { /* gebruik 'manual' als fallback */ }
+      await closePosition(id, closeReason, null);
+    }
   }
 
   for (const lp of live) {
@@ -687,20 +714,52 @@ app.post("/webhook", async (req, res) => {
 
   // Place order
   let positionId;
+  const orderComment = (()=>{
+    const d = direction === 'buy' ? 'B' : 'S';
+    const s = session === 'new_york' ? 'NY' : session === 'london' ? 'LD' : session === 'asia' ? 'AS' : (session||'??').slice(0,4).toUpperCase();
+    const v = vwapPos === 'above' ? 'ABV' : vwapPos === 'below' ? 'BLW' : 'UNK';
+    const n = tradeNumber ?? '?';
+    return `${d}-${s}-${v} #${n}`;
+  })();
   try {
-    const r  = await placeOrder({
+    const r = await placeOrder({
       symbol: mt5Sym,
       actionType: direction === "buy" ? "ORDER_TYPE_BUY" : "ORDER_TYPE_SELL",
       volume: lots, stopLoss: slPrice, takeProfit: tpPrice,
-      comment: (()=>{
-        const d = direction === 'buy' ? 'B' : 'S';
-        const s = session === 'new_york' ? 'NY' : session === 'london' ? 'LD' : session === 'asia' ? 'AS' : (session||'??').slice(0,4).toUpperCase();
-        const v = vwapPos === 'above' ? 'ABV' : vwapPos === 'below' ? 'BLW' : 'UNK';
-        const n = tradeNumber ?? '?';
-        return `${d}-${s}-${v} #${n}`;
-      })(),
+      comment: orderComment,
     });
-    positionId = r?.positionId ?? r?.orderId ?? String(Date.now());
+    positionId = r?.positionId ?? r?.orderId ?? null;
+
+    // ── v13.5.1: ORDER_NOT_CONFIRMED — poll MT5 voor positionId ──
+    // Stocks (GOOG, AAPL, JNJ etc.) geven soms geen positionId terug
+    // bij market open. Poll tot 10s om de nieuwe positie te vinden.
+    if (!positionId) {
+      console.warn(`[Order] Geen positionId ontvangen voor ${mt5Sym} ${direction} — polling MT5…`);
+      const placeTime = Date.now();
+      for (let attempt = 0; attempt < 5; attempt++) {
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        try {
+          const livePosNow = await getPositions();
+          // Zoek een positie die matcht: zelfde symbol + direction + recent geopend
+          const match = livePosNow.find(lp => {
+            const lpDir = lp.type === 'POSITION_TYPE_BUY' || lp.type === 'buy' ? 'buy' : 'sell';
+            const openMs = lp.openTime ? new Date(lp.openTime).getTime() : 0;
+            return lp.symbol === mt5Sym && lpDir === direction
+              && openMs >= placeTime - 30000
+              && !openPositions.has(String(lp.id));
+          });
+          if (match) { positionId = String(match.id); console.log(`[Order] Gevonden via poll: ${positionId}`); break; }
+        } catch {}
+      }
+      if (!positionId) {
+        positionId = String(Date.now());
+        console.error(`[Order] ORDER_NOT_CONFIRMED: geen positie gevonden voor ${mt5Sym} ${direction} — fallback id=${positionId}`);
+        db.logSignal({ symbol, direction, session, vwapPosition: vwapPos, optimizerKey: optKey,
+          tvEntry, slPct, outcome: "ORDER_NOT_CONFIRMED",
+          rejectReason: `geen positionId van MetaApi en positie niet gevonden op MT5 (${symbol} ${direction})`,
+          latencyMs: Date.now() - t0 }).catch(() => {});
+      }
+    }
   } catch (e) {
     recordError(`placeOrder: ${e.message}`);
     db.logSignal({ symbol, direction, session, vwapPosition: vwapPos, optimizerKey: optKey,
@@ -814,10 +873,10 @@ apiGet("/api/ghost-combo-analysis",r  => db.loadGhostComboAnalysis(r.query.key??
 apiGet("/api/shadow-analysis",     () => db.loadAllShadowAnalysis(),           []);
 apiGet("/api/shadow-winners",      () => db.loadShadowWinners(),               {});
 apiGet("/api/mae-stats",           r  => db.loadMAEStats(r.query.since??null), []);
-apiGet("/api/signal-stats",        () => db.loadSignalStats(),                 { total:0, placed:0, conversionPct:0 });
-apiGet("/api/signal-rejects",      r  => db.loadSignalRejects({ since: r.query.since }), []);
-apiGet("/api/blocked-raw",         r  => db.loadBlockedRaw(r.query.since??null), []);
-apiGet("/api/webhook-history",     r  => db.loadWebhookHistory(parseInt(r.query.limit)||100), []);
+apiGet("/api/signal-stats",        r  => db.loadSignalStats({ since: r.query.since??null, until: r.query.until??null }), { total:0, placed:0, conversionPct:0 });
+apiGet("/api/signal-rejects",      r  => db.loadSignalRejects({ since: r.query.since??null, until: r.query.until??null }), []);
+apiGet("/api/blocked-raw",         r  => db.loadBlockedRaw(r.query.since??null, r.query.until??null), []);
+apiGet("/api/webhook-history",     r  => db.loadWebhookHistory(parseInt(r.query.limit)||100, r.query.since??null, r.query.until??null), []);
 apiGet("/api/spread-stats",        r  => db.loadSpreadStats(r.query),          []);
 apiGet("/api/spread-log",          r  => db.loadSpreadLog({ symbol: r.query.symbol, session: r.query.session, limit: parseInt(r.query.limit)||500 }), []);
 apiGet("/api/band-ghosts",         r  => db.loadBandGhosts(r.query),           []);
@@ -2703,12 +2762,16 @@ async function loadEVSL(){
 
 // ── Signals & Blocked ─────────────────────────────────────────────
 async function loadSignals(){
-  // /api/signal-stats: {total,placed,conversionPct,byOutcome:[{outcome,count}],topRejectReasons:[{reason,count,pairs}]}
-  // /api/webhook-history: rows from webhook_history table (raw DB rows, snake_case)
+  // v13.5.1: gebruik sig date filter voor alle API calls
+  const from  = _df.sig.openFrom  || _df.sig.closeFrom || null;
+  const to    = _df.sig.openTo    || _df.sig.closeTo   || null;
+  const toEnd = to ? to+'T23:59:59' : null;
+  const qs    = [from?'since='+encodeURIComponent(from):'', toEnd?'until='+encodeURIComponent(toEnd):''].filter(Boolean).join('&');
+  const qStr  = qs ? '?'+qs : '';
   const [stats,hist,rejects]=await Promise.all([
-    api('/api/signal-stats'),
-    api('/api/webhook-history?limit=80'),
-    api('/api/signal-rejects'),
+    api('/api/signal-stats'+qStr),
+    api('/api/webhook-history?limit=80'+(qs?'&'+qs:'')),
+    api('/api/signal-rejects'+qStr),
   ]);
   const s=stats||{};
   setText('sig-tot',s.total||0);
@@ -2775,8 +2838,11 @@ async function loadSignals(){
 }
 
 async function loadBlockedRaw(){
-  // /api/blocked-raw: {symbol,direction,vwapPosition,session,rejectReason,outcome,count,lastSeen}
-  const d=await api('/api/blocked-raw')||[];
+  // v13.5.1: gebruik sig date filter
+  const from = _df.sig.openFrom || _df.sig.closeFrom || null;
+  const to   = _df.sig.openTo   || _df.sig.closeTo   || null;
+  const qs   = [from?'since='+encodeURIComponent(from):'', to?'until='+encodeURIComponent(to+'T23:59:59'):''].filter(Boolean).join('&');
+  const d=await api('/api/blocked-raw'+(qs?'?'+qs:''))||[];
   setText('blkraw-meta',d.length+' entries · compliance+');
   setHtml('blkraw-body',d.length?d.slice(0,200).map(r=>
     '<tr>'+
