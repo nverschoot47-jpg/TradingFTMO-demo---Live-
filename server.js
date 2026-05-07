@@ -81,19 +81,29 @@ async function metaFetch(path, method = "GET", body = null) {
   const opts = {
     method,
     headers: { "auth-token": META_API_TOKEN, "Content-Type": "application/json" },
-    signal: AbortSignal.timeout(8000),
+    signal: AbortSignal.timeout(15000),
   };
   if (body) opts.body = JSON.stringify(body);
   const res = await fetch(url, opts);
-  if (!res.ok) throw new Error(`MetaAPI ${method} ${path} → ${res.status}`);
+  if (!res.ok) {
+    let errBody = "";
+    try { errBody = await res.text(); } catch {}
+    throw new Error(`MetaAPI ${method} ${path} → ${res.status} ${errBody.slice(0, 200)}`);
+  }
   return res.json().catch(() => null);
 }
 
 async function getAccountInfo() {
-  if (!META_API_TOKEN || !META_ACCOUNT) return null;
+  if (!META_API_TOKEN || !META_ACCOUNT) {
+    console.warn("[MetaAPI] getAccountInfo: TOKEN or ACCOUNT not set");
+    return null;
+  }
   try {
     return await metaFetch(`/users/current/accounts/${META_ACCOUNT}/account-information`);
-  } catch (e) { return null; }
+  } catch (e) {
+    recordError(`getAccountInfo: ${e.message}`);
+    return null;
+  }
 }
 
 async function getPositions() {
@@ -334,10 +344,10 @@ app.get("/status", async (req, res) => {
     errorCount:     getErrorCount(),
     ts:             new Date().toISOString(),
   };
-  // Account info: try with 2.5 s timeout — never block
+  // Account info: try with 10 s timeout — never block
   const acct = await Promise.race([
     getAccountInfo(),
-    new Promise(r => setTimeout(() => r(null), 2500)),
+    new Promise(r => setTimeout(() => r(null), 10000)),
   ]);
   res.json({
     ...base,
@@ -391,7 +401,7 @@ app.post("/webhook", async (req, res) => {
   const slPct    = sl_pct ? parseFloat(sl_pct) : 0.003;
 
   let equity = 10000;
-  const acct = await Promise.race([getAccountInfo(), new Promise(r => setTimeout(() => r(null), 3000))]);
+  const acct = await Promise.race([getAccountInfo(), new Promise(r => setTimeout(() => r(null), 8000))]);
   if (acct?.equity) equity = parseFloat(acct.equity);
 
   const baseRisk = symbolRiskMap[symbol] ?? DEFAULT_RISK_BY_TYPE[assetType] ?? DEFAULT_RISK_BY_TYPE.forex;
@@ -2202,6 +2212,27 @@ async function initBackground() {
   // Mark DB as ready
   dbReady = true;
   console.log("[PRONTO-AI] ✅ DB ready — all systems operational");
+
+  // MetaAPI connectivity check
+  if (META_API_TOKEN && META_ACCOUNT) {
+    console.log(`[MetaAPI] Checking connectivity — account ${META_ACCOUNT.slice(0,8)}…`);
+    try {
+      const acct = await Promise.race([
+        metaFetch(`/users/current/accounts/${META_ACCOUNT}/account-information`),
+        new Promise((_, rej) => setTimeout(() => rej(new Error("timeout 15s")), 15000)),
+      ]);
+      if (acct) {
+        console.log(`[MetaAPI] ✅ Connected — balance: ${acct.balance} ${acct.currency}`);
+      } else {
+        console.warn("[MetaAPI] ⚠️ Response empty — account may still be deploying");
+      }
+    } catch (e) {
+      console.error(`[MetaAPI] ❌ Connection failed: ${e.message}`);
+      recordError(`MetaAPI startup check: ${e.message}`);
+    }
+  } else {
+    console.warn("[MetaAPI] ⚠️ META_API_TOKEN or META_ACCOUNT not set — MetaAPI disabled");
+  }
 
   // Start cron jobs
   cron.schedule("*/30 * * * * *", syncPositions);
