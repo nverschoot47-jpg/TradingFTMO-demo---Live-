@@ -1,5 +1,11 @@
 // ===============================================================
-// session.js  v12.5  |  PRONTO-AI
+// session.js  v13.3  |  PRONTO-AI
+//
+// Changes v13.3:
+//  - COMPLIANCE_DATE gezet op '2000-01-01' zodat geen historische
+//    data meer weggefilterd wordt. Dashboard draait vrij zonder
+//    compliance datum restrictie.
+//  - Selectieve datumfilter zit nu in het dashboard (Ghost History).
 //
 // Changes v12.5 (dashboard optimalisaties):
 //  - Versie bump: consistentie met server.js v12.5.0 en package.json v12.5.0.
@@ -360,8 +366,10 @@ const SESSION_LABELS = {
 // ── Data quality compliance date (FIX 8: single source of truth) ────
 // Alle stats (EV, ghost, shadow, signals) filteren op opened_at/closed_at >= deze datum.
 // Aanpasbaar via POST /compliance-date (beveiligd met WEBHOOK_SECRET).
-const COMPLIANCE_DATE    = '2026-05-03 00:00:00';  // UTC midnight → Brussels 02:00 CEST
-const COMPLIANCE_DATE_MS = new Date('2026-05-03T00:00:00.000Z').getTime();
+// v13.3: compliance date restriction verwijderd — alle data doorloopt vrij.
+// Selectieve datumfilter zit nu in het dashboard (Ghost History from/to picker).
+const COMPLIANCE_DATE    = '2000-01-01 00:00:00';
+const COMPLIANCE_DATE_MS = new Date('2000-01-01T00:00:00.000Z').getTime();
 
 module.exports = {
   COMPLIANCE_DATE,
