@@ -447,7 +447,13 @@ app.post("/webhook", async (req, res) => {
       symbol: mt5Sym,
       actionType: direction === "buy" ? "ORDER_TYPE_BUY" : "ORDER_TYPE_SELL",
       volume: lots, stopLoss: slPrice, takeProfit: tpPrice,
-      comment: `PRONTO-AI #${tradeNumber ?? "?"}`,
+      comment: (()=>{
+        const d = direction === 'buy' ? 'B' : 'S';
+        const s = session === 'new_york' ? 'NY' : session === 'london' ? 'LD' : session === 'asia' ? 'AS' : (session||'??').slice(0,4).toUpperCase();
+        const v = vwapPos === 'above' ? 'ABV' : vwapPos === 'below' ? 'BLW' : 'UNK';
+        const n = tradeNumber ?? '?';
+        return `${d}-${s}-${v} #${n}`;
+      })(),
     });
     positionId = r?.positionId ?? r?.orderId ?? String(Date.now());
   } catch (e) {
@@ -1846,7 +1852,7 @@ function renderGhostHistory(){
     const bestTP=last5.length?'avg '+f2(last5.reduce((s,v)=>s+v,0)/last5.length)+'R':'—';
     const reasons=(g.trades||[]).map(t=>t.stopReason).filter(Boolean);
     const topReason=reasons.length?Object.entries(reasons.reduce((m,r)=>{m[r]=(m[r]||0)+1;return m;},{})).sort((a,b)=>b[1]-a[1])[0][0]:'—';
-    return '<tr style="cursor:pointer" onclick="toggleGHHRow(\''+safeKey+'\')">'+
+    return '<tr style="cursor:pointer" onclick="toggleGHHRow(\u0027'+safeKey+'\u0027)">'+
       '<td class="cd" style="font-size:9px">▶</td>'+
       '<td class="cb fw">'+g.symbol+'</td>'+
       '<td>'+tBadge(symType(g.symbol))+'</td>'+
