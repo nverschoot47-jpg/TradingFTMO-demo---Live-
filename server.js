@@ -47,7 +47,7 @@ const {
 } = require("./session");
 
 // ── Version ──────────────────────────────────────────────────────
-const VERSION = "13.4.0";
+const VERSION = "13.5.0";
 
 // ── Config ───────────────────────────────────────────────────────
 const PORT           = process.env.PORT           || 3000;
@@ -322,17 +322,87 @@ async function closeBlockedGhost(id, reason = 'timeout') {
   console.log(`[BlockedGhost] Closed ${id} ${bg.symbol} ${bg.direction} reason=${reason}`);
 }
 
+// ── Adopt an MT5 position that is not in openPositions ───────────
+// Wordt aangeroepen bij syncPositions wanneer een live MT5 positie
+// niet in memory zit — bv. na een deploy/restart terwijl er een trade open stond.
+// Reconstrueert de positie vanuit MT5 data + comment parsing.
+function parseMT5Comment(comment = '') {
+  // Comment format: "B-LD-ABV #42"  →  dir=buy, sess=london, vwap=above, trade#=42
+  // Parts: [dir]-[sess]-[vwap] #[n]
+  const dirMap  = { B: 'buy',  S: 'sell' };
+  const sessMap = { NY: 'ny',  LD: 'london', AS: 'asia', LOND: 'london' };
+  const vwapMap = { ABV: 'above', BLW: 'below', UNK: 'unknown' };
+  const parts   = comment.trim().toUpperCase().split(/[\s#]+/);
+  const core    = parts[0] || '';
+  const segs    = core.split('-');
+  return {
+    direction:    dirMap[segs[0]]  ?? null,
+    session:      sessMap[segs[1]] ?? null,
+    vwapPosition: vwapMap[segs[2]] ?? 'unknown',
+    tradeNumber:  parts[1] ? parseInt(parts[1]) : null,
+  };
+}
+
+async function adoptPosition(lp) {
+  const id  = String(lp.id);
+  if (openPositions.has(id)) return; // already tracked
+
+  // Resolve symbol
+  const rawSym  = lp.symbol ?? '';
+  const symbol  = normalizeSymbol(rawSym) ?? rawSym;
+  const symInfo = getSymbolInfo(symbol);
+  const mt5Sym  = rawSym; // keep original MT5 symbol
+
+  // Parse comment for direction/session/vwap
+  const parsed     = parseMT5Comment(lp.comment ?? lp.type ?? '');
+  const direction  = parsed.direction  ?? (lp.type === 'POSITION_TYPE_BUY' || lp.type === 'buy' ? 'buy' : 'sell');
+  const session    = parsed.session    ?? getSession();
+  const vwapPos    = parsed.vwapPosition ?? 'unknown';
+  const entry      = parseFloat(lp.openPrice ?? lp.currentPrice ?? 0);
+  const sl         = parseFloat(lp.stopLoss  ?? 0);
+  const tp         = parseFloat(lp.takeProfit ?? 0) || null;
+  const lots       = parseFloat(lp.volume ?? 0);
+  const openedAt   = lp.openTime ? new Date(lp.openTime).toISOString() : new Date().toISOString();
+  const optKey     = buildOptimizerKey(symbol, session, direction, vwapPos);
+
+  // Estimate SL pct from entry/sl distance
+  const slPct = entry > 0 && sl > 0 ? Math.abs(entry - sl) / entry : 0.003;
+
+  const pos = {
+    positionId: id, symbol, mt5Symbol: mt5Sym,
+    direction, vwapPosition: vwapPos, session,
+    entry, sl, tp, lots,
+    riskPct: null, riskEUR: null,
+    openedAt, optimizerKey: optKey,
+    tpRRUsed: tp && sl && entry ? Math.abs(tp - entry) / Math.abs(entry - sl) : null,
+    slMultiplier: null, tradeNumber: parsed.tradeNumber,
+    ghost: null,
+  };
+  pos.ghost = initGhost({ ...pos, slPct });
+  openPositions.set(id, pos);
+
+  if (dbReady) db.saveGhostState(pos.ghost).catch(() => {});
+  console.log(`[Adopt] Hersteld MT5 positie ${id} ${symbol} ${direction} entry=${entry} — comment="${lp.comment ?? ''}"`);
+}
+
 // ── Position sync (cron) ─────────────────────────────────────────
 async function syncPositions() {
   if (!isMonitoringActive() || !dbReady) return;
   const live = await getPositions();
   const liveIds = new Set(live.map(p => String(p.id)));
+
+  // Sluit posities die niet meer in MT5 zitten
   for (const [id] of openPositions) {
     if (!liveIds.has(id)) await closePosition(id, "manual", null);
   }
+
   for (const lp of live) {
-    const pos = openPositions.get(String(lp.id));
-    if (pos?.ghost && lp.currentPrice) {
+    const id  = String(lp.id);
+    const pos = openPositions.get(id);
+    if (!pos) {
+      // ── v13.5: positie bestaat in MT5 maar niet in memory → adopteer ──
+      await adoptPosition(lp);
+    } else if (pos.ghost && lp.currentPrice) {
       if (!pos.ghost.direction) continue;
       updateGhost(pos.ghost, lp.currentPrice);
       if (dbReady) db.saveGhostState(pos.ghost).catch(() => {});
@@ -705,6 +775,36 @@ function apiGet(path, fn, empty = []) {
 apiGet("/api/trades",              () => db.loadAllTrades(),                   []);
 apiGet("/api/ghost-trades",        r  => db.loadGhostTrades(r.query.key??null, parseInt(r.query.limit)||200), []);
 apiGet("/api/ghost-grouped",       () => db.loadGhostGrouped(),                []);
+// ── Manual position recovery ──────────────────────────────────────
+// POST /api/recover-positions [secret]
+// Scant MT5 live posities en adopteert alles wat niet in memory zit.
+// Gebruik dit na een deploy als je ziet dat een positie ontbreekt.
+app.post("/api/recover-positions", async (req, res) => {
+  if (!checkSecret(req, res)) return;
+  if (!dbReady) return res.status(503).json({ error: "DB not ready" });
+  try {
+    const live = await Promise.race([
+      getPositions(),
+      new Promise((_, rej) => setTimeout(() => rej(new Error("timeout 15s")), 15000)),
+    ]);
+    const results = [];
+    for (const lp of live) {
+      const id = String(lp.id);
+      const alreadyTracked = openPositions.has(id);
+      if (!alreadyTracked) {
+        await adoptPosition(lp);
+        results.push({ id, symbol: lp.symbol, status: "adopted" });
+      } else {
+        results.push({ id, symbol: lp.symbol, status: "already_tracked" });
+      }
+    }
+    res.json({ ok: true, livePositions: live.length, results });
+  } catch (e) {
+    recordError(`recover-positions: ${e.message}`);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 apiGet("/api/ghost-history-by-pair", r => db.loadGhostHistoryByPair(r.query.from??null, r.query.to??null), []);
 // v13.4: blocked ghost tracker routes
 apiGet("/api/blocked-ghosts/active",  () => db.loadActiveBlockedGhosts(), []);
@@ -1064,6 +1164,7 @@ tr:hover td{background:var(--bg4)}
     <div class="sess-badge" id="h-sess">—</div>
     <div id="hclock">—</div>
     <button class="hbtn" onclick="loadAll()">⟳ Refresh</button>
+    <button class="hbtn" id="recover-btn" onclick="recoverPositions()" title="Scan MT5 en herstel ontbrekende posities na een deploy" style="border-color:var(--y);color:var(--y)">⚡ Recover</button>
   </div>
 </header>
 
@@ -1975,7 +2076,35 @@ function toggleMsCols(){
   if(btn) btn.textContent=_msVisible?'✕ Milestones':'± Milestones';
 }
 
-// ── pollStatus — fills header KPIs from /status ──────────────────
+// ── Manual position recovery ──────────────────────────────────────
+async function recoverPositions(){
+  const btn = document.getElementById('recover-btn');
+  if(btn){ btn.textContent='⏳ Recovering…'; btn.disabled=true; }
+  try {
+    const secret = prompt('Webhook secret:');
+    if(!secret){ if(btn){ btn.textContent='⚡ Recover'; btn.disabled=false; } return; }
+    const r = await fetch('/api/recover-positions', {
+      method:'POST',
+      headers:{'Content-Type':'application/json','x-webhook-secret':secret},
+    });
+    const d = await r.json();
+    if(d.ok){
+      const adopted  = (d.results||[]).filter(x=>x.status==='adopted');
+      const tracked  = (d.results||[]).filter(x=>x.status==='already_tracked');
+      alert('✅ Recovery klaar\n\n'+
+        'Live MT5 posities: '+d.livePositions+'\n'+
+        'Nieuw hersteld: '+adopted.length+(adopted.length?'\n  '+adopted.map(x=>x.symbol+' ('+x.id+')').join('\n  '):'')+'\n'+
+        'Al getrackt: '+tracked.length);
+      await loadAll();
+    } else {
+      alert('❌ Recovery mislukt: '+(d.error||JSON.stringify(d)));
+    }
+  } catch(e){
+    alert('❌ Fout: '+e.message);
+  } finally {
+    if(btn){ btn.textContent='⚡ Recover'; btn.disabled=false; }
+  }
+}
 async function pollStatus(){
   const d=await api('/status',5000); if(!d) return;
   const bal=d.account?.balance, eq=d.account?.equity;
@@ -3003,6 +3132,28 @@ async function initBackground() {
     }
     console.log(`[DB] Restored ${blockedPositions.size} blocked ghost trackers`);
   } catch (e) { console.error("[DB] restoreBlockedGhosts failed:", e.message); }
+
+  // ── v13.5: Adopteer MT5 posities die niet via ghost_state hersteld werden ──
+  // Dit vangt trades op die open stonden vóór een deploy en waarvan de
+  // ghost_state verloren ging (bv. eerste deploy, of DB reset).
+  if (META_API_TOKEN && META_ACCOUNT) {
+    try {
+      const livePosAtBoot = await Promise.race([
+        getPositions(),
+        new Promise(r => setTimeout(() => r([]), 10000)),
+      ]);
+      let adopted = 0;
+      for (const lp of livePosAtBoot) {
+        const id = String(lp.id);
+        if (!openPositions.has(id)) {
+          await adoptPosition(lp);
+          adopted++;
+        }
+      }
+      if (adopted > 0) console.log(`[DB] Adopted ${adopted} MT5 positions not found in ghost_state`);
+      else console.log(`[DB] All MT5 positions already in ghost_state — no adoption needed`);
+    } catch (e) { console.warn(`[DB] MT5 adoption check failed: ${e.message}`); }
+  }
 
   // Sync trade number sequence
   db.syncTradeNumberSequence().catch(() => {});
