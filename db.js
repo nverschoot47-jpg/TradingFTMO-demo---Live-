@@ -1,5 +1,13 @@
 // ===============================================================
-// db.js  v12.6  |  PRONTO-AI
+// db.js  v13.3  |  PRONTO-AI
+//
+// Changes v13.3:
+//  - loadGhostHistoryByPair(from, to): accepteert nu optionele
+//    from/to ISO datum strings voor selectieve datumfilter.
+//    Standaard: from='2000-01-01' (geen compliance beperking).
+//    rr_milestones per trade doorgegeven aan frontend.
+//  - Compliance date restriction verwijderd uit EV_DATA_CUTOFF
+//    default (wordt nu gezet via session.js naar 2000-01-01).
 //
 // Changes v12.6:
 //  - saveLotOverride / loadLotOverrides gemarkeerd als deprecated dead code
@@ -2078,10 +2086,13 @@ async function loadDailyBreakdown() {
   } catch (e) { console.warn('[!] loadDailyBreakdown:', e.message); return null; }
 }
 
-// ── loadGhostHistoryByPair (v12.6: individuele ghost-lijnen per pair) ─
-async function loadGhostHistoryByPair(since) {
+// ── loadGhostHistoryByPair (v13.3: from/to date range + rr_milestones per trade) ─
+async function loadGhostHistoryByPair(from, to) {
   try {
-    const cutoff = since ?? EV_DATA_CUTOFF;
+    // v13.3: compliance date verwijderd — standaard alles (2000-01-01)
+    // from/to zijn optionele ISO strings voor de selectieve datumfilter in het dashboard
+    const cutoff  = from ?? '2000-01-01';
+    const ceiling = to   ?? '2099-12-31';
     const r = await pool.query(`
       SELECT
         id,
@@ -2105,10 +2116,11 @@ async function loadGhostHistoryByPair(since) {
         closed_at                                             AS "closedAt"
       FROM ghost_trades
       WHERE opened_at >= $1
+        AND opened_at <= $2
         AND closed_at IS NOT NULL
         AND vwap_position IN ('above','below')
       ORDER BY optimizer_key ASC, opened_at DESC
-    `, [cutoff]);
+    `, [cutoff, ceiling]);
 
     // Groepeer per optimizer_key
     const grouped = {};
