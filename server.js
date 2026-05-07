@@ -2712,7 +2712,8 @@ function renderBGTTable(tab) {
     const avgBand = tab === 'vwap'
       ? ((g.trades||[]).reduce((s,t)=>s+(t.vwapBandPct||0),0) / (g.trades?.length||1)).toFixed(0)+'%'
       : null;
-    const mainRow = '<tr style="cursor:pointer" onclick="toggleBGTRow(\''+safeKey+'_'+tab+'\')">'+
+    const rowId = safeKey+'_'+tab;
+    const mainRow = '<tr style="cursor:pointer" onclick="toggleBGTRow('+Q+rowId+Q+')">'+
       '<td class="cd" style="font-size:9px">▶</td>'+
       '<td class="cb fw">'+g.symbol+'</td>'+
       '<td>'+tBadge(symType(g.symbol))+'</td>'+
