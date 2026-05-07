@@ -2084,88 +2084,57 @@ async function loadGhostComboAnalysis(optimizerKey = null) {
 // ── loadDailyBreakdown (v12.6: per-dag KPI's voor Overview tab) ──
 async function loadDailyBreakdown() {
   try {
+    // v14.0: Simplified — only peak RR+, P&L, total lots. No win/loss/streak/drawdown.
     const r = await pool.query(`
-      WITH daily AS (
-        SELECT
-          DATE(opened_at AT TIME ZONE 'Europe/Brussels')   AS trade_date,
-          COUNT(*)                                          AS trades,
-          COALESCE(SUM(lots), 0)                           AS total_lots,
-          COUNT(*) FILTER (WHERE hit_tp = TRUE)             AS wins,
-          COUNT(*) FILTER (WHERE close_reason = 'sl')       AS losses,
-          COALESCE(SUM(realized_pnl_eur), 0)               AS day_pnl,
-          COALESCE(AVG(realized_pnl_eur), 0)               AS avg_pnl,
-          MAX(max_rr)                                       AS best_rr,
-          MIN(max_rr)                                       AS worst_rr,
-          AVG(max_rr)                                       AS avg_rr,
-          COALESCE(AVG(lots), 0)                            AS avg_lots
-        FROM closed_trades
-        WHERE opened_at >= $1
-          AND close_reason IN ('tp','sl','manual')
-          AND (exclude_from_ev IS NULL OR exclude_from_ev = FALSE)
-        GROUP BY DATE(opened_at AT TIME ZONE 'Europe/Brussels')
-        ORDER BY trade_date DESC
-      )
-      SELECT *,
-        SUM(day_pnl) OVER (ORDER BY trade_date)  AS cum_pnl
-      FROM daily
-    `, [EV_DATA_CUTOFF]);
-
-    // Bereken max win/loss streaks + drawdown (gesorteerd oudste→nieuwste)
-    const rows = r.rows.slice().reverse();
-    let maxWinStreak = 0, maxLossStreak = 0, curWin = 0, curLoss = 0;
-    let maxDrawdownDay = 0, peakCum = 0;
-    for (const row of rows) {
-      const pnl = parseFloat(row.day_pnl ?? 0);
-      const cum = parseFloat(row.cum_pnl ?? 0);
-      if (pnl >= 0) { curWin++; curLoss = 0; }
-      else          { curLoss++; curWin = 0; }
-      if (curWin  > maxWinStreak)  maxWinStreak  = curWin;
-      if (curLoss > maxLossStreak) maxLossStreak = curLoss;
-      if (cum > peakCum) peakCum = cum;
-      const dd = peakCum - cum;
-      if (dd > maxDrawdownDay) maxDrawdownDay = dd;
-    }
-
-    // Best 5 / Worst 5 setups (closed trades — al geclosed)
-    const topR = await pool.query(`
       SELECT
-        symbol, direction, session, vwap_position AS "vwapPosition",
-        CAST(max_rr AS FLOAT)             AS "maxRR",
-        CAST(realized_pnl_eur AS FLOAT)   AS "pnl",
-        hit_tp AS "hitTP", close_reason AS "closeReason",
-        opened_at AS "openedAt"
+        DATE(opened_at AT TIME ZONE 'Europe/Brussels')   AS trade_date,
+        COUNT(*)                                          AS trades,
+        COALESCE(SUM(lots), 0)                           AS total_lots,
+        COALESCE(SUM(realized_pnl_eur), 0)               AS day_pnl,
+        MAX(true_max_rr)                                  AS best_peak_rr,
+        MAX(realized_pnl_eur)                             AS max_win,
+        MIN(realized_pnl_eur)                             AS max_loss
       FROM closed_trades
       WHERE opened_at >= $1
-        AND realized_pnl_eur IS NOT NULL
-        AND close_reason IN ('tp','sl')
+        AND close_reason IN ('tp','sl','manual')
         AND (exclude_from_ev IS NULL OR exclude_from_ev = FALSE)
-      ORDER BY realized_pnl_eur DESC
-      LIMIT 5
+      GROUP BY DATE(opened_at AT TIME ZONE 'Europe/Brussels')
+      ORDER BY trade_date DESC
+    `, [EV_DATA_CUTOFF]);
+
+    // Best 10 / Worst 10 from ghost_trades by peak_rr_pos (PEAK+RR — not realized pnl)
+    const topR = await pool.query(`
+      SELECT
+        symbol, direction, session, vwap_position AS vwapPosition,
+        CAST(peak_rr_pos AS FLOAT)        AS peakRRPos,
+        CAST(realized_pnl_eur AS FLOAT)   AS pnl,
+        stop_reason AS stopReason,
+        opened_at AS openedAt
+      FROM ghost_trades
+      WHERE opened_at >= $1
+        AND peak_rr_pos IS NOT NULL
+      ORDER BY peak_rr_pos DESC
+      LIMIT 10
     `, [EV_DATA_CUTOFF]);
 
     const botR = await pool.query(`
       SELECT
-        symbol, direction, session, vwap_position AS "vwapPosition",
-        CAST(max_rr AS FLOAT)             AS "maxRR",
-        CAST(realized_pnl_eur AS FLOAT)   AS "pnl",
-        hit_tp AS "hitTP", close_reason AS "closeReason",
-        opened_at AS "openedAt"
-      FROM closed_trades
+        symbol, direction, session, vwap_position AS vwapPosition,
+        CAST(peak_rr_pos AS FLOAT)        AS peakRRPos,
+        CAST(realized_pnl_eur AS FLOAT)   AS pnl,
+        stop_reason AS stopReason,
+        opened_at AS openedAt
+      FROM ghost_trades
       WHERE opened_at >= $1
-        AND realized_pnl_eur IS NOT NULL
-        AND close_reason IN ('tp','sl')
-        AND (exclude_from_ev IS NULL OR exclude_from_ev = FALSE)
-      ORDER BY realized_pnl_eur ASC
-      LIMIT 5
+        AND peak_rr_pos IS NOT NULL
+      ORDER BY peak_rr_pos ASC
+      LIMIT 10
     `, [EV_DATA_CUTOFF]);
 
     return {
-      days:           rows.reverse(),   // meest recent eerst
-      maxWinStreak,
-      maxLossStreak,
-      maxDrawdownDay: parseFloat(maxDrawdownDay.toFixed(2)),
-      bestTrades:     topR.rows,
-      worstTrades:    botR.rows,
+      days:        r.rows,
+      bestTrades:  topR.rows,
+      worstTrades: botR.rows,
     };
   } catch (e) { console.warn('[!] loadDailyBreakdown:', e.message); return null; }
 }
@@ -2199,11 +2168,11 @@ async function loadGhostHistoryByPair(from, to) {
         opened_at                                             AS "openedAt",
         closed_at                                             AS "closedAt"
       FROM ghost_trades
-      WHERE opened_at >= $1
-        AND opened_at <= $2
+      WHERE closed_at >= $1
+        AND closed_at <= $2
         AND closed_at IS NOT NULL
         AND vwap_position IN ('above','below')
-      ORDER BY optimizer_key ASC, opened_at DESC
+      ORDER BY optimizer_key ASC, closed_at DESC
     `, [cutoff, ceiling]);
 
     // Groepeer per optimizer_key
