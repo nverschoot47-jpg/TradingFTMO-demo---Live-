@@ -27,7 +27,7 @@ const PORT           = process.env.PORT           || 3000;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
 const META_API_TOKEN = process.env.META_API_TOKEN || "";
 const META_ACCOUNT   = process.env.META_ACCOUNT   || "";
-const META_BASE      = "https://mt-client-api-v1.agiliumtrade.agiliumtrade.ai";
+const META_BASE      = process.env.META_BASE || "https://mt-client-api-v1.agiliumtrade.agiliumtrade.ai";
 
 // ── App state ────────────────────────────────────────────────────
 let dbReady          = false;   // true once initDB() succeeds
