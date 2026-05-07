@@ -1,21 +1,35 @@
 "use strict";
 // ═══════════════════════════════════════════════════════════════
-//  PRONTO-AI  v13.2.0  server.js
+//  PRONTO-AI  v13.3.0  server.js
 //
-//  FIX 1a — VWAP EXHAUSTION BLOCK (alle asset types):
-//    Signalen geblokkeerd wanneer prijs >= 150% van VWAP band.
-//    bandPct = (|close - vwap_mid| / halfBand) * 100
-//    Reject: VWAP_EXHAUSTION: band_pct=X.X% (max 150%)
-//    Gelogd in signal_log met vwap_band_pct + outcome=REJECTED.
-//    vwapBandPct ook meegestuurd bij PLACED naar logSignal/logWebhook.
+//  CHANGES v13.3.0:
+//  1. RR MILESTONES 0.1R GRANULARITEIT (Open Positions + Ghost Tracker):
+//     updateGhost() trackt nu alle RR stappen van -1.0R t/m +15.0R
+//     in stappen van 0.1R. Keys worden opgeslagen als strings:
+//     FAV: "0.1", "0.2", ... "15.0" in rrMilestones
+//     ADV: "-0.1", "-0.2", ... "-1.0" in rrMilestones
+//     Backward compatible met legacy integer keys (1,2,3,5,10).
 //
-//  FIX 1b — DUPLICATE POSITION BLOCK:
-//    Max 1 open positie per optimizerKey (symbol_session_direction_vwap).
-//    Reject: DUPLICATE_POSITION: <optKey> already open
-//    Gelogd in signal_log met outcome=REJECTED.
+//  2. GHOST HISTORY RR MILESTONES:
+//     Detail sub-tabel toont alle 0.1R milestone kolommen per trade.
+//     SL HIT = peak -RR altijd gelijkgesteld aan 100% / -1.0R.
+//     rrMilestones worden doorgegeven via /api/ghost-history-by-pair.
 //
+//  3. COMPLIANCE DATE VERWIJDERD:
+//     COMPLIANCE_DATE → '2000-01-01' (geen filtering meer).
+//     Compliance bar verborgen in dashboard.
+//     loadAll() filtert trades niet meer op cutoff datum.
+//
+//  4. SELECTIEVE DATUMFILTER GHOST HISTORY:
+//     Datumfilter bovenaan Ghost History tab (van/tot datum).
+//     loadGhostHistory() stuurt from/to params naar API.
+//     /api/ghost-history-by-pair?from=YYYY-MM-DD&to=YYYY-MM-DD
+//     loadGhostHistoryByPair(from, to) in db.js.
+//
+//  INHERITED (v13.2.0):
+//  FIX 1a — VWAP EXHAUSTION BLOCK
+//  FIX 1b — DUPLICATE POSITION BLOCK
 //  KEY FIX: app.listen() fires BEFORE any DB/MetaAPI call.
-//  The server is always reachable. DB init runs in background.
 // ═══════════════════════════════════════════════════════════════
 
 const express = require("express");
@@ -33,7 +47,7 @@ const {
 } = require("./session");
 
 // ── Version ──────────────────────────────────────────────────────
-const VERSION = "13.2.0";
+const VERSION = "13.3.0";
 
 // ── Config ───────────────────────────────────────────────────────
 const PORT           = process.env.PORT           || 3000;
@@ -206,8 +220,17 @@ function updateGhost(ghost, price) {
   if (slUsed > ghost.peakRRNeg)    ghost.peakRRNeg    = slUsed;
   for (const p of [25, 50, 75, 90, 100])
     if (slUsed >= p && !ghost.slMilestones[p]) ghost.slMilestones[p] = new Date().toISOString();
-  for (const r of [1, 2, 3, 5, 10])
-    if (rr >= r && !ghost.rrMilestones[r]) ghost.rrMilestones[r] = new Date().toISOString();
+  // FAV milestones: 0.1R steps from 0.1 to 15.0
+  for (let rv = 0.1; rv <= 15.0 + 1e-9; rv = Math.round((rv + 0.1) * 10) / 10) {
+    const key = rv.toFixed(1);
+    if (rr >= rv - 1e-9 && !ghost.rrMilestones[key]) ghost.rrMilestones[key] = new Date().toISOString();
+  }
+  // ADV milestones: 0.1 steps from 0.1 to 1.0 (stored as negative: -0.1 to -1.0)
+  const advRR = isBuy ? (entry - price) / slRange : (price - entry) / slRange;
+  for (let rv = 0.1; rv <= 1.0 + 1e-9; rv = Math.round((rv + 0.1) * 10) / 10) {
+    const key = '-' + rv.toFixed(1);
+    if (advRR >= rv - 1e-9 && !ghost.rrMilestones[key]) ghost.rrMilestones[key] = new Date().toISOString();
+  }
   const hitSL = isBuy ? price <= sl : price >= sl;
   if (hitSL && !ghost.phantomSLHit) {
     ghost.phantomSLHit = true;
@@ -577,7 +600,7 @@ function apiGet(path, fn, empty = []) {
 apiGet("/api/trades",              () => db.loadAllTrades(),                   []);
 apiGet("/api/ghost-trades",        r  => db.loadGhostTrades(r.query.key??null, parseInt(r.query.limit)||200), []);
 apiGet("/api/ghost-grouped",       () => db.loadGhostGrouped(),                []);
-apiGet("/api/ghost-history-by-pair",() => db.loadGhostHistoryByPair(),         []);
+apiGet("/api/ghost-history-by-pair", r => db.loadGhostHistoryByPair(r.query.from??null, r.query.to??null), []);
 apiGet("/api/ghost-combo-analysis",r  => db.loadGhostComboAnalysis(r.query.key??null), []);
 apiGet("/api/shadow-analysis",     () => db.loadAllShadowAnalysis(),           []);
 apiGet("/api/shadow-winners",      () => db.loadShadowWinners(),               {});
@@ -779,7 +802,7 @@ const FOREX_SYMS     = ['AUDCAD','AUDCHF','AUDNZD','AUDUSD','CADCHF','EURAUD','E
 const INDEX_SYMS     = ['DE30EUR','NAS100USD','UK100GBP','US30USD'];
 const COMM_SYMS      = ['XAUUSD'];
 const FIXED_RISK_PCT = 0.000375;
-const COMPLIANCE_MS  = new Date('2026-05-03T00:00:00.000Z').getTime();
+// v13.3: COMPLIANCE_MS verwijderd — datum restriction opgeheven
 
 // Build milestone arrays: -1.0 → -0.1 then +0.1 → +15.0 in 0.1 steps
 const ADV_STEPS = [];
@@ -1173,6 +1196,21 @@ tr:hover td{background:var(--bg4)}
 <!-- ══════════════ PAGE: GHOST HISTORY ═════════════════════════ -->
 <div class="npage" id="page-history">
   <div class="pg">
+    <!-- Selective Date Filter -->
+    <div class="card">
+      <div class="card-hdr">
+        <div class="card-title">🗓 Selective Date Filter — Ghost History</div>
+        <div class="cmeta" id="ghdate-meta">Selecteer een periode om Ghost History te filteren</div>
+      </div>
+      <div style="display:flex;align-items:center;gap:10px;padding:10px 14px;flex-wrap:wrap">
+        <span class="fl">Van:</span>
+        <input type="date" id="ghdate-from" style="background:var(--bg3);border:1px solid var(--bdr2);color:var(--ink2);padding:4px 8px;border-radius:4px;font:11px 'SF Mono',monospace;cursor:pointer" onchange="applyGHDateFilter()">
+        <span class="fl">Tot:</span>
+        <input type="date" id="ghdate-to" style="background:var(--bg3);border:1px solid var(--bdr2);color:var(--ink2);padding:4px 8px;border-radius:4px;font:11px 'SF Mono',monospace;cursor:pointer" onchange="applyGHDateFilter()">
+        <button class="fb on" id="ghdate-all-btn" onclick="clearGHDateFilter()">Alles tonen</button>
+        <span id="ghdate-active" style="display:none;font-size:10px;color:var(--y);margin-left:4px">⚠ Gefilterd op periode</span>
+      </div>
+    </div>
     <!-- Grouped by pair - expandable -->
     <div class="card">
       <div class="card-hdr">
@@ -1535,7 +1573,8 @@ async function pollStatus(){
     setText('ov-pnl-sub',(live>=0?'+':'')+live.toFixed(2)+' on open trades');
   }
   if(d.openPositions!=null){ setText('h-pos',d.openPositions); setText('nb-pos',d.openPositions); }
-  if(d.complianceDate){ setText('cbar-date','Compliance: '+d.complianceDate.slice(0,10)+' UTC'); }
+  // v13.3: compliance bar verborgen — datum restriction verwijderd
+  const cbar=document.getElementById('cbar'); if(cbar) cbar.style.display='none';
 }
 
 // ── Helpers ───────────────────────────────────────────────────────
@@ -1608,17 +1647,26 @@ async function loadPositions(){
       '<td class="cd">—</td>'+
       '<td class="cd">'+f2(p.lots)+'</td>'+
       '<td class="'+(rPct&&+rPct>0.04?'cr fw':rPct&&+rPct>0.025?'co':'cg')+'">'+(rPct!=null?rPct+'%':'—')+'</td>'+
-      // ADV milestones (-1.0 to -0.1): slMilestones keys 100,90,75,50,25
+      // ADV milestones (-1.0 to -0.1): slMilestones keys 100,90,75,50,25 + new rrMilestones '-0.1' to '-1.0'
       ADV_STEPS.map(v=>{
+        // First try new fine-grained negative keys in rrMilestones
+        const negKey='-'+v.toFixed(1);
+        const msNew=favMs[negKey]||null;
+        if(msNew) return msT(msNew,p.openedAt,false);
+        // Fallback: map to nearest slMilestones pct key (legacy)
         const pctKey=Math.round(v*100);
         const nearest=advKeys.sort((a,b)=>Math.abs(a-pctKey)-Math.abs(b-pctKey))[0];
         const ms=nearest!=null&&Math.abs(nearest-pctKey)<=15?advMs[nearest]:null;
         return msT(ms,p.openedAt,false);
       }).join('')+
-      // FAV milestones (+0.1 to +15): rrMilestones keys 1,2,3,5,10
+      // FAV milestones (+0.1 to +15): new 0.1R string keys first, fallback to integer keys
       FAV_STEPS.map(v=>{
+        const strKey=v.toFixed(1);
+        const msNew=favMs[strKey]||null;
+        if(msNew) return msT(msNew,p.openedAt,true);
+        // Fallback: legacy integer keys 1,2,3,5,10
         const intV=Math.round(v);
-        const nearest=favKeys.sort((a,b)=>Math.abs(a-intV)-Math.abs(b-intV))[0];
+        const nearest=favKeys.filter(k=>Number.isInteger(+k)).sort((a,b)=>Math.abs(a-intV)-Math.abs(b-intV))[0];
         const ms=nearest!=null&&Math.abs(nearest-intV)<=1?favMs[nearest]:null;
         return msT(ms,p.openedAt,true);
       }).join('')+
@@ -1675,14 +1723,20 @@ async function loadGhostTrackers(){
       '<td class="'+(peakPos>=2?'cg fw':peakPos>=1?'cg':peakPos>0?'cy':'cd')+'">'+f2(peakPos)+'R</td>'+
       '<td class="'+(peakNeg>80?'cr fw':peakNeg>50?'cr':peakNeg>25?'co':'cd')+'">'+( peakNeg>0?'-'+f0(peakNeg)+'%':'—')+'</td>'+
       ADV_STEPS.map(v=>{
+        const negKey='-'+v.toFixed(1);
+        const msNew=favMs[negKey]||null;
+        if(msNew) return msT(msNew,g.openedAt,false);
         const pctKey=Math.round(v*100);
         const nearest=advKeys.sort((a,b)=>Math.abs(a-pctKey)-Math.abs(b-pctKey))[0];
         const ms=nearest!=null&&Math.abs(nearest-pctKey)<=15?advMs[nearest]:null;
         return msT(ms,g.openedAt,false);
       }).join('')+
       FAV_STEPS.map(v=>{
+        const strKey=v.toFixed(1);
+        const msNew=favMs[strKey]||null;
+        if(msNew) return msT(msNew,g.openedAt,true);
         const intV=Math.round(v);
-        const nearest=favKeys.sort((a,b)=>Math.abs(a-intV)-Math.abs(b-intV))[0];
+        const nearest=favKeys.filter(k=>Number.isInteger(+k)).sort((a,b)=>Math.abs(a-intV)-Math.abs(b-intV))[0];
         const ms=nearest!=null&&Math.abs(nearest-intV)<=1?favMs[nearest]:null;
         return msT(ms,g.openedAt,true);
       }).join('')+
@@ -1868,6 +1922,37 @@ function renderBW(period){
 
 // ── Ghost History (by pair, expandable) ──────────────────────────
 let _ghhData=[],_ghhF={sess:'all',dir:'all',type:'all'};
+let _ghhDateFrom=null, _ghhDateTo=null;
+
+function applyGHDateFilter(){
+  const fromEl=document.getElementById('ghdate-from');
+  const toEl  =document.getElementById('ghdate-to');
+  _ghhDateFrom=fromEl?.value||null;
+  _ghhDateTo  =toEl?.value||null;
+  const active=document.getElementById('ghdate-active');
+  const allBtn=document.getElementById('ghdate-all-btn');
+  const hasFilter=_ghhDateFrom||_ghhDateTo;
+  if(active) active.style.display=hasFilter?'':'none';
+  if(allBtn) allBtn.classList.toggle('on',!hasFilter);
+  // Reload from server with new date range
+  _loaded['history']=false;
+  loadGhostHistory();
+  loadGhostCombo();
+}
+function clearGHDateFilter(){
+  _ghhDateFrom=null; _ghhDateTo=null;
+  const fromEl=document.getElementById('ghdate-from');
+  const toEl  =document.getElementById('ghdate-to');
+  if(fromEl) fromEl.value='';
+  if(toEl)   toEl.value='';
+  const active=document.getElementById('ghdate-active');
+  const allBtn=document.getElementById('ghdate-all-btn');
+  if(active) active.style.display='none';
+  if(allBtn) allBtn.classList.add('on');
+  _loaded['history']=false;
+  loadGhostHistory();
+  loadGhostCombo();
+}
 function setGHF(k,v,btn){
   _ghhF[k]=v;
   document.querySelectorAll('.fb[onclick*="setGHF"]').forEach(b=>{ if(b.getAttribute('onclick').includes("'"+k+"'")) b.classList.remove('on'); });
@@ -1875,13 +1960,17 @@ function setGHF(k,v,btn){
   renderGhostHistory();
 }
 async function loadGhostHistory(){
-  // /api/ghost-history-by-pair returns grouped: {optimizerKey,symbol,session,direction,vwapPosition,
-  //   n,nSLHit,nMaxRR15,nMaxDays,avgPeakPos,avgPeakNeg,maxPeakPos,maxPeakNeg,trades:[...]}
-  const d=await api('/api/ghost-history-by-pair')||[];
+  let url='/api/ghost-history-by-pair';
+  const params=[];
+  if(_ghhDateFrom) params.push('from='+encodeURIComponent(_ghhDateFrom));
+  if(_ghhDateTo)   params.push('to='  +encodeURIComponent(_ghhDateTo+'T23:59:59'));
+  if(params.length) url+='?'+params.join('&');
+  const d=await api(url)||[];
   _ghhData=d;
   const closed=d.reduce((s,g)=>s+(g.n||0),0);
   setText('h-ghh',closed);
-  setText('ghh-meta',d.length+' combos · compliance+');
+  const dateLbl=(_ghhDateFrom||_ghhDateTo)?(' · '+(_ghhDateFrom||'begin')+' → '+(_ghhDateTo||'nu')):'';
+  setText('ghh-meta',d.length+' combos'+dateLbl);
   renderGhostHistory();
 }
 function renderGhostHistory(){
@@ -1919,14 +2008,35 @@ function renderGhostHistory(){
     '</tr>'+
     '<tr id="ghh-d-'+safeKey+'" style="display:none">'+
       '<td colspan="15" style="padding:0;background:var(--bg3)">'+
-        '<div style="overflow-x:auto"><table style="font-size:9px;min-width:600px">'+
+        '<div style="overflow-x:auto"><table style="font-size:9px;min-width:900px">'+
           '<thead><tr>'+
             '<th>#</th><th>Date</th><th>Stop Reason</th><th>TP RR</th><th>Max RR</th>'+
             '<th>Peak+RR</th><th>Peak-RR%</th><th>MAE%</th>'+
-          '</tr></thead><tbody>'+
+            // ADV milestone headers: -0.1 to -1.0
+            '<th class="adv-th" colspan="10" style="text-align:center">← Adverse (tijd tot)</th>'+
+            // FAV milestone headers: +0.1 to +15.0
+            '<th class="fav-th" colspan="150" style="text-align:center">Favorable (tijd tot) →</th>'+
+          '</tr>'+
+          '<tr>'+
+            '<th colspan="8"></th>'+
+            [0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0].map(v=>'<th class="adv-th" style="font-size:8px">-'+v.toFixed(1)+'</th>').join('')+
+            (()=>{let s='';for(let v=0.1;v<=15.0+1e-9;v=Math.round((v+0.1)*10)/10)s+='<th class="fav-th" style="font-size:8px">+'+v.toFixed(1)+'</th>';return s;})()
+          +'</tr></thead><tbody>'+
           (g.trades||[]).map((t,i)=>{
             const sr=t.stopReason;
+            // v13.3: SL HIT = peak -RR altijd 100% (= 1.0R adverse)
+            const isSLHit = sr==='phantom_sl'||t.phantomSLHit;
             const srCls=sr==='phantom_sl'?'cr':sr==='max_rr_15'?'cg':'cy';
+            const rrMs  = t.rrMilestones || {};
+            const slMs  = t.slMilestones || {};
+            // Milestone cell helper: toont elapsed tijd in minuten
+            const msCell=(iso,opened,isFav)=>{
+              const cls=isFav?'ms-fav cg':'ms-adv cr';
+              if(!iso||!opened) return '<td class="'+cls+'" style="font-size:8px;min-width:28px">—</td>';
+              const mins=Math.round((new Date(iso)-new Date(opened))/60000);
+              const h=Math.floor(mins/60),m=mins%60;
+              return '<td class="'+cls+'" style="font-size:8px;min-width:28px">'+(h>0?h+'h'+m+'m':m+'m')+'</td>';
+            };
             return '<tr style="border-bottom:1px solid var(--bdr)">'+
               '<td class="cd">'+( i+1)+'</td>'+
               '<td class="cd" style="font-size:8px">'+dtS(t.openedAt)+'</td>'+
@@ -1934,9 +2044,23 @@ function renderGhostHistory(){
               '<td class="cy">'+f2(t.tpRRUsed)+'</td>'+
               '<td class="cy">'+f2(t.maxRR)+'R</td>'+
               '<td class="cg">'+f2(t.peakRRPos)+'R</td>'+
-              '<td class="cr">'+f1(t.peakRRNeg)+'%</td>'+
+              // v13.3: SL HIT → peak -RR = 100% (1.0R)
+              '<td class="cr">'+(isSLHit?'100%':f1(t.peakRRNeg)+'%')+'</td>'+
               '<td class="cd">'+f1(t.maxSlPct)+'%</td>'+
-            '</tr>';
+              // ADV milestones -0.1 to -1.0
+              [0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0].map(v=>{
+                // SL HIT: -1.0 milestone = closedAt
+                const key='-'+v.toFixed(1);
+                let iso=rrMs[key]||null;
+                if(!iso&&isSLHit&&Math.abs(v-1.0)<1e-9) iso=t.closedAt||null;
+                return msCell(iso,t.openedAt,false);
+              }).join('')+
+              // FAV milestones +0.1 to +15.0
+              (()=>{let s='';for(let v=0.1;v<=15.0+1e-9;v=Math.round((v+0.1)*10)/10){
+                const key=v.toFixed(1);
+                s+=msCell(rrMs[key]||null,t.openedAt,true);
+              }return s;})()
+            +'</tr>';
           }).join('')+
         '</tbody></table></div>'+
       '</td>'+
@@ -2187,14 +2311,13 @@ async function loadAll(){
   // 1. Status poll + live positions + ghost trackers in parallel
   await Promise.all([pollStatus(), loadPositions(), loadGhostTrackers()]);
   // 2. Trade history + daily breakdown + ghost grouped
-  const compDateStr=document.getElementById('cbar-date')?.textContent?.match(/\d{4}-\d{2}-\d{2}/)?.[0];
-  const cutoff=compDateStr?new Date(compDateStr+'T00:00:00Z').getTime():0;
   const [trades,daily,ghGrouped]=await Promise.all([
     api('/api/trades'),
     api('/api/daily-breakdown'),
     api('/api/ghost-grouped'),
   ]);
-  _allTrades=(trades||[]).filter(t=>t.openedAt&&new Date(t.openedAt).getTime()>=cutoff);
+  // v13.3: compliance date verwijderd — alle trades tonen
+  _allTrades=(trades||[]);
   renderOverview(_allTrades,daily,ghGrouped);
 }
 
