@@ -47,7 +47,7 @@ const {
 } = require("./session");
 
 // ── Version ──────────────────────────────────────────────────────
-const VERSION = "13.3.0";
+const VERSION = "13.4.0";
 
 // ── Config ───────────────────────────────────────────────────────
 const PORT           = process.env.PORT           || 3000;
@@ -59,6 +59,7 @@ const META_BASE      = process.env.META_BASE || "https://mt-client-api-v1.agiliu
 // ── App state ────────────────────────────────────────────────────
 let dbReady          = false;   // true once initDB() succeeds
 let openPositions    = new Map();
+let blockedPositions = new Map(); // invisible ghost trackers voor blocked signals
 let tpConfigs        = {};
 let symbolRiskMap    = {};
 let keyRiskMults     = {};
@@ -289,6 +290,38 @@ async function closePosition(positionId, reason = "manual", pnl = null) {
   console.log(`[Pos] Closed ${positionId} ${pos.symbol} ${pos.direction} reason=${reason} pnl=${realPnl}`);
 }
 
+// ── Blocked Ghost helpers ─────────────────────────────────────────
+// Maak een invisible ghost tracker voor een geblokkeerd signaal
+function initBlockedGhost({ blockType, symbol, mt5Symbol, session, direction,
+    vwapPosition, entry, sl, slPct, tpRRUsed, optimizerKey, vwapBandPct, blockReason }) {
+  const id = `BGT_${Date.now()}_${optimizerKey}`.replace(/[^a-z0-9_]/gi, '_');
+  return {
+    id, blockType, optimizerKey, symbol, mt5Symbol: mt5Symbol ?? symbol,
+    session, direction, vwapPosition: vwapPosition ?? 'unknown',
+    entry: parseFloat(entry), sl: parseFloat(sl),
+    slPct: slPct ?? null, tpRRUsed: tpRRUsed ?? null,
+    maxPrice: parseFloat(entry), maxRR: 0, maxSlPctUsed: 0,
+    peakRRPos: 0, peakRRNeg: 0,
+    slMilestones: {}, rrMilestones: {},
+    phantomSLHit: false, stopReason: null, timeToSLMin: null,
+    vwapBandPct: vwapBandPct ?? null, blockReason: blockReason ?? null,
+    openedAt: new Date().toISOString(), closedAt: null,
+  };
+}
+
+async function closeBlockedGhost(id, reason = 'timeout') {
+  const bg = blockedPositions.get(id);
+  if (!bg) return;
+  blockedPositions.delete(id);
+  bg.closedAt   = new Date().toISOString();
+  bg.stopReason = bg.stopReason ?? reason;
+  if (dbReady) {
+    await db.saveBlockedGhostTrade(bg).catch(e => recordError(`saveBlockedGhostTrade: ${e.message}`));
+    db.deleteBlockedGhostState(id).catch(() => {});
+  }
+  console.log(`[BlockedGhost] Closed ${id} ${bg.symbol} ${bg.direction} reason=${reason}`);
+}
+
 // ── Position sync (cron) ─────────────────────────────────────────
 async function syncPositions() {
   if (!isMonitoringActive() || !dbReady) return;
@@ -300,9 +333,25 @@ async function syncPositions() {
   for (const lp of live) {
     const pos = openPositions.get(String(lp.id));
     if (pos?.ghost && lp.currentPrice) {
-      if (!pos.ghost.direction) continue;  // skip external positions without direction
+      if (!pos.ghost.direction) continue;
       updateGhost(pos.ghost, lp.currentPrice);
       if (dbReady) db.saveGhostState(pos.ghost).catch(() => {});
+    }
+  }
+  // ── Blocked ghost trackers: update via live MT5 prices ──
+  // Gebruik de liveIds priceMap — blocked ghosts volgen hetzelfde symbool
+  const priceMap = new Map(live.map(p => [p.symbol, p.currentPrice]));
+  const now = Date.now();
+  for (const [id, bg] of blockedPositions) {
+    const price = priceMap.get(bg.mt5Symbol) ?? priceMap.get(bg.symbol);
+    if (price) updateGhost(bg, price);
+    // Auto-close na: phantom SL geraakt OF 15R bereikt OF 14 dagen oud
+    const ageDays = (now - new Date(bg.openedAt).getTime()) / 86_400_000;
+    if (bg.phantomSLHit || bg.stopReason === 'max_rr_15' || ageDays > 14) {
+      if (!bg.stopReason) bg.stopReason = ageDays > 14 ? 'timeout_14d' : bg.stopReason;
+      await closeBlockedGhost(id, bg.stopReason ?? 'auto');
+    } else if (dbReady) {
+      db.saveBlockedGhostState(bg).catch(() => {});
     }
   }
 }
@@ -427,6 +476,32 @@ app.post("/webhook", async (req, res) => {
   if (!allowed) {
     db.logSignal({ symbol, direction, outcome: "REJECTED", rejectReason: mktReason,
       session: getSession(), latencyMs: Date.now() - t0 }).catch(() => {});
+    // ── v13.4: NY_DEAD_ZONE → maak invisible blocked ghost tracker ──
+    if (dbReady && mktReason && mktReason.includes('NY_DEAD_ZONE')) {
+      const tvEntryB = req.body?.close ? parseFloat(req.body.close) : null;
+      const slPctB   = req.body?.sl_pct ? parseFloat(req.body.sl_pct) : 0.003;
+      if (tvEntryB && slPctB) {
+        const symInfoB = getSymbolInfo(symbol);
+        const mt5B     = symInfoB?.mt5 ?? symbol;
+        const sesB     = getSession();
+        const vwapB    = req.body?.vwap ? parseFloat(req.body.vwap) : null;
+        const vwapPosB = getVwapPosition(tvEntryB, vwapB);
+        const optKeyB  = buildOptimizerKey(symbol, sesB, direction, vwapPosB);
+        const slBuf    = symInfoB?.type === 'stock' ? STOCK_SL_BUFFER_MULT : SL_BUFFER_MULT;
+        const slDistB  = slPctB * slBuf * tvEntryB;
+        const slPriceB = direction === 'buy' ? tvEntryB - slDistB : tvEntryB + slDistB;
+        const bg = initBlockedGhost({
+          blockType: 'NY_DEAD_ZONE', symbol, mt5Symbol: mt5B,
+          session: sesB, direction, vwapPosition: vwapPosB,
+          entry: tvEntryB, sl: slPriceB, slPct: slPctB,
+          tpRRUsed: tpConfigs[optKeyB]?.lockedRR ?? 2.0,
+          optimizerKey: optKeyB, blockReason: mktReason,
+        });
+        blockedPositions.set(bg.id, bg);
+        db.saveBlockedGhostState(bg).catch(() => {});
+        console.log(`[BlockedGhost] NY_DEAD_ZONE tracker created: ${bg.id} ${symbol} ${direction}`);
+      }
+    }
     return res.json({ ok: false, reason: mktReason });
   }
 
@@ -455,18 +530,48 @@ app.post("/webhook", async (req, res) => {
     db.logSignal({ symbol, direction, session, vwapPosition: vwapPos, optimizerKey: optKey,
       tvEntry, slPct, vwapBandPct, outcome: "REJECTED", rejectReason,
       latencyMs: Date.now() - t0 }).catch(() => {});
+    // ── v13.4: VWAP_EXHAUSTION → maak invisible blocked ghost tracker ──
+    if (dbReady && tvEntry && slPct) {
+      const slBufVE  = assetType === 'stock' ? STOCK_SL_BUFFER_MULT : SL_BUFFER_MULT;
+      const slDistVE = slPct * slBufVE * tvEntry;
+      const slPriceVE = direction === 'buy' ? tvEntry - slDistVE : tvEntry + slDistVE;
+      const bg = initBlockedGhost({
+        blockType: 'VWAP_EXHAUSTION', symbol, mt5Symbol: mt5Sym,
+        session, direction, vwapPosition: vwapPos,
+        entry: tvEntry, sl: slPriceVE, slPct,
+        tpRRUsed: tpConfigs[optKey]?.lockedRR ?? 2.0,
+        optimizerKey: optKey, vwapBandPct, blockReason: rejectReason,
+      });
+      blockedPositions.set(bg.id, bg);
+      db.saveBlockedGhostState(bg).catch(() => {});
+      console.log(`[BlockedGhost] VWAP_EXHAUSTION tracker created: ${bg.id} ${symbol} band=${vwapBandPct}%`);
+    }
     return res.json({ ok: false, reason: rejectReason, vwapBandPct });
   }
 
   // ── FIX 1b: Duplicate check — max 1 open positie per optimizerKey ──
-  // optKey = symbol_session_direction_vwapPos → bv. EURUSD_london_buy_above
-  // Als er al een open positie bestaat met dezelfde key, blokkeer het signaal.
   for (const [, existingPos] of openPositions) {
     if (existingPos.optimizerKey === optKey) {
       const rejectReason = `DUPLICATE_POSITION: ${optKey} already open (positionId=${existingPos.positionId})`;
       db.logSignal({ symbol, direction, session, vwapPosition: vwapPos, optimizerKey: optKey,
         tvEntry, slPct, vwapBandPct, outcome: "REJECTED", rejectReason,
         latencyMs: Date.now() - t0 }).catch(() => {});
+      // ── v13.4: DUPLICATE → maak invisible blocked ghost tracker ──
+      if (dbReady && tvEntry && slPct) {
+        const slBufD  = assetType === 'stock' ? STOCK_SL_BUFFER_MULT : SL_BUFFER_MULT;
+        const slDistD = slPct * slBufD * tvEntry;
+        const slPriceD = direction === 'buy' ? tvEntry - slDistD : tvEntry + slDistD;
+        const bg = initBlockedGhost({
+          blockType: 'DUPLICATE', symbol, mt5Symbol: mt5Sym,
+          session, direction, vwapPosition: vwapPos,
+          entry: tvEntry, sl: slPriceD, slPct,
+          tpRRUsed: tpConfigs[optKey]?.lockedRR ?? 2.0,
+          optimizerKey: optKey, blockReason: rejectReason,
+        });
+        blockedPositions.set(bg.id, bg);
+        db.saveBlockedGhostState(bg).catch(() => {});
+        console.log(`[BlockedGhost] DUPLICATE tracker created: ${bg.id} ${symbol} ${direction}`);
+      }
       return res.json({ ok: false, reason: rejectReason });
     }
   }
@@ -601,6 +706,10 @@ apiGet("/api/trades",              () => db.loadAllTrades(),                   [
 apiGet("/api/ghost-trades",        r  => db.loadGhostTrades(r.query.key??null, parseInt(r.query.limit)||200), []);
 apiGet("/api/ghost-grouped",       () => db.loadGhostGrouped(),                []);
 apiGet("/api/ghost-history-by-pair", r => db.loadGhostHistoryByPair(r.query.from??null, r.query.to??null), []);
+// v13.4: blocked ghost tracker routes
+apiGet("/api/blocked-ghosts/active",  () => db.loadActiveBlockedGhosts(), []);
+apiGet("/api/blocked-ghosts/history", r  => db.loadBlockedGhostHistory(
+  r.query.blockType ?? 'NY_DEAD_ZONE', r.query.from ?? null, r.query.to ?? null), []);
 apiGet("/api/ghost-combo-analysis",r  => db.loadGhostComboAnalysis(r.query.key??null), []);
 apiGet("/api/shadow-analysis",     () => db.loadAllShadowAnalysis(),           []);
 apiGet("/api/shadow-winners",      () => db.loadShadowWinners(),               {});
@@ -965,6 +1074,22 @@ tr:hover td{background:var(--bg4)}
   <span id="cbar-desc">all EV, statistics &amp; P&amp;L calculated only on trades after this date</span>
 </div>
 
+<!-- ═══════════════════════ GLOBAL DATE FILTER ══════════════════ -->
+<div id="global-filter-bar" style="background:#0a1120;border-bottom:1px solid var(--bdr2);padding:4px 14px;display:flex;align-items:center;gap:8px;flex-shrink:0;flex-wrap:wrap">
+  <span style="font-size:9px;color:var(--ink3);text-transform:uppercase;letter-spacing:.6px;font-weight:600">📅 Date Filter:</span>
+  <span style="font-size:9px;color:var(--ink3)">Open:</span>
+  <input type="date" id="gf-open-from" placeholder="van" style="background:var(--bg3);border:1px solid var(--bdr2);color:var(--ink2);padding:2px 6px;border-radius:3px;font:10px 'SF Mono',monospace" onchange="applyGlobalFilter()">
+  <span style="font-size:9px;color:var(--ink3)">→</span>
+  <input type="date" id="gf-open-to" placeholder="tot" style="background:var(--bg3);border:1px solid var(--bdr2);color:var(--ink2);padding:2px 6px;border-radius:3px;font:10px 'SF Mono',monospace" onchange="applyGlobalFilter()">
+  <span style="font-size:9px;color:var(--ink3);margin-left:6px">Closed:</span>
+  <input type="date" id="gf-close-from" placeholder="van" style="background:var(--bg3);border:1px solid var(--bdr2);color:var(--ink2);padding:2px 6px;border-radius:3px;font:10px 'SF Mono',monospace" onchange="applyGlobalFilter()">
+  <span style="font-size:9px;color:var(--ink3)">→</span>
+  <input type="date" id="gf-close-to" placeholder="tot" style="background:var(--bg3);border:1px solid var(--bdr2);color:var(--ink2);padding:2px 6px;border-radius:3px;font:10px 'SF Mono',monospace" onchange="applyGlobalFilter()">
+  <button class="fb on" id="gf-reset-btn" onclick="resetGlobalFilter()" style="margin-left:4px">✕ Reset</button>
+  <span id="gf-active-lbl" style="display:none;font-size:9px;color:var(--y);font-weight:700">⚠ Actief filter</span>
+  <span id="gf-count-lbl" style="font-size:9px;color:var(--ink3);margin-left:auto"></span>
+</div>
+
 <!-- ═══════════════════════ NAV ════════════════════════════════ -->
 <nav id="main-nav">
   <div class="ntab on"  data-page="overview">Overview</div>
@@ -974,6 +1099,7 @@ tr:hover td{background:var(--bg4)}
   <div class="ntab"     data-page="ev">EV TP Optimizer</div>
   <div class="ntab"     data-page="evsl">EV SL Optimizer</div>
   <div class="ntab"     data-page="signals">Signals &amp; Blocked<span class="nbadge" id="nb-sig" style="pointer-events:none;display:none"></span></div>
+  <div class="ntab"     data-page="shadow-playbook" style="color:var(--p)">🔮 Shadow Playbook<span class="nbadge" id="nb-bgt" style="pointer-events:none;display:none;background:var(--p2);color:var(--p)"></span></div>
 </nav>
 
 <!-- ══════════════ PAGE: OVERVIEW ══════════════════════════════ -->
@@ -1468,6 +1594,164 @@ tr:hover td{background:var(--bg4)}
   </div>
 </div>
 
+<!-- ══════════════ PAGE: SHADOW PLAYBOOK ════════════════════════ -->
+<div class="npage" id="page-shadow-playbook">
+  <div class="pg">
+
+    <!-- Info banner -->
+    <div style="background:rgba(188,140,255,.08);border:1px solid rgba(188,140,255,.2);border-radius:8px;padding:12px 16px;font-size:10px;color:var(--ink3);line-height:1.7">
+      <strong style="color:var(--p)">🔮 Shadow Playbook</strong> — Invisible ghost trackers voor geblokkeerde signalen.
+      Elk signaal dat geblokkeerd wordt door <span style="color:var(--o)">NY Dead Zone</span>, <span style="color:var(--y)">Duplicate Position</span> of <span style="color:var(--r)">VWAP Exhaustion</span>
+      wordt bijgehouden als een echte ghost — inclusief RR milestones, peak RR en SL tracking.
+      Gebruik deze data om te beslissen welke setups je aan je playbook wil toevoegen.
+    </div>
+
+    <!-- Date filter -->
+    <div class="card">
+      <div class="card-hdr">
+        <div class="card-title">🗓 Periode Filter — Blocked Ghost History</div>
+        <div class="cmeta" id="bgt-date-meta">Alle blocked ghosts</div>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px;padding:8px 14px;flex-wrap:wrap">
+        <span class="fl">Van:</span>
+        <input type="date" id="bgt-from" style="background:var(--bg3);border:1px solid var(--bdr2);color:var(--ink2);padding:3px 7px;border-radius:3px;font:10px 'SF Mono',monospace" onchange="loadShadowPlaybook()">
+        <span class="fl">Tot:</span>
+        <input type="date" id="bgt-to"   style="background:var(--bg3);border:1px solid var(--bdr2);color:var(--ink2);padding:3px 7px;border-radius:3px;font:10px 'SF Mono',monospace" onchange="loadShadowPlaybook()">
+        <button class="fb" onclick="document.getElementById('bgt-from').value='';document.getElementById('bgt-to').value='';loadShadowPlaybook()">Reset</button>
+      </div>
+    </div>
+
+    <!-- Active blocked ghosts -->
+    <div class="card">
+      <div class="card-hdr">
+        <div class="card-title"><div class="dot r"></div>Actieve Blocked Ghosts — Live Tracking</div>
+        <div class="cmeta" id="bgt-active-meta">loading…</div>
+      </div>
+      <div class="tw">
+        <table>
+          <thead><tr>
+            <th>Symbol</th><th>Type</th><th>Block Type</th><th>Dir</th><th>VWAP</th><th>Session</th>
+            <th>Entry</th><th>Peak+RR</th><th>Peak−RR%</th><th>Band%</th><th>Elapsed</th><th>Reden</th>
+          </tr></thead>
+          <tbody id="bgt-active-body"><tr><td colspan="12" class="nd">Geen actieve blocked ghosts</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Sub-tabs voor 3 block types -->
+    <div class="card">
+      <div style="display:flex;border-bottom:1px solid var(--bdr);background:var(--bg3)">
+        <div id="bgt-tab-ny"   class="ntab on"  onclick="setBGTTab('ny')"   style="color:var(--o);border-bottom:2px solid var(--o)">⏰ NY Dead Zone</div>
+        <div id="bgt-tab-dup"  class="ntab"     onclick="setBGTTab('dup')"  style="">📌 Duplicate Position</div>
+        <div id="bgt-tab-vwap" class="ntab"     onclick="setBGTTab('vwap')" style="">📊 VWAP Exhaustion</div>
+      </div>
+
+      <!-- NY DEAD ZONE -->
+      <div id="bgt-pane-ny">
+        <div style="padding:8px 14px;background:rgba(240,136,62,.05);border-bottom:1px solid rgba(240,136,62,.15);font-size:10px;color:var(--ink3)">
+          <strong style="color:var(--o)">NY Dead Zone</strong> (15:30–18:00 Brussels): Forex, Commodity &amp; Stocks geblokkeerd bij NYSE open.
+          Indexes worden nooit geblokkeerd. Track hier of bepaalde symbolen/richtingen het waard zijn toe te voegen.
+        </div>
+        <div class="fbar">
+          <span class="fl">Session:</span>
+          <button class="fb on" onclick="setBGTFilter('ny','sess','all',this)">All</button>
+          <button class="fb" onclick="setBGTFilter('ny','sess','ny',this)">NY</button>
+          <button class="fb" onclick="setBGTFilter('ny','sess','london',this)">London</button>
+          &nbsp;<span class="fl">Dir:</span>
+          <button class="fb on" onclick="setBGTFilter('ny','dir','all',this)">All</button>
+          <button class="fb" onclick="setBGTFilter('ny','dir','buy',this)">Buy</button>
+          <button class="fb" onclick="setBGTFilter('ny','dir','sell',this)">Sell</button>
+          &nbsp;<span class="fl">Type:</span>
+          <button class="fb on" onclick="setBGTFilter('ny','type','all',this)">All</button>
+          <button class="fb" onclick="setBGTFilter('ny','type','forex',this)">Forex</button>
+          <button class="fb" onclick="setBGTFilter('ny','type','stock',this)">Stock</button>
+          <button class="fb" onclick="setBGTFilter('ny','type','commodity',this)">Comm</button>
+        </div>
+        <div class="tw"><table id="bgt-ny-tbl">
+          <thead><tr>
+            <th style="width:16px"></th>
+            <th>Symbol</th><th>Type</th><th>Session</th><th>Dir</th><th>VWAP</th>
+            <th># Blocked</th><th>SL Hits</th><th>15R Hits</th>
+            <th>Avg Peak+RR</th><th>Max Peak+RR</th><th>Avg Peak−RR%</th>
+            <th>Verdict</th>
+          </tr></thead>
+          <tbody id="bgt-ny-body"><tr><td colspan="13" class="nd"><span class="spin">⟳</span></td></tr></tbody>
+        </table></div>
+      </div>
+
+      <!-- DUPLICATE POSITION -->
+      <div id="bgt-pane-dup" style="display:none">
+        <div style="padding:8px 14px;background:rgba(210,153,34,.05);border-bottom:1px solid rgba(210,153,34,.15);font-size:10px;color:var(--ink3)">
+          <strong style="color:var(--y)">Duplicate Position</strong>: Signalen geblokkeerd omdat er al een open trade is voor dezelfde key (symbol/session/dir/vwap).
+          Track hier of het waard is om meerdere posities per key toe te staan.
+        </div>
+        <div class="fbar">
+          <span class="fl">Session:</span>
+          <button class="fb on" onclick="setBGTFilter('dup','sess','all',this)">All</button>
+          <button class="fb" onclick="setBGTFilter('dup','sess','asia',this)">Asia</button>
+          <button class="fb" onclick="setBGTFilter('dup','sess','london',this)">London</button>
+          <button class="fb" onclick="setBGTFilter('dup','sess','ny',this)">NY</button>
+          &nbsp;<span class="fl">Dir:</span>
+          <button class="fb on" onclick="setBGTFilter('dup','dir','all',this)">All</button>
+          <button class="fb" onclick="setBGTFilter('dup','dir','buy',this)">Buy</button>
+          <button class="fb" onclick="setBGTFilter('dup','dir','sell',this)">Sell</button>
+          &nbsp;<span class="fl">Type:</span>
+          <button class="fb on" onclick="setBGTFilter('dup','type','all',this)">All</button>
+          <button class="fb" onclick="setBGTFilter('dup','type','forex',this)">Forex</button>
+          <button class="fb" onclick="setBGTFilter('dup','type','stock',this)">Stock</button>
+          <button class="fb" onclick="setBGTFilter('dup','type','index',this)">Index</button>
+          <button class="fb" onclick="setBGTFilter('dup','type','commodity',this)">Comm</button>
+        </div>
+        <div class="tw"><table id="bgt-dup-tbl">
+          <thead><tr>
+            <th style="width:16px"></th>
+            <th>Symbol</th><th>Type</th><th>Session</th><th>Dir</th><th>VWAP</th>
+            <th># Blocked</th><th>SL Hits</th><th>15R Hits</th>
+            <th>Avg Peak+RR</th><th>Max Peak+RR</th><th>Avg Peak−RR%</th>
+            <th>Verdict</th>
+          </tr></thead>
+          <tbody id="bgt-dup-body"><tr><td colspan="13" class="nd"><span class="spin">⟳</span></td></tr></tbody>
+        </table></div>
+      </div>
+
+      <!-- VWAP EXHAUSTION -->
+      <div id="bgt-pane-vwap" style="display:none">
+        <div style="padding:8px 14px;background:rgba(248,81,73,.05);border-bottom:1px solid rgba(248,81,73,.15);font-size:10px;color:var(--ink3)">
+          <strong style="color:var(--r)">VWAP Exhaustion</strong>: Signalen geblokkeerd omdat de prijs ≥ 150% van de VWAP band is.
+          Track hier de band% bij blokkering — zijn er symbolen die op 160%, 200%+ nog steeds goede setups geven?
+          Overweeg de drempel per symbol/combo aan te passen.
+        </div>
+        <div class="fbar">
+          <span class="fl">Session:</span>
+          <button class="fb on" onclick="setBGTFilter('vwap','sess','all',this)">All</button>
+          <button class="fb" onclick="setBGTFilter('vwap','sess','asia',this)">Asia</button>
+          <button class="fb" onclick="setBGTFilter('vwap','sess','london',this)">London</button>
+          <button class="fb" onclick="setBGTFilter('vwap','sess','ny',this)">NY</button>
+          &nbsp;<span class="fl">Dir:</span>
+          <button class="fb on" onclick="setBGTFilter('vwap','dir','all',this)">All</button>
+          <button class="fb" onclick="setBGTFilter('vwap','dir','buy',this)">Buy</button>
+          <button class="fb" onclick="setBGTFilter('vwap','dir','sell',this)">Sell</button>
+          &nbsp;<span class="fl">Band%:</span>
+          <button class="fb on" onclick="setBGTFilter('vwap','band','all',this)">All</button>
+          <button class="fb" onclick="setBGTFilter('vwap','band','150_200',this)">150–200%</button>
+          <button class="fb" onclick="setBGTFilter('vwap','band','200_300',this)">200–300%</button>
+          <button class="fb" onclick="setBGTFilter('vwap','band','300plus',this)">300%+</button>
+        </div>
+        <div class="tw"><table id="bgt-vwap-tbl">
+          <thead><tr>
+            <th style="width:16px"></th>
+            <th>Symbol</th><th>Type</th><th>Session</th><th>Dir</th><th>VWAP</th>
+            <th># Blocked</th><th>SL Hits</th><th>15R Hits</th>
+            <th>Avg Peak+RR</th><th>Max Peak+RR</th><th>Avg Peak−RR%</th>
+            <th>Avg Band%</th><th>Verdict</th>
+          </tr></thead>
+          <tbody id="bgt-vwap-body"><tr><td colspan="14" class="nd"><span class="spin">⟳</span></td></tr></tbody>
+        </table></div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <script>
 'use strict';
 
@@ -1526,7 +1810,7 @@ function updateClock(){
 setInterval(updateClock,1000); updateClock();
 
 // ── Page nav (event delegation) ──────────────────────────────────
-const PAGES=['overview','positions','ghosts','history','ev','evsl','signals'];
+const PAGES=['overview','positions','ghosts','history','ev','evsl','signals','shadow-playbook'];
 const _loaded={};
 function showPage(name){
   PAGES.forEach(p=>{ const pg=document.getElementById('page-'+p); if(pg) pg.classList.remove('on'); });
@@ -1535,15 +1819,57 @@ function showPage(name){
   const tab=document.querySelector('.ntab[data-page="'+name+'"]'); if(tab) tab.classList.add('on');
   if(!_loaded[name]){
     _loaded[name]=true;
-    if(name==='history') { loadGhostHistory(); loadGhostCombo(); }
-    if(name==='evsl')    loadEVSL();
-    if(name==='signals') { loadSignals(); loadBlockedRaw(); loadBand(); }
-    if(name==='ev')      loadEV();
+    if(name==='history')         { loadGhostHistory(); loadGhostCombo(); }
+    if(name==='evsl')            loadEVSL();
+    if(name==='signals')         { loadSignals(); loadBlockedRaw(); loadBand(); }
+    if(name==='ev')              loadEV();
+    if(name==='shadow-playbook') loadShadowPlaybook();
   }
 }
 document.addEventListener('click',e=>{
   const t=e.target.closest('.ntab[data-page]'); if(t) showPage(t.dataset.page);
 });
+
+// ══════════════════════════════════════════════════════════════════
+//  GLOBAL DATE FILTER
+// ══════════════════════════════════════════════════════════════════
+const _gf = { openFrom: null, openTo: null, closeFrom: null, closeTo: null };
+
+function applyGlobalFilter() {
+  _gf.openFrom  = document.getElementById('gf-open-from')?.value  || null;
+  _gf.openTo    = document.getElementById('gf-open-to')?.value    || null;
+  _gf.closeFrom = document.getElementById('gf-close-from')?.value || null;
+  _gf.closeTo   = document.getElementById('gf-close-to')?.value   || null;
+  const active  = _gf.openFrom || _gf.openTo || _gf.closeFrom || _gf.closeTo;
+  const lbl     = document.getElementById('gf-active-lbl');
+  const rst     = document.getElementById('gf-reset-btn');
+  if(lbl) lbl.style.display = active ? '' : 'none';
+  if(rst) rst.classList.toggle('on', !!active);
+  // Reload alle actieve pagina's
+  Object.keys(_loaded).forEach(p => { _loaded[p] = false; });
+  showPage(PAGES.find(p => document.getElementById('page-'+p)?.classList.contains('on')) || 'overview');
+}
+function resetGlobalFilter() {
+  ['gf-open-from','gf-open-to','gf-close-from','gf-close-to'].forEach(id => {
+    const el = document.getElementById(id); if(el) el.value = '';
+  });
+  _gf.openFrom = _gf.openTo = _gf.closeFrom = _gf.closeTo = null;
+  const lbl = document.getElementById('gf-active-lbl');
+  if(lbl) lbl.style.display = 'none';
+  Object.keys(_loaded).forEach(p => { _loaded[p] = false; });
+  showPage(PAGES.find(p => document.getElementById('page-'+p)?.classList.contains('on')) || 'overview');
+}
+
+// Bouw query string voor globale datumfilter
+function gfParams(extra) {
+  const p = { ...(extra || {}) };
+  if(_gf.openFrom)  p.openFrom  = _gf.openFrom;
+  if(_gf.openTo)    p.openTo    = _gf.openTo;
+  if(_gf.closeFrom) p.closeFrom = _gf.closeFrom;
+  if(_gf.closeTo)   p.closeTo   = _gf.closeTo;
+  const qs = Object.entries(p).map(([k,v])=>k+'='+encodeURIComponent(v)).join('&');
+  return qs ? '?'+qs : '';
+}
 
 // ── Milestone toggle ─────────────────────────────────────────────
 let _msVisible=false;
@@ -2307,6 +2633,208 @@ async function loadBand(){
   });
 })();
 
+// ══════════════════════════════════════════════════════════════════
+//  SHADOW PLAYBOOK — Blocked Ghost Tracker UI
+// ══════════════════════════════════════════════════════════════════
+let _bgtTab = 'ny';
+let _bgtFilters = {
+  ny:   { sess: 'all', dir: 'all', type: 'all' },
+  dup:  { sess: 'all', dir: 'all', type: 'all' },
+  vwap: { sess: 'all', dir: 'all', band: 'all' },
+};
+let _bgtData = { ny: [], dup: [], vwap: [] };
+
+function setBGTTab(tab) {
+  _bgtTab = tab;
+  ['ny','dup','vwap'].forEach(t => {
+    const pane = document.getElementById('bgt-pane-'+t);
+    const tabEl= document.getElementById('bgt-tab-'+t);
+    if(pane) pane.style.display = t === tab ? '' : 'none';
+    if(tabEl){
+      tabEl.classList.toggle('on', t === tab);
+      const col = t==='ny'?'var(--o)':t==='dup'?'var(--y)':'var(--r)';
+      tabEl.style.borderBottomColor = t === tab ? col : 'transparent';
+      tabEl.style.color = t === tab ? col : 'var(--ink3)';
+    }
+  });
+}
+
+function setBGTFilter(tab, key, val, btn) {
+  _bgtFilters[tab][key] = val;
+  // deselect sibling buttons with same key
+  if(btn) {
+    const par = btn.closest('.fbar');
+    if(par) par.querySelectorAll('.fb[onclick*="setBGTFilter(\''+tab+"','"+key+"'").forEach(b=>b.classList.remove('on'));
+    btn.classList.add('on');
+  }
+  renderBGTTable(tab);
+}
+
+// Verdict helper: geeft een aanbeveling op basis van win rate + avg RR
+function bgtVerdict(g) {
+  const slRate = g.n > 0 ? g.nSLHit / g.n : 1;
+  const avg    = g.avgPeakPos ?? 0;
+  const mx     = g.maxPeakPos ?? 0;
+  if(slRate <= 0.3 && avg >= 1.5) return '<span class="cg fw">✅ Playbook worthy</span>';
+  if(slRate <= 0.5 && avg >= 1.0) return '<span class="cy">⚠ Mogelijk</span>';
+  if(slRate >= 0.7) return '<span class="cr">❌ Te risicovol</span>';
+  return '<span class="cd">🔍 Meer data</span>';
+}
+
+function renderBGTTable(tab) {
+  const raw  = _bgtData[tab] || [];
+  const filt = _bgtFilters[tab];
+  const data = raw.filter(g => {
+    if(filt.sess && filt.sess !== 'all' && g.session !== filt.sess) return false;
+    if(filt.dir  && filt.dir  !== 'all' && g.direction !== filt.dir) return false;
+    if(filt.type && filt.type !== 'all' && symType(g.symbol) !== filt.type) return false;
+    if(filt.band && filt.band !== 'all' && tab === 'vwap') {
+      const avgBand = (g.trades||[]).reduce((s,t)=>s+(t.vwapBandPct||0),0) / (g.trades?.length||1);
+      if(filt.band === '150_200' && !(avgBand >= 150 && avgBand < 200)) return false;
+      if(filt.band === '200_300' && !(avgBand >= 200 && avgBand < 300)) return false;
+      if(filt.band === '300plus' && !(avgBand >= 300)) return false;
+    }
+    return true;
+  });
+
+  const tblId = 'bgt-'+tab+'-body';
+  const cols  = tab === 'vwap' ? 14 : 13;
+  if(!data.length){ setHtml(tblId, emptyRow(cols, 'Geen blocked ghost data')); return; }
+
+  const tbody = document.getElementById(tblId); if(!tbody) return;
+  tbody.innerHTML = data.map(g => {
+    const safeKey = (g.optimizerKey||'').replace(/[^a-z0-9]/gi,'_');
+    const avgBand = tab === 'vwap'
+      ? ((g.trades||[]).reduce((s,t)=>s+(t.vwapBandPct||0),0) / (g.trades?.length||1)).toFixed(0)+'%'
+      : null;
+    const mainRow = '<tr style="cursor:pointer" onclick="toggleBGTRow(\''+safeKey+'_'+tab+'\')">'+
+      '<td class="cd" style="font-size:9px">▶</td>'+
+      '<td class="cb fw">'+g.symbol+'</td>'+
+      '<td>'+tBadge(symType(g.symbol))+'</td>'+
+      '<td>'+sBadge(g.session)+'</td>'+
+      '<td>'+dBadge(g.direction)+'</td>'+
+      '<td>'+vBadge(g.vwapPosition)+'</td>'+
+      '<td class="cy fw">'+g.n+'</td>'+
+      '<td class="cr">'+g.nSLHit+'</td>'+
+      '<td class="cg">'+g.nMaxRR15+'</td>'+
+      '<td class="cg fw">'+f2(g.avgPeakPos)+'R</td>'+
+      '<td class="cg fw">'+f2(g.maxPeakPos)+'R</td>'+
+      '<td class="cr">'+f1(g.avgPeakNeg)+'%</td>'+
+      (avgBand ? '<td class="cr fw">'+avgBand+'</td>' : '')+
+      '<td>'+bgtVerdict(g)+'</td>'+
+    '</tr>';
+
+    // Detail sub-tabel
+    const detailRow = '<tr id="bgt-d-'+safeKey+'_'+tab+'" style="display:none">'+
+      '<td colspan="'+cols+'" style="padding:0;background:var(--bg3)">'+
+        '<div style="overflow-x:auto"><table style="font-size:9px;min-width:700px">'+
+          '<thead><tr>'+
+            '<th>#</th><th>Datum</th><th>Stop</th><th>Peak+RR</th><th>Peak−RR%</th>'+
+            (tab==='vwap'?'<th>Band%</th>':'')+
+            '<th>Elapsed</th>'+
+            // ADV milestones -0.1 to -1.0
+            [0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0].map(v=>'<th class="adv-th" style="font-size:8px">-'+v.toFixed(1)+'</th>').join('')+
+            // FAV milestones +0.1 to +5.0 (beperkt voor leesbaarheid)
+            (()=>{let s='';for(let v=0.1;v<=5.0+1e-9;v=Math.round((v+0.1)*10)/10)s+='<th class="fav-th" style="font-size:8px">+'+v.toFixed(1)+'</th>';return s;})()
+          +'</tr></thead><tbody>'+
+          (g.trades||[]).map((t,i) => {
+            const sr = t.stopReason;
+            const srCls = sr==='phantom_sl'?'cr':sr==='max_rr_15'?'cg':'cy';
+            const isSLHit = sr==='phantom_sl'||t.phantomSLHit;
+            const rrMs = t.rrMilestones || {};
+            const msC = (iso, opened, isFav) => {
+              const cls = isFav ? 'ms-fav cg' : 'ms-adv cr';
+              if(!iso||!opened) return '<td class="'+cls+'" style="font-size:8px">—</td>';
+              const mins = Math.round((new Date(iso)-new Date(opened))/60000);
+              const h=Math.floor(mins/60),m=mins%60;
+              return '<td class="'+cls+'" style="font-size:8px">'+(h>0?h+'h'+m+'m':m+'m')+'</td>';
+            };
+            const elapsed = t.openedAt && t.closedAt
+              ? Math.round((new Date(t.closedAt)-new Date(t.openedAt))/60000) : null;
+            return '<tr style="border-bottom:1px solid var(--bdr)">'+
+              '<td class="cd">'+(i+1)+'</td>'+
+              '<td class="cd" style="font-size:8px">'+dtS(t.openedAt)+'</td>'+
+              '<td class="'+srCls+'" style="font-size:8px">'+(sr||'—')+'</td>'+
+              '<td class="cg fw">'+f2(t.peakRRPos)+'R</td>'+
+              '<td class="cr">'+(isSLHit?'100%':f1(t.peakRRNeg)+'%')+'</td>'+
+              (tab==='vwap'?'<td class="cr">'+(t.vwapBandPct?f0(t.vwapBandPct)+'%':'—')+'</td>':'')+
+              '<td class="cd">'+msFmt(elapsed)+'</td>'+
+              [0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0].map(v=>{
+                const key='-'+v.toFixed(1);
+                let iso=rrMs[key]||null;
+                if(!iso&&isSLHit&&Math.abs(v-1.0)<1e-9) iso=t.closedAt||null;
+                return msC(iso,t.openedAt,false);
+              }).join('')+
+              (()=>{let s='';for(let v=0.1;v<=5.0+1e-9;v=Math.round((v+0.1)*10)/10){
+                s+=msC(rrMs[v.toFixed(1)]||null,t.openedAt,true);
+              }return s;})()
+            +'</tr>';
+          }).join('')+
+        '</tbody></table></div>'+
+      '</td></tr>';
+
+    return mainRow + detailRow;
+  }).join('');
+}
+
+function toggleBGTRow(key) {
+  const el = document.getElementById('bgt-d-'+key);
+  if(el) el.style.display = el.style.display === 'none' ? '' : 'none';
+}
+
+async function loadShadowPlaybook() {
+  const from = document.getElementById('bgt-from')?.value || null;
+  const to   = document.getElementById('bgt-to')?.value   || null;
+  const toFull = to ? to + 'T23:59:59' : null;
+  const meta  = document.getElementById('bgt-date-meta');
+  if(meta) meta.textContent = (from||to) ? (from||'begin')+' → '+(to||'nu') : 'Alle blocked ghosts';
+
+  // Laad actieve blocked ghosts
+  const active = await api('/api/blocked-ghosts/active') || [];
+  const nbBgt  = document.getElementById('nb-bgt');
+  if(nbBgt&&active.length) { nbBgt.textContent=active.length; nbBgt.style.display=''; }
+  setText('bgt-active-meta', active.length + ' actieve blocked ghosts live');
+  const now = Date.now();
+  setHtml('bgt-active-body', active.length ? active.map(bg => {
+    const elapsed = bg.openedAt ? Math.round((now - new Date(bg.openedAt))/60000) : null;
+    const btCls = bg.blockType==='NY_DEAD_ZONE'?'co':bg.blockType==='DUPLICATE'?'cy':'cr';
+    return '<tr>'+
+      '<td class="cb fw">'+bg.symbol+'</td>'+
+      '<td>'+tBadge(symType(bg.symbol))+'</td>'+
+      '<td><span class="bd" style="background:rgba(255,255,255,.06);color:var(--'+btCls.slice(1)+')">'+(bg.blockType||'—')+'</span></td>'+
+      '<td>'+dBadge(bg.direction)+'</td>'+
+      '<td>'+vBadge(bg.vwapPosition)+'</td>'+
+      '<td>'+sBadge(bg.session)+'</td>'+
+      '<td class="cd">'+f2(bg.entry)+'</td>'+
+      '<td class="cg fw">'+f2(bg.peakRRPos)+'R</td>'+
+      '<td class="cr">'+f1(bg.peakRRNeg)+'%</td>'+
+      '<td class="cr">'+(bg.vwapBandPct?f0(bg.vwapBandPct)+'%':'—')+'</td>'+
+      '<td class="cd">'+msFmt(elapsed)+'</td>'+
+      '<td class="cd" style="font-size:8px;max-width:200px;overflow:hidden;text-overflow:ellipsis">'+(bg.blockReason||'—')+'</td>'+
+    '</tr>';
+  }).join('') : emptyRow(12, 'Geen actieve blocked ghosts'));
+
+  // Laad history voor de 3 types parallel
+  const buildUrl = (type) => {
+    let url = '/api/blocked-ghosts/history?blockType='+type;
+    if(from) url += '&from='+encodeURIComponent(from);
+    if(toFull) url += '&to='+encodeURIComponent(toFull);
+    return url;
+  };
+  const [nyData, dupData, vwapData] = await Promise.all([
+    api(buildUrl('NY_DEAD_ZONE'))   || [],
+    api(buildUrl('DUPLICATE'))      || [],
+    api(buildUrl('VWAP_EXHAUSTION'))|| [],
+  ]);
+  _bgtData.ny   = nyData;
+  _bgtData.dup  = dupData;
+  _bgtData.vwap = vwapData;
+
+  renderBGTTable('ny');
+  renderBGTTable('dup');
+  renderBGTTable('vwap');
+}
+
 async function loadAll(){
   // 1. Status poll + live positions + ghost trackers in parallel
   await Promise.all([pollStatus(), loadPositions(), loadGhostTrackers()]);
@@ -2387,6 +2915,24 @@ async function initBackground() {
     }
     console.log(`[DB] Restored ${openPositions.size} open positions`);
   } catch (e) { console.error("[DB] restorePositions failed:", e.message); }
+
+  // Restore blocked ghost trackers
+  try {
+    const bgStates = await db.loadAllBlockedGhostStates();
+    for (const bg of bgStates) {
+      if (!bg.id || !bg.direction || !bg.entry || !bg.sl) continue;
+      blockedPositions.set(bg.id, {
+        ...bg,
+        maxPrice:     bg.maxPrice ?? bg.entry,
+        maxRR:        bg.maxRR ?? 0,
+        maxSlPctUsed: bg.maxSlPctUsed ?? 0,
+        slMilestones: bg.slMilestones ?? {},
+        rrMilestones: bg.rrMilestones ?? {},
+        phantomSLHit: false, stopReason: null, closedAt: null,
+      });
+    }
+    console.log(`[DB] Restored ${blockedPositions.size} blocked ghost trackers`);
+  } catch (e) { console.error("[DB] restoreBlockedGhosts failed:", e.message); }
 
   // Sync trade number sequence
   db.syncTradeNumberSequence().catch(() => {});
