@@ -1393,6 +1393,7 @@ const COMM_S  = new Set(['XAUUSD']);
 function symType(s){ if(FOREX_S.has(s)) return 'forex'; if(INDEX_S.has(s)) return 'index'; if(COMM_S.has(s)) return 'commodity'; return 'stock'; }
 
 // ── Milestone steps: -1.0→-0.1 then +0.1→+15.0 ──────────────────
+const Q=String.fromCharCode(39); // safe single-quote for onclick strings
 const ADV_STEPS=[],FAV_STEPS=[];
 for(let v=1.0;v>=0.1-1e-9;v=Math.round((v-0.1)*10)/10) ADV_STEPS.push(+v.toFixed(1));
 for(let v=0.1;v<=15.0+1e-9;v=Math.round((v+0.1)*10)/10) FAV_STEPS.push(+v.toFixed(1));
@@ -1852,7 +1853,7 @@ function renderGhostHistory(){
     const bestTP=last5.length?'avg '+f2(last5.reduce((s,v)=>s+v,0)/last5.length)+'R':'—';
     const reasons=(g.trades||[]).map(t=>t.stopReason).filter(Boolean);
     const topReason=reasons.length?Object.entries(reasons.reduce((m,r)=>{m[r]=(m[r]||0)+1;return m;},{})).sort((a,b)=>b[1]-a[1])[0][0]:'—';
-    return '<tr style="cursor:pointer" onclick="toggleGHHRow(\u0027'+safeKey+'\u0027)">'+
+    return '<tr style="cursor:pointer" onclick="toggleGHHRow('+Q+safeKey+Q+')">'+
       '<td class="cd" style="font-size:9px">▶</td>'+
       '<td class="cb fw">'+g.symbol+'</td>'+
       '<td>'+tBadge(symType(g.symbol))+'</td>'+
