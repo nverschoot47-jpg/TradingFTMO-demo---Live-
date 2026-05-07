@@ -264,6 +264,7 @@ async function syncPositions() {
   for (const lp of live) {
     const pos = openPositions.get(String(lp.id));
     if (pos?.ghost && lp.currentPrice) {
+      if (!pos.ghost.direction) continue;  // skip external positions without direction
       updateGhost(pos.ghost, lp.currentPrice);
       if (dbReady) db.saveGhostState(pos.ghost).catch(() => {});
     }
@@ -2193,6 +2194,10 @@ async function initBackground() {
     const states = await db.loadAllGhostStates();
     for (const gs of states) {
       if (openPositions.has(gs.positionId)) continue;
+      if (!gs.direction || !gs.entry || !gs.sl) {
+        console.warn(`[DB] Skipping incomplete ghost state ${gs.positionId} — missing direction/entry/sl`);
+        continue;
+      }
       const ghost = { ...gs, maxPrice: gs.maxPrice??gs.entry, maxRR: gs.maxRR??0,
         maxSlPctUsed: gs.maxSlPctUsed??0, slMilestones: gs.slMilestones??{},
         rrMilestones: gs.rrMilestones??{}, phantomSLHit: false, stopReason: null, closedAt: null };
