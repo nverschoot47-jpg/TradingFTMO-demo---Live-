@@ -47,7 +47,7 @@ const {
 } = require("./session");
 
 // ── Version ──────────────────────────────────────────────────────
-const VERSION = "13.5.1";
+const VERSION = "14.0.0";
 
 // ── Config ───────────────────────────────────────────────────────
 const PORT           = process.env.PORT           || 3000;
@@ -354,16 +354,25 @@ async function adoptPosition(lp) {
   const mt5Sym  = rawSym; // keep original MT5 symbol
 
   // Parse comment for direction/session/vwap
-  const parsed     = parseMT5Comment(lp.comment ?? lp.type ?? '');
-  const direction  = parsed.direction  ?? (lp.type === 'POSITION_TYPE_BUY' || lp.type === 'buy' ? 'buy' : 'sell');
-  const session    = parsed.session    ?? getSession();
-  const vwapPos    = parsed.vwapPosition ?? 'unknown';
-  const entry      = parseFloat(lp.openPrice ?? lp.currentPrice ?? 0);
-  const sl         = parseFloat(lp.stopLoss  ?? 0);
-  const tp         = parseFloat(lp.takeProfit ?? 0) || null;
-  const lots       = parseFloat(lp.volume ?? 0);
-  const openedAt   = lp.openTime ? new Date(lp.openTime).toISOString() : new Date().toISOString();
-  const optKey     = buildOptimizerKey(symbol, session, direction, vwapPos);
+  const parsed = parseMT5Comment(lp.comment ?? '');
+  // Determine direction: comment parse → MT5 type field → current position type
+  const lpType = (lp.type ?? lp.positionType ?? '').toString().toUpperCase();
+  const isBuyType = lpType.includes('BUY') || lpType === 'BUY' || lpType === 'POSITION_TYPE_BUY';
+  const direction = parsed.direction ?? (isBuyType ? 'buy' : 'sell');
+  const session   = parsed.session ?? getSession();
+  const vwapPos   = parsed.vwapPosition ?? 'unknown';
+  const entry     = parseFloat(lp.openPrice ?? lp.currentPrice ?? 0);
+  const sl        = parseFloat(lp.stopLoss  ?? 0);
+  const tp        = parseFloat(lp.takeProfit ?? 0) || null;
+  const lots      = parseFloat(lp.volume ?? 0);
+  const openedAt  = lp.openTime ? new Date(lp.openTime).toISOString() : new Date().toISOString();
+  const optKey    = buildOptimizerKey(symbol, session, direction, vwapPos);
+
+  // Guard: don't adopt if we can't determine direction reliably — log and skip
+  if (!direction) {
+    console.error(`[Adopt] SKIP ${id} ${symbol} — cannot determine direction. lp.type="${lp.type}", comment="${lp.comment ?? ''}"`);
+    return;
+  }
 
   // Estimate SL pct from entry/sl distance
   const slPct = entry > 0 && sl > 0 ? Math.abs(entry - sl) / entry : 0.003;
@@ -559,8 +568,14 @@ app.post("/webhook", async (req, res) => {
   if (!checkSecret(req, res)) return;
   if (!dbReady) return res.status(503).json({ error: "DB not ready yet, retry in a moment" });
 
-  const { symbol: rawSym, direction, sl_pct, vwap, vwap_upper, vwap_upper2,
+  const { symbol: rawSym, direction: _dir, action: _action, sl_pct, vwap, vwap_upper, vwap_upper2,
           vwap_lower, vwap_lower2, close: tvClose } = req.body ?? {};
+  // Pine Script sends "action":"buy"/"sell" — normalize to direction
+  const direction = (_dir ?? _action ?? '').toLowerCase().trim() || null;
+  if (!direction || (direction !== 'buy' && direction !== 'sell')) {
+    recordError(`Webhook missing valid direction/action. body=${JSON.stringify(req.body).slice(0,200)}`);
+    return res.status(400).json({ error: `Missing or invalid direction/action field. Got: "${direction}"` });
+  }
 
   const symbol = normalizeSymbol(rawSym);
   if (!symbol) return res.status(400).json({ error: `Unknown symbol: ${rawSym}` });
@@ -602,7 +617,8 @@ app.post("/webhook", async (req, res) => {
     return res.json({ ok: false, reason: mktReason });
   }
 
-  const tvEntry  = tvClose ? parseFloat(tvClose) : null;
+  // Pine Script sends both "entry" and "close" — accept either
+  const tvEntry  = tvClose ? parseFloat(tvClose) : (req.body?.entry ? parseFloat(req.body.entry) : null);
   const vwapMid  = vwap    ? parseFloat(vwap)    : null;
   const session  = getSession();
   const vwapPos  = getVwapPosition(tvEntry, vwapMid);
@@ -752,12 +768,14 @@ app.post("/webhook", async (req, res) => {
         } catch {}
       }
       if (!positionId) {
-        positionId = String(Date.now());
-        console.error(`[Order] ORDER_NOT_CONFIRMED: geen positie gevonden voor ${mt5Sym} ${direction} — fallback id=${positionId}`);
+        // ORDER_NOT_CONFIRMED: positie niet gevonden — log en geef error terug.
+        // Maak GEEN fallback ghost met Date.now() ID — dit leidt tot orphan ghosts.
+        const _errMsg = `geen positionId van MetaApi en positie niet gevonden op MT5 (${symbol} ${direction})`;
+        console.error(`[Order] ORDER_NOT_CONFIRMED: geen positie gevonden voor ${mt5Sym} ${direction}`);
         db.logSignal({ symbol, direction, session, vwapPosition: vwapPos, optimizerKey: optKey,
           tvEntry, slPct, outcome: "ORDER_NOT_CONFIRMED",
-          rejectReason: `geen positionId van MetaApi en positie niet gevonden op MT5 (${symbol} ${direction})`,
-          latencyMs: Date.now() - t0 }).catch(() => {});
+          rejectReason: _errMsg, latencyMs: Date.now() - t0 }).catch(() => {});
+        return res.status(202).json({ ok: false, reason: "ORDER_NOT_CONFIRMED", message: _errMsg });
       }
     }
   } catch (e) {
@@ -922,7 +940,7 @@ app.get("/api/performance", async (req, res) => {
 });
 
 app.get("/api/daily-breakdown", async (req, res) => {
-  const empty = { days: [], maxWinStreak: 0, maxLossStreak: 0, maxDrawdownDay: 0 };
+  const empty = { days: [], bestTrades: [], worstTrades: [] };
   if (!dbReady) return res.json(empty);
   res.json(await dbCall(db.loadDailyBreakdown(), empty));
 });
@@ -1084,7 +1102,7 @@ return `<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PRONTO·AI v13.0</title>
+<title>PRONTO·AI v14.0</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -1350,38 +1368,29 @@ tr:hover td{background:var(--bg4)}
         <div class="card-title"><div class="dot" id="daily-dot"></div>Daily Breakdown — Performance (compliance+)</div>
         <div class="cmeta" id="daily-meta">loading…</div>
       </div>
-      <div class="kstrip">
-        <div class="ks"><div class="ksl">Max Win Streak</div><div class="ksv cg" id="d-wstrk">—</div></div>
-        <div class="ks"><div class="ksl">Max Loss Streak</div><div class="ksv cr" id="d-lstrk">—</div></div>
-        <div class="ks"><div class="ksl">Max Drawdown</div><div class="ksv cy" id="d-dd">—</div></div>
-      </div>
       <div class="tw">
         <table><thead><tr>
-          <th>Date</th><th># Trades</th><th>Wins</th><th>Losses</th><th>Win%</th>
-          <th>Day P&amp;L</th><th>Cum P&amp;L</th><th>Avg Lots</th><th>Best RR</th><th>Avg RR</th>
-        </tr></thead><tbody id="daily-body"><tr><td colspan="10" class="nd"><span class="spin">⟳</span></td></tr></tbody></table>
+          <th>Date</th><th># Trades</th><th>Total Lots</th>
+          <th>Day P&amp;L</th><th>Best Peak+RR</th><th>Max Win</th><th>Max Loss</th>
+        </tr></thead><tbody id="daily-body"><tr><td colspan="7" class="nd"><span class="spin">⟳</span></td></tr></tbody></table>
       </div>
 
-      <!-- Best / Worst Setups -->
+      <!-- Best 10 / Worst 10 Setups — from Ghost History PEAK+RR -->
       <div class="bw-section">
         <div class="bw-hdr">
-          <span class="fl">Period:</span>
-          <button class="fb on" onclick="setBWP('all',this)">All Time</button>
-          <button class="fb" onclick="setBWP('week',this)">This Week</button>
-          <button class="fb" onclick="setBWP('day',this)">Today</button>
-          <span id="bw-period-lbl" style="font-size:9px;color:var(--ink3);margin-left:4px">all time</span>
+          <span style="font-size:9px;color:var(--ink3);text-transform:uppercase;letter-spacing:.5px">Based on Ghost History PEAK+RR — all time</span>
         </div>
         <div class="bw-grid">
           <div>
-            <div style="font-size:9px;color:var(--g);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;font-weight:700">🏆 Best 5 Setups</div>
+            <div style="font-size:9px;color:var(--g);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;font-weight:700">🏆 Best 10 Setups — Peak+RR</div>
             <table style="font-size:10px"><thead><tr>
-              <th>Symbol</th><th>Dir</th><th>Sess</th><th>VWAP</th><th>RR</th><th>P&amp;L</th><th>Date</th>
+              <th>Symbol</th><th>Dir</th><th>Sess</th><th>VWAP</th><th>Peak+RR</th><th>P&amp;L</th><th>Date</th>
             </tr></thead><tbody id="best-body"></tbody></table>
           </div>
           <div>
-            <div style="font-size:9px;color:var(--r);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;font-weight:700">💀 Worst 5 Setups</div>
+            <div style="font-size:9px;color:var(--r);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;font-weight:700">💀 Worst 10 Setups — Peak+RR</div>
             <table style="font-size:10px"><thead><tr>
-              <th>Symbol</th><th>Dir</th><th>Sess</th><th>VWAP</th><th>RR</th><th>P&amp;L</th><th>Date</th>
+              <th>Symbol</th><th>Dir</th><th>Sess</th><th>VWAP</th><th>Peak+RR</th><th>P&amp;L</th><th>Date</th>
             </tr></thead><tbody id="worst-body"></tbody></table>
           </div>
         </div>
@@ -1408,7 +1417,6 @@ tr:hover td{background:var(--bg4)}
       <div class="card-hdr">
         <div class="card-title"><div class="dot r" id="pos-dot"></div>Open Positions — Live</div>
         <div style="display:flex;gap:6px;align-items:center">
-          <button class="fb" onclick="toggleMsCols()" id="ms-btn">± Milestones</button>
           <div class="cmeta" id="pos-meta">loading…</div>
         </div>
       </div>
@@ -1428,19 +1436,14 @@ tr:hover td{background:var(--bg4)}
           <thead><tr>
             <th>Symbol</th><th>Type</th><th>Dir</th><th>VWAP</th><th>Session</th>
             <th>Entry</th><th>SL</th><th>TP</th>
-            <th>RR Now</th><th title="Best favorable RR">Peak+RR</th><th title="Worst adverse RR%">Peak−RR%</th>
-            <th>→TP</th><th>P&amp;L€</th><th>Lots</th><th>Risk%</th>
-            <th colspan="${ADV_STEPS.length}" class="adv-th" style="text-align:center">← Adverse (−1R to −0.1R)</th>
-            <th colspan="${FAV_STEPS.length}" class="fav-th" style="text-align:center">Favorable (+0.1R to +15R) →</th>
+            <th title="Current RR vs entry">RR Now</th>
+            <th title="Best favorable RR reached">Peak+RR</th>
+            <th title="Worst adverse % of SL used">Peak−RR%</th>
+            <th title="Distance to TP in RR">→TP</th>
+            <th>P&amp;L €</th><th>Lots</th><th>Risk %</th>
             <th>Opened</th>
-          </tr>
-          <tr>
-            <th colspan="15"></th>
-            ${ADV_STEPS.map(v=>'<th class="adv-th">-'+v.toFixed(1)+'</th>').join('')}
-            ${FAV_STEPS.map(v=>'<th class="fav-th">+'+v.toFixed(1)+'</th>').join('')}
-            <th></th>
           </tr></thead>
-          <tbody id="pos-body"><tr><td colspan="100" class="nd"><span class="spin">⟳</span></td></tr></tbody>
+          <tbody id="pos-body"><tr><td colspan="16" class="nd"><span class="spin">⟳</span></td></tr></tbody>
         </table>
       </div>
     </div>
@@ -1508,10 +1511,11 @@ tr:hover td{background:var(--bg4)}
 <!-- Date filter: history -->
   <div id="hist-dfbar" style="background:var(--bg3);border-bottom:1px solid var(--bdr);padding:5px 14px;display:flex;align-items:center;gap:6px;flex-wrap:wrap">
     <span style="font-size:9px;font-weight:700;color:var(--b);text-transform:uppercase;letter-spacing:.5px">📅</span>
-    <span class="fl">Open:</span>
+    <span class="fl">Closed:</span>
     <input type="date" id="hist-open-from" style="background:var(--bg2);border:1px solid var(--bdr2);color:var(--ink2);padding:2px 7px;border-radius:3px;font:10px 'SF Mono',monospace;cursor:pointer">
     <span style="color:var(--ink3);font-size:10px">→</span>
     <input type="date" id="hist-open-to"   style="background:var(--bg2);border:1px solid var(--bdr2);color:var(--ink2);padding:2px 7px;border-radius:3px;font:10px 'SF Mono',monospace;cursor:pointer">
+    <span style="font-size:9px;color:var(--ink3);margin-left:4px">Filter op CLOSED datum (wanneer ghost gesloten werd)</span>
     <button class="fb" onclick="applyHISTFilter()" style="margin-left:4px;background:var(--b2);color:var(--b);border-color:rgba(88,166,255,.4)">Apply</button>
     <button class="fb" onclick="resetHISTFilter()" style="margin-left:2px">Reset</button>
     <span id="hist-df-active" style="display:none;font-size:9px;color:var(--y);font-weight:700;margin-left:4px">⚠ Gefilterd</span>
@@ -1604,7 +1608,7 @@ tr:hover td{background:var(--bg4)}
     <div class="card">
       <div class="card-hdr">
         <div class="card-title"><div class="dot r" id="ev-dot"></div>EV / TP Optimizer — All Signal Combos</div>
-        <div class="cmeta" id="ev-meta">EV locked at ≥5 ghost trades</div>
+        <div class="cmeta" id="ev-meta">EV data from ≥5 ghosts · TP auto-locked by server at ≥10 ghosts</div>
       </div>
       <div class="fbar">
         <span class="fl">Type:</span>
@@ -1630,7 +1634,7 @@ tr:hover td{background:var(--bg4)}
       <div class="kstrip">
         <div class="ks"><div class="ksl">Combos Shown</div><div class="ksv cb" id="ev-cnt">0</div></div>
         <div class="ks"><div class="ksl">With Ghost Data</div><div class="ksv cc" id="ev-data">0</div></div>
-        <div class="ks"><div class="ksl">EV+ Locked</div><div class="ksv cg" id="ev-lock">0</div></div>
+        <div class="ks"><div class="ksl">TP Locked (≥10)</div><div class="ksv cg" id="ev-lock">0</div></div>
         <div class="ks"><div class="ksl">Total P&amp;L (compliance+)</div><div class="ksv cy" id="ev-pnl">+€0.00</div></div>
       </div>
       <div class="tw">
@@ -1736,46 +1740,17 @@ tr:hover td{background:var(--bg4)}
         <div class="sig-cell"><div class="sig-lbl">NY Dead Zone</div><div class="sig-val cr" id="blk-ny">—</div></div>
       </div>
 
-      <!-- Placed + Blocked side by side -->
-      <div class="two-col">
-        <div class="col-pane">
-          <div class="col-hdr">
-            <div style="width:6px;height:6px;border-radius:50%;background:var(--g)"></div>
-            <span class="col-hdr-title" style="color:var(--g)">Recent Placed Signals</span>
-            <span class="cmeta" style="margin-left:auto">in-memory log</span>
-          </div>
-          <div class="tw" style="max-height:350px;overflow-y:auto">
-            <table id="placed-tbl"><thead><tr>
-              <th>Time</th><th>Symbol</th><th>Dir</th><th>Session</th><th>VWAP</th>
-              <th>Entry</th><th>SL%</th><th>Latency</th>
-            </tr></thead><tbody id="placed-body"><tr><td colspan="8" class="nd">—</td></tr></tbody></table>
-          </div>
-        </div>
-        <div class="col-pane" style="border-left:1px solid var(--bdr)">
-          <div class="col-hdr">
-            <div style="width:6px;height:6px;border-radius:50%;background:var(--r)"></div>
-            <span class="col-hdr-title" style="color:var(--r)">Blocked Signals</span>
-            <span class="cmeta" style="margin-left:auto">grouped by reason</span>
-          </div>
-          <div class="tw" style="max-height:350px;overflow-y:auto">
-            <table id="blk-tbl"><thead><tr>
-              <th>Reason</th><th>Symbol</th><th>Dir</th><th>Session</th><th>VWAP</th><th>Count</th>
-            </tr></thead><tbody id="blk-body"><tr><td colspan="6" class="nd">—</td></tr></tbody></table>
-          </div>
-        </div>
-      </div>
-
-      <!-- Webhook Errors full width -->
+      <!-- v14.0: Full signal log — shows where each signal went: Ghost Tracker OR Shadow Playbook -->
       <div class="col-hdr" style="border-top:1px solid var(--bdr)">
-        <div style="width:6px;height:6px;border-radius:50%;background:var(--o)"></div>
-        <span class="col-hdr-title" style="color:var(--o)">Webhook Errors</span>
-        <span class="cmeta" style="margin-left:auto">last 80 in memory</span>
+        <div style="width:6px;height:6px;border-radius:50%;background:var(--b)"></div>
+        <span class="col-hdr-title" style="color:var(--b)">All Signals — Where did each signal go?</span>
+        <span class="cmeta" style="margin-left:auto">PLACED → Ghost Tracker · BLOCKED → Shadow Playbook · ERRORS excluded</span>
       </div>
-      <div class="tw">
-        <table id="whe-tbl"><thead><tr>
+      <div class="tw" style="max-height:500px;overflow-y:auto">
+        <table id="placed-tbl"><thead><tr>
           <th>Time</th><th>Symbol</th><th>Dir</th><th>Session</th><th>VWAP</th>
-          <th>Entry</th><th>SL%</th><th>Band%</th><th>Reason</th>
-        </tr></thead><tbody id="whe-body"><tr><td colspan="9" class="nd"><span class="spin">⟳</span></td></tr></tbody></table>
+          <th>Entry</th><th>SL%</th><th>Band%</th><th>Outcome</th><th>Destination</th><th>Latency</th>
+        </tr></thead><tbody id="placed-body"><tr><td colspan="11" class="nd">—</td></tr></tbody></table>
       </div>
 
       <!-- Blocked Raw all-time -->
@@ -2219,25 +2194,13 @@ async function loadPositions(){
   const tbody=document.getElementById('pos-body');
   if(!tbody) return;
   tbody.innerHTML=d.map(p=>{
-    const dec=(p.symbol||'').includes('JPY')?3:p.lots<0.5?5:4;
     const slDist=Math.abs((p.entry||0)-(p.sl||0));
     const peakPos=p.ghost?.peakRRPos??p.ghost?.maxRR??0;
     const peakNeg=p.ghost?.peakRRNeg??p.ghost?.maxSlPctUsed??0;
     const tpRR=slDist>0?Math.abs((p.tp||0)-(p.entry||0))/slDist:null;
     const rPct=p.riskPct?(p.riskPct*100).toFixed(3):null;
-    // Milestone time helper
-    const msT=(ms,opened,isFav)=>{
-      const cls='td class="'+(isFav?'ms-fav cg':'ms-adv cr')+'" style="font-size:8px"';
-      if(!ms||!opened) return '<'+cls+'>—</td>';
-      const mins=Math.round((new Date(ms)-new Date(opened))/60000);
-      return '<'+cls+'>'+msFmt(mins)+'</td>';
-    };
-    // slMilestones keys: {25,50,75,90,100} → map ADV step to nearest pct key
-    const advMs=p.ghost?.slMilestones||{};
-    const favMs=p.ghost?.rrMilestones||{};
-    const advKeys=Object.keys(advMs).map(Number);
-    const favKeys=Object.keys(favMs).map(Number);
     return '<tr>'+
+      // v14.0: Simplified — no milestone columns in Open Positions
       '<td class="cb fw" style="font-size:11px">'+p.symbol+'</td>'+
       '<td>'+tBadge(symType(p.symbol))+'</td>'+
       '<td>'+dBadge(p.direction)+'</td>'+
@@ -2247,35 +2210,11 @@ async function loadPositions(){
       '<td class="cr" style="font-size:10px">'+f2(p.sl)+'</td>'+
       '<td class="cg" style="font-size:10px">'+f2(p.tp)+'</td>'+
       '<td class="'+(peakPos>=1?'cg fw':peakPos>0?'cy':'cd')+' fw">'+f2(peakPos)+'R</td>'+
-      '<td class="'+(peakPos>=2?'cg fw':peakPos>=1?'cg':peakPos>0?'cy':'cd')+'">'+f2(peakPos)+'R</td>'+
       '<td class="'+(peakNeg>80?'cr fw':peakNeg>50?'cr':peakNeg>25?'co':'cd')+'">'+( peakNeg>0?'-'+f0(peakNeg)+'%':'—')+'</td>'+
       '<td class="cy">'+(tpRR!=null?f2(tpRR)+'R':'—')+'</td>'+
       '<td class="cd">—</td>'+
       '<td class="cd">'+f2(p.lots)+'</td>'+
       '<td class="'+(rPct&&+rPct>0.04?'cr fw':rPct&&+rPct>0.025?'co':'cg')+'">'+(rPct!=null?rPct+'%':'—')+'</td>'+
-      // ADV milestones (-1.0 to -0.1): slMilestones keys 100,90,75,50,25 + new rrMilestones '-0.1' to '-1.0'
-      ADV_STEPS.map(v=>{
-        // First try new fine-grained negative keys in rrMilestones
-        const negKey='-'+v.toFixed(1);
-        const msNew=favMs[negKey]||null;
-        if(msNew) return msT(msNew,p.openedAt,false);
-        // Fallback: map to nearest slMilestones pct key (legacy)
-        const pctKey=Math.round(v*100);
-        const nearest=advKeys.sort((a,b)=>Math.abs(a-pctKey)-Math.abs(b-pctKey))[0];
-        const ms=nearest!=null&&Math.abs(nearest-pctKey)<=15?advMs[nearest]:null;
-        return msT(ms,p.openedAt,false);
-      }).join('')+
-      // FAV milestones (+0.1 to +15): new 0.1R string keys first, fallback to integer keys
-      FAV_STEPS.map(v=>{
-        const strKey=v.toFixed(1);
-        const msNew=favMs[strKey]||null;
-        if(msNew) return msT(msNew,p.openedAt,true);
-        // Fallback: legacy integer keys 1,2,3,5,10
-        const intV=Math.round(v);
-        const nearest=favKeys.filter(k=>Number.isInteger(+k)).sort((a,b)=>Math.abs(a-intV)-Math.abs(b-intV))[0];
-        const ms=nearest!=null&&Math.abs(nearest-intV)<=1?favMs[nearest]:null;
-        return msT(ms,p.openedAt,true);
-      }).join('')+
       '<td class="cd" style="font-size:9px">'+dt(p.openedAt)+'</td>'+
     '</tr>';
   }).join('');
@@ -2427,34 +2366,25 @@ function renderOverview(trades, daily, ghGrouped){
   setText('ft-ba',ba_t); setText('ft-bb',bb_t); setText('ft-sa',sa_t); setText('ft-sb',sb_t); setText('ft-t',total);
 
   // Daily breakdown
-  // days rows: {trade_date, trades, wins, losses, day_pnl, avg_pnl, best_rr, worst_rr, avg_rr, avg_lots, cum_pnl}
+  // v14.0: Daily — Peak+RR, P&L, total lots, max win/loss per day
   const days=daily?.days||[];
-  setText('daily-meta',days.length+' trading days · compliance+');
-  setText('d-wstrk',(daily?.maxWinStreak||0)+' days');
-  setText('d-lstrk',(daily?.maxLossStreak||0)+' days');
-  setText('d-dd','€'+f2(daily?.maxDrawdownDay));
   setHtml('daily-body',days.length?days.slice(0,60).map(r=>{
-    const wins=parseInt(r.wins||0), tot=parseInt(r.trades||0), lss=parseInt(r.losses||0);
-    const wpct=tot>0?(wins/tot*100):0;
+    const tot=parseInt(r.trades||0);
     return '<tr>'+
       '<td class="cd" style="font-size:10px">'+dtS(r.trade_date)+'</td>'+
       '<td class="cb">'+tot+'</td>'+
-      '<td class="cg">'+wins+'</td>'+
-      '<td class="cr">'+lss+'</td>'+
-      '<td class="'+(wpct>=50?'cg':wpct>=40?'cy':'cr')+'">'+wpct.toFixed(1)+'%</td>'+
+      '<td class="cd">'+f2(r.total_lots)+'</td>'+
       '<td class="'+pC(r.day_pnl)+' fw">'+eu(r.day_pnl)+'</td>'+
-      '<td class="'+pC(r.cum_pnl)+'">'+eu(r.cum_pnl)+'</td>'+
-      '<td class="cd">'+f2(r.avg_lots)+'</td>'+
-      '<td class="cy">'+f2(r.best_rr)+'R</td>'+
-      '<td class="cd">'+f2(r.avg_rr)+'R</td>'+
+      '<td class="cy fw">'+(r.best_peak_rr!=null?f2(r.best_peak_rr)+'R':'—')+'</td>'+
+      '<td class="cg">'+(r.max_win!=null?eu(r.max_win):'—')+'</td>'+
+      '<td class="cr">'+(r.max_loss!=null?eu(r.max_loss):'—')+'</td>'+
     '</tr>';
-  }).join(''):emptyRow(10,'No daily data'));
+  }).join(''):emptyRow(7,'No daily data'));
 
-  // Best/Worst: comes from daily.bestTrades/worstTrades
-  // fields: symbol, direction, session, vwapPosition, maxRR, pnl, hitTP, closeReason, openedAt
+  // Best 10 / Worst 10 from ghost history PEAK+RR
   window._bestTrades  = daily?.bestTrades  || [];
   window._worstTrades = daily?.worstTrades || [];
-  renderBW('all');
+  renderBW();
 }
 
 // ── Trade Activity table ──────────────────────────────────────────
@@ -2481,49 +2411,23 @@ function renderWRTable(typeFilter){
   setText('wr-meta',(filtered.length)+' trades · compliance+');
 }
 
-// ── Best/Worst setups ─────────────────────────────────────────────
-let _bwPeriod='all';
-function setBWP(p,btn){
-  _bwPeriod=p;
-  document.querySelectorAll('.fb[onclick*="setBWP"]').forEach(b=>b.classList.remove('on'));
-  if(btn) btn.classList.add('on');
-  setText('bw-period-lbl',p==='day'?'today':p==='week'?'this week':'all time');
-  renderBW(p);
-}
-function renderBW(period){
-  // bestTrades/worstTrades from daily endpoint: {symbol,direction,session,vwapPosition,maxRR,pnl,openedAt}
-  const now=new Date();
-  const today=new Date(now); today.setHours(0,0,0,0);
-  const weekStart=new Date(now); weekStart.setDate(now.getDate()-now.getDay()); weekStart.setHours(0,0,0,0);
-  function filt(arr){
-    if(period==='all') return arr;
-    return arr.filter(t=>{ const d=new Date(t.openedAt); return period==='day'?d>=today:d>=weekStart; });
-  }
-  let best,worst;
-  if(period==='all'){
-    best  = window._bestTrades||[];
-    worst = window._worstTrades||[];
-  } else {
-    // Filter _allTrades by period
-    const pool=filt(_allTrades).filter(t=>t.realizedPnlEUR!=null);
-    const sorted=pool.sort((a,b)=>(b.realizedPnlEUR||0)-(a.realizedPnlEUR||0));
-    best=sorted.slice(0,5);
-    worst=sorted.slice(-5).reverse();
-    // Map field names to match bestTrades format
-    best=best.map(t=>({...t, pnl:t.realizedPnlEUR, maxRR:t.maxRR}));
-    worst=worst.map(t=>({...t, pnl:t.realizedPnlEUR, maxRR:t.maxRR}));
-  }
-  const row=t=>'<tr>'+
+// ── Best/Worst setups — v14.0: from ghost_trades PEAK+RR (not realized P&L) ──
+function renderBW(){
+  // From db.loadDailyBreakdown: ghost_trades sorted by peak_rr_pos
+  // Fields: symbol, direction, session, vwapPosition, peakRRPos, pnl, stopReason, openedAt
+  const best  = window._bestTrades  || [];
+  const worst = window._worstTrades || [];
+  const row = t => '<tr>'+
     '<td class="cb fw" style="font-size:10px">'+t.symbol+'</td>'+
     '<td>'+dBadge(t.direction)+'</td>'+
     '<td>'+sBadge(t.session)+'</td>'+
     '<td>'+vBadge(t.vwapPosition)+'</td>'+
-    '<td class="cy" style="font-size:10px">'+f2(t.maxRR)+'R</td>'+
+    '<td class="cg fw" style="font-size:10px">'+f2(t.peakRRPos)+'R</td>'+
     '<td class="'+((+(t.pnl||0))>=0?'cg':'cr')+' fw" style="font-size:10px">'+eu(t.pnl)+'</td>'+
     '<td class="cd" style="font-size:9px">'+dtS(t.openedAt)+'</td>'+
   '</tr>';
-  setHtml('best-body', (best||[]).map(row).join('')||emptyRow(7,'No trades'));
-  setHtml('worst-body',(worst||[]).map(row).join('')||emptyRow(7,'No trades'));
+  setHtml('best-body',  (best||[]).map(row).join('')  || emptyRow(7,'No ghost history yet'));
+  setHtml('worst-body', (worst||[]).map(row).join('') || emptyRow(7,'No ghost history yet'));
 }
 
 // ── Ghost History (by pair, expandable) ──────────────────────────
@@ -2706,6 +2610,10 @@ function renderEV(){
   setText('ev-data',rows.filter(r=>r.n>0).length);
   setText('ev-lock',rows.filter(r=>r.tpLocked?.lockedRR).length);
   setText('ev-meta',rows.length+' combos shown · ≥'+minN+' ghosts required for EV lock');
+  // Compute total P&L from all EV trades visible
+  const totalPnl = (_allTrades||[]).reduce((s,t)=>s+(t.realizedPnlEUR||0),0);
+  const pnlEl = document.getElementById('ev-pnl');
+  if(pnlEl){ pnlEl.textContent=(totalPnl>=0?'+':'')+'\u20AC'+totalPnl.toFixed(2); pnlEl.className='ksv '+(totalPnl>=0?'cg':'cr'); }
   const tbody=document.getElementById('ev-body'); if(!tbody) return;
   if(!rows.length){ tbody.innerHTML=emptyRow(15,'No combos match filters'); return; }
   tbody.innerHTML=rows.map(r=>{
@@ -2790,51 +2698,45 @@ async function loadSignals(){
   const nbSig=document.getElementById('nb-sig');
   if(nbSig&&totalBlocked>0){ nbSig.textContent=totalBlocked; nbSig.style.display=''; }
 
-  // Webhook history — DB rows are snake_case: ts, symbol, direction, session, vwap_position, entry, sl_pct, band_pct, status, reason
-  const placed=(hist||[]).filter(r=>r.status==='OK'||r.status==='PLACED');
-  const errors=(hist||[]).filter(r=>r.status!=='OK'&&r.status!=='PLACED');
-  setHtml('placed-body',placed.length?placed.map(r=>
-    '<tr>'+
-    '<td class="cd" style="font-size:9px">'+dt(r.ts)+'</td>'+
-    '<td class="cb fw">'+r.symbol+'</td>'+
-    '<td>'+dBadge(r.direction)+'</td>'+
-    '<td>'+sBadge(r.session)+'</td>'+
-    '<td>'+(r.vwap_position?vBadge(r.vwap_position):'—')+'</td>'+
-    '<td class="cd">'+f2(r.entry)+'</td>'+
-    '<td class="cd">'+(r.sl_pct!=null?pct(r.sl_pct*100):'—')+'</td>'+
-    '<td class="cd">'+(r.latency_ms!=null?r.latency_ms+'ms':'—')+'</td>'+
-    '</tr>'
-  ).join(''):emptyRow(8,'No placed signals in memory · resets on restart'));
-
-  setHtml('whe-body',errors.length?errors.map(r=>
-    '<tr>'+
-    '<td class="cd" style="font-size:9px">'+dt(r.ts)+'</td>'+
-    '<td class="cb fw">'+r.symbol+'</td>'+
-    '<td>'+dBadge(r.direction)+'</td>'+
-    '<td>'+sBadge(r.session)+'</td>'+
-    '<td>'+(r.vwap_position?vBadge(r.vwap_position):'—')+'</td>'+
-    '<td class="cd">'+f2(r.entry)+'</td>'+
-    '<td class="cd">'+(r.sl_pct!=null?pct(r.sl_pct*100):'—')+'</td>'+
-    '<td class="cd">'+(r.band_pct!=null?pct(r.band_pct):'—')+'</td>'+
-    '<td class="cr" style="font-size:9px">'+(r.reason||r.status||'—')+'</td>'+
-    '</tr>'
-  ).join(''):emptyRow(9,'No webhook errors in memory'));
-
-  // Signal rejects: loadSignalRejects returns [{outcome,total,pairs:[{symbol,direction,session,rejectReason,count}]}]
-  const blkRows=[];
-  for(const outcome of (rejects||[])){
-    for(const p of (outcome.pairs||[]).slice(0,5)){
-      blkRows.push('<tr>'+
-        '<td class="cr" style="font-size:9px">'+(p.rejectReason||outcome.outcome||'—')+'</td>'+
-        '<td class="cb">'+p.symbol+'</td>'+
-        '<td>'+dBadge(p.direction)+'</td>'+
-        '<td>'+sBadge(p.session)+'</td>'+
-        '<td>—</td>'+
-        '<td class="cr fw">'+p.count+'</td>'+
-      '</tr>');
-    }
-  }
-  setHtml('blk-body',blkRows.join('')||emptyRow(6,'No blocked signals'));
+  // v14.0: Full signal log — shows ALL signals from webhook history, each with destination
+  // Destination: PLACED → Ghost Tracker, BLOCKED (VWAP/DUPLICATE/NY_DEAD_ZONE) → Shadow Playbook
+  // ERRORS (ORDER_NOT_CONFIRMED, fetch failed, missing data) = excluded / shown as error only
+  const validOutcomes = new Set(['OK','PLACED','REJECTED','BLOCKED','VWAP_EXHAUSTION','DUPLICATE_POSITION','NY_DEAD_ZONE','ORDER_NOT_CONFIRMED']);
+  const allSig = (hist||[]).filter(r => {
+    // Exclude pure technical errors — missing data, fetch failed
+    const st = (r.status||'').toUpperCase();
+    if(st==='ERROR'&&!(r.symbol)) return false;
+    return true;
+  });
+  const outcomeDestination = r => {
+    const st = (r.status||r.outcome||'').toUpperCase();
+    if(st==='OK'||st==='PLACED') return {label:'→ Ghost Tracker', cls:'cg fw', dest:'ghost'};
+    const reason = (r.reason||'').toUpperCase();
+    if(reason.includes('VWAP_EXHAUSTION')||reason.includes('DUPLICATE')||reason.includes('NY_DEAD_ZONE'))
+      return {label:'→ Shadow Playbook', cls:'cp fw', dest:'shadow'};
+    if(st==='ORDER_NOT_CONFIRMED') return {label:'⚠ Not confirmed', cls:'cy', dest:'error'};
+    return {label:'✗ Blocked/Error', cls:'cr', dest:'reject'};
+  };
+  setHtml('placed-body', allSig.length ? allSig.map(r=>{
+    const dest = outcomeDestination(r);
+    if(dest.dest==='error') return ''; // skip pure errors
+    const outcomeLabel = dest.dest==='ghost'?'<span class="bd bd-buy">PLACED</span>':
+      dest.dest==='shadow'?'<span class="bd bd-bw">SHADOW</span>':
+      '<span class="bd bd-sell">REJECT</span>';
+    return '<tr>'+
+      '<td class="cd" style="font-size:9px">'+dt(r.ts)+'</td>'+
+      '<td class="cb fw">'+r.symbol+'</td>'+
+      '<td>'+(r.direction?dBadge(r.direction):'—')+'</td>'+
+      '<td>'+(r.session?sBadge(r.session):'—')+'</td>'+
+      '<td>'+(r.vwap_position?vBadge(r.vwap_position):'—')+'</td>'+
+      '<td class="cd">'+f2(r.entry)+'</td>'+
+      '<td class="cd">'+(r.sl_pct!=null?pct(r.sl_pct*100):'—')+'</td>'+
+      '<td class="cd">'+(r.band_pct!=null?pct(r.band_pct):'—')+'</td>'+
+      '<td>'+outcomeLabel+'</td>'+
+      '<td class="'+dest.cls+'" style="font-size:9px">'+dest.label+'</td>'+
+      '<td class="cd">'+(r.latency_ms!=null?r.latency_ms+'ms':'—')+'</td>'+
+    '</tr>';
+  }).filter(Boolean).join('') : emptyRow(11,'No signals in DB · resets on restart'));
 }
 
 async function loadBlockedRaw(){
