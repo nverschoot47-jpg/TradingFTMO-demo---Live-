@@ -1138,11 +1138,15 @@ async function logSignal(s) {
   } catch (e) { /* non-critical */ }
 }
 
-async function loadWebhookHistory(limit = 100) {
+async function loadWebhookHistory(limit = 100, since = null, until = null) {
   try {
+    const cutoff  = since ?? '2000-01-01';
+    const ceiling = until ?? '2099-12-31';
     const r = await pool.query(`
-      SELECT * FROM webhook_history ORDER BY ts DESC LIMIT $1
-    `, [limit]);
+      SELECT * FROM webhook_history
+      WHERE ts >= $2 AND ts <= $3
+      ORDER BY ts DESC LIMIT $1
+    `, [limit, cutoff, ceiling]);
     return r.rows;
   } catch (e) { return []; }
 }
@@ -1150,13 +1154,17 @@ async function loadWebhookHistory(limit = 100) {
 // ── Signal stats — FIX 7 ───────────────────────────────────────
 // Computes signal conversion ratio from signal_log table.
 // Returns: total, placed, conversionPct, byOutcome, topRejectReasons
-async function loadSignalStats() {
+async function loadSignalStats({ since = null, until = null } = {}) {
   try {
+    const cutoff  = since ?? '2000-01-01';
+    const ceiling = until ?? '2099-12-31';
+    const dateFilter = `received_at >= '${cutoff}' AND received_at <= '${ceiling}'`;
     const [totalR, byOutcomeR, rejectR, rejectSymR] = await Promise.all([
-      pool.query(`SELECT COUNT(*) AS cnt FROM signal_log`),
+      pool.query(`SELECT COUNT(*) AS cnt FROM signal_log WHERE ${dateFilter}`),
       pool.query(`
         SELECT outcome, COUNT(*) AS cnt
         FROM signal_log
+        WHERE ${dateFilter}
         GROUP BY outcome
         ORDER BY cnt DESC
       `),
@@ -1164,6 +1172,7 @@ async function loadSignalStats() {
         SELECT reject_reason, COUNT(*) AS cnt
         FROM signal_log
         WHERE reject_reason IS NOT NULL AND reject_reason != ''
+        AND ${dateFilter}
         GROUP BY reject_reason
         ORDER BY cnt DESC
         LIMIT 20
@@ -1868,9 +1877,10 @@ async function loadBandGhostStats(bandTier) {
 // ── loadSignalRejects (v12.1: niet-genomen trades breakdown) ───
 // Retourneert per outcome + symbol + direction het aantal afgewezen signalen
 // met de meest voorkomende reject_reason. Gebruikt voor het dashboard reject tabel.
-async function loadSignalRejects({ since } = {}) {
+async function loadSignalRejects({ since = null, until = null } = {}) {
   try {
-    const cutoff = since ?? COMPLIANCE_DATE;
+    const cutoff  = since ?? '2000-01-01';
+    const ceiling = until ?? '2099-12-31';
     const r = await pool.query(`
       SELECT
         outcome,
@@ -1882,10 +1892,11 @@ async function loadSignalRejects({ since } = {}) {
       FROM signal_log
       WHERE outcome NOT IN ('PLACED')
         AND received_at >= $1
+        AND received_at <= $2
       GROUP BY outcome, symbol, direction, session, reject_reason
       ORDER BY count DESC
       LIMIT 500
-    `, [cutoff]);
+    `, [cutoff, ceiling]);
     // Aggregeer per outcome: totaal + top pairs
     const byOutcome = {};
     for (const row of r.rows) {
@@ -2236,9 +2247,10 @@ async function loadGhostHistoryByPair(from, to) {
 }
 
 // ── loadBlockedRaw (v12.6: raw grouped blocked signals) ──────────
-async function loadBlockedRaw(since) {
+async function loadBlockedRaw(since, until) {
   try {
-    const cutoff = since ?? EV_DATA_CUTOFF;
+    const cutoff  = since ?? '2000-01-01';
+    const ceiling = until ?? '2099-12-31';
     const r = await pool.query(`
       SELECT
         symbol, direction,
@@ -2251,10 +2263,11 @@ async function loadBlockedRaw(since) {
       FROM signal_log
       WHERE outcome NOT IN ('PLACED')
         AND received_at >= $1
+        AND received_at <= $2
       GROUP BY symbol, direction, vwap_position, session, reject_reason, outcome
       ORDER BY count DESC
       LIMIT 500
-    `, [cutoff]);
+    `, [cutoff, ceiling]);
     return r.rows;
   } catch (e) { console.warn('[!] loadBlockedRaw:', e.message); return []; }
 }
