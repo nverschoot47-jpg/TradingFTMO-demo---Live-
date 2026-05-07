@@ -398,7 +398,80 @@ async function initDB() {
       CREATE INDEX IF NOT EXISTS idx_signal_log_key    ON signal_log (optimizer_key);
     `);
 
-    // ── vwap_band_ghost — ghost data for signals rejected by VWAP band exhaustion ──
+    // ── blocked_ghost_tracker (v13.4) ────────────────────────────
+    // Invisible ghost tracker voor geblokkeerde signalen:
+    // - NY_DEAD_ZONE: signalen geblokkeerd buiten tradingvenster
+    // - DUPLICATE_POSITION: signalen geblokkeerd door dubbele positie
+    // - VWAP_EXHAUSTION: signalen geblokkeerd door VWAP band > 150%
+    // Elke blocked signal krijgt zijn eigen ghost die bijgehouden wordt
+    // via de syncPositions cron, zodat we kunnen analyseren wat er zou
+    // zijn gebeurd als we het signaal WEL hadden genomen.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS blocked_ghost_tracker (
+        id              SERIAL      PRIMARY KEY,
+        block_type      TEXT        NOT NULL,   -- 'NY_DEAD_ZONE' | 'DUPLICATE' | 'VWAP_EXHAUSTION'
+        optimizer_key   TEXT        NOT NULL,
+        symbol          TEXT        NOT NULL,
+        mt5_symbol      TEXT,
+        session         TEXT        NOT NULL,
+        direction       TEXT        NOT NULL,
+        vwap_position   TEXT        DEFAULT 'unknown',
+        entry           NUMERIC     NOT NULL,
+        sl              NUMERIC     NOT NULL,
+        sl_pct          NUMERIC,
+        tp_rr_used      NUMERIC,
+        max_price       NUMERIC,
+        max_rr          NUMERIC     DEFAULT 0,
+        max_sl_pct_used NUMERIC     DEFAULT 0,
+        peak_rr_pos     NUMERIC     DEFAULT 0,
+        peak_rr_neg     NUMERIC     DEFAULT 0,
+        sl_milestones   JSONB       DEFAULT '{}'::jsonb,
+        rr_milestones   JSONB       DEFAULT '{}'::jsonb,
+        phantom_sl_hit  BOOLEAN     DEFAULT FALSE,
+        stop_reason     TEXT,
+        time_to_sl_min  INTEGER,
+        vwap_band_pct   NUMERIC,            -- voor VWAP_EXHAUSTION
+        block_reason    TEXT,               -- volledige reject reason string
+        opened_at       TIMESTAMPTZ NOT NULL,
+        closed_at       TIMESTAMPTZ,
+        created_at      TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_bgt_key     ON blocked_ghost_tracker (optimizer_key);
+      CREATE INDEX IF NOT EXISTS idx_bgt_type    ON blocked_ghost_tracker (block_type);
+      CREATE INDEX IF NOT EXISTS idx_bgt_sym     ON blocked_ghost_tracker (symbol);
+      CREATE INDEX IF NOT EXISTS idx_bgt_opened  ON blocked_ghost_tracker (opened_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_bgt_closed  ON blocked_ghost_tracker (closed_at);
+    `);
+
+    // ── blocked_ghost_state (actieve invisible ghosts — persist over restart) ──
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS blocked_ghost_state (
+        id              TEXT        PRIMARY KEY,  -- uniek ID bijv. "BGT_<ts>_<key>"
+        block_type      TEXT        NOT NULL,
+        optimizer_key   TEXT        NOT NULL,
+        symbol          TEXT        NOT NULL,
+        mt5_symbol      TEXT,
+        session         TEXT        NOT NULL,
+        direction       TEXT        NOT NULL,
+        vwap_position   TEXT        DEFAULT 'unknown',
+        entry           NUMERIC     NOT NULL,
+        sl              NUMERIC     NOT NULL,
+        sl_pct          NUMERIC,
+        tp_rr_used      NUMERIC,
+        max_price       NUMERIC,
+        max_rr          NUMERIC     DEFAULT 0,
+        max_sl_pct_used NUMERIC     DEFAULT 0,
+        peak_rr_pos     NUMERIC     DEFAULT 0,
+        peak_rr_neg     NUMERIC     DEFAULT 0,
+        sl_milestones   JSONB       DEFAULT '{}'::jsonb,
+        rr_milestones   JSONB       DEFAULT '{}'::jsonb,
+        vwap_band_pct   NUMERIC,
+        block_reason    TEXT,
+        opened_at       TIMESTAMPTZ NOT NULL,
+        updated_at      TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+
     // Separate from main ghost_trades. Tracks what would have happened if we took
     // the trade at 150–250% and 250–350% VWAP band exhaustion.
     // NEVER merged into main EV / TP optimizer tables.
@@ -2186,7 +2259,202 @@ async function loadBlockedRaw(since) {
   } catch (e) { console.warn('[!] loadBlockedRaw:', e.message); return []; }
 }
 
-// ── Compliance date persistence ───────────────────────────────
+// ══════════════════════════════════════════════════════════════
+//  BLOCKED GHOST TRACKER (v13.4)
+//  Invisible ghost tracking voor NY_DEAD_ZONE, DUPLICATE, VWAP_EXHAUSTION
+// ══════════════════════════════════════════════════════════════
+
+// Sla een actieve blocked ghost op (persist over restart)
+async function saveBlockedGhostState(g) {
+  try {
+    await pool.query(`
+      INSERT INTO blocked_ghost_state
+        (id, block_type, optimizer_key, symbol, mt5_symbol, session, direction,
+         vwap_position, entry, sl, sl_pct, tp_rr_used,
+         max_price, max_rr, max_sl_pct_used, peak_rr_pos, peak_rr_neg,
+         sl_milestones, rr_milestones, vwap_band_pct, block_reason,
+         opened_at, updated_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,NOW())
+      ON CONFLICT (id) DO UPDATE SET
+        max_price       = EXCLUDED.max_price,
+        max_rr          = EXCLUDED.max_rr,
+        max_sl_pct_used = EXCLUDED.max_sl_pct_used,
+        peak_rr_pos     = GREATEST(EXCLUDED.peak_rr_pos, blocked_ghost_state.peak_rr_pos),
+        peak_rr_neg     = GREATEST(EXCLUDED.peak_rr_neg, blocked_ghost_state.peak_rr_neg),
+        sl_milestones   = COALESCE(EXCLUDED.sl_milestones, blocked_ghost_state.sl_milestones),
+        rr_milestones   = COALESCE(EXCLUDED.rr_milestones, blocked_ghost_state.rr_milestones),
+        updated_at      = NOW()
+    `, [
+      g.id, g.blockType, g.optimizerKey, g.symbol, g.mt5Symbol ?? g.symbol,
+      g.session, g.direction, g.vwapPosition ?? 'unknown',
+      g.entry, g.sl, g.slPct ?? null, g.tpRRUsed ?? null,
+      g.maxPrice ?? g.entry, g.maxRR ?? 0, g.maxSlPctUsed ?? 0,
+      g.peakRRPos ?? 0, g.peakRRNeg ?? 0,
+      g.slMilestones && Object.keys(g.slMilestones).length > 0 ? JSON.stringify(g.slMilestones) : null,
+      g.rrMilestones && Object.keys(g.rrMilestones).length > 0 ? JSON.stringify(g.rrMilestones) : null,
+      g.vwapBandPct ?? null, g.blockReason ?? null,
+      g.openedAt,
+    ]);
+  } catch (e) { console.warn('[!] saveBlockedGhostState:', e.message); }
+}
+
+async function loadAllBlockedGhostStates() {
+  try {
+    const r = await pool.query(`
+      SELECT
+        id, block_type AS "blockType", optimizer_key AS "optimizerKey",
+        symbol, mt5_symbol AS "mt5Symbol", session, direction,
+        vwap_position AS "vwapPosition",
+        CAST(entry AS FLOAT) AS entry, CAST(sl AS FLOAT) AS sl,
+        CAST(sl_pct AS FLOAT) AS "slPct",
+        CAST(tp_rr_used AS FLOAT) AS "tpRRUsed",
+        CAST(max_price AS FLOAT) AS "maxPrice",
+        CAST(max_rr AS FLOAT) AS "maxRR",
+        CAST(max_sl_pct_used AS FLOAT) AS "maxSlPctUsed",
+        CAST(peak_rr_pos AS FLOAT) AS "peakRRPos",
+        CAST(peak_rr_neg AS FLOAT) AS "peakRRNeg",
+        sl_milestones AS "slMilestones",
+        rr_milestones AS "rrMilestones",
+        CAST(vwap_band_pct AS FLOAT) AS "vwapBandPct",
+        block_reason AS "blockReason",
+        opened_at AS "openedAt"
+      FROM blocked_ghost_state
+    `);
+    return r.rows;
+  } catch (e) { console.warn('[!] loadAllBlockedGhostStates:', e.message); return []; }
+}
+
+async function deleteBlockedGhostState(id) {
+  try {
+    await pool.query('DELETE FROM blocked_ghost_state WHERE id=$1', [id]);
+  } catch (e) { console.warn('[!] deleteBlockedGhostState:', e.message); }
+}
+
+// Sla een afgesloten blocked ghost op in de history tabel
+async function saveBlockedGhostTrade(g) {
+  try {
+    await pool.query(`
+      INSERT INTO blocked_ghost_tracker
+        (block_type, optimizer_key, symbol, mt5_symbol, session, direction,
+         vwap_position, entry, sl, sl_pct, tp_rr_used,
+         max_price, max_rr, max_sl_pct_used, peak_rr_pos, peak_rr_neg,
+         sl_milestones, rr_milestones, phantom_sl_hit, stop_reason,
+         time_to_sl_min, vwap_band_pct, block_reason, opened_at, closed_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
+    `, [
+      g.blockType, g.optimizerKey, g.symbol, g.mt5Symbol ?? g.symbol,
+      g.session, g.direction, g.vwapPosition ?? 'unknown',
+      g.entry, g.sl, g.slPct ?? null, g.tpRRUsed ?? null,
+      g.maxPrice ?? null, g.maxRR ?? 0, g.maxSlPctUsed ?? 0,
+      g.peakRRPos ?? 0, g.peakRRNeg ?? 0,
+      g.slMilestones ? JSON.stringify(g.slMilestones) : null,
+      g.rrMilestones ? JSON.stringify(g.rrMilestones) : null,
+      g.phantomSLHit ?? false, g.stopReason ?? null,
+      g.timeToSLMin ?? null, g.vwapBandPct ?? null,
+      g.blockReason ?? null, g.openedAt, g.closedAt ?? new Date().toISOString(),
+    ]);
+  } catch (e) { console.warn('[!] saveBlockedGhostTrade:', e.message); }
+}
+
+// Laad blocked ghost history gegroepeerd per blockType + optimizerKey
+async function loadBlockedGhostHistory(blockType, from, to) {
+  try {
+    const cutoff  = from ?? '2000-01-01';
+    const ceiling = to   ?? '2099-12-31';
+    const r = await pool.query(`
+      SELECT
+        id,
+        block_type                                    AS "blockType",
+        optimizer_key                                 AS "optimizerKey",
+        symbol, session, direction,
+        vwap_position                                 AS "vwapPosition",
+        CAST(entry           AS FLOAT)                AS entry,
+        CAST(sl              AS FLOAT)                AS sl,
+        CAST(sl_pct          AS FLOAT)                AS "slPct",
+        CAST(tp_rr_used      AS FLOAT)                AS "tpRRUsed",
+        CAST(max_rr          AS FLOAT)                AS "maxRR",
+        CAST(max_sl_pct_used AS FLOAT)                AS "maxSlPct",
+        CAST(peak_rr_pos     AS FLOAT)                AS "peakRRPos",
+        CAST(peak_rr_neg     AS FLOAT)                AS "peakRRNeg",
+        phantom_sl_hit                                AS "phantomSLHit",
+        stop_reason                                   AS "stopReason",
+        time_to_sl_min                                AS "timeToSL",
+        rr_milestones                                 AS "rrMilestones",
+        sl_milestones                                 AS "slMilestones",
+        CAST(vwap_band_pct   AS FLOAT)                AS "vwapBandPct",
+        block_reason                                  AS "blockReason",
+        opened_at                                     AS "openedAt",
+        closed_at                                     AS "closedAt"
+      FROM blocked_ghost_tracker
+      WHERE block_type = $1
+        AND opened_at >= $2
+        AND opened_at <= $3
+        AND closed_at IS NOT NULL
+      ORDER BY optimizer_key ASC, opened_at DESC
+    `, [blockType, cutoff, ceiling]);
+
+    // Groepeer per optimizer_key
+    const grouped = {};
+    for (const row of r.rows) {
+      const key = row.optimizerKey;
+      if (!grouped[key]) grouped[key] = {
+        optimizerKey: key, blockType: row.blockType,
+        symbol: row.symbol, session: row.session,
+        direction: row.direction, vwapPosition: row.vwapPosition,
+        trades: [],
+        n: 0, nSLHit: 0, nMaxRR15: 0,
+        sumPeakPos: 0, sumPeakNeg: 0,
+        maxPeakPos: 0, maxPeakNeg: 0,
+      };
+      const g = grouped[key];
+      g.trades.push(row);
+      g.n++;
+      if (row.stopReason === 'phantom_sl' || row.phantomSLHit) g.nSLHit++;
+      if (row.stopReason === 'max_rr_15') g.nMaxRR15++;
+      const pp = parseFloat(row.peakRRPos ?? row.maxRR ?? 0);
+      const pn = parseFloat(row.peakRRNeg ?? row.maxSlPct ?? 0);
+      g.sumPeakPos += pp; g.sumPeakNeg += pn;
+      if (pp > g.maxPeakPos) g.maxPeakPos = pp;
+      if (pn > g.maxPeakNeg) g.maxPeakNeg = pn;
+    }
+    for (const g of Object.values(grouped)) {
+      g.avgPeakPos = g.n > 0 ? parseFloat((g.sumPeakPos / g.n).toFixed(3)) : 0;
+      g.avgPeakNeg = g.n > 0 ? parseFloat((g.sumPeakNeg / g.n).toFixed(3)) : 0;
+      g.maxPeakPos = parseFloat(g.maxPeakPos.toFixed(3));
+      g.maxPeakNeg = parseFloat(g.maxPeakNeg.toFixed(3));
+      delete g.sumPeakPos; delete g.sumPeakNeg;
+    }
+    return Object.values(grouped).sort((a, b) => b.n - a.n);
+  } catch (e) { console.warn('[!] loadBlockedGhostHistory:', e.message); return []; }
+}
+
+// Actieve blocked ghosts (open posities die worden gevolgd)
+async function loadActiveBlockedGhosts() {
+  try {
+    const r = await pool.query(`
+      SELECT
+        id, block_type AS "blockType", optimizer_key AS "optimizerKey",
+        symbol, mt5_symbol AS "mt5Symbol", session, direction,
+        vwap_position AS "vwapPosition",
+        CAST(entry AS FLOAT) AS entry, CAST(sl AS FLOAT) AS sl,
+        CAST(sl_pct AS FLOAT) AS "slPct",
+        CAST(max_rr AS FLOAT) AS "maxRR",
+        CAST(max_sl_pct_used AS FLOAT) AS "maxSlPctUsed",
+        CAST(peak_rr_pos AS FLOAT) AS "peakRRPos",
+        CAST(peak_rr_neg AS FLOAT) AS "peakRRNeg",
+        sl_milestones AS "slMilestones",
+        rr_milestones AS "rrMilestones",
+        CAST(vwap_band_pct AS FLOAT) AS "vwapBandPct",
+        block_reason AS "blockReason",
+        opened_at AS "openedAt"
+      FROM blocked_ghost_state
+      ORDER BY opened_at DESC
+    `);
+    return r.rows;
+  } catch (e) { console.warn('[!] loadActiveBlockedGhosts:', e.message); return []; }
+}
+
+
 async function saveComplianceDate(isoStr) {
   try {
     await pool.query(`
@@ -2266,6 +2534,13 @@ module.exports = {
   syncTradeNumberSequence,
   computeAndSaveGhostComboAnalysis,
   loadGhostComboAnalysis,
+  // v13.4: blocked ghost tracker
+  saveBlockedGhostState,
+  loadAllBlockedGhostStates,
+  deleteBlockedGhostState,
+  saveBlockedGhostTrade,
+  loadBlockedGhostHistory,
+  loadActiveBlockedGhosts,
   // v12.5: compliance date management
   setComplianceDateLive,
   saveComplianceDate,
