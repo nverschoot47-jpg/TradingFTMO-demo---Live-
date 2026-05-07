@@ -1449,7 +1449,6 @@ function toggleMsCols(){
   let s=document.getElementById('ms-style');
   if(!s){ s=document.createElement('style'); s.id='ms-style'; document.head.appendChild(s); }
   s.textContent=_msVisible?'':'.ms-adv,.ms-fav{display:none!important}';
-  // Also override inline display styles set by DOMContentLoaded
   document.querySelectorAll('th.adv-th,th.fav-th').forEach(el=>el.style.display=_msVisible?'':'none');
   const btn=document.getElementById('ms-btn');
   if(btn) btn.textContent=_msVisible?'✕ Milestones':'± Milestones';
@@ -1920,18 +1919,11 @@ function setEVF(k,v,btn){
 async function loadEV(){
   const [g,tp]=await Promise.all([api('/api/ghost-grouped'),api('/api/tp-config')]);
   const grouped=g||[];
-  // Batch-fetch EV stats for all keys with enough ghost data
   const evKeys=grouped.filter(r=>r.n>=5).map(r=>r.optimizerKey);
-  const evResults=await Promise.all(
-    evKeys.map(key=>api('/api/ev-stats?key='+encodeURIComponent(key)))
-  );
+  const evResults=await Promise.all(evKeys.map(key=>api('/api/ev-stats?key='+encodeURIComponent(key))));
   const evMap={};
   evKeys.forEach((key,i)=>{ if(evResults[i]) evMap[key]=evResults[i]; });
-  _evData=grouped.map(r=>({
-    ...r,
-    tpLocked:(tp||{})[r.optimizerKey],
-    evStats: evMap[r.optimizerKey]||null,
-  }));
+  _evData=grouped.map(r=>({...r,tpLocked:(tp||{})[r.optimizerKey],evStats:evMap[r.optimizerKey]||null}));
   renderEV();
 }
 function renderEV(){
@@ -1951,9 +1943,6 @@ function renderEV(){
   if(!rows.length){ tbody.innerHTML=emptyRow(15,'No combos match filters'); return; }
   tbody.innerHTML=rows.map(r=>{
     const tp=r.tpLocked;
-    const ev=r.evStats;
-    const evScore=ev?.bestEV!=null?ev.bestEV:null;
-    const evCls=evScore!=null?(evScore>0?'cg fw':evScore<0?'cr':'cd'):'cd';
     return '<tr>'+
       '<td class="cb fw">'+r.symbol+'</td>'+
       '<td>'+tBadge(symType(r.symbol))+'</td>'+
@@ -1961,19 +1950,18 @@ function renderEV(){
       '<td>'+dBadge(r.direction)+'</td>'+
       '<td>'+vBadge(r.vwapPosition)+'</td>'+
       '<td class="'+(r.n>=5?'cy fw':'cc')+'">'+r.n+'</td>'+
-      '<td class="cd">'+(ev?.count!=null?ev.count:r.n)+'</td>'+
-      '<td class="cg fw">'+(ev?.bestRR!=null?f2(ev.bestRR)+'R':f2(r.bestMaxRR)+'R')+'</td>'+
-      '<td class="cd">'+(ev?.avgRR!=null?f2(ev.avgRR)+'R':f2(r.avgMaxRR)+'R')+'</td>'+
-      '<td class="'+evCls+'">'+(evScore!=null?evScore.toFixed(3):'—')+'</td>'+
+      '<td class="cd">'+r.n+'</td>'+
+      '<td class="cg fw">'+f2(r.bestMaxRR)+'R</td>'+
+      '<td class="cd">'+f2(r.avgMaxRR)+'R</td>'+
+      '<td class="cd">—</td>'+
       '<td class="'+(tp?.lockedRR?'cg':'cy')+'" style="font-size:9px">'+(tp?.lockedRR?'✓ EV+ Locked':'need≥5')+'</td>'+
-      '<td class="'+(tp?.lockedRR?'cg fw':'cd')+'">'+(tp?.lockedRR?tp.lockedRR+'R':'—')+'</td>'+
-      '<td class="cd">'+(ev?.avgTimeToSLMin!=null?msFmt(ev.avgTimeToSLMin):'—')+'</td>'+
-      '<td class="cd">'+(ev?.avgMaxSlPct!=null?f1(ev.avgMaxSlPct)+'%':'—')+'</td>'+
+      '<td class="'+(tp?.lockedRR?'cg fw':'cd')+'">'+( tp?.lockedRR?tp.lockedRR+'R':'—')+'</td>'+
+      '<td class="cd">'+f1(r.avgSlPct)+'% avg SL</td>'+
+      '<td class="cd">—</td>'+
       '<td class="cd">—</td>'+
     '</tr>';
   }).join('');
 }
-
 
 // ── EV SL Optimizer ───────────────────────────────────────────────
 async function loadEVSL(){
@@ -1982,4 +1970,14 @@ async function loadEVSL(){
   const tbody=document.getElementById('evsl-body'); if(!tbody) return;
   if(!d.length){ tbody.innerHTML=emptyRow(14,'Min 3 ghost trades required per combo · waiting for ghost data'); return; }
   tbody.innerHTML=d.map(r=>{
-    const 
+    const parts=(r.optimizerKey||'').split('_');
+    const sym=parts[0]||'—',sess=parts[1]||'—',dir=parts[2]||'—',vwap=parts[3]||'—';
+    const p90=r.maeP90; const slRec=r.slReduction;
+    const cls=slRec?.color==='g'?'cg':slRec?.color==='y'?'cy':slRec?.color==='r'?'cr':'cd';
+    const pot=p90!=null&&p90<100?(100-p90).toFixed(1)+'% possible':'—';
+    return '<tr>'+
+      '<td class="cb fw">'+sym+'</td>'+
+      '<td>'+tBadge(symType(sym))+'</td>'+
+      '<td>'+sBadge(sess)+'</td>'+
+      '<td>'+dBadge(dir)+'</td>'+
+      '<td>'+vBadge(vwap)+'</td>'+
