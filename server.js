@@ -1074,21 +1074,6 @@ tr:hover td{background:var(--bg4)}
   <span id="cbar-desc">all EV, statistics &amp; P&amp;L calculated only on trades after this date</span>
 </div>
 
-<!-- ═══════════════════════ GLOBAL DATE FILTER ══════════════════ -->
-<div id="global-filter-bar" style="background:#0a1120;border-bottom:1px solid var(--bdr2);padding:4px 14px;display:flex;align-items:center;gap:8px;flex-shrink:0;flex-wrap:wrap">
-  <span style="font-size:9px;color:var(--ink3);text-transform:uppercase;letter-spacing:.6px;font-weight:600">📅 Date Filter:</span>
-  <span style="font-size:9px;color:var(--ink3)">Open:</span>
-  <input type="date" id="gf-open-from" placeholder="van" style="background:var(--bg3);border:1px solid var(--bdr2);color:var(--ink2);padding:2px 6px;border-radius:3px;font:10px 'SF Mono',monospace" onchange="applyGlobalFilter()">
-  <span style="font-size:9px;color:var(--ink3)">→</span>
-  <input type="date" id="gf-open-to" placeholder="tot" style="background:var(--bg3);border:1px solid var(--bdr2);color:var(--ink2);padding:2px 6px;border-radius:3px;font:10px 'SF Mono',monospace" onchange="applyGlobalFilter()">
-  <span style="font-size:9px;color:var(--ink3);margin-left:6px">Closed:</span>
-  <input type="date" id="gf-close-from" placeholder="van" style="background:var(--bg3);border:1px solid var(--bdr2);color:var(--ink2);padding:2px 6px;border-radius:3px;font:10px 'SF Mono',monospace" onchange="applyGlobalFilter()">
-  <span style="font-size:9px;color:var(--ink3)">→</span>
-  <input type="date" id="gf-close-to" placeholder="tot" style="background:var(--bg3);border:1px solid var(--bdr2);color:var(--ink2);padding:2px 6px;border-radius:3px;font:10px 'SF Mono',monospace" onchange="applyGlobalFilter()">
-  <button class="fb on" id="gf-reset-btn" onclick="resetGlobalFilter()" style="margin-left:4px">✕ Reset</button>
-  <span id="gf-active-lbl" style="display:none;font-size:9px;color:var(--y);font-weight:700">⚠ Actief filter</span>
-  <span id="gf-count-lbl" style="font-size:9px;color:var(--ink3);margin-left:auto"></span>
-</div>
 
 <!-- ═══════════════════════ NAV ════════════════════════════════ -->
 <nav id="main-nav">
@@ -1105,6 +1090,22 @@ tr:hover td{background:var(--bg4)}
 <!-- ══════════════ PAGE: OVERVIEW ══════════════════════════════ -->
 <div class="npage on" id="page-overview">
   <div class="pg">
+
+<!-- Date filter: ov -->
+  <div id="ov-dfbar" style="background:var(--bg3);border-bottom:1px solid var(--bdr);padding:5px 14px;display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+    <span style="font-size:9px;font-weight:700;color:var(--b);text-transform:uppercase;letter-spacing:.5px">📅</span>
+    <span class="fl">Open:</span>
+    <input type="date" id="ov-open-from" style="background:var(--bg2);border:1px solid var(--bdr2);color:var(--ink2);padding:2px 7px;border-radius:3px;font:10px 'SF Mono',monospace;cursor:pointer">
+    <span style="color:var(--ink3);font-size:10px">→</span>
+    <input type="date" id="ov-open-to"   style="background:var(--bg2);border:1px solid var(--bdr2);color:var(--ink2);padding:2px 7px;border-radius:3px;font:10px 'SF Mono',monospace;cursor:pointer">
+        <span class="fl" style="margin-left:8px">Closed:</span>
+        <input type="date" id="ov-close-from" style="background:var(--bg2);border:1px solid var(--bdr2);color:var(--ink2);padding:2px 7px;border-radius:3px;font:10px 'SF Mono',monospace;cursor:pointer">
+        <span style="color:var(--ink3);font-size:10px">→</span>
+        <input type="date" id="ov-close-to"   style="background:var(--bg2);border:1px solid var(--bdr2);color:var(--ink2);padding:2px 7px;border-radius:3px;font:10px 'SF Mono',monospace;cursor:pointer">
+    <button class="fb" onclick="applyOVFilter()" style="margin-left:4px;background:var(--b2);color:var(--b);border-color:rgba(88,166,255,.4)">Apply</button>
+    <button class="fb" onclick="resetOVFilter()" style="margin-left:2px">Reset</button>
+    <span id="ov-df-active" style="display:none;font-size:9px;color:var(--y);font-weight:700;margin-left:4px">⚠ Gefilterd</span>
+  </div>
 
     <!-- KPI Row -->
     <div class="card" style="overflow:hidden">
@@ -1232,6 +1233,17 @@ tr:hover td{background:var(--bg4)}
 <!-- ══════════════ PAGE: OPEN POSITIONS ════════════════════════ -->
 <div class="npage" id="page-positions">
   <div class="pg">
+<!-- Date filter: pos -->
+  <div id="pos-dfbar" style="background:var(--bg3);border-bottom:1px solid var(--bdr);padding:5px 14px;display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+    <span style="font-size:9px;font-weight:700;color:var(--b);text-transform:uppercase;letter-spacing:.5px">📅</span>
+    <span class="fl">Open:</span>
+    <input type="date" id="pos-open-from" style="background:var(--bg2);border:1px solid var(--bdr2);color:var(--ink2);padding:2px 7px;border-radius:3px;font:10px 'SF Mono',monospace;cursor:pointer">
+    <span style="color:var(--ink3);font-size:10px">→</span>
+    <input type="date" id="pos-open-to"   style="background:var(--bg2);border:1px solid var(--bdr2);color:var(--ink2);padding:2px 7px;border-radius:3px;font:10px 'SF Mono',monospace;cursor:pointer">
+    <button class="fb" onclick="applyPOSFilter()" style="margin-left:4px;background:var(--b2);color:var(--b);border-color:rgba(88,166,255,.4)">Apply</button>
+    <button class="fb" onclick="resetPOSFilter()" style="margin-left:2px">Reset</button>
+    <span id="pos-df-active" style="display:none;font-size:9px;color:var(--y);font-weight:700;margin-left:4px">⚠ Gefilterd</span>
+  </div>
     <div class="card">
       <div class="card-hdr">
         <div class="card-title"><div class="dot r" id="pos-dot"></div>Open Positions — Live</div>
@@ -1278,6 +1290,17 @@ tr:hover td{background:var(--bg4)}
 <!-- ══════════════ PAGE: GHOST TRACKER ═════════════════════════ -->
 <div class="npage" id="page-ghosts">
   <div class="pg">
+<!-- Date filter: gh -->
+  <div id="gh-dfbar" style="background:var(--bg3);border-bottom:1px solid var(--bdr);padding:5px 14px;display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+    <span style="font-size:9px;font-weight:700;color:var(--b);text-transform:uppercase;letter-spacing:.5px">📅</span>
+    <span class="fl">Open:</span>
+    <input type="date" id="gh-open-from" style="background:var(--bg2);border:1px solid var(--bdr2);color:var(--ink2);padding:2px 7px;border-radius:3px;font:10px 'SF Mono',monospace;cursor:pointer">
+    <span style="color:var(--ink3);font-size:10px">→</span>
+    <input type="date" id="gh-open-to"   style="background:var(--bg2);border:1px solid var(--bdr2);color:var(--ink2);padding:2px 7px;border-radius:3px;font:10px 'SF Mono',monospace;cursor:pointer">
+    <button class="fb" onclick="applyGHFilter()" style="margin-left:4px;background:var(--b2);color:var(--b);border-color:rgba(88,166,255,.4)">Apply</button>
+    <button class="fb" onclick="resetGHFilter()" style="margin-left:2px">Reset</button>
+    <span id="gh-df-active" style="display:none;font-size:9px;color:var(--y);font-weight:700;margin-left:4px">⚠ Gefilterd</span>
+  </div>
     <div class="card">
       <div class="card-hdr">
         <div class="card-title"><div class="dot r" id="gh-dot"></div>Ghost Tracker — Active (until SL hit | 15R | timeout)</div>
@@ -1322,21 +1345,17 @@ tr:hover td{background:var(--bg4)}
 <!-- ══════════════ PAGE: GHOST HISTORY ═════════════════════════ -->
 <div class="npage" id="page-history">
   <div class="pg">
-    <!-- Selective Date Filter -->
-    <div class="card">
-      <div class="card-hdr">
-        <div class="card-title">🗓 Selective Date Filter — Ghost History</div>
-        <div class="cmeta" id="ghdate-meta">Selecteer een periode om Ghost History te filteren</div>
-      </div>
-      <div style="display:flex;align-items:center;gap:10px;padding:10px 14px;flex-wrap:wrap">
-        <span class="fl">Van:</span>
-        <input type="date" id="ghdate-from" style="background:var(--bg3);border:1px solid var(--bdr2);color:var(--ink2);padding:4px 8px;border-radius:4px;font:11px 'SF Mono',monospace;cursor:pointer" onchange="applyGHDateFilter()">
-        <span class="fl">Tot:</span>
-        <input type="date" id="ghdate-to" style="background:var(--bg3);border:1px solid var(--bdr2);color:var(--ink2);padding:4px 8px;border-radius:4px;font:11px 'SF Mono',monospace;cursor:pointer" onchange="applyGHDateFilter()">
-        <button class="fb on" id="ghdate-all-btn" onclick="clearGHDateFilter()">Alles tonen</button>
-        <span id="ghdate-active" style="display:none;font-size:10px;color:var(--y);margin-left:4px">⚠ Gefilterd op periode</span>
-      </div>
-    </div>
+<!-- Date filter: history -->
+  <div id="hist-dfbar" style="background:var(--bg3);border-bottom:1px solid var(--bdr);padding:5px 14px;display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+    <span style="font-size:9px;font-weight:700;color:var(--b);text-transform:uppercase;letter-spacing:.5px">📅</span>
+    <span class="fl">Open:</span>
+    <input type="date" id="hist-open-from" style="background:var(--bg2);border:1px solid var(--bdr2);color:var(--ink2);padding:2px 7px;border-radius:3px;font:10px 'SF Mono',monospace;cursor:pointer">
+    <span style="color:var(--ink3);font-size:10px">→</span>
+    <input type="date" id="hist-open-to"   style="background:var(--bg2);border:1px solid var(--bdr2);color:var(--ink2);padding:2px 7px;border-radius:3px;font:10px 'SF Mono',monospace;cursor:pointer">
+    <button class="fb" onclick="applyHISTFilter()" style="margin-left:4px;background:var(--b2);color:var(--b);border-color:rgba(88,166,255,.4)">Apply</button>
+    <button class="fb" onclick="resetHISTFilter()" style="margin-left:2px">Reset</button>
+    <span id="hist-df-active" style="display:none;font-size:9px;color:var(--y);font-weight:700;margin-left:4px">⚠ Gefilterd</span>
+  </div>
     <!-- Grouped by pair - expandable -->
     <div class="card">
       <div class="card-hdr">
@@ -1407,6 +1426,21 @@ tr:hover td{background:var(--bg4)}
 <!-- ══════════════ PAGE: EV TP OPTIMIZER ═══════════════════════ -->
 <div class="npage" id="page-ev">
   <div class="pg">
+<!-- Date filter: ev -->
+  <div id="ev-dfbar" style="background:var(--bg3);border-bottom:1px solid var(--bdr);padding:5px 14px;display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+    <span style="font-size:9px;font-weight:700;color:var(--b);text-transform:uppercase;letter-spacing:.5px">📅</span>
+    <span class="fl">Open:</span>
+    <input type="date" id="ev-open-from" style="background:var(--bg2);border:1px solid var(--bdr2);color:var(--ink2);padding:2px 7px;border-radius:3px;font:10px 'SF Mono',monospace;cursor:pointer">
+    <span style="color:var(--ink3);font-size:10px">→</span>
+    <input type="date" id="ev-open-to"   style="background:var(--bg2);border:1px solid var(--bdr2);color:var(--ink2);padding:2px 7px;border-radius:3px;font:10px 'SF Mono',monospace;cursor:pointer">
+        <span class="fl" style="margin-left:8px">Closed:</span>
+        <input type="date" id="ev-close-from" style="background:var(--bg2);border:1px solid var(--bdr2);color:var(--ink2);padding:2px 7px;border-radius:3px;font:10px 'SF Mono',monospace;cursor:pointer">
+        <span style="color:var(--ink3);font-size:10px">→</span>
+        <input type="date" id="ev-close-to"   style="background:var(--bg2);border:1px solid var(--bdr2);color:var(--ink2);padding:2px 7px;border-radius:3px;font:10px 'SF Mono',monospace;cursor:pointer">
+    <button class="fb" onclick="applyEVFilter()" style="margin-left:4px;background:var(--b2);color:var(--b);border-color:rgba(88,166,255,.4)">Apply</button>
+    <button class="fb" onclick="resetEVFilter()" style="margin-left:2px">Reset</button>
+    <span id="ev-df-active" style="display:none;font-size:9px;color:var(--y);font-weight:700;margin-left:4px">⚠ Gefilterd</span>
+  </div>
     <div class="card">
       <div class="card-hdr">
         <div class="card-title"><div class="dot r" id="ev-dot"></div>EV / TP Optimizer — All Signal Combos</div>
@@ -1457,6 +1491,21 @@ tr:hover td{background:var(--bg4)}
 <!-- ══════════════ PAGE: EV SL OPTIMIZER ══════════════════════ -->
 <div class="npage" id="page-evsl">
   <div class="pg">
+<!-- Date filter: evsl -->
+  <div id="evsl-dfbar" style="background:var(--bg3);border-bottom:1px solid var(--bdr);padding:5px 14px;display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+    <span style="font-size:9px;font-weight:700;color:var(--b);text-transform:uppercase;letter-spacing:.5px">📅</span>
+    <span class="fl">Open:</span>
+    <input type="date" id="evsl-open-from" style="background:var(--bg2);border:1px solid var(--bdr2);color:var(--ink2);padding:2px 7px;border-radius:3px;font:10px 'SF Mono',monospace;cursor:pointer">
+    <span style="color:var(--ink3);font-size:10px">→</span>
+    <input type="date" id="evsl-open-to"   style="background:var(--bg2);border:1px solid var(--bdr2);color:var(--ink2);padding:2px 7px;border-radius:3px;font:10px 'SF Mono',monospace;cursor:pointer">
+        <span class="fl" style="margin-left:8px">Closed:</span>
+        <input type="date" id="evsl-close-from" style="background:var(--bg2);border:1px solid var(--bdr2);color:var(--ink2);padding:2px 7px;border-radius:3px;font:10px 'SF Mono',monospace;cursor:pointer">
+        <span style="color:var(--ink3);font-size:10px">→</span>
+        <input type="date" id="evsl-close-to"   style="background:var(--bg2);border:1px solid var(--bdr2);color:var(--ink2);padding:2px 7px;border-radius:3px;font:10px 'SF Mono',monospace;cursor:pointer">
+    <button class="fb" onclick="applyEVSLFilter()" style="margin-left:4px;background:var(--b2);color:var(--b);border-color:rgba(88,166,255,.4)">Apply</button>
+    <button class="fb" onclick="resetEVSLFilter()" style="margin-left:2px">Reset</button>
+    <span id="evsl-df-active" style="display:none;font-size:9px;color:var(--y);font-weight:700;margin-left:4px">⚠ Gefilterd</span>
+  </div>
     <div class="card">
       <div class="card-hdr">
         <div class="card-title"><div class="dot" id="evsl-dot"></div>EV SL Optimizer — MAE-based SL Reduction · Read Only</div>
@@ -1494,6 +1543,21 @@ tr:hover td{background:var(--bg4)}
 <!-- ══════════════ PAGE: SIGNALS & BLOCKED ═════════════════════ -->
 <div class="npage" id="page-signals">
   <div class="pg">
+<!-- Date filter: sig -->
+  <div id="sig-dfbar" style="background:var(--bg3);border-bottom:1px solid var(--bdr);padding:5px 14px;display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+    <span style="font-size:9px;font-weight:700;color:var(--b);text-transform:uppercase;letter-spacing:.5px">📅</span>
+    <span class="fl">Open:</span>
+    <input type="date" id="sig-open-from" style="background:var(--bg2);border:1px solid var(--bdr2);color:var(--ink2);padding:2px 7px;border-radius:3px;font:10px 'SF Mono',monospace;cursor:pointer">
+    <span style="color:var(--ink3);font-size:10px">→</span>
+    <input type="date" id="sig-open-to"   style="background:var(--bg2);border:1px solid var(--bdr2);color:var(--ink2);padding:2px 7px;border-radius:3px;font:10px 'SF Mono',monospace;cursor:pointer">
+        <span class="fl" style="margin-left:8px">Closed:</span>
+        <input type="date" id="sig-close-from" style="background:var(--bg2);border:1px solid var(--bdr2);color:var(--ink2);padding:2px 7px;border-radius:3px;font:10px 'SF Mono',monospace;cursor:pointer">
+        <span style="color:var(--ink3);font-size:10px">→</span>
+        <input type="date" id="sig-close-to"   style="background:var(--bg2);border:1px solid var(--bdr2);color:var(--ink2);padding:2px 7px;border-radius:3px;font:10px 'SF Mono',monospace;cursor:pointer">
+    <button class="fb" onclick="applySIGFilter()" style="margin-left:4px;background:var(--b2);color:var(--b);border-color:rgba(88,166,255,.4)">Apply</button>
+    <button class="fb" onclick="resetSIGFilter()" style="margin-left:2px">Reset</button>
+    <span id="sig-df-active" style="display:none;font-size:9px;color:var(--y);font-weight:700;margin-left:4px">⚠ Gefilterd</span>
+  </div>
     <div class="card">
       <div class="card-hdr">
         <div class="card-title"><div class="dot r" id="sig-dot"></div>Signal Intelligence — Placed, Blocked &amp; Errors</div>
@@ -1833,43 +1897,71 @@ document.addEventListener('click',e=>{
 // ══════════════════════════════════════════════════════════════════
 //  GLOBAL DATE FILTER
 // ══════════════════════════════════════════════════════════════════
-const _gf = { openFrom: null, openTo: null, closeFrom: null, closeTo: null };
+// ══════════════════════════════════════════════════════════════════
+//  PER-TAB DATE FILTERS  (v13.4.1)
+//  Elke tab heeft zijn eigen datumfilter met Apply/Reset knop.
+//  Geen globale filter meer — elke tab beheert zijn eigen staat.
+// ══════════════════════════════════════════════════════════════════
 
-function applyGlobalFilter() {
-  _gf.openFrom  = document.getElementById('gf-open-from')?.value  || null;
-  _gf.openTo    = document.getElementById('gf-open-to')?.value    || null;
-  _gf.closeFrom = document.getElementById('gf-close-from')?.value || null;
-  _gf.closeTo   = document.getElementById('gf-close-to')?.value   || null;
-  const active  = _gf.openFrom || _gf.openTo || _gf.closeFrom || _gf.closeTo;
-  const lbl     = document.getElementById('gf-active-lbl');
-  const rst     = document.getElementById('gf-reset-btn');
+// Generieke helper: lees inputs + toon active label
+function _dfRead(pfx, hasClosed) {
+  const v = {
+    openFrom:  document.getElementById(pfx+'-open-from')?.value  || null,
+    openTo:    document.getElementById(pfx+'-open-to')?.value    || null,
+    closeFrom: hasClosed ? (document.getElementById(pfx+'-close-from')?.value || null) : null,
+    closeTo:   hasClosed ? (document.getElementById(pfx+'-close-to')?.value   || null) : null,
+  };
+  const active = v.openFrom || v.openTo || v.closeFrom || v.closeTo;
+  const lbl = document.getElementById(pfx+'-df-active');
   if(lbl) lbl.style.display = active ? '' : 'none';
-  if(rst) rst.classList.toggle('on', !!active);
-  // Reload alle actieve pagina's
-  Object.keys(_loaded).forEach(p => { _loaded[p] = false; });
-  showPage(PAGES.find(p => document.getElementById('page-'+p)?.classList.contains('on')) || 'overview');
+  return v;
 }
-function resetGlobalFilter() {
-  ['gf-open-from','gf-open-to','gf-close-from','gf-close-to'].forEach(id => {
-    const el = document.getElementById(id); if(el) el.value = '';
-  });
-  _gf.openFrom = _gf.openTo = _gf.closeFrom = _gf.closeTo = null;
-  const lbl = document.getElementById('gf-active-lbl');
+function _dfReset(pfx, hasClosed) {
+  [pfx+'-open-from', pfx+'-open-to',
+   ...(hasClosed ? [pfx+'-close-from', pfx+'-close-to'] : [])
+  ].forEach(id => { const el=document.getElementById(id); if(el) el.value=''; });
+  const lbl = document.getElementById(pfx+'-df-active');
   if(lbl) lbl.style.display = 'none';
-  Object.keys(_loaded).forEach(p => { _loaded[p] = false; });
-  showPage(PAGES.find(p => document.getElementById('page-'+p)?.classList.contains('on')) || 'overview');
 }
 
-// Bouw query string voor globale datumfilter
-function gfParams(extra) {
-  const p = { ...(extra || {}) };
-  if(_gf.openFrom)  p.openFrom  = _gf.openFrom;
-  if(_gf.openTo)    p.openTo    = _gf.openTo;
-  if(_gf.closeFrom) p.closeFrom = _gf.closeFrom;
-  if(_gf.closeTo)   p.closeTo   = _gf.closeTo;
-  const qs = Object.entries(p).map(([k,v])=>k+'='+encodeURIComponent(v)).join('&');
-  return qs ? '?'+qs : '';
-}
+// Per-tab filter state
+const _df = {
+  ov:   { openFrom:null, openTo:null, closeFrom:null, closeTo:null },
+  pos:  { openFrom:null, openTo:null, closeFrom:null, closeTo:null },
+  gh:   { openFrom:null, openTo:null, closeFrom:null, closeTo:null },
+  hist: { openFrom:null, openTo:null, closeFrom:null, closeTo:null },
+  ev:   { openFrom:null, openTo:null, closeFrom:null, closeTo:null },
+  evsl: { openFrom:null, openTo:null, closeFrom:null, closeTo:null },
+  sig:  { openFrom:null, openTo:null, closeFrom:null, closeTo:null },
+};
+
+// Overview
+function applyOVFilter(){ Object.assign(_df.ov, _dfRead('ov',true));  _loaded.overview=false; loadAll(); }
+function resetOVFilter() { _dfReset('ov',true);  Object.assign(_df.ov, {openFrom:null,openTo:null,closeFrom:null,closeTo:null}); loadAll(); }
+
+// Open Positions — only openFrom/openTo (no closed date for live positions)
+function applyPOSFilter(){ Object.assign(_df.pos, _dfRead('pos',false)); _loaded.positions=false; loadPositions(); }
+function resetPOSFilter() { _dfReset('pos',false); Object.assign(_df.pos,{openFrom:null,openTo:null,closeFrom:null,closeTo:null}); loadPositions(); }
+
+// Ghost Tracker — open date only (active ghosts)
+function applyGHFilter(){ Object.assign(_df.gh, _dfRead('gh',false));  _loaded.ghosts=false; loadGhostTrackers(); }
+function resetGHFilter() { _dfReset('gh',false);  Object.assign(_df.gh, {openFrom:null,openTo:null,closeFrom:null,closeTo:null}); loadGhostTrackers(); }
+
+// Ghost History
+function applyHISTFilter(){ Object.assign(_df.hist, _dfRead('hist',false)); _loaded.history=false; loadGhostHistory(); loadGhostCombo(); }
+function resetHISTFilter() { _dfReset('hist',false); Object.assign(_df.hist,{openFrom:null,openTo:null,closeFrom:null,closeTo:null}); loadGhostHistory(); loadGhostCombo(); }
+
+// EV TP Optimizer
+function applyEVFilter(){ Object.assign(_df.ev, _dfRead('ev',true));   _loaded.ev=false; loadEV(); }
+function resetEVFilter() { _dfReset('ev',true);   Object.assign(_df.ev,  {openFrom:null,openTo:null,closeFrom:null,closeTo:null}); loadEV(); }
+
+// EV SL Optimizer
+function applyEVSLFilter(){ Object.assign(_df.evsl, _dfRead('evsl',true)); _loaded.evsl=false; loadEVSL(); }
+function resetEVSLFilter() { _dfReset('evsl',true); Object.assign(_df.evsl,{openFrom:null,openTo:null,closeFrom:null,closeTo:null}); loadEVSL(); }
+
+// Signals
+function applySIGFilter(){ Object.assign(_df.sig, _dfRead('sig',true));  _loaded.signals=false; loadSignals(); loadBlockedRaw(); loadBand(); }
+function resetSIGFilter() { _dfReset('sig',true);  Object.assign(_df.sig, {openFrom:null,openTo:null,closeFrom:null,closeTo:null}); loadSignals(); loadBlockedRaw(); loadBand(); }
 
 // ── Milestone toggle ─────────────────────────────────────────────
 let _msVisible=false;
@@ -2248,37 +2340,7 @@ function renderBW(period){
 
 // ── Ghost History (by pair, expandable) ──────────────────────────
 let _ghhData=[],_ghhF={sess:'all',dir:'all',type:'all'};
-let _ghhDateFrom=null, _ghhDateTo=null;
 
-function applyGHDateFilter(){
-  const fromEl=document.getElementById('ghdate-from');
-  const toEl  =document.getElementById('ghdate-to');
-  _ghhDateFrom=fromEl?.value||null;
-  _ghhDateTo  =toEl?.value||null;
-  const active=document.getElementById('ghdate-active');
-  const allBtn=document.getElementById('ghdate-all-btn');
-  const hasFilter=_ghhDateFrom||_ghhDateTo;
-  if(active) active.style.display=hasFilter?'':'none';
-  if(allBtn) allBtn.classList.toggle('on',!hasFilter);
-  // Reload from server with new date range
-  _loaded['history']=false;
-  loadGhostHistory();
-  loadGhostCombo();
-}
-function clearGHDateFilter(){
-  _ghhDateFrom=null; _ghhDateTo=null;
-  const fromEl=document.getElementById('ghdate-from');
-  const toEl  =document.getElementById('ghdate-to');
-  if(fromEl) fromEl.value='';
-  if(toEl)   toEl.value='';
-  const active=document.getElementById('ghdate-active');
-  const allBtn=document.getElementById('ghdate-all-btn');
-  if(active) active.style.display='none';
-  if(allBtn) allBtn.classList.add('on');
-  _loaded['history']=false;
-  loadGhostHistory();
-  loadGhostCombo();
-}
 function setGHF(k,v,btn){
   _ghhF[k]=v;
   document.querySelectorAll('.fb[onclick*="setGHF"]').forEach(b=>{ if(b.getAttribute('onclick').includes("'"+k+"'")) b.classList.remove('on'); });
@@ -2286,16 +2348,18 @@ function setGHF(k,v,btn){
   renderGhostHistory();
 }
 async function loadGhostHistory(){
+  const from = _df.hist.openFrom || null;
+  const to   = _df.hist.openTo   || null;
   let url='/api/ghost-history-by-pair';
   const params=[];
-  if(_ghhDateFrom) params.push('from='+encodeURIComponent(_ghhDateFrom));
-  if(_ghhDateTo)   params.push('to='  +encodeURIComponent(_ghhDateTo+'T23:59:59'));
+  if(from) params.push('from='+encodeURIComponent(from));
+  if(to)   params.push('to='  +encodeURIComponent(to+'T23:59:59'));
   if(params.length) url+='?'+params.join('&');
   const d=await api(url)||[];
   _ghhData=d;
   const closed=d.reduce((s,g)=>s+(g.n||0),0);
   setText('h-ghh',closed);
-  const dateLbl=(_ghhDateFrom||_ghhDateTo)?(' · '+(_ghhDateFrom||'begin')+' → '+(_ghhDateTo||'nu')):'';
+  const dateLbl=(from||to)?(' · '+(from||'begin')+' → '+(to||'nu')):'';
   setText('ghh-meta',d.length+' combos'+dateLbl);
   renderGhostHistory();
 }
