@@ -2664,7 +2664,12 @@ function setBGTFilter(tab, key, val, btn) {
   // deselect sibling buttons with same key
   if(btn) {
     const par = btn.closest('.fbar');
-    if(par) par.querySelectorAll('.fb[onclick*="setBGTFilter(\''+tab+"','"+key+"'").forEach(b=>b.classList.remove('on'));
+    if(par) {
+      par.querySelectorAll('.fb').forEach(b => {
+        const oc = b.getAttribute('onclick') || '';
+        if(oc.startsWith('setBGTFilter(') && oc.includes(tab) && oc.includes(key)) b.classList.remove('on');
+      });
+    }
     btn.classList.add('on');
   }
   renderBGTTable(tab);
