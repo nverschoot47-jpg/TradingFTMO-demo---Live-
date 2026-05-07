@@ -1062,8 +1062,8 @@ tr:hover td{background:var(--bg4)}
           </tr>
           <tr>
             <th colspan="15"></th>
-            ${ADV_STEPS.map(v=>`<th class="adv-th">-${v.toFixed(1)}</th>`).join('')}
-            ${FAV_STEPS.map(v=>`<th class="fav-th">+${v.toFixed(1)}</th>`).join('')}
+            ${ADV_STEPS.map(v=>'<th class="adv-th">-'+v.toFixed(1)+'</th>').join('')}
+            ${FAV_STEPS.map(v=>'<th class="fav-th">+'+v.toFixed(1)+'</th>').join('')}
             <th></th>
           </tr></thead>
           <tbody id="pos-body"><tr><td colspan="100" class="nd"><span class="spin">⟳</span></td></tr></tbody>
@@ -1106,8 +1106,8 @@ tr:hover td{background:var(--bg4)}
           </tr>
           <tr>
             <th colspan="7"></th>
-            ${ADV_STEPS.map(v=>`<th class="adv-th">-${v.toFixed(1)}</th>`).join('')}
-            ${FAV_STEPS.map(v=>`<th class="fav-th">+${v.toFixed(1)}</th>`).join('')}
+            ${ADV_STEPS.map(v=>'<th class="adv-th">-'+v.toFixed(1)+'</th>').join('')}
+            ${FAV_STEPS.map(v=>'<th class="fav-th">+'+v.toFixed(1)+'</th>').join('')}
             <th colspan="2"></th>
           </tr></thead>
           <tbody id="gh-body"><tr><td colspan="100" class="nd">No active ghost trackers</td></tr></tbody>
