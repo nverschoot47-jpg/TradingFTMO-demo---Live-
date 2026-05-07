@@ -451,27 +451,9 @@ async function initDB() {
       ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS exclude_from_ev BOOLEAN DEFAULT FALSE;
     `);
 
-    // ── v12.5.1: trade_number — doorlopend nummer per positie ────────
-    // Elke nieuwe trade krijgt een uniek oplopend nummer (globaal).
-    // Wordt gebruikt in open positions, ghost tracker en ghost history
-    // zodat je altijd weet welke trade #N je volgt.
-    await client.query(`
-      ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS trade_number INTEGER;
-      CREATE SEQUENCE IF NOT EXISTS trade_number_seq START 1;
-    `);
-    // ghost_trades krijgt ook trade_number mee
-    await client.query(`
-      ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS trade_number    INTEGER;
-      ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS peak_rr_pos     NUMERIC DEFAULT 0;
-      ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS peak_rr_neg     NUMERIC DEFAULT 0;
-    `);
-    // ghost_state krijgt trade_number + peak RR kolommen
-    await client.query(`
-      ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS trade_number     INTEGER;
-      ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS peak_rr_pos      NUMERIC DEFAULT 0;
-      ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS peak_rr_neg      NUMERIC DEFAULT 0;
-      ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS rr_milestones    JSONB DEFAULT '{}'::jsonb;
-    `);
+    // ── v12.5.1: trade_number sequence — created inside transaction (safe) ──
+    // Individual ALTER TABLE columns moved outside transaction (see safeAlter below)
+    // to prevent a single column-exists conflict from rolling back the entire schema.
 
     // ── ghost_combo_analysis — gecombineerde analyse per optimizer_key ──
     // Wordt herberekend telkens een ghost trade afgewerkt wordt voor die combo.
@@ -557,7 +539,7 @@ async function initDB() {
     `);
 
     await client.query("COMMIT");
-    console.log("[DB] v10.7 schema OK");
+    console.log("[DB] v12.6 schema OK");
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("[DB] initDB ROLLBACK:", err.message);
@@ -565,6 +547,34 @@ async function initDB() {
   } finally {
     client.release();
   }
+
+  // ── Safe additive migrations (outside main transaction) ────────
+  // Each runs independently — a failure here does NOT roll back the
+  // core schema above. ADD COLUMN IF NOT EXISTS is idempotent.
+  const safeAlter = async (sql) => {
+    try { await pool.query(sql); }
+    catch (e) { console.warn('[DB] safe alter skipped:', e.message); }
+  };
+
+  // v12.5.1: trade_number sequence + columns
+  await safeAlter(`CREATE SEQUENCE IF NOT EXISTS trade_number_seq START 1`);
+  await safeAlter(`ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS trade_number INTEGER`);
+  // ghost_trades: trade_number + peak RR columns
+  await safeAlter(`ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS trade_number    INTEGER`);
+  await safeAlter(`ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS peak_rr_pos     NUMERIC DEFAULT 0`);
+  await safeAlter(`ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS peak_rr_neg     NUMERIC DEFAULT 0`);
+  // ghost_state: trade_number + peak RR + rr_milestones
+  await safeAlter(`ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS trade_number     INTEGER`);
+  await safeAlter(`ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS peak_rr_pos      NUMERIC DEFAULT 0`);
+  await safeAlter(`ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS peak_rr_neg      NUMERIC DEFAULT 0`);
+  await safeAlter(`ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS rr_milestones    JSONB DEFAULT '{}'::jsonb`);
+  // ghost_state: risk/ev columns (FIX GH2)
+  await safeAlter(`ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS risk_pct  NUMERIC`);
+  await safeAlter(`ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS risk_eur  NUMERIC`);
+  await safeAlter(`ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS ev_mult   NUMERIC DEFAULT 1.0`);
+  await safeAlter(`ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS day_mult  NUMERIC DEFAULT 1.0`);
+  await safeAlter(`ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS sl_milestones JSONB DEFAULT '{}'::jsonb`);
+  console.log('[DB] Safe migrations complete');
 }
 
 // ── closed_trades ──────────────────────────────────────────────
@@ -2251,9 +2261,4 @@ module.exports = {
   // v12.5: nieuwe functies
   loadPerformanceSummary,
   loadMAEStats,
-  loadGhostGrouped,
-  // v12.6: daily breakdown, ghost history per pair, blocked raw
-  loadDailyBreakdown,
-  loadGhostHistoryByPair,
-  loadBlockedRaw,
-}; 
+  l
