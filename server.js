@@ -1,6 +1,19 @@
 "use strict";
 // ═══════════════════════════════════════════════════════════════
-//  PRONTO-AI  v13.1.0  server.js
+//  PRONTO-AI  v13.2.0  server.js
+//
+//  FIX 1a — VWAP EXHAUSTION BLOCK (alle asset types):
+//    Signalen geblokkeerd wanneer prijs >= 150% van VWAP band.
+//    bandPct = (|close - vwap_mid| / halfBand) * 100
+//    Reject: VWAP_EXHAUSTION: band_pct=X.X% (max 150%)
+//    Gelogd in signal_log met vwap_band_pct + outcome=REJECTED.
+//    vwapBandPct ook meegestuurd bij PLACED naar logSignal/logWebhook.
+//
+//  FIX 1b — DUPLICATE POSITION BLOCK:
+//    Max 1 open positie per optimizerKey (symbol_session_direction_vwap).
+//    Reject: DUPLICATE_POSITION: <optKey> already open
+//    Gelogd in signal_log met outcome=REJECTED.
+//
 //  KEY FIX: app.listen() fires BEFORE any DB/MetaAPI call.
 //  The server is always reachable. DB init runs in background.
 // ═══════════════════════════════════════════════════════════════
@@ -20,7 +33,7 @@ const {
 } = require("./session");
 
 // ── Version ──────────────────────────────────────────────────────
-const VERSION = "13.1.0";
+const VERSION = "13.2.0";
 
 // ── Config ───────────────────────────────────────────────────────
 const PORT           = process.env.PORT           || 3000;
@@ -401,6 +414,40 @@ app.post("/webhook", async (req, res) => {
   const optKey   = buildOptimizerKey(symbol, session, direction, vwapPos);
   const slPct    = sl_pct ? parseFloat(sl_pct) : 0.003;
 
+  // ── FIX 1a: VWAP band% block — blokkeer signalen ≥150% van de VWAP band ──
+  // bandPct = afstand van prijs tot VWAP mid, uitgedrukt als % van de halve band breedte.
+  // 100% = prijs zit op de eerste band (vwap_upper / vwap_lower).
+  // 150% = prijs zit 1.5× de halve band buiten de VWAP mid → te ver uitgerokken.
+  // Geldt voor ALLE asset types: forex, stock, index, commodity.
+  let vwapBandPct = null;
+  if (tvEntry !== null && vwapMid !== null && vwap_upper) {
+    const halfBand = Math.abs(parseFloat(vwap_upper) - vwapMid);
+    if (halfBand > 0) {
+      const dist  = Math.abs(tvEntry - vwapMid);
+      vwapBandPct = parseFloat(((dist / halfBand) * 100).toFixed(2));
+    }
+  }
+  if (vwapBandPct !== null && vwapBandPct >= 150) {
+    const rejectReason = `VWAP_EXHAUSTION: band_pct=${vwapBandPct.toFixed(1)}% (max 150%)`;
+    db.logSignal({ symbol, direction, session, vwapPosition: vwapPos, optimizerKey: optKey,
+      tvEntry, slPct, vwapBandPct, outcome: "REJECTED", rejectReason,
+      latencyMs: Date.now() - t0 }).catch(() => {});
+    return res.json({ ok: false, reason: rejectReason, vwapBandPct });
+  }
+
+  // ── FIX 1b: Duplicate check — max 1 open positie per optimizerKey ──
+  // optKey = symbol_session_direction_vwapPos → bv. EURUSD_london_buy_above
+  // Als er al een open positie bestaat met dezelfde key, blokkeer het signaal.
+  for (const [, existingPos] of openPositions) {
+    if (existingPos.optimizerKey === optKey) {
+      const rejectReason = `DUPLICATE_POSITION: ${optKey} already open (positionId=${existingPos.positionId})`;
+      db.logSignal({ symbol, direction, session, vwapPosition: vwapPos, optimizerKey: optKey,
+        tvEntry, slPct, vwapBandPct, outcome: "REJECTED", rejectReason,
+        latencyMs: Date.now() - t0 }).catch(() => {});
+      return res.json({ ok: false, reason: rejectReason });
+    }
+  }
+
   let equity = 10000;
   const acct = await Promise.race([getAccountInfo(), new Promise(r => setTimeout(() => r(null), 8000))]);
   if (acct?.equity) equity = parseFloat(acct.equity);
@@ -467,17 +514,17 @@ app.post("/webhook", async (req, res) => {
     vwapPosition: vwapPos, session, entry: execPrice, sl: slPrice, tp: tpPrice, lots,
     riskPct, riskEUR, openedAt: new Date().toISOString(), optimizerKey: optKey,
     tpRRUsed: tpRR, slMultiplier: slBuf, vwapAtEntry: vwapMid, tvEntry, executionPrice: execPrice,
-    slippage, spreadAtEntry, vwapBandPct: null, tradeNumber, ghost: null };
+    slippage, spreadAtEntry, vwapBandPct, tradeNumber, ghost: null };
   pos.ghost = initGhost({ ...pos, slPct, evMult: km.evMult, dayMult: km.dayMult });
   openPositions.set(positionId, pos);
 
   if (dbReady) {
     db.saveGhostState(pos.ghost).catch(() => {});
     db.logSignal({ symbol, direction, session, vwapPosition: vwapPos, optimizerKey: optKey,
-      tvEntry, slPct, outcome: "PLACED", latencyMs: Date.now() - t0, positionId }).catch(() => {});
+      tvEntry, slPct, vwapBandPct, outcome: "PLACED", latencyMs: Date.now() - t0, positionId }).catch(() => {});
     db.logWebhook({ symbol, direction, session, vwapPos, action: "place", status: "OK",
       positionId, entry: execPrice, sl: slPrice, tp: tpPrice, lots, riskPct, optimizerKey: optKey,
-      latencyMs: Date.now() - t0, tvEntry, executionPrice: execPrice, slippage }).catch(() => {});
+      latencyMs: Date.now() - t0, tvEntry, executionPrice: execPrice, slippage, vwapBandPct }).catch(() => {});
     if (bid && ask) db.saveSpreadLog({ symbol, mt5Symbol: mt5Sym, session,
       hourBrussels: getBrusselsComponents().hour, minuteBrussels: getBrusselsComponents().minute,
       dayOfWeek: getBrusselsComponents().day,
