@@ -19,6 +19,9 @@ const {
   normalizeSymbol, getSymbolInfo, getVwapPosition, buildOptimizerKey,
 } = require("./session");
 
+// ── Version ──────────────────────────────────────────────────────
+const VERSION = "13.1.0";
+
 // ── Config ───────────────────────────────────────────────────────
 const PORT           = process.env.PORT           || 3000;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
@@ -59,7 +62,7 @@ const server = app.listen(PORT, () => {
 // ── Webhook secret check ──────────────────────────────────────────
 function checkSecret(req, res) {
   if (!WEBHOOK_SECRET) {
-    res.status(503).json({ error: "WEBHOOK_SECRET not configured" });
+    res.status(401).json({ error: "Unauthorized" });
     return false;
   }
   const provided = req.headers["x-webhook-secret"] || req.body?.secret || req.query?.secret;
@@ -318,13 +321,13 @@ app.get("/dashboard", (req, res) => {
 
 // ── Health ────────────────────────────────────────────────────────
 app.get("/health", (req, res) => {
-  res.json({ ok: true, version: "13.1.0", dbReady, ts: new Date().toISOString() });
+  res.json({ ok: true, version: VERSION, dbReady, ts: new Date().toISOString() });
 });
 
 // ── Status (always fast) ──────────────────────────────────────────
 app.get("/status", async (req, res) => {
   const base = {
-    version:        "13.0.0",
+    version:        VERSION,
     dbReady,
     openPositions:  openPositions.size,
     complianceDate: liveComplianceDate,
@@ -622,7 +625,7 @@ app.get("/api/snapshot", async (req, res) => {
 
   res.json({
     meta: {
-      version: "13.1.0",
+      version: VERSION,
       ts: new Date().toISOString(),
       dbReady,
       errorCount: getErrorCount(),
@@ -1446,7 +1449,10 @@ function toggleMsCols(){
   let s=document.getElementById('ms-style');
   if(!s){ s=document.createElement('style'); s.id='ms-style'; document.head.appendChild(s); }
   s.textContent=_msVisible?'':'.ms-adv,.ms-fav{display:none!important}';
+  // Also override inline display styles set by DOMContentLoaded
   document.querySelectorAll('th.adv-th,th.fav-th').forEach(el=>el.style.display=_msVisible?'':'none');
+  const btn=document.getElementById('ms-btn');
+  if(btn) btn.textContent=_msVisible?'✕ Milestones':'± Milestones';
 }
 
 // ── pollStatus — fills header KPIs from /status ──────────────────
@@ -1913,7 +1919,19 @@ function setEVF(k,v,btn){
 }
 async function loadEV(){
   const [g,tp]=await Promise.all([api('/api/ghost-grouped'),api('/api/tp-config')]);
-  _evData=(g||[]).map(r=>({...r,tpLocked:(tp||{})[r.optimizerKey]}));
+  const grouped=g||[];
+  // Batch-fetch EV stats for all keys with enough ghost data
+  const evKeys=grouped.filter(r=>r.n>=5).map(r=>r.optimizerKey);
+  const evResults=await Promise.all(
+    evKeys.map(key=>api('/api/ev-stats?key='+encodeURIComponent(key)))
+  );
+  const evMap={};
+  evKeys.forEach((key,i)=>{ if(evResults[i]) evMap[key]=evResults[i]; });
+  _evData=grouped.map(r=>({
+    ...r,
+    tpLocked:(tp||{})[r.optimizerKey],
+    evStats: evMap[r.optimizerKey]||null,
+  }));
   renderEV();
 }
 function renderEV(){
@@ -1933,6 +1951,9 @@ function renderEV(){
   if(!rows.length){ tbody.innerHTML=emptyRow(15,'No combos match filters'); return; }
   tbody.innerHTML=rows.map(r=>{
     const tp=r.tpLocked;
+    const ev=r.evStats;
+    const evScore=ev?.bestEV!=null?ev.bestEV:null;
+    const evCls=evScore!=null?(evScore>0?'cg fw':evScore<0?'cr':'cd'):'cd';
     return '<tr>'+
       '<td class="cb fw">'+r.symbol+'</td>'+
       '<td>'+tBadge(symType(r.symbol))+'</td>'+
@@ -1940,18 +1961,19 @@ function renderEV(){
       '<td>'+dBadge(r.direction)+'</td>'+
       '<td>'+vBadge(r.vwapPosition)+'</td>'+
       '<td class="'+(r.n>=5?'cy fw':'cc')+'">'+r.n+'</td>'+
-      '<td class="cd">'+r.n+'</td>'+
-      '<td class="cg fw">'+f2(r.bestMaxRR)+'R</td>'+
-      '<td class="cd">'+f2(r.avgMaxRR)+'R</td>'+
-      '<td class="cd">—</td>'+
+      '<td class="cd">'+(ev?.count!=null?ev.count:r.n)+'</td>'+
+      '<td class="cg fw">'+(ev?.bestRR!=null?f2(ev.bestRR)+'R':f2(r.bestMaxRR)+'R')+'</td>'+
+      '<td class="cd">'+(ev?.avgRR!=null?f2(ev.avgRR)+'R':f2(r.avgMaxRR)+'R')+'</td>'+
+      '<td class="'+evCls+'">'+(evScore!=null?evScore.toFixed(3):'—')+'</td>'+
       '<td class="'+(tp?.lockedRR?'cg':'cy')+'" style="font-size:9px">'+(tp?.lockedRR?'✓ EV+ Locked':'need≥5')+'</td>'+
-      '<td class="'+(tp?.lockedRR?'cg fw':'cd')+'">'+( tp?.lockedRR?tp.lockedRR+'R':'—')+'</td>'+
-      '<td class="cd">'+f1(r.avgSlPct)+'% avg SL</td>'+
-      '<td class="cd">—</td>'+
+      '<td class="'+(tp?.lockedRR?'cg fw':'cd')+'">'+(tp?.lockedRR?tp.lockedRR+'R':'—')+'</td>'+
+      '<td class="cd">'+(ev?.avgTimeToSLMin!=null?msFmt(ev.avgTimeToSLMin):'—')+'</td>'+
+      '<td class="cd">'+(ev?.avgMaxSlPct!=null?f1(ev.avgMaxSlPct)+'%':'—')+'</td>'+
       '<td class="cd">—</td>'+
     '</tr>';
   }).join('');
 }
+
 
 // ── EV SL Optimizer ───────────────────────────────────────────────
 async function loadEVSL(){
@@ -1960,241 +1982,4 @@ async function loadEVSL(){
   const tbody=document.getElementById('evsl-body'); if(!tbody) return;
   if(!d.length){ tbody.innerHTML=emptyRow(14,'Min 3 ghost trades required per combo · waiting for ghost data'); return; }
   tbody.innerHTML=d.map(r=>{
-    const parts=(r.optimizerKey||'').split('_');
-    const sym=parts[0]||'—',sess=parts[1]||'—',dir=parts[2]||'—',vwap=parts[3]||'—';
-    const p90=r.maeP90; const slRec=r.slReduction;
-    const cls=slRec?.color==='g'?'cg':slRec?.color==='y'?'cy':slRec?.color==='r'?'cr':'cd';
-    const pot=p90!=null&&p90<100?(100-p90).toFixed(1)+'% possible':'—';
-    return '<tr>'+
-      '<td class="cb fw">'+sym+'</td>'+
-      '<td>'+tBadge(symType(sym))+'</td>'+
-      '<td>'+sBadge(sess)+'</td>'+
-      '<td>'+dBadge(dir)+'</td>'+
-      '<td>'+vBadge(vwap)+'</td>'+
-      '<td class="'+(r.nTotal>=5?'cy':'cc')+'">'+r.nTotal+' <span class="cd" style="font-size:9px">('+r.nSurvivors+' surv/'+r.nSLHit+' SL)</span></td>'+
-      '<td class="cg">'+f1(r.maeP50)+'%</td>'+
-      '<td class="cy">'+f1(r.maeP75)+'%</td>'+
-      '<td class="'+cls+' fw">'+f1(r.maeP90)+'%</td>'+
-      '<td class="'+cls+' fw" style="font-size:9px">'+(slRec?.label||'—')+'</td>'+
-      '<td class="cd">'+f1(r.maeAvg)+'%</td>'+
-      '<td class="'+(pot!=='—'?'cg':'cd')+'" style="font-size:9px">'+pot+'</td>'+
-      '<td class="cd">—</td><td class="cd">—</td>'+
-    '</tr>';
-  }).join('');
-}
-
-// ── Signals & Blocked ─────────────────────────────────────────────
-async function loadSignals(){
-  // /api/signal-stats: {total,placed,conversionPct,byOutcome:[{outcome,count}],topRejectReasons:[{reason,count,pairs}]}
-  // /api/webhook-history: rows from webhook_history table (raw DB rows, snake_case)
-  const [stats,hist,rejects]=await Promise.all([
-    api('/api/signal-stats'),
-    api('/api/webhook-history?limit=80'),
-    api('/api/signal-rejects'),
-  ]);
-  const s=stats||{};
-  setText('sig-tot',s.total||0);
-  setText('sig-placed',s.placed||0);
-  setText('sig-conv',s.conversionPct!=null?pct(s.conversionPct):'—');
-  const totalBlocked=(s.byOutcome||[]).filter(o=>o.outcome!=='PLACED').reduce((sum,o)=>sum+(o.count||0),0);
-  setText('blk-tot',totalBlocked);
-  // topRejectReasons[].reason = raw string from DB e.g. "DUPLICATE_OPEN"
-  const reasons={};
-  (s.topRejectReasons||[]).forEach(r=>{ reasons[(r.reason||'').toLowerCase().replace(/[^a-z]/g,'_')]=r.count||0; });
-  setText('blk-dup',reasons['duplicate_open']||reasons['duplicate']||0);
-  setText('blk-vw', reasons['vwap_exhausted']||reasons['vwap']||0);
-  setText('blk-win',reasons['outside_window']||reasons['outside_trading_window']||0);
-  setText('blk-cur',reasons['currency_budget']||reasons['budget']||0);
-  setText('blk-ny', reasons['ny_dead_zone']||reasons['ny_dz']||0);
-  const nbSig=document.getElementById('nb-sig');
-  if(nbSig&&totalBlocked>0){ nbSig.textContent=totalBlocked; nbSig.style.display=''; }
-
-  // Webhook history — DB rows are snake_case: ts, symbol, direction, session, vwap_position, entry, sl_pct, band_pct, status, reason
-  const placed=(hist||[]).filter(r=>r.status==='OK'||r.status==='PLACED');
-  const errors=(hist||[]).filter(r=>r.status!=='OK'&&r.status!=='PLACED');
-  setHtml('placed-body',placed.length?placed.map(r=>
-    '<tr>'+
-    '<td class="cd" style="font-size:9px">'+dt(r.ts)+'</td>'+
-    '<td class="cb fw">'+r.symbol+'</td>'+
-    '<td>'+dBadge(r.direction)+'</td>'+
-    '<td>'+sBadge(r.session)+'</td>'+
-    '<td>'+(r.vwap_position?vBadge(r.vwap_position):'—')+'</td>'+
-    '<td class="cd">'+f2(r.entry)+'</td>'+
-    '<td class="cd">'+(r.sl_pct!=null?pct(r.sl_pct*100):'—')+'</td>'+
-    '<td class="cd">'+(r.latency_ms!=null?r.latency_ms+'ms':'—')+'</td>'+
-    '</tr>'
-  ).join(''):emptyRow(8,'No placed signals in memory · resets on restart'));
-
-  setHtml('whe-body',errors.length?errors.map(r=>
-    '<tr>'+
-    '<td class="cd" style="font-size:9px">'+dt(r.ts)+'</td>'+
-    '<td class="cb fw">'+r.symbol+'</td>'+
-    '<td>'+dBadge(r.direction)+'</td>'+
-    '<td>'+sBadge(r.session)+'</td>'+
-    '<td>'+(r.vwap_position?vBadge(r.vwap_position):'—')+'</td>'+
-    '<td class="cd">'+f2(r.entry)+'</td>'+
-    '<td class="cd">'+(r.sl_pct!=null?pct(r.sl_pct*100):'—')+'</td>'+
-    '<td class="cd">'+(r.band_pct!=null?pct(r.band_pct):'—')+'</td>'+
-    '<td class="cr" style="font-size:9px">'+(r.reason||r.status||'—')+'</td>'+
-    '</tr>'
-  ).join(''):emptyRow(9,'No webhook errors in memory'));
-
-  // Signal rejects: loadSignalRejects returns [{outcome,total,pairs:[{symbol,direction,session,rejectReason,count}]}]
-  const blkRows=[];
-  for(const outcome of (rejects||[])){
-    for(const p of (outcome.pairs||[]).slice(0,5)){
-      blkRows.push('<tr>'+
-        '<td class="cr" style="font-size:9px">'+(p.rejectReason||outcome.outcome||'—')+'</td>'+
-        '<td class="cb">'+p.symbol+'</td>'+
-        '<td>'+dBadge(p.direction)+'</td>'+
-        '<td>'+sBadge(p.session)+'</td>'+
-        '<td>—</td>'+
-        '<td class="cr fw">'+p.count+'</td>'+
-      '</tr>');
-    }
-  }
-  setHtml('blk-body',blkRows.join('')||emptyRow(6,'No blocked signals'));
-}
-
-async function loadBlockedRaw(){
-  // /api/blocked-raw: {symbol,direction,vwapPosition,session,rejectReason,outcome,count,lastSeen}
-  const d=await api('/api/blocked-raw')||[];
-  setText('blkraw-meta',d.length+' entries · compliance+');
-  setHtml('blkraw-body',d.length?d.slice(0,200).map(r=>
-    '<tr>'+
-    '<td class="cb fw">'+r.symbol+'</td>'+
-    '<td>'+dBadge(r.direction)+'</td>'+
-    '<td>'+vBadge(r.vwapPosition)+'</td>'+
-    '<td>'+sBadge(r.session)+'</td>'+
-    '<td class="'+(r.outcome==='PLACED'?'cg':'cr')+'" style="font-size:9px">'+(r.outcome||'—')+'</td>'+
-    '<td class="cr" style="font-size:9px">'+(r.rejectReason||'—')+'</td>'+
-    '<td class="cr fw">'+(r.count||1)+'</td>'+
-    '<td class="cd" style="font-size:9px">'+dt(r.lastSeen)+'</td>'+
-    '</tr>'
-  ).join(''):emptyRow(8,'No blocked raw data'));
-}
-
-async function loadBand(){
-  // /api/band-ghost-stats?bandTier=150 — check if endpoint exists
-  const [b1,b2]=await Promise.all([
-    api('/api/shadow-analysis'),
-    api('/api/shadow-analysis'),
-  ]);
-  const fill=(data,bId)=>{
-    const tbody=document.getElementById(bId); if(!tbody) return;
-    if(!data?.length){ tbody.innerHTML=emptyRow(8,'No band data'); return; }
-    tbody.innerHTML=data.slice(0,30).map(r=>'<tr>'+
-      '<td class="cb fw">'+r.symbol+'</td>'+
-      '<td>'+sBadge(r.session||'—')+'</td>'+
-      '<td>'+dBadge(r.direction||'buy')+'</td>'+
-      '<td>'+vBadge(r.vwapPosition||r.vwap_position||'above')+'</td>'+
-      '<td class="cc">'+(r.n||0)+'</td>'+
-      '<td class="cg">'+f2(r.avgMaxRR||r.avg_max_rr)+'R</td>'+
-      '<td class="cg fw">'+f2(r.bestMaxRR||r.best_max_rr)+'R</td>'+
-      '<td class="cd">'+f1(r.avgSlPct||r.avg_sl_pct)+'%</td>'+
-    '</tr>').join('');
-  };
-  fill(b1,'b150-body'); fill(b2,'b250-body');
-}
-
-// ── Boot ──────────────────────────────────────────────────────────
-// Initialise milestone styles
-(function(){
-  const s=document.createElement('style'); s.id='ms-style';
-  s.textContent='.ms-adv,.ms-fav{display:none!important}';
-  document.head.appendChild(s);
-  // Also hide th columns
-  document.addEventListener('DOMContentLoaded',()=>{
-    document.querySelectorAll('th.adv-th,th.fav-th').forEach(el=>el.style.display='none');
-  });
-})();
-
-async function loadAll(){
-  // 1. Status poll + live positions + ghost trackers in parallel
-  await Promise.all([pollStatus(), loadPositions(), loadGhostTrackers()]);
-  // 2. Trade history + daily breakdown + ghost grouped
-  const cutoff=new Date('2026-05-03T00:00:00Z').getTime();
-  const [trades,daily,ghGrouped]=await Promise.all([
-    api('/api/trades'),
-    api('/api/daily-breakdown'),
-    api('/api/ghost-grouped'),
-  ]);
-  _allTrades=(trades||[]).filter(t=>t.openedAt&&new Date(t.openedAt).getTime()>=cutoff);
-  renderOverview(_allTrades,daily,ghGrouped);
-}
-
-loadAll();
-setInterval(loadAll,30000);
-</script>
-
-</body>
-</html>`;
-}
-
-// ══════════════════════════════════════════════════════════════════
-//  BACKGROUND DB INIT  (runs after server is already listening)
-// ══════════════════════════════════════════════════════════════════
-async function initBackground() {
-  // Retry DB init up to 5 times with backoff
-  for (let attempt = 1; attempt <= 5; attempt++) {
-    try {
-      await db.initDB();
-      console.log("[DB] initDB() success");
-      break;
-    } catch (e) {
-      console.error(`[DB] initDB attempt ${attempt}/5 failed: ${e.message}`);
-      if (attempt < 5) await new Promise(r => setTimeout(r, 3000 * attempt));
-      else { recordError(`initDB failed permanently: ${e.message}`); return; }
-    }
-  }
-
-  // Load compliance date
-  try {
-    const saved = await db.loadComplianceDate();
-    if (saved) { liveComplianceDate = saved; db.setComplianceDateLive(saved); }
-  } catch {}
-
-  // Load cached config
-  try {
-    [tpConfigs, symbolRiskMap, keyRiskMults] = await Promise.all([
-      db.loadTPConfig().catch(() => ({})),
-      db.loadSymbolRiskConfig().catch(() => ({})),
-      db.loadKeyRiskMults().catch(() => ({})),
-    ]);
-    console.log(`[DB] Loaded: ${Object.keys(tpConfigs).length} TP, ${Object.keys(symbolRiskMap).length} risk, ${Object.keys(keyRiskMults).length} mults`);
-  } catch {}
-
-  // Restore open positions
-  try {
-    const states = await db.loadAllGhostStates();
-    for (const gs of states) {
-      if (openPositions.has(gs.positionId)) continue;
-      const ghost = { ...gs, maxPrice: gs.maxPrice??gs.entry, maxRR: gs.maxRR??0,
-        maxSlPctUsed: gs.maxSlPctUsed??0, slMilestones: gs.slMilestones??{},
-        rrMilestones: gs.rrMilestones??{}, phantomSLHit: false, stopReason: null, closedAt: null };
-      openPositions.set(gs.positionId, {
-        positionId: gs.positionId, symbol: gs.symbol, mt5Symbol: gs.mt5Symbol??gs.symbol,
-        direction: gs.direction, vwapPosition: gs.vwapPosition,
-        session: gs.session, entry: gs.entry, sl: gs.sl, tp: null, lots: null,
-        riskPct: gs.riskPct, riskEUR: gs.riskEUR, openedAt: gs.openedAt,
-        optimizerKey: gs.optimizerKey, ghost });
-    }
-    console.log(`[DB] Restored ${openPositions.size} open positions`);
-  } catch (e) { console.error("[DB] restorePositions failed:", e.message); }
-
-  // Sync trade number sequence
-  db.syncTradeNumberSequence().catch(() => {});
-
-  // Mark DB as ready
-  dbReady = true;
-  console.log("[PRONTO-AI] ✅ DB ready — all systems operational");
-
-  // Start cron jobs
-  cron.schedule("*/30 * * * * *", syncPositions);
-  cron.schedule("*/5 * * * *",    runShadowSnapshots);
-  cron.schedule("0 * * * *",      runTPOptimizer);
-  console.log("[PRONTO-AI] Cron jobs active");
-}
-
-// Start background init (non-blocking)
-initBackground().catch(e => console.error("[FATAL] initBackground:", e.message));
+    const
