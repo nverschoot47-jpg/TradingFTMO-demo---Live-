@@ -661,6 +661,7 @@ async function initDB() {
   await safeAlter(`ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS peak_rr_neg     NUMERIC DEFAULT 0`);
   // ghost_state: trade_number + peak RR + rr_milestones
   await safeAlter(`ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS trade_number     INTEGER`);
+  await safeAlter(`ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS lots             NUMERIC`);
   await safeAlter(`ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS peak_rr_pos      NUMERIC DEFAULT 0`);
   await safeAlter(`ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS peak_rr_neg      NUMERIC DEFAULT 0`);
   await safeAlter(`ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS rr_milestones    JSONB DEFAULT '{}'::jsonb`);
@@ -1758,14 +1759,14 @@ async function saveGhostState(g) {
     await pool.query(`
       INSERT INTO ghost_state
         (position_id, optimizer_key, symbol, mt5_symbol, session, direction,
-         vwap_position, entry, sl, sl_pct, tp_rr_used,
+         vwap_position, entry, sl, sl_pct, tp_rr_used, lots,
          max_price, max_rr, max_sl_pct_used, opened_at,
          risk_pct, risk_eur, ev_mult, day_mult,
          sl_milestones, rr_milestones,
          trade_number, peak_rr_pos, peak_rr_neg,
          phantom_sl_hit, stop_reason,
          updated_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,NOW())
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,NOW())
       ON CONFLICT (position_id) DO UPDATE SET
         max_price       = EXCLUDED.max_price,
         max_rr          = EXCLUDED.max_rr,
@@ -1785,7 +1786,7 @@ async function saveGhostState(g) {
     `, [
       g.positionId, g.optimizerKey, g.symbol, g.mt5Symbol ?? g.symbol,
       g.session, g.direction, g.vwapPosition ?? 'unknown',
-      g.entry, g.sl, g.slPct ?? null, g.tpRRUsed ?? null,
+      g.entry, g.sl, g.slPct ?? null, g.tpRRUsed ?? null, g.lots ?? null,
       g.maxPrice ?? g.entry, g.maxRR ?? 0, g.maxSlPctUsed ?? 0,
       g.openedAt ?? null,
       g.riskPct ?? null, g.riskEUR ?? null,
@@ -1816,6 +1817,7 @@ async function loadAllGhostStates() {
         CAST(sl               AS FLOAT) AS sl,
         CAST(sl_pct           AS FLOAT) AS "slPct",
         CAST(tp_rr_used       AS FLOAT) AS "tpRRUsed",
+        CAST(lots             AS FLOAT) AS lots,
         CAST(max_price        AS FLOAT) AS "maxPrice",
         CAST(max_rr           AS FLOAT) AS "maxRR",
         CAST(max_sl_pct_used  AS FLOAT) AS "maxSlPctUsed",
