@@ -488,15 +488,27 @@ async function _doSyncPositions() {
     if (!pos) {
       // ── v13.5: positie bestaat in MT5 maar niet in memory → adopteer ──
       await adoptPosition(lp);
-    } else if (pos.ghost && lp.currentPrice) {
-      // v14.0: guard — skip incomplete ghosts to prevent null DB constraint errors
-      if (!pos.ghost.direction || !pos.ghost.entry || !pos.ghost.sl) {
-        console.warn(`[Sync] Skipping ghost ${id} ${pos.symbol} — missing direction/entry/sl`);
-        continue;
-      }
+    } else if (lp.currentPrice) {
+      // Sync live MT5 data to pos (lots, sl, tp, profit)
+      if (lp.volume)      pos.lots       = parseFloat(lp.volume);
+      if (lp.stopLoss)    pos.sl         = parseFloat(lp.stopLoss);
+      if (lp.takeProfit)  pos.tp         = parseFloat(lp.takeProfit) || null;
+      if (lp.profit!=null)pos.liveProfitMT5 = parseFloat(lp.profit);
       pos.currentPrice = lp.currentPrice;
-      updateGhost(pos.ghost, lp.currentPrice);
-      if (dbReady) db.saveGhostState(pos.ghost).catch(() => {});
+      // Recalculate risk based on actual lots and balance
+      if (pos.lots && pos.entry && pos.sl) {
+        const slDist = Math.abs(pos.entry - pos.sl);
+        // riskEUR = lots × (100000 for forex, price for stocks, 1 for index) × slDist
+        // We store the original riskEUR from order placement — keep it, just show lots
+      }
+      if (pos.ghost) {
+        if (!pos.ghost.direction || !pos.ghost.entry || !pos.ghost.sl) {
+          console.warn(`[Sync] Skipping ghost ${id} ${pos.symbol} — missing direction/entry/sl`);
+          continue;
+        }
+        updateGhost(pos.ghost, lp.currentPrice);
+        if (dbReady) db.saveGhostState(pos.ghost).catch(() => {});
+      }
     }
   }
   // ── Blocked ghost trackers: update via live MT5 prices ──
@@ -953,7 +965,27 @@ app.post("/api/recover-positions", async (req, res) => {
 
 apiGet("/api/ghost-history-by-pair", r => db.loadGhostHistoryByPair(r.query.from??null, r.query.to??null), []);
 // v13.4: blocked ghost tracker routes
-apiGet("/api/blocked-ghosts/active",  () => db.loadActiveBlockedGhosts(), []);
+app.get("/api/blocked-ghosts/active", (req, res) => {
+  // Serve from in-memory blockedPositions map for live milestone data
+  // Fall back to DB if memory is empty (after restart before sync)
+  if(blockedPositions.size > 0) {
+    return res.json([...blockedPositions.values()].map(bg => ({
+      id: bg.id, blockType: bg.blockType, optimizerKey: bg.optimizerKey,
+      symbol: bg.symbol, mt5Symbol: bg.mt5Symbol, session: bg.session,
+      direction: bg.direction, vwapPosition: bg.vwapPosition,
+      entry: bg.entry, sl: bg.sl, slPct: bg.slPct,
+      maxRR: bg.maxRR, maxSlPctUsed: bg.maxSlPctUsed,
+      peakRRPos: bg.peakRRPos ?? bg.maxRR ?? 0,
+      peakRRNeg: bg.peakRRNeg ?? bg.maxSlPctUsed ?? 0,
+      slMilestones: bg.slMilestones ?? {},
+      rrMilestones: bg.rrMilestones ?? {},
+      vwapBandPct: bg.vwapBandPct, blockReason: bg.blockReason,
+      openedAt: bg.openedAt, currentPrice: bg.currentPrice ?? null,
+    })));
+  }
+  if(!dbReady) return res.json([]);
+  db.loadActiveBlockedGhosts().then(r => res.json(r)).catch(() => res.json([]));
+});
 apiGet("/api/blocked-ghosts/history", r  => db.loadBlockedGhostHistory(
   r.query.blockType ?? 'NY_DEAD_ZONE', r.query.from ?? null, r.query.to ?? null), []);
 apiGet("/api/ghost-combo-analysis",r  => db.loadGhostComboAnalysis(r.query.key??null), []);
@@ -981,8 +1013,8 @@ app.get("/api/open-positions", (req, res) => {
       entry: pos.entry, sl: pos.sl, tp: pos.tp, lots: pos.lots,
       riskPct: pos.riskPct, riskEUR: pos.riskEUR, openedAt: pos.openedAt,
       tradeNumber: pos.tradeNumber,
-      // v14.0: currentPrice stored in pos from last syncPositions update
       currentPrice: pos.currentPrice ?? null,
+      liveProfitMT5: pos.liveProfitMT5 ?? null,
       ghost: pos.ghost ? {
         maxRR:        pos.ghost.maxRR,
         maxSlPctUsed: pos.ghost.maxSlPctUsed,
@@ -2055,6 +2087,17 @@ const pC  = v => (+v||0)>=0?'cg':'cr';
 const dt  = s => { try{ return new Date(s).toLocaleString('nl-BE',{timeZone:'Europe/Brussels',day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}); }catch{return s||'—';} };
 const dtS = s => { try{ return new Date(s).toLocaleDateString('nl-BE'); }catch{return s||'—';} };
 const msFmt = m => { if(!m&&m!==0) return '—'; m=Math.round(+m); const h=Math.floor(m/60),mn=m%60; return h>0?h+'h'+mn+'m':mn+'m'; };
+// fPrice: correct decimal places per asset type
+function fPrice(v, symbol) {
+  if(v==null||v===0) return '—';
+  const t = symType(symbol||'');
+  if(t==='stock') return parseFloat(v).toFixed(2);
+  if(t==='index') return parseFloat(v).toFixed(2);
+  if(t==='commodity') return parseFloat(v).toFixed(2);
+  // forex: JPY pairs 3 decimals, others 5
+  const s = (symbol||'').toUpperCase();
+  return parseFloat(v).toFixed(s.includes('JPY')?3:5);
+}
 
 // ── Badge helpers ─────────────────────────────────────────────────
 const dBadge = d => d==='buy'?'<span class="bd bd-buy">BUY</span>':'<span class="bd bd-sell">SELL</span>';
@@ -2293,13 +2336,11 @@ async function loadPositions(){
     const tpRR=slDist>0?Math.abs((p.tp||0)-(p.entry||0))/slDist:null;
     const lots = p.lots ?? p.ghost?.lots ?? null;
     const rPct = p.riskPct ? (p.riskPct*100).toFixed(3) : null;
-    // Live P&L: try ghost pnl (currentPrice - entry) × lots × pip value, else use header
-    let livePnl = null;
-    if(p.currentPrice && p.entry && lots && p.sl) {
+    // Live P&L: prefer liveProfitMT5 (direct from MT5 via syncPositions), else estimate
+    let livePnl = p.liveProfitMT5 ?? null;
+    if(livePnl === null && p.currentPrice && p.entry && lots && p.sl) {
       const slDist = Math.abs(p.entry - p.sl);
       const pnlDir = p.direction === 'buy' ? p.currentPrice - p.entry : p.entry - p.currentPrice;
-      // For forex: pnl ≈ lots × 100000 × pnlDir (rough, in quote currency)
-      // For now just show RR-based estimate relative to riskEUR
       const riskEUR = p.riskEUR ?? (p.riskPct ? 50000 * p.riskPct : null);
       if(riskEUR && slDist > 0) livePnl = parseFloat((riskEUR * pnlDir / slDist).toFixed(2));
     }
@@ -2320,9 +2361,9 @@ async function loadPositions(){
       '<td class="'+(peakNeg>80?'cr fw':peakNeg>50?'cr':peakNeg>25?'co':'cd')+'">'+
         (peakNeg>0?'-'+f1(peakNeg)+'% ('+f2(peakNeg/100)+'R)':'—')+'</td>'+
       '<td class="cy">'+(tpRR!=null?f2(tpRR)+'R':'—')+'</td>'+
-      '<td class="cd" style="font-size:10px">'+f2(p.entry)+'</td>'+
-      '<td class="cr" style="font-size:10px">'+f2(p.sl)+'</td>'+
-      '<td class="cg" style="font-size:10px">'+f2(p.tp)+'</td>'+
+      '<td class="cd" style="font-size:9px">'+fPrice(p.entry,p.symbol)+'</td>'+
+      '<td class="cr" style="font-size:9px">'+fPrice(p.sl,p.symbol)+'</td>'+
+      '<td class="cg" style="font-size:9px">'+(p.tp?fPrice(p.tp,p.symbol):'—')+'</td>'+
       '<td class="'+(livePnl!=null?(livePnl>=0?'cg':'cr'):'cd')+' fw">'+(livePnl!=null?(livePnl>=0?'+':'')+eu(livePnl):'—')+'</td>'+
       '<td class="cd">'+(lots!=null?f2(lots):'—')+'</td>'+
       '<td class="'+(rPct&&+rPct>0.04?'cr fw':rPct&&+rPct>0.025?'co':'cg')+'">'+(rPct!=null?rPct+'%':'—')+'</td>'+
@@ -2587,8 +2628,8 @@ function renderGhostHistory(){
     const topReason=reasons.length?Object.entries(reasons.reduce((m,r)=>{m[r]=(m[r]||0)+1;return m;},{})).sort((a,b)=>b[1]-a[1])[0][0]:'—';
     return '<tr style="cursor:pointer" onclick="toggleGHHRow('+Q+safeKey+Q+')">'+
       '<td class="cd" style="font-size:9px">▶</td>'+
-      '<td class="cb fw">'+g.symbol+'</td>'+
-      '<td>'+tBadge(symType(g.symbol))+'</td>'+
+      '<td class="cb fw" style="white-space:nowrap">'+g.symbol+'</td>'+
+      '<td style="min-width:40px">'+tBadge(symType(g.symbol))+'</td>'+
       '<td>'+sBadge(g.session)+'</td>'+
       '<td>'+dBadge(g.direction)+'</td>'+
       '<td>'+vBadge(g.vwapPosition)+'</td>'+
