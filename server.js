@@ -341,6 +341,7 @@ function initBlockedGhost({ blockType, symbol, mt5Symbol, session, direction,
     slMilestones: {}, rrMilestones: {},
     phantomSLHit: false, stopReason: null, timeToSLMin: null,
     vwapBandPct: vwapBandPct ?? null, blockReason: blockReason ?? null,
+    duplicateCount: null,
     openedAt: new Date().toISOString(), closedAt: null,
   };
 }
@@ -750,6 +751,8 @@ app.post("/webhook", async (req, res) => {
           entry: tvEntry, sl: slPriceD, slPct,
           tpRRUsed: tpConfigs[optKey]?.lockedRR ?? 2.0,
           optimizerKey: optKey, blockReason: rejectReason,
+          vwapBandPct,
+          duplicateCount: [...blockedPositions.values()].filter(b=>b.optimizerKey===optKey&&b.blockType==='DUPLICATE').length + 1,
         });
         blockedPositions.set(bg.id, bg);
         db.saveBlockedGhostState(bg).catch(() => {});
@@ -780,6 +783,11 @@ app.post("/webhook", async (req, res) => {
   const slippage    = tvEntry && execPrice ? parseFloat(Math.abs(execPrice - tvEntry).toFixed(6)) : null;
   const slBuf       = assetType === "stock" ? STOCK_SL_BUFFER_MULT : SL_BUFFER_MULT;
   const slDist      = (slPct * slBuf) * execPrice;
+  // Risk calculation log for verification:
+  // TV signal: entry=${tvEntry}, sl_pct=${slPct} (${(slPct*100).toFixed(3)}% from entry)
+  // MT5 exec:  execPrice=${execPrice}, slippage=${slippage}
+  // slDist = ${slPct} × ${slBuf}× (buf) × ${execPrice} = ${slDist.toFixed(6)}
+  // Applied to MT5 price — SL moves with execution price, not TV entry
   const slPrice     = direction === "buy"
     ? parseFloat((execPrice - slDist).toFixed(6))
     : parseFloat((execPrice + slDist).toFixed(6));
@@ -980,6 +988,7 @@ app.get("/api/blocked-ghosts/active", (req, res) => {
       slMilestones: bg.slMilestones ?? {},
       rrMilestones: bg.rrMilestones ?? {},
       vwapBandPct: bg.vwapBandPct, blockReason: bg.blockReason,
+      duplicateCount: bg.duplicateCount ?? null,
       openedAt: bg.openedAt, currentPrice: bg.currentPrice ?? null,
     })));
   }
@@ -1647,11 +1656,14 @@ tr:hover td{background:var(--bg4)}
           <thead><tr>
             <th style="width:16px"></th>
             <th>Symbol</th><th>Type</th><th>Session</th><th>Dir</th><th>VWAP</th>
-            <th># Ghosts</th><th>SL Hits</th><th>15R Hits</th><th>Timeout</th>
-            <th>Avg Peak+RR</th><th>Avg Peak−RR%</th><th>Max Peak+RR</th>
-            <th>EV TP (last 5)</th><th>Close Reason</th>
+            <th title="Total ghost trades"># Ghosts</th>
+            <th class="cr">SL Hits</th><th class="cg">15R Hits</th><th class="cy">Timeout</th>
+            <th class="cg">Avg Peak+RR</th><th class="cr">Avg Peak−RR%</th><th class="cg">Max Peak+RR</th>
+            <th class="cy">EV TP (last 5)</th>
+            <th class="cd" title="Total realized P&L for this combo">P&amp;L</th>
+            <th>Stop Reason</th>
           </tr></thead>
-          <tbody id="ghh-body"><tr><td colspan="15" class="nd"><span class="spin">⟳</span></td></tr></tbody>
+          <tbody id="ghh-body"><tr><td colspan="16" class="nd"><span class="spin">⟳</span></td></tr></tbody>
         </table>
       </div>
     </div>
@@ -2066,10 +2078,27 @@ tr:hover td{background:var(--bg4)}
 'use strict';
 
 // ── Symbol type lookup ────────────────────────────────────────────
-const FOREX_S = new Set(['AUDCAD','AUDCHF','AUDNZD','AUDUSD','CADCHF','EURAUD','EURCHF','EURUSD','GBPAUD','GBPNZD','GBPUSD','NZDCAD','NZDCHF','NZDUSD','USDCAD','USDCHF']);
-const INDEX_S = new Set(['DE30EUR','NAS100USD','UK100GBP','US30USD']);
-const COMM_S  = new Set(['XAUUSD']);
-function symType(s){ if(FOREX_S.has(s)) return 'forex'; if(INDEX_S.has(s)) return 'index'; if(COMM_S.has(s)) return 'commodity'; return 'stock'; }
+const FOREX_S = new Set(['AUDCAD','AUDCHF','AUDNZD','AUDUSD','CADCHF','EURAUD','EURCHF','EURUSD','GBPAUD','GBPNZD','GBPUSD','NZDCAD','NZDCHF','NZDUSD','USDCAD','USDCHF',
+  // include common aliases stored in older DB records
+  'EURUSD','GBPUSD','USDJPY','USDCHF','AUDUSD','NZDUSD','USDCAD']);
+const INDEX_S = new Set([
+  // Canonical names
+  'DE30EUR','NAS100USD','UK100GBP','US30USD',
+  // MT5 broker names (stored in older closed_trades records)
+  'GER40.cash','US100.cash','UK100.cash','US30.cash',
+  // TradingView aliases people may have used
+  'NAS100','US100','UK100','US30','GER40','DE30',
+  // Additional common broker names
+  'NAS100USD','USTEC','SPX500','DAX']);
+const COMM_S  = new Set(['XAUUSD','XAGUSD','XAUEUR','GOLD','XAUUSD.cash','WTIUSD','BCOUSD']);
+function symType(s){
+  if(!s) return 'stock';
+  const u = s.toUpperCase();
+  if(FOREX_S.has(u)||FOREX_S.has(s)) return 'forex';
+  if(INDEX_S.has(u)||INDEX_S.has(s)) return 'index';
+  if(COMM_S.has(u)||COMM_S.has(s))   return 'commodity';
+  return 'stock';
+}
 
 // ── Milestone steps: -1.0→-0.1 then +0.1→+15.0 ──────────────────
 const Q=String.fromCharCode(39); // safe single-quote for onclick strings
@@ -2595,19 +2624,64 @@ function setGHF(k,v,btn){
   renderGhostHistory();
 }
 async function loadGhostHistory(){
-  const from = _df.hist.openFrom || null;
-  const to   = _df.hist.openTo   || null;
+  // Use closeFrom/closeTo (filter by when ghost was CLOSED)
+  const from = _df.hist.openFrom || _df.hist.closeFrom || null;
+  const to   = _df.hist.openTo   || _df.hist.closeTo   || null;
   let url='/api/ghost-history-by-pair';
   const params=[];
   if(from) params.push('from='+encodeURIComponent(from));
   if(to)   params.push('to='  +encodeURIComponent(to+'T23:59:59'));
   if(params.length) url+='?'+params.join('&');
-  const d=await api(url)||[];
-  _ghhData=d;
-  const closed=d.reduce((s,g)=>s+(g.n||0),0);
-  setText('h-ghh',closed);
-  const dateLbl=(from||to)?(' · '+(from||'begin')+' → '+(to||'nu')):'';
-  setText('ghh-meta',d.length+' combos'+dateLbl);
+  // Fetch both closed ghost_trades AND active open positions (with live ghost data)
+  const [closedData, activePosData] = await Promise.all([
+    api(url),
+    api('/api/open-positions'),
+  ]);
+  const d = closedData || [];
+
+  // Merge active ghost trackers into grouped view
+  const activeGhosts = (activePosData||[]).filter(p=>p.ghost!=null);
+  for(const p of activeGhosts) {
+    const key = p.optimizerKey || '';
+    let group = d.find(g=>g.optimizerKey===key);
+    if(!group) {
+      group = { optimizerKey: key, symbol: p.symbol, session: p.session,
+        direction: p.direction, vwapPosition: p.vwapPosition,
+        n: 0, nSLHit: 0, nMaxRR15: 0, nMaxDays: 0,
+        avgPeakPos: 0, avgPeakNeg: 0, maxPeakPos: 0, maxPeakNeg: 0, avgSlPct: 0,
+        trades: [] };
+      d.push(group);
+    }
+    if(!group.trades.find(t=>t.id===p.positionId)) {
+      const ghost = p.ghost;
+      group.trades.push({
+        id: p.positionId, optimizerKey: key,
+        symbol: p.symbol, session: p.session,
+        direction: p.direction, vwapPosition: p.vwapPosition,
+        entry: p.entry, sl: p.sl, tpRRUsed: ghost.tpRRUsed ?? null,
+        maxRR: ghost.maxRR ?? 0, maxSlPct: ghost.maxSlPctUsed ?? 0,
+        peakRRPos: ghost.peakRRPos ?? ghost.maxRR ?? 0,
+        peakRRNeg: ghost.peakRRNeg ?? ghost.maxSlPctUsed ?? 0,
+        phantomSLHit: ghost.phantomSLHit ?? false,
+        stopReason: ghost.stopReason ?? null,
+        rrMilestones: ghost.rrMilestones ?? {},
+        slMilestones: ghost.slMilestones ?? {},
+        realizedPnlEUR: p.liveProfitMT5 ?? null,
+        lots: p.lots ?? null,
+        openedAt: p.openedAt, closedAt: null, _active: true,
+      });
+      group.n++;
+      const pp = ghost.peakRRPos ?? 0;
+      if(pp > group.maxPeakPos) group.maxPeakPos = pp;
+      group.avgPeakPos = group.trades.reduce((s,t)=>s+(t.peakRRPos||0),0)/group.n;
+    }
+  }
+
+  _ghhData = d;
+  const total = d.reduce((s,g)=>s+(g.n||0),0);
+  setText('h-ghh', total);
+  const dateLbl = (from||to) ? (' · '+(from||'begin')+' → '+(to||'nu')) : '';
+  setText('ghh-meta', d.length+' combos · '+total+' trades'+dateLbl);
   renderGhostHistory();
 }
 function renderGhostHistory(){
@@ -2617,7 +2691,7 @@ function renderGhostHistory(){
     if(_ghhF.type!=='all'&&symType(g.symbol)!==_ghhF.type) return false;
     return true;
   });
-  if(!data.length){ setHtml('ghh-body',emptyRow(15,'No ghost history')); return; }
+  if(!data.length){ setHtml('ghh-body',emptyRow(16,'No ghost history')); return; }
   const tbody=document.getElementById('ghh-body'); if(!tbody) return;
   tbody.innerHTML=data.map(g=>{
     const safeKey=(g.optimizerKey||'').replace(/[^a-z0-9]/gi,'_');
@@ -2626,29 +2700,41 @@ function renderGhostHistory(){
     const bestTP=last5.length?'avg '+f2(last5.reduce((s,v)=>s+v,0)/last5.length)+'R':'—';
     const reasons=(g.trades||[]).map(t=>t.stopReason).filter(Boolean);
     const topReason=reasons.length?Object.entries(reasons.reduce((m,r)=>{m[r]=(m[r]||0)+1;return m;},{})).sort((a,b)=>b[1]-a[1])[0][0]:'—';
-    return '<tr style="cursor:pointer" onclick="toggleGHHRow('+Q+safeKey+Q+')">'+
+    // Data completeness: show partial indicator for old trades missing stats
+    const pctC = g.pctComplete ?? (g.trades.filter(t=>t.rrMilestones&&Object.keys(t.rrMilestones).length>0).length / Math.max(g.n,1) * 100);
+    const complBadge = pctC >= 80 ? '' :
+      pctC >= 40 ? '<span title="'+Math.round(pctC)+'% trades with full milestone data" style="font-size:8px;color:var(--y)"> ⚠'+Math.round(pctC)+'%</span>' :
+      '<span title="'+Math.round(pctC)+'% trades with full milestone data (older data)" style="font-size:8px;color:var(--ink3)"> ◐'+Math.round(pctC)+'%</span>';
+    const avgRRLabel = g.nWithPeakRR > 0
+      ? f2(g.avgPeakPos)+'R'
+      : (g.trades.some(t=>(t.peakRRPos||0)>0) ? f2(g.avgPeakPos)+'R' : '—');
+    const pnlLabel = g.totalPnl != null
+      ? '<span class="'+(g.totalPnl>=0?'cg':'cr')+'">'+eu(g.totalPnl)+'</span>'
+      : '—';
+    return '<tr style="cursor:pointer;border-left:3px solid '+(g.direction==='buy'?'var(--g)':'var(--r)')+'" onclick="toggleGHHRow('+Q+safeKey+Q+')">'+
       '<td class="cd" style="font-size:9px">▶</td>'+
-      '<td class="cb fw" style="white-space:nowrap">'+g.symbol+'</td>'+
+      '<td class="cb fw" style="white-space:nowrap">'+g.symbol+complBadge+'</td>'+
       '<td style="min-width:40px">'+tBadge(symType(g.symbol))+'</td>'+
-      '<td>'+sBadge(g.session)+'</td>'+
-      '<td>'+dBadge(g.direction)+'</td>'+
-      '<td>'+vBadge(g.vwapPosition)+'</td>'+
+      '<td>'+(g.session?sBadge(g.session):'<span class="cd">—</span>')+'</td>'+
+      '<td>'+(g.direction?dBadge(g.direction):'<span class="cd">—</span>')+'</td>'+
+      '<td>'+(g.vwapPosition?vBadge(g.vwapPosition):'<span class="cd">—</span>')+'</td>'+
       '<td class="'+(g.n>=5?'cy fw':'cc')+'">'+g.n+'</td>'+
       '<td class="cr">'+(g.nSLHit||0)+'</td>'+
       '<td class="cg">'+(g.nMaxRR15||0)+'</td>'+
       '<td class="cy">'+(g.nMaxDays||0)+'</td>'+
-      '<td class="cg fw">'+f2(g.avgPeakPos)+'R</td>'+
-      '<td class="cr">'+f1(g.avgPeakNeg)+'%</td>'+
-      '<td class="cg fw">'+f2(g.maxPeakPos)+'R</td>'+
+      '<td class="cg fw">'+avgRRLabel+'</td>'+
+      '<td class="cr">'+(g.avgPeakNeg>0?f1(g.avgPeakNeg)+'%':'—')+'</td>'+
+      '<td class="cg fw">'+( g.maxPeakPos>0?f2(g.maxPeakPos)+'R':'—')+'</td>'+
       '<td class="cy" style="font-size:9px">'+bestTP+'</td>'+
+      '<td>'+pnlLabel+'</td>'+
       '<td class="cd" style="font-size:9px">'+topReason+'</td>'+
     '</tr>'+
     '<tr id="ghh-d-'+safeKey+'" style="display:none">'+
-      '<td colspan="15" style="padding:0;background:var(--bg3)">'+
+      '<td colspan="16" style="padding:0;background:var(--bg3)">'+
         '<div style="overflow-x:auto"><table style="font-size:9px;min-width:900px">'+
           '<thead><tr>'+
             '<th>#</th><th>Geopend</th><th>Gesloten</th><th>Stop</th><th>TP RR</th>'+
-            '<th>Peak+RR</th>'+
+            '<th>Peak+RR</th><th class="cd">P&L</th>'+
             '<th class="ghh-ms-col" style="display:none;text-align:center" colspan="10">← Adverse (tijd) →</th>'+
             '<th class="ghh-ms-col" style="display:none;text-align:center" colspan="150">Favorable (tijd) →</th>'+
           '</tr>'+
@@ -2675,10 +2761,15 @@ function renderGhostHistory(){
             return '<tr style="border-bottom:1px solid var(--bdr)">'+
               '<td class="cd">'+(i+1)+'</td>'+
               '<td class="cd" style="font-size:8px">'+dt(t.openedAt)+'</td>'+
-              '<td class="cd" style="font-size:8px">'+(t.closedAt?dt(t.closedAt):'<span class="cy">open</span>')+'</td>'+
-              '<td class="'+srCls+'" style="font-size:8px">'+(sr==='gap_stop'?'⚡ GAP SL':sr==='phantom_sl'?'SL HIT':sr==='max_rr_15'?'TP 15R':sr||'<span class="cy">running</span>')+'</td>'+
-              '<td class="cy">'+f2(t.tpRRUsed)+'</td>'+
-              '<td class="cg fw">'+f2(t.peakRRPos)+'R</td>'+
+              '<td class="cd" style="font-size:8px">'+(t.closedAt?dt(t.closedAt):t._active?'<span class="cg">● LIVE</span>':'<span class="cy">?</span>')+'</td>'+
+              '<td class="'+srCls+'" style="font-size:8px">'+
+                (sr==='gap_stop'?'⚡ GAP SL':sr==='phantom_sl'?'SL HIT':sr==='max_rr_15'?'TP 15R':
+                 sr==='timeout_14d'?'TIMEOUT':t._active?'<span style="color:var(--g)">● LIVE</span>':
+                 sr?sr:'<span class="cd">—</span>')+'</td>'+
+              '<td class="cy">'+(t.tpRRUsed!=null?f2(t.tpRRUsed)+'R':'—')+'</td>'+
+              '<td class="cg fw">'+(t.peakRRPos>0?f2(t.peakRRPos)+'R':t._active&&(t.peakRRPos||0)===0?'<span class="cd">0.00R</span>':'—')+'</td>'+
+              '<td class="'+(t.realizedPnlEUR!=null?(t.realizedPnlEUR>=0?'cg':'cr'):'cd')+'" style="font-size:9px">'+
+                (t.realizedPnlEUR!=null?eu(t.realizedPnlEUR):'—')+'</td>'+
               // ADV milestones -0.1 to -1.0 (hidden until ± Milestones clicked)
               [0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0].map(v=>{
                 const key='-'+v.toFixed(1);
@@ -3167,10 +3258,10 @@ async function loadShadowPlaybook() {
       return '<td class="'+cls+'" style="display:'+d+';font-size:7px">'+(h>0?h+'h'+m+'m':m+'m')+'</td>';
     };
     const extraCell = bt==='VWAP_EXHAUSTION'
-      ? '<td class="cp fw" style="font-size:9px">'+(bg.vwapBandPct?f1(bg.vwapBandPct)+'%':'—')+'</td>'
+      ? '<td class="cp fw" style="font-size:9px">📊 '+(bg.vwapBandPct?f1(bg.vwapBandPct)+'%':'—')+'</td>'
       : bt==='DUPLICATE'
-      ? '<td class="cy" style="font-size:9px">'+( bg.vwapBandPct?f1(bg.vwapBandPct)+'%':'—')+'</td>'
-      : '<td class="co" style="font-size:9px">'+( bg.openedAt?dt(bg.openedAt):'—')+'</td>';
+      ? '<td class="cp fw" style="font-size:9px">📌 Dup #'+(bg.duplicateCount??'?')+'</td>'
+      : '<td class="co fw" style="font-size:9px">⏰ '+(bg.openedAt?dt(bg.openedAt):'—')+'</td>';
     return '<tr>'+
       '<td class="cb fw" style="position:sticky;left:0;background:var(--bg3);font-size:10px">'+bg.symbol+'</td>'+
       '<td>'+tBadge(symType(bg.symbol))+'</td>'+
