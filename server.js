@@ -1357,6 +1357,7 @@ tr:hover td{background:var(--bg4)}
     <button class="fb" onclick="resetOVFilter()" style="margin-left:2px">Reset</button>
     <span id="ov-df-active" style="display:none;font-size:9px;color:var(--y);font-weight:700;margin-left:4px">⚠ Gefilterd</span>
   </div>
+  <div id="ov-filter-hint" style="display:none;padding:6px 14px;background:rgba(210,153,34,.1);border-bottom:1px solid rgba(210,153,34,.2);font-size:10px;color:var(--y)"></div>
 
     <!-- KPI Row -->
     <div class="card" style="overflow:hidden">
@@ -2364,6 +2365,18 @@ let _allTrades=[];
 function renderOverview(trades, daily, ghGrouped){
   // Trades: realizedPnlEUR, direction, vwapPosition, session, symbol, openedAt, closedAt, maxRR, hitTP
   const total=trades.length;
+  // Show filter hint when active but no results
+  const ov=_df.ov;
+  const filterActive=ov.openFrom||ov.openTo||ov.closeFrom||ov.closeTo;
+  const filterHint=document.getElementById('ov-filter-hint');
+  if(filterHint){
+    if(total===0&&filterActive){
+      filterHint.style.display='';
+      filterHint.textContent='⚠ Geen trades gevonden voor de geselecteerde periode. Klik Reset om alle trades te tonen.';
+    } else {
+      filterHint.style.display='none';
+    }
+  }
   setText('ov-comp',total);
   setText('wr-meta',total+' trades · compliance+');
   setText('dist-meta',total+' trades · compliance+');
