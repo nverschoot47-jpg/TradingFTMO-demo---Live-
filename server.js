@@ -414,11 +414,29 @@ async function adoptPosition(lp) {
   // Estimate SL pct from entry/sl distance
   const slPct = entry > 0 && sl > 0 ? Math.abs(entry - sl) / entry : 0.003;
 
+  // Reconstruct risk from actual lots + slDist + equity
+  // riskEUR = lots × slDist × pip_value
+  // For forex: pip_value ≈ 100000 (1 standard lot moves 1 pip = 1 unit of quote)
+  // For index: pip_value ≈ 1 (1 lot = 1 point)
+  // For stocks: pip_value ≈ execPrice (1 share)
+  const assetTypeA = symInfo?.type ?? 'forex';
+  const slDistA = Math.abs(entry - sl);
+  let riskEURAdopted = null;
+  if (lots > 0 && slDistA > 0) {
+    if (assetTypeA === 'forex')     riskEURAdopted = lots * 100000 * slDistA;
+    else if (assetTypeA === 'index')riskEURAdopted = lots * slDistA;
+    else if (assetTypeA === 'stock')riskEURAdopted = lots * slDistA;
+    else                            riskEURAdopted = lots * 100 * slDistA;
+    riskEURAdopted = parseFloat(riskEURAdopted.toFixed(2));
+  }
+  const equityA  = latestEquity || 50000;
+  const riskPctA = riskEURAdopted ? riskEURAdopted / equityA : null;
+
   const pos = {
     positionId: id, symbol, mt5Symbol: mt5Sym,
     direction, vwapPosition: vwapPos, session,
     entry, sl, tp, lots,
-    riskPct: null, riskEUR: null,
+    riskPct: riskPctA, riskEUR: riskEURAdopted,
     openedAt, optimizerKey: optKey,
     tpRRUsed: tp && sl && entry ? Math.abs(tp - entry) / Math.abs(entry - sl) : null,
     slMultiplier: null, tradeNumber: parsed.tradeNumber,
@@ -433,6 +451,7 @@ async function adoptPosition(lp) {
 
 // ── Position sync (cron) ─────────────────────────────────────────
 let _syncRunning = false;
+let latestEquity = 50000;  // updated by pollStatus / placeOrder
 async function syncPositions() {
   if (!isMonitoringActive() || !dbReady) return;
   if (_syncRunning) {
@@ -612,6 +631,7 @@ app.get("/status", async (req, res) => {
     getAccountInfo(),
     new Promise(r => setTimeout(() => r(null), 10000)),
   ]);
+  if (acct?.equity) latestEquity = parseFloat(acct.equity);
   res.json({
     ...base,
     account: acct ? { balance: acct.balance, equity: acct.equity,
@@ -661,9 +681,10 @@ app.post("/webhook", async (req, res) => {
       session: getSession(), latencyMs: Date.now() - t0 }).catch(() => {});
     // ── v13.4: NY_DEAD_ZONE → maak invisible blocked ghost tracker ──
     if (dbReady && mktReason && mktReason.includes('NY_DEAD_ZONE')) {
-      const tvEntryB = req.body?.close ? parseFloat(req.body.close) : null;
-      const slPctB   = req.body?.sl_pct ? parseFloat(req.body.sl_pct) : 0.003;
-      if (tvEntryB && slPctB) {
+      // Pine Script sends 'entry' OR 'close' — accept both
+      const tvEntryB = parseFloat(req.body?.entry ?? req.body?.close ?? 0) || null;
+      const slPctB   = parseFloat(req.body?.sl_pct ?? 0.003);
+      if (tvEntryB && slPctB && direction) {
         const symInfoB = getSymbolInfo(symbol);
         const mt5B     = symInfoB?.mt5 ?? symbol;
         const sesB     = getSession();
@@ -764,7 +785,7 @@ app.post("/webhook", async (req, res) => {
 
   let equity = 10000;
   const acct = await Promise.race([getAccountInfo(), new Promise(r => setTimeout(() => r(null), 8000))]);
-  if (acct?.equity) equity = parseFloat(acct.equity);
+  if (acct?.equity) { equity = parseFloat(acct.equity); latestEquity = equity; }
 
   const baseRisk = symbolRiskMap[symbol] ?? DEFAULT_RISK_BY_TYPE[assetType] ?? DEFAULT_RISK_BY_TYPE.forex;
   const km       = keyRiskMults[optKey] ?? { evMult: 1.0, dayMult: 1.0 };
@@ -2364,7 +2385,21 @@ async function loadPositions(){
     const peakNeg=p.ghost?.peakRRNeg??p.ghost?.maxSlPctUsed??0;
     const tpRR=slDist>0?Math.abs((p.tp||0)-(p.entry||0))/slDist:null;
     const lots = p.lots ?? p.ghost?.lots ?? null;
-    const rPct = p.riskPct ? (p.riskPct*100).toFixed(3) : null;
+    // Risk%: use stored riskPct first, else calculate from lots × slDist / equity
+    let rPct = null;
+    if (p.riskPct) {
+      rPct = (p.riskPct * 100).toFixed(3);
+    } else if (lots && p.entry && p.sl) {
+      const slDistR = Math.abs(p.entry - p.sl);
+      const tp = symType(p.symbol);
+      let riskEst = 0;
+      if (tp === 'forex')     riskEst = lots * 100000 * slDistR;
+      else if (tp === 'index')riskEst = lots * slDistR;
+      else if (tp === 'stock')riskEst = lots * slDistR;
+      else                    riskEst = lots * 100 * slDistR;
+      const eq = 50000; // conservative fallback — actual equity from header
+      rPct = riskEst > 0 ? (riskEst / eq * 100).toFixed(3) : null;
+    }
     // Live P&L: prefer liveProfitMT5 (direct from MT5 via syncPositions), else estimate
     let livePnl = p.liveProfitMT5 ?? null;
     if(livePnl === null && p.currentPrice && p.entry && lots && p.sl) {
