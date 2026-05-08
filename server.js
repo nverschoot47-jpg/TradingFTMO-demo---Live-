@@ -2050,13 +2050,27 @@ const emptyRow = (cols,msg) => '<tr><td colspan="'+cols+'" class="nd">'+msg+'</t
 
 // ── API helper ───────────────────────────────────────────────────
 async function api(url, ms=12000){
-  const ctrl=new AbortController(), tid=setTimeout(()=>ctrl.abort(),ms);
-  try{
+  // Try fetch first, fall back to XHR if extension interference detected
+  try {
+    const ctrl=new AbortController(), tid=setTimeout(()=>ctrl.abort(),ms);
     const r=await fetch(url,{signal:ctrl.signal});
     clearTimeout(tid);
     if(!r.ok) throw new Error(r.status);
     return await r.json();
-  }catch(e){ clearTimeout(tid); console.warn('[API]',url,e.message||e); return null; }
+  } catch(e) {
+    // Fallback: XMLHttpRequest (not intercepted by most extensions)
+    return new Promise((resolve) => {
+      try {
+        const xhr = new XMLHttpRequest();
+        xhr.open('GET', url, true);
+        xhr.timeout = ms;
+        xhr.onload  = () => { try { resolve(JSON.parse(xhr.responseText)); } catch { resolve(null); } };
+        xhr.onerror = () => resolve(null);
+        xhr.ontimeout = () => resolve(null);
+        xhr.send();
+      } catch { resolve(null); }
+    });
+  }
 }
 
 // ── Clock ────────────────────────────────────────────────────────
@@ -3107,22 +3121,14 @@ async function loadAll(){
 }
 
 async function waitForDBAndLoad() {
-  // Always clear filters on fresh load — prevent browser autofill from filtering data
+  // Clear all filters and autofill on load
   _dfReset('ov', true);
   Object.assign(_df.ov, {openFrom:null,openTo:null,closeFrom:null,closeTo:null});
-  // Clear ALL date inputs explicitly (belt + suspenders against browser autofill)
   document.querySelectorAll('input[type="date"]').forEach(el => { el.value = ''; });
-  // Hide all "Gefilterd" labels
   document.querySelectorAll('[id$="-df-active"]').forEach(el => { el.style.display = 'none'; });
 
-  // Poll until DB is ready (max 60s), then load data
-  let dbReady = false;
-  for (let i = 0; i < 30; i++) {
-    const s = await api('/status', 3000);
-    if (s && s.dbReady) { dbReady = true; break; }
-    await new Promise(r => setTimeout(r, 2000));
-  }
-  if (!dbReady) console.warn('[Dashboard] DB not ready after 60s — loading anyway');
+  // Load immediately — don't wait for DB ready poll (avoids 60s freeze)
+  // The 30s interval will catch up if first load is empty (DB still starting)
   await loadAll();
   setInterval(loadAll, 30000);
 }
