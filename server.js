@@ -3106,10 +3106,18 @@ async function loadAll(){
 }
 
 if(document.readyState==='loading'){
-  document.addEventListener('DOMContentLoaded',()=>{loadAll();setInterval(loadAll,30000);});
+  document.addEventListener('DOMContentLoaded',()=>{
+    // Always start with NO filter — show all data on load
+    _dfReset('ov', true);
+    Object.assign(_df.ov, {openFrom:null,openTo:null,closeFrom:null,closeTo:null});
+    loadAll();
+    setInterval(loadAll, 30000);
+  });
 }else{
+  _dfReset('ov', true);
+  Object.assign(_df.ov, {openFrom:null,openTo:null,closeFrom:null,closeTo:null});
   loadAll();
-  setInterval(loadAll,30000);
+  setInterval(loadAll, 30000);
 }
 </script>
 
