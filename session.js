@@ -1,5 +1,9 @@
 // ===============================================================
-// session.js  v13.3  |  PRONTO-AI
+// session.js  v14.0  |  PRONTO-AI
+//
+// Changes v14.0:
+//  - Versie bump: consistent met server.js v14.0.0.
+//  - Geen functionele wijzigingen — alle logica stabiel.
 //
 // Changes v13.3:
 //  - COMPLIANCE_DATE gezet op '2000-01-01' zodat geen historische
