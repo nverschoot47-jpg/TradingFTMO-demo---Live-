@@ -1,5 +1,18 @@
 // ===============================================================
-// db.js  v13.3  |  PRONTO-AI
+// db.js  v14.0  |  PRONTO-AI
+//
+// Changes v14.0:
+//  - saveGhostTrade: ON CONFLICT DO NOTHING → UPSERT on position_id.
+//    Fixes: ghost trades nooit gesloten in DB (closed_at, milestones, stopReason).
+//  - ghost_state: phantom_sl_hit + stop_reason kolommen toegevoegd.
+//    saveGhostState/loadAllGhostStates bijgewerkt. Restart behoudt nu ghost status.
+//  - loadAllTrades: accepteert nu since/until/openFrom/openTo params voor filter.
+//  - loadDailyBreakdown: vereenvoudigd — alleen Peak+RR, P&L, total lots, max win/loss.
+//    Best/Worst 10 nu vanuit ghost_trades (peak_rr_pos) ipv closed_trades.
+//  - loadGhostHistoryByPair: filtert nu op closed_at ipv opened_at.
+//  - loadSignalLog (NIEUW): volledige signaallijst uit signal_log voor Signals tab.
+//    Retourneert outcome per signaal: PLACED/VWAP_EXHAUSTION/DUPLICATE_POSITION/NY_DEAD_ZONE.
+//  - Unique index op ghost_trades.position_id toegevoegd voor UPSERT.
 //
 // Changes v13.3:
 //  - loadGhostHistoryByPair(from, to): accepteert nu optionele
@@ -209,6 +222,8 @@ async function initDB() {
       CREATE INDEX IF NOT EXISTS idx_ghost_trades_key     ON ghost_trades (optimizer_key);
       CREATE INDEX IF NOT EXISTS idx_ghost_trades_symbol  ON ghost_trades (symbol);
       CREATE INDEX IF NOT EXISTS idx_ghost_trades_closed  ON ghost_trades (closed_at);
+      -- v14.0: unique constraint on position_id so ON CONFLICT UPDATE works correctly
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_ghost_trades_pos_id ON ghost_trades (position_id) WHERE position_id IS NOT NULL;
     `);
 
     // ── ghost_state (persists ghost tracking across restarts) ─────
@@ -649,6 +664,9 @@ async function initDB() {
   await safeAlter(`ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS peak_rr_pos      NUMERIC DEFAULT 0`);
   await safeAlter(`ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS peak_rr_neg      NUMERIC DEFAULT 0`);
   await safeAlter(`ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS rr_milestones    JSONB DEFAULT '{}'::jsonb`);
+  // v14.0: persist phantom_sl_hit and stop_reason so restart preserves ghost status
+  await safeAlter(`ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS phantom_sl_hit   BOOLEAN DEFAULT FALSE`);
+  await safeAlter(`ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS stop_reason      TEXT`);
   // ghost_state: risk/ev columns (FIX GH2)
   await safeAlter(`ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS risk_pct  NUMERIC`);
   await safeAlter(`ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS risk_eur  NUMERIC`);
@@ -726,8 +744,17 @@ async function saveTrade(t) {
   } catch (e) { console.warn("[!] saveTrade:", e.message); }
 }
 
-async function loadAllTrades() {
+async function loadAllTrades({ since = null, until = null, openFrom = null, openTo = null } = {}) {
+  // v14.0: supports date filtering for Overview tab filter
+  // since/until = closed_at filter; openFrom/openTo = opened_at filter
   try {
+    const params = [];
+    const where  = [];
+    if (since)    { params.push(since);    where.push(`closed_at  >= $${params.length}`); }
+    if (until)    { params.push(until);    where.push(`closed_at  <= $${params.length}`); }
+    if (openFrom) { params.push(openFrom); where.push(`opened_at  >= $${params.length}`); }
+    if (openTo)   { params.push(openTo);   where.push(`opened_at  <= $${params.length}`); }
+    const whereClause = where.length ? 'WHERE ' + where.join(' AND ') : '';
     const r = await pool.query(`
       SELECT
         position_id         AS "positionId",
@@ -759,15 +786,19 @@ async function loadAllTrades() {
         CAST(tv_entry       AS FLOAT) AS "tvEntry",
         CAST(slippage       AS FLOAT) AS slippage
       FROM closed_trades
+      ${whereClause}
       ORDER BY closed_at DESC
       LIMIT 10000
-    `);
+    `, params);
     return r.rows;
   } catch (e) { console.warn("[!] loadAllTrades:", e.message); return []; }
 }
 
 // ── ghost_trades ───────────────────────────────────────────────
 async function saveGhostTrade(g) {
+  // v14.0: UPSERT on position_id — ON CONFLICT DO NOTHING was silently dropping
+  // all ghost close data (closed_at, stopReason, peak milestones) on repeated saves.
+  // Now: INSERT on first save, UPDATE all mutable fields on conflict.
   try {
     await pool.query(`
       INSERT INTO ghost_trades
@@ -778,12 +809,24 @@ async function saveGhostTrade(g) {
          trade_number, peak_rr_pos, peak_rr_neg,
          opened_at, closed_at)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
-      ON CONFLICT DO NOTHING
+      ON CONFLICT (position_id) WHERE position_id IS NOT NULL
+      DO UPDATE SET
+        max_price        = EXCLUDED.max_price,
+        max_rr_before_sl = EXCLUDED.max_rr_before_sl,
+        phantom_sl_hit   = EXCLUDED.phantom_sl_hit,
+        stop_reason      = EXCLUDED.stop_reason,
+        time_to_sl_min   = EXCLUDED.time_to_sl_min,
+        max_sl_pct_used  = EXCLUDED.max_sl_pct_used,
+        sl_milestones    = EXCLUDED.sl_milestones,
+        rr_milestones    = EXCLUDED.rr_milestones,
+        peak_rr_pos      = EXCLUDED.peak_rr_pos,
+        peak_rr_neg      = EXCLUDED.peak_rr_neg,
+        closed_at        = EXCLUDED.closed_at
     `, [
       g.positionId      ?? null,
       g.symbol, g.session, g.direction,
-      g.vwapPosition    ?? "unknown",
-      g.optimizerKey    ?? "",
+      g.vwapPosition    ?? 'unknown',
+      g.optimizerKey    ?? '',
       g.entry, g.sl,
       g.slPct           ?? null,
       g.phantomSL       ?? g.sl,
@@ -802,7 +845,7 @@ async function saveGhostTrade(g) {
       g.openedAt        ?? null,
       g.closedAt        ?? null,
     ]);
-  } catch (e) { console.warn("[!] saveGhostTrade:", e.message); }
+  } catch (e) { console.warn('[!] saveGhostTrade:', e.message); }
 }
 
 async function loadGhostTrades(optimizerKey = null, limitRows = 200) {
@@ -1281,9 +1324,10 @@ async function computeEVStats(optimizerKey) {
         )
     `, [optimizerKey, EV_DATA_CUTOFF]);
 
-    // Filter 0.00R ghosts — went straight to SL, no movement
-    // Filter < 0.5R ghosts — can never hit any realistic TP level, only inflate loss count
-    const rows = r.rows.filter(x => (x.maxRR ?? 0) >= 0.5);
+    // v14.1: ALL closed ghosts count — including direct SL-hits (maxRR < 0.5R).
+    // These are real losses and must be in the denominator for accurate win rate + EV.
+    // Excluding them inflated EV artificially.
+    const rows = r.rows;
     if (rows.length < 1) return { key: optimizerKey, count: 0, rrLevels: [], bestRR: null, bestEV: null, avgRR: null, avgTimeToSLMin: null, avgMaxSlPct: null, bestWinnerSlPct: null };
 
     const arr      = rows.map(x => x.maxRR);
@@ -1715,8 +1759,9 @@ async function saveGhostState(g) {
          risk_pct, risk_eur, ev_mult, day_mult,
          sl_milestones, rr_milestones,
          trade_number, peak_rr_pos, peak_rr_neg,
+         phantom_sl_hit, stop_reason,
          updated_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,NOW())
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,NOW())
       ON CONFLICT (position_id) DO UPDATE SET
         max_price       = EXCLUDED.max_price,
         max_rr          = EXCLUDED.max_rr,
@@ -1730,6 +1775,8 @@ async function saveGhostState(g) {
         peak_rr_pos     = GREATEST(EXCLUDED.peak_rr_pos, ghost_state.peak_rr_pos),
         peak_rr_neg     = GREATEST(EXCLUDED.peak_rr_neg, ghost_state.peak_rr_neg),
         trade_number    = COALESCE(ghost_state.trade_number, EXCLUDED.trade_number),
+        phantom_sl_hit  = EXCLUDED.phantom_sl_hit,
+        stop_reason     = EXCLUDED.stop_reason,
         updated_at      = NOW()
     `, [
       g.positionId, g.optimizerKey, g.symbol, g.mt5Symbol ?? g.symbol,
@@ -1746,6 +1793,8 @@ async function saveGhostState(g) {
       g.tradeNumber ?? null,
       g.peakRRPos ?? g.maxRR ?? 0,
       g.peakRRNeg ?? g.maxSlPctUsed ?? 0,
+      g.phantomSLHit ?? false,
+      g.stopReason ?? null,
     ]);
   } catch (e) { console.warn('[!] saveGhostState:', e.message); }
 }
@@ -1775,7 +1824,9 @@ async function loadAllGhostStates() {
         rr_milestones         AS "rrMilestones",
         trade_number          AS "tradeNumber",
         CAST(peak_rr_pos      AS FLOAT) AS "peakRRPos",
-        CAST(peak_rr_neg      AS FLOAT) AS "peakRRNeg"
+        CAST(peak_rr_neg      AS FLOAT) AS "peakRRNeg",
+        COALESCE(phantom_sl_hit, FALSE) AS "phantomSLHit",
+        stop_reason           AS "stopReason"
       FROM ghost_state
     `);
     return r.rows;
@@ -1915,7 +1966,39 @@ async function loadSignalRejects({ since = null, until = null } = {}) {
   } catch (e) { console.warn('[!] loadSignalRejects:', e.message); return []; }
 }
 
-// ── Trade number — volgende beschikbare nummer ────────────────
+// ── loadSignalLog (v14.0) — volledige signaallijst voor Signals tab ─
+// Retourneert alle signalen (geplaatst + geblokkeerd) uit signal_log.
+// Elke rij heeft: outcome → bepaalt bestemming (Ghost Tracker vs Shadow Playbook).
+// Exclude puur technische errors (geen symbol of outcome = null).
+async function loadSignalLog({ since = null, until = null } = {}) {
+  try {
+    const cutoff  = since ?? '2000-01-01';
+    const ceiling = until ?? '2099-12-31';
+    const r = await pool.query(`
+      SELECT
+        received_at                  AS ts,
+        symbol, direction, session,
+        vwap_position                AS "vwap_position",
+        optimizer_key                AS "optimizer_key",
+        CAST(tv_entry AS FLOAT)      AS entry,
+        CAST(sl_pct   AS FLOAT)      AS "sl_pct",
+        CAST(vwap_band_pct AS FLOAT) AS "band_pct",
+        outcome,
+        reject_reason                AS reason,
+        latency_ms,
+        position_id
+      FROM signal_log
+      WHERE received_at >= $1
+        AND received_at <= $2
+        AND symbol IS NOT NULL
+        AND outcome IS NOT NULL
+        AND outcome NOT IN ('ERROR','FETCH_FAILED','MISSING_DATA')
+      ORDER BY received_at DESC
+      LIMIT 1000
+    `, [cutoff, ceiling]);
+    return r.rows;
+  } catch (e) { console.warn('[!] loadSignalLog:', e.message); return []; }
+}
 // Geeft het volgende globale trade nummer terug (atomisch via sequence).
 async function getNextTradeNumber() {
   try {
@@ -1976,8 +2059,9 @@ async function computeAndSaveGhostComboAnalysis(optimizerKey) {
     const dir   = rows[0].direction;
     const vwap  = rows[0].vwap_position;
 
-    // EV-eligible: phantom SL hit OR max_rr_15, AND maxRR >= 0.5
-    const evRows = rows.filter(g => (g.phantomSLHit || g.stopReason === 'max_rr_15') && (g.maxRR ?? 0) >= 0.5);
+    // v14.1: ALL properly closed ghosts are EV-eligible (phantom_sl OR max_rr_15 OR timeout)
+    // Direct SL-hits (maxRR < 0.5R) are real losses — count them.
+    const evRows = rows.filter(g => g.phantomSLHit || g.stopReason === 'max_rr_15' || g.stopReason === 'timeout_14d');
     const evCount = evRows.length;
 
     const avgPeakPos = rows.reduce((s,g) => s+(g.peakPos??g.maxRR??0), 0) / n;
@@ -2208,6 +2292,9 @@ async function loadGhostHistoryByPair(from, to) {
       g.avgPeakNeg = g.n > 0 ? parseFloat((g.sumPeakNeg / g.n).toFixed(3)) : 0;
       g.maxPeakPos = parseFloat(g.maxPeakPos.toFixed(3));
       g.maxPeakNeg = parseFloat(g.maxPeakNeg.toFixed(3));
+      // v14.1: avgSlPct — average max_sl_pct_used across all trades (was showing 0.0% before)
+      const slPcts = (g.trades||[]).map(t => parseFloat(t.maxSlPctUsed ?? 0)).filter(v => v > 0);
+      g.avgSlPct = slPcts.length ? parseFloat((slPcts.reduce((s,v)=>s+v,0)/slPcts.length).toFixed(1)) : 0;
       delete g.sumPeakPos; delete g.sumPeakNeg;
     }
 
@@ -2507,6 +2594,7 @@ module.exports = {
   // Signal stats
   loadSignalStats,
   loadSignalRejects,    // v12.1: niet-genomen trades breakdown
+  loadSignalLog,        // v14.0: volledige signaallijst voor Signals tab
   // EV stats
   computeEVStats,
   // Shadow winners
