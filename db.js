@@ -754,7 +754,9 @@ async function loadAllTrades({ since = null, until = null, openFrom = null, open
     if (until)    { params.push(until);    where.push(`closed_at  <= $${params.length}`); }
     if (openFrom) { params.push(openFrom); where.push(`opened_at  >= $${params.length}`); }
     if (openTo)   { params.push(openTo);   where.push(`opened_at  <= $${params.length}`); }
-    const whereClause = where.length ? 'WHERE ' + where.join(' AND ') : '';
+    // Safety: always exclude rows with no opened_at (corrupt data)
+    where.push('opened_at IS NOT NULL');
+    const whereClause = 'WHERE ' + where.join(' AND ');
     const r = await pool.query(`
       SELECT
         position_id         AS "positionId",
@@ -1312,7 +1314,6 @@ async function computeEVStats(optimizerKey) {
       FROM ghost_trades g
       LEFT JOIN closed_trades ct ON ct.position_id = g.position_id
       WHERE g.optimizer_key=$1
-        AND g.closed_at IS NOT NULL
         AND g.max_rr_before_sl IS NOT NULL
         AND g.max_rr_before_sl >= 0
         AND g.opened_at >= $2
@@ -1320,7 +1321,8 @@ async function computeEVStats(optimizerKey) {
         AND (ct.exclude_from_ev IS NULL OR ct.exclude_from_ev = FALSE)
         AND (
           g.phantom_sl_hit = TRUE
-          OR g.stop_reason = 'max_rr_15'
+          OR g.stop_reason IN ('max_rr_15', 'timeout_14d', 'gap_stop', 'phantom_sl')
+          OR (g.closed_at IS NOT NULL AND g.stop_reason IS NOT NULL)
         )
     `, [optimizerKey, EV_DATA_CUTOFF]);
 
@@ -1695,9 +1697,13 @@ async function loadGhostGrouped() {
         MAX(opened_at)                                              AS last_opened,
         COUNT(*) FILTER (WHERE phantom_sl_hit = TRUE)               AS sl_hits
       FROM ghost_trades
-      WHERE closed_at IS NOT NULL
-        AND opened_at >= $1
+      WHERE opened_at >= $1
         AND vwap_position IN ('above','below')
+        AND (
+          closed_at IS NOT NULL
+          OR phantom_sl_hit = TRUE
+          OR stop_reason IS NOT NULL
+        )
       GROUP BY optimizer_key, symbol, session, direction, vwap_position
       ORDER BY last_opened DESC
       LIMIT 200
@@ -2180,7 +2186,7 @@ async function loadDailyBreakdown() {
         MIN(realized_pnl_eur)                             AS max_loss
       FROM closed_trades
       WHERE opened_at >= $1
-        AND close_reason IN ('tp','sl','manual')
+        AND close_reason IN ('tp','sl','sl_gap','manual')
         AND (exclude_from_ev IS NULL OR exclude_from_ev = FALSE)
       GROUP BY DATE(opened_at AT TIME ZONE 'Europe/Brussels')
       ORDER BY trade_date DESC
@@ -2252,11 +2258,15 @@ async function loadGhostHistoryByPair(from, to) {
         opened_at                                             AS "openedAt",
         closed_at                                             AS "closedAt"
       FROM ghost_trades
-      WHERE closed_at >= $1
-        AND closed_at <= $2
-        AND closed_at IS NOT NULL
-        AND vwap_position IN ('above','below')
-      ORDER BY optimizer_key ASC, closed_at DESC
+      WHERE vwap_position IN ('above','below')
+        AND (
+          -- No date filter: show all (open + closed)
+          ($1 = '2000-01-01' AND $2 = '2099-12-31')
+          OR
+          -- Date filter: only closed trades within range
+          (closed_at IS NOT NULL AND closed_at >= $1 AND closed_at <= $2)
+        )
+      ORDER BY optimizer_key ASC, COALESCE(closed_at, opened_at) DESC
     `, [cutoff, ceiling]);
 
     // Groepeer per optimizer_key
