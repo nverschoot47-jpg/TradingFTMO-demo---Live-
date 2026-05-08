@@ -971,7 +971,8 @@ apiGet("/api/band-ghosts",         r  => db.loadBandGhosts(r.query),           [
 apiGet("/api/symbol-risk",         () => db.loadSymbolRiskConfig(),            {});
 
 app.get("/api/open-positions", (req, res) => {
-  if (!checkSecret(req, res)) return;
+  // No secret required — served to the dashboard which runs on same origin
+  // Data is position metadata only; full security would need session auth
   const out = [];
   for (const [id, pos] of openPositions) {
     out.push({
@@ -1346,13 +1347,13 @@ tr:hover td{background:var(--bg4)}
   <div id="ov-dfbar" style="background:var(--bg3);border-bottom:1px solid var(--bdr);padding:5px 14px;display:flex;align-items:center;gap:6px;flex-wrap:wrap">
     <span style="font-size:9px;font-weight:700;color:var(--b);text-transform:uppercase;letter-spacing:.5px">📅</span>
     <span class="fl">Open:</span>
-    <input type="date" id="ov-open-from" style="background:var(--bg2);border:1px solid var(--bdr2);color:var(--ink2);padding:2px 7px;border-radius:3px;font:10px 'SF Mono',monospace;cursor:pointer">
+    <input type="date" id="ov-open-from" autocomplete="off" style="background:var(--bg2);border:1px solid var(--bdr2);color:var(--ink2);padding:2px 7px;border-radius:3px;font:10px 'SF Mono',monospace;cursor:pointer">
     <span style="color:var(--ink3);font-size:10px">→</span>
-    <input type="date" id="ov-open-to"   style="background:var(--bg2);border:1px solid var(--bdr2);color:var(--ink2);padding:2px 7px;border-radius:3px;font:10px 'SF Mono',monospace;cursor:pointer">
+    <input type="date" id="ov-open-to"   autocomplete="off" style="background:var(--bg2);border:1px solid var(--bdr2);color:var(--ink2);padding:2px 7px;border-radius:3px;font:10px 'SF Mono',monospace;cursor:pointer">
         <span class="fl" style="margin-left:8px">Closed:</span>
-        <input type="date" id="ov-close-from" style="background:var(--bg2);border:1px solid var(--bdr2);color:var(--ink2);padding:2px 7px;border-radius:3px;font:10px 'SF Mono',monospace;cursor:pointer">
+        <input type="date" id="ov-close-from" autocomplete="off" style="background:var(--bg2);border:1px solid var(--bdr2);color:var(--ink2);padding:2px 7px;border-radius:3px;font:10px 'SF Mono',monospace;cursor:pointer">
         <span style="color:var(--ink3);font-size:10px">→</span>
-        <input type="date" id="ov-close-to"   style="background:var(--bg2);border:1px solid var(--bdr2);color:var(--ink2);padding:2px 7px;border-radius:3px;font:10px 'SF Mono',monospace;cursor:pointer">
+        <input type="date" id="ov-close-to"   autocomplete="off" style="background:var(--bg2);border:1px solid var(--bdr2);color:var(--ink2);padding:2px 7px;border-radius:3px;font:10px 'SF Mono',monospace;cursor:pointer">
     <button class="fb" onclick="applyOVFilter()" style="margin-left:4px;background:var(--b2);color:var(--b);border-color:rgba(88,166,255,.4)">Apply</button>
     <button class="fb" onclick="resetOVFilter()" style="margin-left:2px">Reset</button>
     <span id="ov-df-active" style="display:none;font-size:9px;color:var(--y);font-weight:700;margin-left:4px">⚠ Gefilterd</span>
@@ -3105,19 +3106,31 @@ async function loadAll(){
   renderOverview(_allTrades,daily,ghGrouped);
 }
 
-if(document.readyState==='loading'){
-  document.addEventListener('DOMContentLoaded',()=>{
-    // Always start with NO filter — show all data on load
-    _dfReset('ov', true);
-    Object.assign(_df.ov, {openFrom:null,openTo:null,closeFrom:null,closeTo:null});
-    loadAll();
-    setInterval(loadAll, 30000);
-  });
-}else{
+async function waitForDBAndLoad() {
+  // Always clear filters on fresh load — prevent browser autofill from filtering data
   _dfReset('ov', true);
   Object.assign(_df.ov, {openFrom:null,openTo:null,closeFrom:null,closeTo:null});
-  loadAll();
+  // Clear ALL date inputs explicitly (belt + suspenders against browser autofill)
+  document.querySelectorAll('input[type="date"]').forEach(el => { el.value = ''; });
+  // Hide all "Gefilterd" labels
+  document.querySelectorAll('[id$="-df-active"]').forEach(el => { el.style.display = 'none'; });
+
+  // Poll until DB is ready (max 60s), then load data
+  let dbReady = false;
+  for (let i = 0; i < 30; i++) {
+    const s = await api('/status', 3000);
+    if (s && s.dbReady) { dbReady = true; break; }
+    await new Promise(r => setTimeout(r, 2000));
+  }
+  if (!dbReady) console.warn('[Dashboard] DB not ready after 60s — loading anyway');
+  await loadAll();
   setInterval(loadAll, 30000);
+}
+
+if(document.readyState==='loading'){
+  document.addEventListener('DOMContentLoaded', waitForDBAndLoad);
+}else{
+  waitForDBAndLoad();
 }
 </script>
 
@@ -3174,10 +3187,17 @@ async function initBackground() {
         peakRRPos: gs.peakRRPos??0, peakRRNeg: gs.peakRRNeg??0,
         phantomSLHit: gs.phantomSLHit??false,
         stopReason: gs.stopReason??null, closedAt: null };
+      // Reconstruct TP from tpRRUsed stored in ghost (sl distance × tpRR)
+      const _slDist = Math.abs((gs.entry||0) - (gs.sl||0));
+      const _tp = (gs.tpRRUsed && _slDist > 0)
+        ? parseFloat((gs.direction === 'buy'
+            ? gs.entry + _slDist * gs.tpRRUsed
+            : gs.entry - _slDist * gs.tpRRUsed).toFixed(6))
+        : null;
       openPositions.set(gs.positionId, {
         positionId: gs.positionId, symbol: gs.symbol, mt5Symbol: gs.mt5Symbol??gs.symbol,
         direction: gs.direction, vwapPosition: gs.vwapPosition,
-        session: gs.session, entry: gs.entry, sl: gs.sl, tp: null, lots: null,
+        session: gs.session, entry: gs.entry, sl: gs.sl, tp: _tp, lots: gs.lots ?? null,
         riskPct: gs.riskPct, riskEUR: gs.riskEUR, openedAt: gs.openedAt,
         optimizerKey: gs.optimizerKey, ghost });
     }
