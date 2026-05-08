@@ -222,7 +222,13 @@ async function initDB() {
       CREATE INDEX IF NOT EXISTS idx_ghost_trades_key     ON ghost_trades (optimizer_key);
       CREATE INDEX IF NOT EXISTS idx_ghost_trades_symbol  ON ghost_trades (symbol);
       CREATE INDEX IF NOT EXISTS idx_ghost_trades_closed  ON ghost_trades (closed_at);
-      -- v14.0: unique constraint on position_id so ON CONFLICT UPDATE works correctly
+      -- v14.1: Deduplicate ghost_trades BEFORE creating unique index
+      -- Keep only the most complete row per position_id (prefer rows with closed_at, then latest id)
+      DELETE FROM ghost_trades a USING ghost_trades b
+        WHERE a.position_id = b.position_id
+          AND a.position_id IS NOT NULL
+          AND a.id < b.id;
+      -- Now safe to create unique index
       CREATE UNIQUE INDEX IF NOT EXISTS idx_ghost_trades_pos_id ON ghost_trades (position_id) WHERE position_id IS NOT NULL;
     `);
 
