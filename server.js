@@ -90,14 +90,20 @@ const server = app.listen(PORT, () => {
 // ── Webhook secret check ──────────────────────────────────────────
 function checkSecret(req, res) {
   if (!WEBHOOK_SECRET) {
-    res.status(401).json({ error: "Unauthorized" });
+    res.status(401).json({ error: 'Unauthorized — WEBHOOK_SECRET not configured' });
     return false;
   }
-  const provided = req.headers["x-webhook-secret"] || req.body?.secret || req.query?.secret;
+  // v14.1: Header-only auth. Query params are logged by proxies/Railway — security risk.
+  // TradingView supports custom headers: add "x-webhook-secret: YOUR_SECRET" in alert config.
+  // Body/query fallback kept ONLY for backward compat with existing TV alerts (deprecated).
+  const provided = req.headers['x-webhook-secret']
+    || req.headers['x-secret']
+    || req.body?.secret   // deprecated: body secret logged in Railway access logs
+    || req.query?.secret; // deprecated: URL params logged everywhere — migrate to header
   if (provided !== WEBHOOK_SECRET) {
-    const ip = req.ip || "?";
-    recordError(`Bad webhook secret from ${ip}`);
-    res.status(401).json({ error: "Unauthorized" });
+    const ip = req.ip || '?';
+    recordError(`Bad webhook secret from ${ip} — migrate TradingView alerts to x-webhook-secret header`);
+    res.status(401).json({ error: 'Unauthorized' });
     return false;
   }
   return true;
@@ -262,9 +268,38 @@ async function closePosition(positionId, reason = "manual", pnl = null) {
     } catch (e) { recordError(`closePos deals: ${e.message}`); }
   }
 
+  // v14.1: Gap detection — mark if trade was stopped out via opening gap
+  // Conditions: SL hit + closing deal price went BEYOND SL (not at SL) + opened near market open
+  let gapStop = false;
+  if (reason === 'sl' && pos) {
+    try {
+      const slDist = Math.abs(pos.entry - pos.sl);
+      // Re-fetch closing deal price for gap check
+      const deals = await fetchHistoryDeals(positionId).catch(() => []);
+      const closingDeal = deals
+        .filter(d => d.entryType === 'DEAL_ENTRY_OUT' || (d.type||'').includes('OUT'))
+        .sort((a,b) => new Date(b.time||0) - new Date(a.time||0))[0];
+      if (closingDeal && slDist > 0) {
+        const fillPrice = parseFloat(closingDeal.price ?? closingDeal.executionPrice ?? 0);
+        if (fillPrice > 0) {
+          // How far PAST the SL was the actual fill?
+          const overrun = pos.direction === 'buy'
+            ? pos.sl - fillPrice    // buy: SL is below entry, fill should be AT SL, gap = fill below SL
+            : fillPrice - pos.sl;   // sell: SL is above entry, gap = fill above SL
+          // If fill is more than 0.5× slDist past the SL → gap
+          if (overrun > slDist * 0.5) {
+            gapStop = true;
+            console.warn(`[Gap] ${positionId} ${pos.symbol} stopped via GAP — fill=${fillPrice} SL=${pos.sl} overrun=${overrun.toFixed(5)}`);
+          }
+        }
+      }
+    } catch { /* non-critical */ }
+  }
+  const finalCloseReason = gapStop ? 'sl_gap' : reason;
+
   if (ghost && dbReady) {
     ghost.closedAt   = now;
-    ghost.stopReason = ghost.stopReason ?? reason;
+    ghost.stopReason = gapStop ? 'gap_stop' : (ghost.stopReason ?? reason);
     await db.saveGhostTrade({ ...ghost, maxRRBeforeSL: ghost.maxRR }).catch(e => recordError(e.message));
     db.computeAndSaveGhostComboAnalysis(ghost.optimizerKey).catch(() => {});
   }
@@ -281,7 +316,8 @@ async function closePosition(positionId, reason = "manual", pnl = null) {
       session: pos.session, vwapAtEntry: pos.vwapAtEntry,
       openedAt: pos.openedAt, closedAt: now,
       slMultiplier: pos.slMultiplier ?? 1.0,
-      realizedPnlEUR: realPnl, hitTP: reason === "tp", closeReason: reason,
+      realizedPnlEUR: realPnl, hitTP: reason === 'tp',
+      closeReason: finalCloseReason,  // 'sl' or 'sl_gap'
       spreadAtEntry: pos.spreadAtEntry, vwapBandPct: pos.vwapBandPct,
       executionPrice: pos.executionPrice, tvEntry: pos.tvEntry, slippage: pos.slippage,
     }).catch(e => recordError(e.message));
@@ -395,7 +431,21 @@ async function adoptPosition(lp) {
 }
 
 // ── Position sync (cron) ─────────────────────────────────────────
+let _syncRunning = false;
 async function syncPositions() {
+  if (!isMonitoringActive() || !dbReady) return;
+  if (_syncRunning) {
+    console.warn('[Sync] Skipping — previous sync still running');
+    return;
+  }
+  _syncRunning = true;
+  try {
+    await _doSyncPositions();
+  } finally {
+    _syncRunning = false;
+  }
+}
+async function _doSyncPositions() {
   if (!isMonitoringActive() || !dbReady) return;
   const live = await getPositions();
   const liveIds = new Set(live.map(p => String(p.id)));
@@ -439,7 +489,12 @@ async function syncPositions() {
       // ── v13.5: positie bestaat in MT5 maar niet in memory → adopteer ──
       await adoptPosition(lp);
     } else if (pos.ghost && lp.currentPrice) {
-      if (!pos.ghost.direction) continue;
+      // v14.0: guard — skip incomplete ghosts to prevent null DB constraint errors
+      if (!pos.ghost.direction || !pos.ghost.entry || !pos.ghost.sl) {
+        console.warn(`[Sync] Skipping ghost ${id} ${pos.symbol} — missing direction/entry/sl`);
+        continue;
+      }
+      pos.currentPrice = lp.currentPrice;
       updateGhost(pos.ghost, lp.currentPrice);
       if (dbReady) db.saveGhostState(pos.ghost).catch(() => {});
     }
@@ -470,13 +525,16 @@ async function runShadowSnapshots() {
   for (const [id, pos] of openPositions) {
     const price   = priceMap.get(id);
     if (!price) continue;
+    // v14.0: skip if direction missing — would cause NOT NULL constraint error
+    if (!pos.direction || !pos.symbol || !pos.session) continue;
     const slDist  = Math.abs(pos.entry - pos.sl);
     if (slDist <= 0) continue;
-    const adv     = pos.direction === "buy" ? pos.entry - price : price - pos.entry;
+    const adv     = pos.direction === 'buy' ? pos.entry - price : price - pos.entry;
     const pctUsed = Math.max(0, parseFloat(((adv / slDist) * 100).toFixed(2)));
     db.saveShadowSnapshot({ positionId: id, optimizerKey: pos.optimizerKey,
       symbol: pos.symbol, session: pos.session, direction: pos.direction,
-      vwapPosition: pos.vwapPosition, entry: pos.entry, sl: pos.sl,
+      vwapPosition: pos.vwapPosition ?? 'unknown',
+      entry: pos.entry, sl: pos.sl,
       currentPrice: price, pctSlUsed: pctUsed }).catch(() => {});
   }
 }
@@ -720,9 +778,14 @@ app.post("/webhook", async (req, res) => {
 
   let lots;
   const lotNom = slDist > 0 ? riskEUR / slDist : 0.01;
-  if (assetType === "forex")     lots = Math.max(0.01, parseFloat((lotNom / 100000).toFixed(2)));
-  else if (assetType === "index") lots = Math.max(0.01, parseFloat(lotNom.toFixed(2)));
-  else if (assetType === "stock") lots = Math.max(0.01, parseFloat((lotNom / execPrice).toFixed(2)));
+  if (assetType === 'forex')     lots = Math.max(0.01, parseFloat((lotNom / 100000).toFixed(2)));
+  else if (assetType === 'index') lots = Math.max(0.01, parseFloat(lotNom.toFixed(2)));
+  else if (assetType === 'stock') {
+    // Stocks: lot = 1 share (CFD). No decimals — FTMO stock CFDs trade in whole shares.
+    // Keep existing formula (lotNom / execPrice) per user preference, but round to integer.
+    const rawLots = lotNom / execPrice;
+    lots = Math.max(1, Math.round(rawLots));  // min 1 share, no decimals
+  }
   else lots = Math.max(0.01, parseFloat((lotNom / 100).toFixed(2)));
 
   let tradeNumber = null;
@@ -730,12 +793,18 @@ app.post("/webhook", async (req, res) => {
 
   // Place order
   let positionId;
+  // v14.0: MT5 comment — readable format shown in MetaTrader position list
+  // Format: "SYMBOL D-SESS-VWAP #N"  e.g. "GBPUSD S-NY-BLW #42"
   const orderComment = (()=>{
     const d = direction === 'buy' ? 'B' : 'S';
-    const s = session === 'new_york' ? 'NY' : session === 'london' ? 'LD' : session === 'asia' ? 'AS' : (session||'??').slice(0,4).toUpperCase();
+    // getSession() returns 'ny'|'london'|'asia'|'outside' — NOT 'new_york'
+    const sessMap = { ny: 'NY', london: 'LD', asia: 'AS', outside: 'EXT' };
+    const s = sessMap[session] ?? (session||'??').slice(0,2).toUpperCase();
     const v = vwapPos === 'above' ? 'ABV' : vwapPos === 'below' ? 'BLW' : 'UNK';
     const n = tradeNumber ?? '?';
-    return `${d}-${s}-${v} #${n}`;
+    // Keep under 31 chars (MT5 comment limit)
+    const sym = (symbol||mt5Sym||'').slice(0,7);
+    return `${sym} ${d}-${s}-${v} #${n}`;
   })();
   try {
     const r = await placeOrder({
@@ -849,7 +918,7 @@ function apiGet(path, fn, empty = []) {
   });
 }
 
-apiGet("/api/trades",              () => db.loadAllTrades(),                   []);
+apiGet("/api/trades",              r  => db.loadAllTrades({ since: r.query.since??null, until: r.query.until??null, openFrom: r.query.openFrom??null, openTo: r.query.openTo??null }), []);
 apiGet("/api/ghost-trades",        r  => db.loadGhostTrades(r.query.key??null, parseInt(r.query.limit)||200), []);
 apiGet("/api/ghost-grouped",       () => db.loadGhostGrouped(),                []);
 // ── Manual position recovery ──────────────────────────────────────
@@ -893,6 +962,7 @@ apiGet("/api/shadow-winners",      () => db.loadShadowWinners(),               {
 apiGet("/api/mae-stats",           r  => db.loadMAEStats(r.query.since??null), []);
 apiGet("/api/signal-stats",        r  => db.loadSignalStats({ since: r.query.since??null, until: r.query.until??null }), { total:0, placed:0, conversionPct:0 });
 apiGet("/api/signal-rejects",      r  => db.loadSignalRejects({ since: r.query.since??null, until: r.query.until??null }), []);
+apiGet("/api/signal-log",          r  => db.loadSignalLog({ since: r.query.since??null, until: r.query.until??null }), []);
 apiGet("/api/blocked-raw",         r  => db.loadBlockedRaw(r.query.since??null, r.query.until??null), []);
 apiGet("/api/webhook-history",     r  => db.loadWebhookHistory(parseInt(r.query.limit)||100, r.query.since??null, r.query.until??null), []);
 apiGet("/api/spread-stats",        r  => db.loadSpreadStats(r.query),          []);
@@ -901,6 +971,7 @@ apiGet("/api/band-ghosts",         r  => db.loadBandGhosts(r.query),           [
 apiGet("/api/symbol-risk",         () => db.loadSymbolRiskConfig(),            {});
 
 app.get("/api/open-positions", (req, res) => {
+  if (!checkSecret(req, res)) return;
   const out = [];
   for (const [id, pos] of openPositions) {
     out.push({
@@ -909,14 +980,15 @@ app.get("/api/open-positions", (req, res) => {
       entry: pos.entry, sl: pos.sl, tp: pos.tp, lots: pos.lots,
       riskPct: pos.riskPct, riskEUR: pos.riskEUR, openedAt: pos.openedAt,
       tradeNumber: pos.tradeNumber,
-      // currentPrice not available server-side without live fetch — omit
+      // v14.0: currentPrice stored in pos from last syncPositions update
+      currentPrice: pos.currentPrice ?? null,
       ghost: pos.ghost ? {
         maxRR:        pos.ghost.maxRR,
         maxSlPctUsed: pos.ghost.maxSlPctUsed,
         peakRRPos:    pos.ghost.peakRRPos,
         peakRRNeg:    pos.ghost.peakRRNeg,
-        slMilestones: pos.ghost.slMilestones,   // {25: iso, 50: iso, 75: iso, 90: iso, 100: iso}
-        rrMilestones: pos.ghost.rrMilestones,   // {1: iso, 2: iso, 3: iso, 5: iso, 10: iso}
+        slMilestones: pos.ghost.slMilestones,
+        rrMilestones: pos.ghost.rrMilestones,
         phantomSLHit: pos.ghost.phantomSLHit,
         stopReason:   pos.ghost.stopReason,
         openedAt:     pos.ghost.openedAt,
@@ -1065,6 +1137,7 @@ app.get("/api/snapshot", async (req, res) => {
       "GET  /api/shadow-analysis",
       "GET  /api/shadow-winners",
       "GET  /api/mae-stats",
+      "GET  /api/signal-log",
       "GET  /api/signal-stats",
       "GET  /api/signal-rejects",
       "GET  /api/blocked-raw",
@@ -1402,16 +1475,10 @@ tr:hover td{background:var(--bg4)}
 <!-- ══════════════ PAGE: OPEN POSITIONS ════════════════════════ -->
 <div class="npage" id="page-positions">
   <div class="pg">
-<!-- Date filter: pos -->
-  <div id="pos-dfbar" style="background:var(--bg3);border-bottom:1px solid var(--bdr);padding:5px 14px;display:flex;align-items:center;gap:6px;flex-wrap:wrap">
-    <span style="font-size:9px;font-weight:700;color:var(--b);text-transform:uppercase;letter-spacing:.5px">📅</span>
-    <span class="fl">Open:</span>
-    <input type="date" id="pos-open-from" style="background:var(--bg2);border:1px solid var(--bdr2);color:var(--ink2);padding:2px 7px;border-radius:3px;font:10px 'SF Mono',monospace;cursor:pointer">
-    <span style="color:var(--ink3);font-size:10px">→</span>
-    <input type="date" id="pos-open-to"   style="background:var(--bg2);border:1px solid var(--bdr2);color:var(--ink2);padding:2px 7px;border-radius:3px;font:10px 'SF Mono',monospace;cursor:pointer">
-    <button class="fb" onclick="applyPOSFilter()" style="margin-left:4px;background:var(--b2);color:var(--b);border-color:rgba(88,166,255,.4)">Apply</button>
-    <button class="fb" onclick="resetPOSFilter()" style="margin-left:2px">Reset</button>
-    <span id="pos-df-active" style="display:none;font-size:9px;color:var(--y);font-weight:700;margin-left:4px">⚠ Gefilterd</span>
+<!-- Open Positions: no date filter — always shows LIVE MT5 positions -->
+  <div id="pos-dfbar" style="background:var(--bg3);border-bottom:1px solid var(--bdr);padding:5px 14px;display:flex;align-items:center;gap:6px">
+    <span style="font-size:9px;color:var(--g);font-weight:700">● LIVE</span>
+    <span style="font-size:9px;color:var(--ink3)">Toont alle actuele MT5 posities · geen datumfilter van toepassing · ververst elke 30s</span>
   </div>
     <div class="card">
       <div class="card-hdr">
@@ -1434,12 +1501,13 @@ tr:hover td{background:var(--bg4)}
       <div class="tw">
         <table id="pos-tbl">
           <thead><tr>
-            <th>Symbol</th><th>Type</th><th>Dir</th><th>VWAP</th><th>Session</th>
-            <th>Entry</th><th>SL</th><th>TP</th>
+            <th style="position:sticky;left:0;background:var(--bg3);z-index:2;min-width:90px">Symbol</th>
+            <th>Dir</th><th>VWAP</th><th>Sess</th>
             <th title="Current RR vs entry">RR Now</th>
             <th title="Best favorable RR reached">Peak+RR</th>
             <th title="Worst adverse % of SL used">Peak−RR%</th>
             <th title="Distance to TP in RR">→TP</th>
+            <th>Entry</th><th>SL</th><th>TP</th>
             <th>P&amp;L €</th><th>Lots</th><th>Risk %</th>
             <th>Opened</th>
           </tr></thead>
@@ -1453,16 +1521,10 @@ tr:hover td{background:var(--bg4)}
 <!-- ══════════════ PAGE: GHOST TRACKER ═════════════════════════ -->
 <div class="npage" id="page-ghosts">
   <div class="pg">
-<!-- Date filter: gh -->
-  <div id="gh-dfbar" style="background:var(--bg3);border-bottom:1px solid var(--bdr);padding:5px 14px;display:flex;align-items:center;gap:6px;flex-wrap:wrap">
-    <span style="font-size:9px;font-weight:700;color:var(--b);text-transform:uppercase;letter-spacing:.5px">📅</span>
-    <span class="fl">Open:</span>
-    <input type="date" id="gh-open-from" style="background:var(--bg2);border:1px solid var(--bdr2);color:var(--ink2);padding:2px 7px;border-radius:3px;font:10px 'SF Mono',monospace;cursor:pointer">
-    <span style="color:var(--ink3);font-size:10px">→</span>
-    <input type="date" id="gh-open-to"   style="background:var(--bg2);border:1px solid var(--bdr2);color:var(--ink2);padding:2px 7px;border-radius:3px;font:10px 'SF Mono',monospace;cursor:pointer">
-    <button class="fb" onclick="applyGHFilter()" style="margin-left:4px;background:var(--b2);color:var(--b);border-color:rgba(88,166,255,.4)">Apply</button>
-    <button class="fb" onclick="resetGHFilter()" style="margin-left:2px">Reset</button>
-    <span id="gh-df-active" style="display:none;font-size:9px;color:var(--y);font-weight:700;margin-left:4px">⚠ Gefilterd</span>
+<!-- Ghost Tracker: no date filter — always shows ACTIVE ghosts (same as Open Positions) -->
+  <div id="gh-dfbar" style="background:var(--bg3);border-bottom:1px solid var(--bdr);padding:5px 14px;display:flex;align-items:center;gap:6px">
+    <span style="font-size:9px;color:var(--p);font-weight:700">● ACTIEF</span>
+    <span style="font-size:9px;color:var(--ink3)">Toont alle actieve ghost trackers · sluit automatisch bij −1R SL / +15R TP / 14 dagen · ververst elke 30s</span>
   </div>
     <div class="card">
       <div class="card-hdr">
@@ -2199,19 +2261,25 @@ async function loadPositions(){
     const peakNeg=p.ghost?.peakRRNeg??p.ghost?.maxSlPctUsed??0;
     const tpRR=slDist>0?Math.abs((p.tp||0)-(p.entry||0))/slDist:null;
     const rPct=p.riskPct?(p.riskPct*100).toFixed(3):null;
+    // Compute live RR from currentPrice if available, else show peak
+    const currentRR = slDist > 0 && p.currentPrice
+      ? parseFloat(((p.direction==='buy' ? p.currentPrice - p.entry : p.entry - p.currentPrice) / slDist).toFixed(2))
+      : null;
     return '<tr>'+
-      // v14.0: Simplified — no milestone columns in Open Positions
-      '<td class="cb fw" style="font-size:11px">'+p.symbol+'</td>'+
-      '<td>'+tBadge(symType(p.symbol))+'</td>'+
+      // v14.0: Symbol sticky | Dir | VWAP | Sess | RR metrics | Prices | Opened
+      '<td class="cb fw" style="position:sticky;left:0;background:var(--bg3);font-size:11px;z-index:1">'+
+        p.symbol+'<br><span style="font-size:8px;color:var(--ink3)">'+tBadge(symType(p.symbol))+'</span></td>'+
       '<td>'+dBadge(p.direction)+'</td>'+
       '<td>'+vBadge(p.vwapPosition)+'</td>'+
       '<td>'+sBadge(p.session)+'</td>'+
+      '<td class="'+(currentRR!=null?(currentRR>=1?'cg fw':currentRR>0?'cy':'cr'):'cd')+'">'+
+        (currentRR!=null?currentRR.toFixed(2)+'R':'—')+'</td>'+
+      '<td class="'+(peakPos>=2?'cg fw':peakPos>=1?'cg':peakPos>0?'cy':'cd')+' fw">'+f2(peakPos)+'R</td>'+
+      '<td class="'+(peakNeg>80?'cr fw':peakNeg>50?'cr':peakNeg>25?'co':'cd')+'">'+( peakNeg>0?'-'+f0(peakNeg)+'%':'—')+'</td>'+
+      '<td class="cy">'+(tpRR!=null?f2(tpRR)+'R':'—')+'</td>'+
       '<td class="cd" style="font-size:10px">'+f2(p.entry)+'</td>'+
       '<td class="cr" style="font-size:10px">'+f2(p.sl)+'</td>'+
       '<td class="cg" style="font-size:10px">'+f2(p.tp)+'</td>'+
-      '<td class="'+(peakPos>=1?'cg fw':peakPos>0?'cy':'cd')+' fw">'+f2(peakPos)+'R</td>'+
-      '<td class="'+(peakNeg>80?'cr fw':peakNeg>50?'cr':peakNeg>25?'co':'cd')+'">'+( peakNeg>0?'-'+f0(peakNeg)+'%':'—')+'</td>'+
-      '<td class="cy">'+(tpRR!=null?f2(tpRR)+'R':'—')+'</td>'+
       '<td class="cd">—</td>'+
       '<td class="cd">'+f2(p.lots)+'</td>'+
       '<td class="'+(rPct&&+rPct>0.04?'cr fw':rPct&&+rPct>0.025?'co':'cg')+'">'+(rPct!=null?rPct+'%':'—')+'</td>'+
@@ -2508,7 +2576,7 @@ function renderGhostHistory(){
             const sr=t.stopReason;
             // v13.3: SL HIT = peak -RR altijd 100% (= 1.0R adverse)
             const isSLHit = sr==='phantom_sl'||t.phantomSLHit;
-            const srCls=sr==='phantom_sl'?'cr':sr==='max_rr_15'?'cg':'cy';
+            const srCls=sr==='phantom_sl'||sr==='gap_stop'?'cr':sr==='max_rr_15'?'cg':'cy';
             const rrMs  = t.rrMilestones || {};
             const slMs  = t.slMilestones || {};
             // Milestone cell helper: toont elapsed tijd in minuten
@@ -2522,7 +2590,7 @@ function renderGhostHistory(){
             return '<tr style="border-bottom:1px solid var(--bdr)">'+
               '<td class="cd">'+( i+1)+'</td>'+
               '<td class="cd" style="font-size:8px">'+dtS(t.openedAt)+'</td>'+
-              '<td class="'+srCls+'" style="font-size:8px">'+(sr||'—')+'</td>'+
+              '<td class="'+srCls+'" style="font-size:8px">'+(sr==='gap_stop'?'⚡ GAP SL':sr==='phantom_sl'?'SL HIT':sr==='max_rr_15'?'TP 15R':sr||'—')+'</td>'+
               '<td class="cy">'+f2(t.tpRRUsed)+'</td>'+
               '<td class="cy">'+f2(t.maxRR)+'R</td>'+
               '<td class="cg">'+f2(t.peakRRPos)+'R</td>'+
@@ -2676,67 +2744,59 @@ async function loadSignals(){
   const toEnd = to ? to+'T23:59:59' : null;
   const qs    = [from?'since='+encodeURIComponent(from):'', toEnd?'until='+encodeURIComponent(toEnd):''].filter(Boolean).join('&');
   const qStr  = qs ? '?'+qs : '';
-  const [stats,hist,rejects]=await Promise.all([
+  const [stats,sigLog]=await Promise.all([
     api('/api/signal-stats'+qStr),
-    api('/api/webhook-history?limit=80'+(qs?'&'+qs:'')),
-    api('/api/signal-rejects'+qStr),
+    api('/api/signal-log'+qStr),
   ]);
   const s=stats||{};
-  setText('sig-tot',s.total||0);
-  setText('sig-placed',s.placed||0);
-  setText('sig-conv',s.conversionPct!=null?pct(s.conversionPct):'—');
-  const totalBlocked=(s.byOutcome||[]).filter(o=>o.outcome!=='PLACED').reduce((sum,o)=>sum+(o.count||0),0);
-  setText('blk-tot',totalBlocked);
-  // topRejectReasons[].reason = raw string from DB e.g. "DUPLICATE_OPEN"
-  const reasons={};
-  (s.topRejectReasons||[]).forEach(r=>{ reasons[(r.reason||'').toLowerCase().replace(/[^a-z]/g,'_')]=r.count||0; });
-  setText('blk-dup',reasons['duplicate_open']||reasons['duplicate']||0);
-  setText('blk-vw', reasons['vwap_exhausted']||reasons['vwap']||0);
-  setText('blk-win',reasons['outside_window']||reasons['outside_trading_window']||0);
-  setText('blk-cur',reasons['currency_budget']||reasons['budget']||0);
-  setText('blk-ny', reasons['ny_dead_zone']||reasons['ny_dz']||0);
+  // KPI counts from signal_log directly
+  const allSig = sigLog||[];
+  const placedCount   = allSig.filter(r=>(r.outcome||'').toUpperCase()==='PLACED').length;
+  const shadowCount   = allSig.filter(r=>['VWAP_EXHAUSTION','DUPLICATE_POSITION','NY_DEAD_ZONE'].includes((r.outcome||'').toUpperCase())).length;
+  const blockedCount  = allSig.filter(r=>!['PLACED','VWAP_EXHAUSTION','DUPLICATE_POSITION','NY_DEAD_ZONE'].includes((r.outcome||'').toUpperCase())).length;
+  const totalCount    = allSig.length;
+  setText('sig-tot',   s.total   || totalCount);
+  setText('sig-placed',s.placed  || placedCount);
+  setText('sig-conv',  s.conversionPct!=null ? pct(s.conversionPct) : (totalCount>0?pct(placedCount/totalCount*100):'—'));
+  setText('blk-tot',   shadowCount + blockedCount);
+  // Count by block reason
+  const byReason = {};
+  allSig.forEach(r=>{ const k=(r.reason||r.outcome||'').toLowerCase(); byReason[k]=(byReason[k]||0)+1; });
+  setText('blk-dup', byReason['duplicate_position']||byReason['duplicate_open']||byReason['duplicate']||0);
+  setText('blk-vw',  byReason['vwap_exhaustion']||byReason['vwap_exhausted']||byReason['vwap']||0);
+  setText('blk-win', byReason['outside_window']||byReason['outside_trading_window']||0);
+  setText('blk-cur', byReason['currency_budget']||byReason['budget']||0);
+  setText('blk-ny',  byReason['ny_dead_zone']||byReason['ny_dz']||0);
   const nbSig=document.getElementById('nb-sig');
-  if(nbSig&&totalBlocked>0){ nbSig.textContent=totalBlocked; nbSig.style.display=''; }
+  if(nbSig){ nbSig.textContent=shadowCount||''; nbSig.style.display=shadowCount?'':'none'; }
 
-  // v14.0: Full signal log — shows ALL signals from webhook history, each with destination
-  // Destination: PLACED → Ghost Tracker, BLOCKED (VWAP/DUPLICATE/NY_DEAD_ZONE) → Shadow Playbook
-  // ERRORS (ORDER_NOT_CONFIRMED, fetch failed, missing data) = excluded / shown as error only
-  const validOutcomes = new Set(['OK','PLACED','REJECTED','BLOCKED','VWAP_EXHAUSTION','DUPLICATE_POSITION','NY_DEAD_ZONE','ORDER_NOT_CONFIRMED']);
-  const allSig = (hist||[]).filter(r => {
-    // Exclude pure technical errors — missing data, fetch failed
-    const st = (r.status||'').toUpperCase();
-    if(st==='ERROR'&&!(r.symbol)) return false;
-    return true;
-  });
+  // Full signal log — one row per signal, shows exact destination
   const outcomeDestination = r => {
-    const st = (r.status||r.outcome||'').toUpperCase();
-    if(st==='OK'||st==='PLACED') return {label:'→ Ghost Tracker', cls:'cg fw', dest:'ghost'};
-    const reason = (r.reason||'').toUpperCase();
-    if(reason.includes('VWAP_EXHAUSTION')||reason.includes('DUPLICATE')||reason.includes('NY_DEAD_ZONE'))
-      return {label:'→ Shadow Playbook', cls:'cp fw', dest:'shadow'};
-    if(st==='ORDER_NOT_CONFIRMED') return {label:'⚠ Not confirmed', cls:'cy', dest:'error'};
-    return {label:'✗ Blocked/Error', cls:'cr', dest:'reject'};
+    const oc = (r.outcome||'').toUpperCase();
+    const rs = (r.reason||'').toUpperCase();
+    if(oc==='PLACED') return {label:'✓ Ghost Tracker', cls:'cg fw', badge:'<span style="color:var(--g);font-weight:700">PLACED</span>'};
+    if(['VWAP_EXHAUSTION','DUPLICATE_POSITION','NY_DEAD_ZONE'].includes(oc))
+      return {label:'→ Shadow Playbook', cls:'cp fw', badge:'<span style="color:var(--p);font-weight:700">SHADOW</span>'};
+    if(oc==='ORDER_NOT_CONFIRMED')
+      return {label:'⚠ Niet bevestigd', cls:'cy', badge:'<span style="color:var(--y)">UNCONF</span>'};
+    return {label:'✗ '+( r.reason||oc).slice(0,25), cls:'cr', badge:'<span style="color:var(--r)">REJECT</span>'};
   };
   setHtml('placed-body', allSig.length ? allSig.map(r=>{
     const dest = outcomeDestination(r);
-    if(dest.dest==='error') return ''; // skip pure errors
-    const outcomeLabel = dest.dest==='ghost'?'<span class="bd bd-buy">PLACED</span>':
-      dest.dest==='shadow'?'<span class="bd bd-bw">SHADOW</span>':
-      '<span class="bd bd-sell">REJECT</span>';
     return '<tr>'+
       '<td class="cd" style="font-size:9px">'+dt(r.ts)+'</td>'+
-      '<td class="cb fw">'+r.symbol+'</td>'+
+      '<td class="cb fw">'+( r.symbol||'—')+'</td>'+
       '<td>'+(r.direction?dBadge(r.direction):'—')+'</td>'+
       '<td>'+(r.session?sBadge(r.session):'—')+'</td>'+
       '<td>'+(r.vwap_position?vBadge(r.vwap_position):'—')+'</td>'+
       '<td class="cd">'+f2(r.entry)+'</td>'+
       '<td class="cd">'+(r.sl_pct!=null?pct(r.sl_pct*100):'—')+'</td>'+
       '<td class="cd">'+(r.band_pct!=null?pct(r.band_pct):'—')+'</td>'+
-      '<td>'+outcomeLabel+'</td>'+
+      '<td>'+dest.badge+'</td>'+
       '<td class="'+dest.cls+'" style="font-size:9px">'+dest.label+'</td>'+
       '<td class="cd">'+(r.latency_ms!=null?r.latency_ms+'ms':'—')+'</td>'+
     '</tr>';
-  }).filter(Boolean).join('') : emptyRow(11,'No signals in DB · resets on restart'));
+  }).join('') : emptyRow(11,'Geen signalen gevonden · pas filter aan of wacht op nieuwe webhooks'));
 }
 
 async function loadBlockedRaw(){
@@ -2896,8 +2956,11 @@ function renderBGTTable(tab) {
       '<td colspan="'+cols+'" style="padding:0;background:var(--bg3)">'+
         '<div style="overflow-x:auto"><table style="font-size:9px;min-width:700px">'+
           '<thead><tr>'+
-            '<th>#</th><th>Datum</th><th>Stop</th><th>Peak+RR</th><th>Peak−RR%</th>'+
-            (tab==='vwap'?'<th>Band%</th>':'')+
+            '<th>#</th><th>Geopend</th>'+
+            (tab==='ny'  ? '<th style="color:var(--o)">⏰ Open Tijd (Brussel)</th>' : '')+
+            (tab==='dup' ? '<th style="color:var(--y)">📌 Trade # / Totaal</th>' : '')+
+            (tab==='vwap'? '<th style="color:var(--r)">📊 Band%</th>' : '')+
+            '<th>Stop</th><th>Peak+RR</th><th>Peak−RR%</th>'+
             '<th>Elapsed</th>'+
             // ADV milestones -0.1 to -1.0
             [0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0].map(v=>'<th class="adv-th" style="font-size:8px">-'+v.toFixed(1)+'</th>').join('')+
@@ -2906,7 +2969,7 @@ function renderBGTTable(tab) {
           +'</tr></thead><tbody>'+
           (g.trades||[]).map((t,i) => {
             const sr = t.stopReason;
-            const srCls = sr==='phantom_sl'?'cr':sr==='max_rr_15'?'cg':'cy';
+            const srCls = sr==='phantom_sl'||sr==='gap_stop'?'cr':sr==='max_rr_15'?'cg':'cy';
             const isSLHit = sr==='phantom_sl'||t.phantomSLHit;
             const rrMs = t.rrMilestones || {};
             const msC = (iso, opened, isFav) => {
@@ -2918,13 +2981,19 @@ function renderBGTTable(tab) {
             };
             const elapsed = t.openedAt && t.closedAt
               ? Math.round((new Date(t.closedAt)-new Date(t.openedAt))/60000) : null;
+            // v14.1: per-trade extra context based on block type
+            const nyTime = tab==='ny' ? '<td class="co" style="font-size:8px;font-weight:700">'+dt(t.openedAt)+'</td>' : '';
+            const dupNum = tab==='dup' ? '<td class="cy" style="font-size:8px">#'+(i+1)+' ('+g.n+' total)</td>' : '';
+            const vwapBand = tab==='vwap' ? '<td class="cr fw" style="font-size:9px">'+(t.vwapBandPct?f1(t.vwapBandPct)+'%':'—')+'</td>' : '';
             return '<tr style="border-bottom:1px solid var(--bdr)">'+
               '<td class="cd">'+(i+1)+'</td>'+
-              '<td class="cd" style="font-size:8px">'+dtS(t.openedAt)+'</td>'+
-              '<td class="'+srCls+'" style="font-size:8px">'+(sr||'—')+'</td>'+
+              '<td class="cd" style="font-size:8px">'+dt(t.openedAt)+'</td>'+
+              (tab==='ny'  ? nyTime   : '')+
+              (tab==='dup' ? dupNum   : '')+
+              (tab==='vwap'? vwapBand : '')+
+              '<td class="'+srCls+'" style="font-size:8px">'+(sr==='gap_stop'?'⚡ GAP SL':sr==='phantom_sl'?'SL HIT':sr==='max_rr_15'?'TP 15R':sr||'—')+'</td>'+
               '<td class="cg fw">'+f2(t.peakRRPos)+'R</td>'+
               '<td class="cr">'+(isSLHit?'100%':f1(t.peakRRNeg)+'%')+'</td>'+
-              (tab==='vwap'?'<td class="cr">'+(t.vwapBandPct?f0(t.vwapBandPct)+'%':'—')+'</td>':'')+
               '<td class="cd">'+msFmt(elapsed)+'</td>'+
               [0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0].map(v=>{
                 const key='-'+v.toFixed(1);
@@ -3005,13 +3074,20 @@ async function loadShadowPlaybook() {
 async function loadAll(){
   // 1. Status poll + live positions + ghost trackers in parallel
   await Promise.all([pollStatus(), loadPositions(), loadGhostTrackers()]);
-  // 2. Trade history + daily breakdown + ghost grouped
+  // 2. Trade history + daily breakdown + ghost grouped — respect Overview date filter
+  const ov = _df.ov;
+  const ovQs = [
+    ov.openFrom  ? 'openFrom='  + encodeURIComponent(ov.openFrom)               : '',
+    ov.openTo    ? 'openTo='    + encodeURIComponent(ov.openTo + 'T23:59:59')   : '',
+    ov.closeFrom ? 'since='     + encodeURIComponent(ov.closeFrom)              : '',
+    ov.closeTo   ? 'until='     + encodeURIComponent(ov.closeTo + 'T23:59:59')  : '',
+  ].filter(Boolean).join('&');
+  const ovQ = ovQs ? '?' + ovQs : '';
   const [trades,daily,ghGrouped]=await Promise.all([
-    api('/api/trades'),
+    api('/api/trades' + ovQ),
     api('/api/daily-breakdown'),
     api('/api/ghost-grouped'),
   ]);
-  // v13.3: compliance date verwijderd — alle trades tonen
   _allTrades=(trades||[]);
   renderOverview(_allTrades,daily,ghGrouped);
 }
@@ -3070,9 +3146,13 @@ async function initBackground() {
         console.warn(`[DB] Skipping incomplete ghost state ${gs.positionId} — missing direction/entry/sl`);
         continue;
       }
+      // v14.0: Preserve phantomSLHit/stopReason from ghost_state (don't reset on restart)
       const ghost = { ...gs, maxPrice: gs.maxPrice??gs.entry, maxRR: gs.maxRR??0,
         maxSlPctUsed: gs.maxSlPctUsed??0, slMilestones: gs.slMilestones??{},
-        rrMilestones: gs.rrMilestones??{}, phantomSLHit: false, stopReason: null, closedAt: null };
+        rrMilestones: gs.rrMilestones??{},
+        peakRRPos: gs.peakRRPos??0, peakRRNeg: gs.peakRRNeg??0,
+        phantomSLHit: gs.phantomSLHit??false,
+        stopReason: gs.stopReason??null, closedAt: null };
       openPositions.set(gs.positionId, {
         positionId: gs.positionId, symbol: gs.symbol, mt5Symbol: gs.mt5Symbol??gs.symbol,
         direction: gs.direction, vwapPosition: gs.vwapPosition,
