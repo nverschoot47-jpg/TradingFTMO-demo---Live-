@@ -1588,7 +1588,10 @@ tr:hover td{background:var(--bg4)}
     <div class="card">
       <div class="card-hdr">
         <div class="card-title"><div class="dot" id="ghh-dot"></div>Ghost History — Grouped per Pair · Click row for detail</div>
-        <div class="cmeta" id="ghh-meta">loading…</div>
+        <div style="display:flex;gap:6px;align-items:center">
+          <button class="fb" id="ghh-ms-btn" onclick="toggleGHHMilestones()">± Milestones</button>
+          <div class="cmeta" id="ghh-meta">loading…</div>
+        </div>
       </div>
       <div class="fbar">
         <span class="fl">Session:</span>
@@ -1888,15 +1891,27 @@ tr:hover td{background:var(--bg4)}
     <div class="card">
       <div class="card-hdr">
         <div class="card-title"><div class="dot r"></div>Actieve Blocked Ghosts — Live Tracking</div>
-        <div class="cmeta" id="bgt-active-meta">loading…</div>
+        <div style="display:flex;gap:6px;align-items:center">
+          <button class="fb" id="bgt-ms-btn" onclick="toggleBGTMilestones()">± Milestones</button>
+          <div class="cmeta" id="bgt-active-meta">loading…</div>
+        </div>
       </div>
       <div class="tw">
         <table>
           <thead><tr>
-            <th>Symbol</th><th>Type</th><th>Block Type</th><th>Dir</th><th>VWAP</th><th>Session</th>
-            <th>Entry</th><th>Peak+RR</th><th>Peak−RR%</th><th>Band%</th><th>Elapsed</th><th>Reden</th>
+            <th style="position:sticky;left:0;background:var(--bg3)">Symbol</th>
+            <th>Type</th><th>Block</th><th>Dir</th><th>VWAP</th><th>Sess</th>
+            <th>Entry</th><th>Peak+RR</th><th title="MAE: % of SL used">Peak−MAE</th>
+            <th title="VWAP band% at block">Band%</th>
+            <th title="When signal was blocked">Blocked At</th><th>Elapsed</th>
+            <th class="adv-th bgt-ms-col" style="display:none" colspan="10">← Adverse</th>
+            <th class="fav-th bgt-ms-col" style="display:none" colspan="150">Favorable →</th>
+          </tr><tr>
+            <th colspan="12"></th>
+            ${[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0].map(v=>'<th class="adv-th bgt-ms-col" style="display:none;font-size:7px">-'+v.toFixed(1)+'</th>').join('')}
+            ${(()=>{let s='';for(let v=0.1;v<=15.0+1e-9;v=Math.round((v+0.1)*10)/10)s+='<th class="fav-th bgt-ms-col" style="display:none;font-size:7px">+'+v.toFixed(1)+'</th>';return s;})()}
           </tr></thead>
-          <tbody id="bgt-active-body"><tr><td colspan="12" class="nd">Geen actieve blocked ghosts</td></tr></tbody>
+          <tbody id="bgt-active-body"><tr><td colspan="170" class="nd">Geen actieve blocked ghosts</td></tr></tbody>
         </table>
       </div>
     </div>
@@ -2276,7 +2291,18 @@ async function loadPositions(){
     const peakPos=p.ghost?.peakRRPos??p.ghost?.maxRR??0;
     const peakNeg=p.ghost?.peakRRNeg??p.ghost?.maxSlPctUsed??0;
     const tpRR=slDist>0?Math.abs((p.tp||0)-(p.entry||0))/slDist:null;
-    const rPct=p.riskPct?(p.riskPct*100).toFixed(3):null;
+    const lots = p.lots ?? p.ghost?.lots ?? null;
+    const rPct = p.riskPct ? (p.riskPct*100).toFixed(3) : null;
+    // Live P&L: try ghost pnl (currentPrice - entry) × lots × pip value, else use header
+    let livePnl = null;
+    if(p.currentPrice && p.entry && lots && p.sl) {
+      const slDist = Math.abs(p.entry - p.sl);
+      const pnlDir = p.direction === 'buy' ? p.currentPrice - p.entry : p.entry - p.currentPrice;
+      // For forex: pnl ≈ lots × 100000 × pnlDir (rough, in quote currency)
+      // For now just show RR-based estimate relative to riskEUR
+      const riskEUR = p.riskEUR ?? (p.riskPct ? 50000 * p.riskPct : null);
+      if(riskEUR && slDist > 0) livePnl = parseFloat((riskEUR * pnlDir / slDist).toFixed(2));
+    }
     // Compute live RR from currentPrice if available, else show peak
     const currentRR = slDist > 0 && p.currentPrice
       ? parseFloat(((p.direction==='buy' ? p.currentPrice - p.entry : p.entry - p.currentPrice) / slDist).toFixed(2))
@@ -2291,13 +2317,14 @@ async function loadPositions(){
       '<td class="'+(currentRR!=null?(currentRR>=1?'cg fw':currentRR>0?'cy':'cr'):'cd')+'">'+
         (currentRR!=null?currentRR.toFixed(2)+'R':'—')+'</td>'+
       '<td class="'+(peakPos>=2?'cg fw':peakPos>=1?'cg':peakPos>0?'cy':'cd')+' fw">'+f2(peakPos)+'R</td>'+
-      '<td class="'+(peakNeg>80?'cr fw':peakNeg>50?'cr':peakNeg>25?'co':'cd')+'">'+( peakNeg>0?'-'+f0(peakNeg)+'%':'—')+'</td>'+
+      '<td class="'+(peakNeg>80?'cr fw':peakNeg>50?'cr':peakNeg>25?'co':'cd')+'">'+
+        (peakNeg>0?'-'+f1(peakNeg)+'% ('+f2(peakNeg/100)+'R)':'—')+'</td>'+
       '<td class="cy">'+(tpRR!=null?f2(tpRR)+'R':'—')+'</td>'+
       '<td class="cd" style="font-size:10px">'+f2(p.entry)+'</td>'+
       '<td class="cr" style="font-size:10px">'+f2(p.sl)+'</td>'+
       '<td class="cg" style="font-size:10px">'+f2(p.tp)+'</td>'+
-      '<td class="cd">—</td>'+
-      '<td class="cd">'+f2(p.lots)+'</td>'+
+      '<td class="'+(livePnl!=null?(livePnl>=0?'cg':'cr'):'cd')+' fw">'+(livePnl!=null?(livePnl>=0?'+':'')+eu(livePnl):'—')+'</td>'+
+      '<td class="cd">'+(lots!=null?f2(lots):'—')+'</td>'+
       '<td class="'+(rPct&&+rPct>0.04?'cr fw':rPct&&+rPct>0.025?'co':'cg')+'">'+(rPct!=null?rPct+'%':'—')+'</td>'+
       '<td class="cd" style="font-size:9px">'+dt(p.openedAt)+'</td>'+
     '</tr>';
@@ -2350,24 +2377,15 @@ async function loadGhostTrackers(){
       '<td>'+dBadge(g.direction)+'</td>'+
       '<td>'+vBadge(g.vwapPosition)+'</td>'+
       '<td class="'+(peakPos>=2?'cg fw':peakPos>=1?'cg':peakPos>0?'cy':'cd')+'">'+f2(peakPos)+'R</td>'+
-      '<td class="'+(peakNeg>80?'cr fw':peakNeg>50?'cr':peakNeg>25?'co':'cd')+'">'+( peakNeg>0?'-'+f0(peakNeg)+'%':'—')+'</td>'+
+      '<td class="'+(peakNeg>80?'cr fw':peakNeg>50?'cr':peakNeg>25?'co':'cd')+'">'+
+        (peakNeg>0?'-'+f1(peakNeg)+'% ('+f2(peakNeg/100)+'R)':'—')+'</td>'+
       ADV_STEPS.map(v=>{
-        const negKey='-'+v.toFixed(1);
-        const msNew=favMs[negKey]||null;
-        if(msNew) return msT(msNew,g.openedAt,false);
-        const pctKey=Math.round(v*100);
-        const nearest=advKeys.sort((a,b)=>Math.abs(a-pctKey)-Math.abs(b-pctKey))[0];
-        const ms=nearest!=null&&Math.abs(nearest-pctKey)<=15?advMs[nearest]:null;
-        return msT(ms,g.openedAt,false);
+        // ADV keys stored as "-0.1", "-0.2" ... "-1.0" in rrMilestones
+        return msT(favMs['-'+v.toFixed(1)]||null, g.openedAt, false);
       }).join('')+
       FAV_STEPS.map(v=>{
-        const strKey=v.toFixed(1);
-        const msNew=favMs[strKey]||null;
-        if(msNew) return msT(msNew,g.openedAt,true);
-        const intV=Math.round(v);
-        const nearest=favKeys.filter(k=>Number.isInteger(+k)).sort((a,b)=>Math.abs(a-intV)-Math.abs(b-intV))[0];
-        const ms=nearest!=null&&Math.abs(nearest-intV)<=1?favMs[nearest]:null;
-        return msT(ms,g.openedAt,true);
+        // Keys always stored as strings like "0.1","1.1" etc — direct lookup only
+        return msT(favMs[v.toFixed(1)]||null, g.openedAt, true);
       }).join('')+
       '<td class="cd">'+msFmt(elapsed)+'</td>'+
       '<td class="cd" style="font-size:9px">'+dt(g.openedAt)+'</td>'+
@@ -2588,17 +2606,15 @@ function renderGhostHistory(){
       '<td colspan="15" style="padding:0;background:var(--bg3)">'+
         '<div style="overflow-x:auto"><table style="font-size:9px;min-width:900px">'+
           '<thead><tr>'+
-            '<th>#</th><th>Date</th><th>Stop Reason</th><th>TP RR</th><th>Max RR</th>'+
-            '<th>Peak+RR</th><th>Peak-RR%</th><th>MAE%</th>'+
-            // ADV milestone headers: -0.1 to -1.0
-            '<th class="adv-th" colspan="10" style="text-align:center">← Adverse (tijd tot)</th>'+
-            // FAV milestone headers: +0.1 to +15.0
-            '<th class="fav-th" colspan="150" style="text-align:center">Favorable (tijd tot) →</th>'+
+            '<th>#</th><th>Geopend</th><th>Gesloten</th><th>Stop</th><th>TP RR</th>'+
+            '<th>Peak+RR</th>'+
+            '<th class="ghh-ms-col" style="display:none;text-align:center" colspan="10">← Adverse (tijd) →</th>'+
+            '<th class="ghh-ms-col" style="display:none;text-align:center" colspan="150">Favorable (tijd) →</th>'+
           '</tr>'+
           '<tr>'+
-            '<th colspan="8"></th>'+
-            [0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0].map(v=>'<th class="adv-th" style="font-size:8px">-'+v.toFixed(1)+'</th>').join('')+
-            (()=>{let s='';for(let v=0.1;v<=15.0+1e-9;v=Math.round((v+0.1)*10)/10)s+='<th class="fav-th" style="font-size:8px">+'+v.toFixed(1)+'</th>';return s;})()
+            '<th colspan="5"></th>'+
+            [0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0].map(v=>'<th class="adv-th ghh-ms-col" style="display:none;font-size:8px">-'+v.toFixed(1)+'</th>').join('')+
+            (()=>{let s='';for(let v=0.1;v<=15.0+1e-9;v=Math.round((v+0.1)*10)/10)s+='<th class="fav-th ghh-ms-col" style="display:none;font-size:8px">+'+v.toFixed(1)+'</th>';return s;})()
           +'</tr></thead><tbody>'+
           (g.trades||[]).map((t,i)=>{
             const sr=t.stopReason;
@@ -2616,27 +2632,32 @@ function renderGhostHistory(){
               return '<td class="'+cls+'" style="font-size:8px;min-width:28px">'+(h>0?h+'h'+m+'m':m+'m')+'</td>';
             };
             return '<tr style="border-bottom:1px solid var(--bdr)">'+
-              '<td class="cd">'+( i+1)+'</td>'+
-              '<td class="cd" style="font-size:8px">'+dtS(t.openedAt)+'</td>'+
-              '<td class="'+srCls+'" style="font-size:8px">'+(sr==='gap_stop'?'⚡ GAP SL':sr==='phantom_sl'?'SL HIT':sr==='max_rr_15'?'TP 15R':sr||'—')+'</td>'+
+              '<td class="cd">'+(i+1)+'</td>'+
+              '<td class="cd" style="font-size:8px">'+dt(t.openedAt)+'</td>'+
+              '<td class="cd" style="font-size:8px">'+(t.closedAt?dt(t.closedAt):'<span class="cy">open</span>')+'</td>'+
+              '<td class="'+srCls+'" style="font-size:8px">'+(sr==='gap_stop'?'⚡ GAP SL':sr==='phantom_sl'?'SL HIT':sr==='max_rr_15'?'TP 15R':sr||'<span class="cy">running</span>')+'</td>'+
               '<td class="cy">'+f2(t.tpRRUsed)+'</td>'+
-              '<td class="cy">'+f2(t.maxRR)+'R</td>'+
-              '<td class="cg">'+f2(t.peakRRPos)+'R</td>'+
-              // v13.3: SL HIT → peak -RR = 100% (1.0R)
-              '<td class="cr">'+(isSLHit?'100%':f1(t.peakRRNeg)+'%')+'</td>'+
-              '<td class="cd">'+f1(t.maxSlPct)+'%</td>'+
-              // ADV milestones -0.1 to -1.0
+              '<td class="cg fw">'+f2(t.peakRRPos)+'R</td>'+
+              // ADV milestones -0.1 to -1.0 (hidden until ± Milestones clicked)
               [0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0].map(v=>{
-                // SL HIT: -1.0 milestone = closedAt
                 const key='-'+v.toFixed(1);
                 let iso=rrMs[key]||null;
                 if(!iso&&isSLHit&&Math.abs(v-1.0)<1e-9) iso=t.closedAt||null;
-                return msCell(iso,t.openedAt,false);
+                const cls='adv-cr ghh-ms-col'; const d=_ghhMsVisible?'':'none';
+                if(!iso||!t.openedAt) return '<td class="'+cls+'" style="display:'+d+';font-size:8px">—</td>';
+                const mins=Math.round((new Date(iso)-new Date(t.openedAt))/60000);
+                const hh=Math.floor(mins/60),mm=mins%60;
+                return '<td class="'+cls+'" style="display:'+d+';font-size:8px">'+(hh>0?hh+'h'+mm+'m':mm+'m')+'</td>';
               }).join('')+
-              // FAV milestones +0.1 to +15.0
+              // FAV milestones +0.1 to +15.0 (hidden until ± Milestones clicked)
               (()=>{let s='';for(let v=0.1;v<=15.0+1e-9;v=Math.round((v+0.1)*10)/10){
                 const key=v.toFixed(1);
-                s+=msCell(rrMs[key]||null,t.openedAt,true);
+                const iso=rrMs[key]||null;
+                const cls='fav-cg ghh-ms-col'; const d=_ghhMsVisible?'':'none';
+                if(!iso||!t.openedAt){ s+='<td class="'+cls+'" style="display:'+d+';font-size:8px">—</td>'; continue; }
+                const mins=Math.round((new Date(iso)-new Date(t.openedAt))/60000);
+                const hh=Math.floor(mins/60),mm=mins%60;
+                s+='<td class="'+cls+'" style="display:'+d+';font-size:8px">'+(hh>0?hh+'h'+mm+'m':mm+'m')+'</td>';
               }return s;})()
             +'</tr>';
           }).join('')+
@@ -2645,7 +2666,24 @@ function renderGhostHistory(){
     '</tr>';
   }).join('');
 }
-function toggleGHHRow(key){ const el=document.getElementById('ghh-d-'+key); if(el) el.style.display=el.style.display==='none'?'':'none'; }
+function toggleGHHRow(key){ 
+  const el=document.getElementById('ghh-d-'+key); 
+  if(el) el.style.display=el.style.display==='none'?'':'none'; 
+}
+let _ghhMsVisible=false;
+let _bgtMsVisible=false;
+function toggleBGTMilestones(){
+  _bgtMsVisible=!_bgtMsVisible;
+  document.querySelectorAll('.bgt-ms-col').forEach(el=>el.style.display=_bgtMsVisible?'':'none');
+  const btn=document.getElementById('bgt-ms-btn');
+  if(btn) btn.classList.toggle('on',_bgtMsVisible);
+}
+function toggleGHHMilestones(){
+  _ghhMsVisible=!_ghhMsVisible;
+  document.querySelectorAll('.ghh-ms-col').forEach(el=>el.style.display=_ghhMsVisible?'':'none');
+  const btn=document.getElementById('ghh-ms-btn');
+  if(btn) btn.classList.toggle('on',_ghhMsVisible);
+}
 
 // ── Ghost Combo (signal combo grouped) ───────────────────────────
 async function loadGhostCombo(){
@@ -2801,13 +2839,24 @@ async function loadSignals(){
   // Full signal log — one row per signal, shows exact destination
   const outcomeDestination = r => {
     const oc = (r.outcome||'').toUpperCase();
-    const rs = (r.reason||'').toUpperCase();
-    if(oc==='PLACED') return {label:'✓ Ghost Tracker', cls:'cg fw', badge:'<span style="color:var(--g);font-weight:700">PLACED</span>'};
-    if(['VWAP_EXHAUSTION','DUPLICATE_POSITION','NY_DEAD_ZONE'].includes(oc))
-      return {label:'→ Shadow Playbook', cls:'cp fw', badge:'<span style="color:var(--p);font-weight:700">SHADOW</span>'};
+    const bandPct = r.band_pct ? f1(r.band_pct)+'%' : '';
+    if(oc==='PLACED')
+      return {label:'✓ Ghost Tracker', cls:'cg fw',
+              badge:'<span style="background:#1b5e20;color:#fff;padding:1px 5px;border-radius:3px;font-size:9px">PLACED</span>'};
+    if(oc==='NY_DEAD_ZONE')
+      return {label:'⏰ Shadow (NY Dead Zone)', cls:'co fw',
+              badge:'<span style="background:#e65100;color:#fff;padding:1px 5px;border-radius:3px;font-size:9px">NY ZONE</span>'};
+    if(oc==='DUPLICATE_POSITION')
+      return {label:'📌 Shadow (Duplicate)', cls:'cy fw',
+              badge:'<span style="background:#f57f17;color:#fff;padding:1px 5px;border-radius:3px;font-size:9px">DUPL</span>'};
+    if(oc==='VWAP_EXHAUSTION')
+      return {label:'📊 Shadow (VWAP '+(bandPct||'>')+' 150%)', cls:'cp fw',
+              badge:'<span style="background:#4a148c;color:#fff;padding:1px 5px;border-radius:3px;font-size:9px">VWAP</span>'};
     if(oc==='ORDER_NOT_CONFIRMED')
-      return {label:'⚠ Niet bevestigd', cls:'cy', badge:'<span style="color:var(--y)">UNCONF</span>'};
-    return {label:'✗ '+( r.reason||oc).slice(0,25), cls:'cr', badge:'<span style="color:var(--r)">REJECT</span>'};
+      return {label:'⚠ Niet bevestigd', cls:'cy',
+              badge:'<span style="color:var(--y)">UNCONF</span>'};
+    return {label:'✗ '+(r.reason||oc).slice(0,25), cls:'cr',
+            badge:'<span style="background:#b71c1c;color:#fff;padding:1px 5px;border-radius:3px;font-size:9px">REJECT</span>'};
   };
   setHtml('placed-body', allSig.length ? allSig.map(r=>{
     const dest = outcomeDestination(r);
@@ -3061,22 +3110,43 @@ async function loadShadowPlaybook() {
   const now = Date.now();
   setHtml('bgt-active-body', active.length ? active.map(bg => {
     const elapsed = bg.openedAt ? Math.round((now - new Date(bg.openedAt))/60000) : null;
-    const btCls = bg.blockType==='NY_DEAD_ZONE'?'co':bg.blockType==='DUPLICATE'?'cy':'cr';
+    const bt = bg.blockType||'';
+    const btBadge = bt==='NY_DEAD_ZONE'
+      ? '<span style="background:#e65100;color:#fff;padding:1px 4px;border-radius:3px;font-size:8px">⏰ NY ZONE</span>'
+      : bt==='DUPLICATE'
+      ? '<span style="background:#f57f17;color:#fff;padding:1px 4px;border-radius:3px;font-size:8px">📌 DUPL</span>'
+      : '<span style="background:#4a148c;color:#fff;padding:1px 4px;border-radius:3px;font-size:8px">📊 VWAP</span>';
+    const rrMs = bg.rrMilestones||{};
+    const msBgt=(iso,isFav)=>{
+      const d=_bgtMsVisible?'':'none';
+      const cls=(isFav?'ms-fav cg':'ms-adv cr')+' bgt-ms-col';
+      if(!iso||!bg.openedAt) return '<td class="'+cls+'" style="display:'+d+';font-size:7px">—</td>';
+      const mins=Math.round((new Date(iso)-new Date(bg.openedAt))/60000);
+      const h=Math.floor(mins/60),m=mins%60;
+      return '<td class="'+cls+'" style="display:'+d+';font-size:7px">'+(h>0?h+'h'+m+'m':m+'m')+'</td>';
+    };
+    const extraCell = bt==='VWAP_EXHAUSTION'
+      ? '<td class="cp fw" style="font-size:9px">'+(bg.vwapBandPct?f1(bg.vwapBandPct)+'%':'—')+'</td>'
+      : bt==='DUPLICATE'
+      ? '<td class="cy" style="font-size:9px">'+( bg.vwapBandPct?f1(bg.vwapBandPct)+'%':'—')+'</td>'
+      : '<td class="co" style="font-size:9px">'+( bg.openedAt?dt(bg.openedAt):'—')+'</td>';
     return '<tr>'+
-      '<td class="cb fw">'+bg.symbol+'</td>'+
+      '<td class="cb fw" style="position:sticky;left:0;background:var(--bg3);font-size:10px">'+bg.symbol+'</td>'+
       '<td>'+tBadge(symType(bg.symbol))+'</td>'+
-      '<td><span class="bd" style="background:rgba(255,255,255,.06);color:var(--'+btCls.slice(1)+')">'+(bg.blockType||'—')+'</span></td>'+
+      '<td>'+btBadge+'</td>'+
       '<td>'+dBadge(bg.direction)+'</td>'+
       '<td>'+vBadge(bg.vwapPosition)+'</td>'+
       '<td>'+sBadge(bg.session)+'</td>'+
       '<td class="cd">'+f2(bg.entry)+'</td>'+
       '<td class="cg fw">'+f2(bg.peakRRPos)+'R</td>'+
-      '<td class="cr">'+f1(bg.peakRRNeg)+'%</td>'+
-      '<td class="cr">'+(bg.vwapBandPct?f0(bg.vwapBandPct)+'%':'—')+'</td>'+
+      '<td class="cr">'+(bg.peakRRNeg>0?'-'+f1(bg.peakRRNeg)+'% ('+f2(bg.peakRRNeg/100)+'R)':'—')+'</td>'+
+      extraCell+
+      '<td class="cd" style="font-size:9px">'+dt(bg.openedAt)+'</td>'+
       '<td class="cd">'+msFmt(elapsed)+'</td>'+
-      '<td class="cd" style="font-size:8px;max-width:200px;overflow:hidden;text-overflow:ellipsis">'+(bg.blockReason||'—')+'</td>'+
-    '</tr>';
-  }).join('') : emptyRow(12, 'Geen actieve blocked ghosts'));
+      [0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0].map(v=>msBgt(rrMs['-'+v.toFixed(1)]||null,false)).join('')+
+      (()=>{let s='';for(let v=0.1;v<=15.0+1e-9;v=Math.round((v+0.1)*10)/10)s+=msBgt(rrMs[v.toFixed(1)]||null,true);return s;})()
+    +'</tr>';
+  }).join('') : emptyRow(170, 'Geen actieve blocked ghosts'));
 
   // Laad history voor de 3 types parallel
   const buildUrl = (type) => {
