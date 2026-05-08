@@ -745,18 +745,17 @@ async function saveTrade(t) {
 }
 
 async function loadAllTrades({ since = null, until = null, openFrom = null, openTo = null } = {}) {
-  // v14.0: supports date filtering for Overview tab filter
+  // v14.1: supports date filtering for Overview tab filter
   // since/until = closed_at filter; openFrom/openTo = opened_at filter
+  // When NO filter params given -> returns ALL trades (no WHERE restriction)
   try {
     const params = [];
     const where  = [];
-    if (since)    { params.push(since);    where.push(`closed_at  >= $${params.length}`); }
-    if (until)    { params.push(until);    where.push(`closed_at  <= $${params.length}`); }
-    if (openFrom) { params.push(openFrom); where.push(`opened_at  >= $${params.length}`); }
-    if (openTo)   { params.push(openTo);   where.push(`opened_at  <= $${params.length}`); }
-    // Safety: always exclude rows with no opened_at (corrupt data)
-    where.push('opened_at IS NOT NULL');
-    const whereClause = 'WHERE ' + where.join(' AND ');
+    if (since)    { params.push(since);    where.push(`closed_at >= $${params.length}`); }
+    if (until)    { params.push(until);    where.push(`closed_at <= $${params.length}`); }
+    if (openFrom) { params.push(openFrom); where.push(`opened_at >= $${params.length}`); }
+    if (openTo)   { params.push(openTo);   where.push(`opened_at <= $${params.length}`); }
+    const whereClause = where.length ? 'WHERE ' + where.join(' AND ') : '';
     const r = await pool.query(`
       SELECT
         position_id         AS "positionId",
@@ -1697,8 +1696,7 @@ async function loadGhostGrouped() {
         MAX(opened_at)                                              AS last_opened,
         COUNT(*) FILTER (WHERE phantom_sl_hit = TRUE)               AS sl_hits
       FROM ghost_trades
-      WHERE opened_at >= $1
-        AND vwap_position IN ('above','below')
+      WHERE vwap_position IN ('above','below')
         AND (
           closed_at IS NOT NULL
           OR phantom_sl_hit = TRUE
@@ -1707,7 +1705,7 @@ async function loadGhostGrouped() {
       GROUP BY optimizer_key, symbol, session, direction, vwap_position
       ORDER BY last_opened DESC
       LIMIT 200
-    `, [EV_DATA_CUTOFF]);
+    `);
 
     return r.rows.map(row => ({
       optimizerKey:   row.optimizerKey,
@@ -2185,12 +2183,11 @@ async function loadDailyBreakdown() {
         MAX(realized_pnl_eur)                             AS max_win,
         MIN(realized_pnl_eur)                             AS max_loss
       FROM closed_trades
-      WHERE opened_at >= $1
-        AND close_reason IN ('tp','sl','sl_gap','manual')
+      WHERE close_reason IN ('tp','sl','sl_gap','manual')
         AND (exclude_from_ev IS NULL OR exclude_from_ev = FALSE)
       GROUP BY DATE(opened_at AT TIME ZONE 'Europe/Brussels')
       ORDER BY trade_date DESC
-    `, [EV_DATA_CUTOFF]);
+    `);
 
     // Best 10 / Worst 10 from ghost_trades by peak_rr_pos (PEAK+RR — not realized pnl)
     const topR = await pool.query(`
@@ -2201,11 +2198,11 @@ async function loadDailyBreakdown() {
         stop_reason AS stopReason,
         opened_at AS openedAt
       FROM ghost_trades
-      WHERE opened_at >= $1
-        AND peak_rr_pos IS NOT NULL
+      WHERE peak_rr_pos IS NOT NULL
+        AND peak_rr_pos > 0
       ORDER BY peak_rr_pos DESC
       LIMIT 10
-    `, [EV_DATA_CUTOFF]);
+    `);
 
     const botR = await pool.query(`
       SELECT
@@ -2215,11 +2212,11 @@ async function loadDailyBreakdown() {
         stop_reason AS stopReason,
         opened_at AS openedAt
       FROM ghost_trades
-      WHERE opened_at >= $1
-        AND peak_rr_pos IS NOT NULL
+      WHERE peak_rr_pos IS NOT NULL
+        AND peak_rr_pos > 0
       ORDER BY peak_rr_pos ASC
       LIMIT 10
-    `, [EV_DATA_CUTOFF]);
+    `);
 
     return {
       days:        r.rows,
@@ -2259,13 +2256,8 @@ async function loadGhostHistoryByPair(from, to) {
         closed_at                                             AS "closedAt"
       FROM ghost_trades
       WHERE vwap_position IN ('above','below')
-        AND (
-          -- No date filter: show all (open + closed)
-          ($1 = '2000-01-01' AND $2 = '2099-12-31')
-          OR
-          -- Date filter: only closed trades within range
-          (closed_at IS NOT NULL AND closed_at >= $1 AND closed_at <= $2)
-        )
+        AND ($1 = '2000-01-01' OR closed_at >= $1)
+        AND ($2 = '2099-12-31' OR closed_at <= $2)
       ORDER BY optimizer_key ASC, COALESCE(closed_at, opened_at) DESC
     `, [cutoff, ceiling]);
 
