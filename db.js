@@ -1781,8 +1781,11 @@ async function saveGhostState(g) {
         risk_eur        = COALESCE(EXCLUDED.risk_eur,  ghost_state.risk_eur),
         ev_mult         = COALESCE(EXCLUDED.ev_mult,   ghost_state.ev_mult),
         day_mult        = COALESCE(EXCLUDED.day_mult,  ghost_state.day_mult),
-        sl_milestones   = COALESCE(EXCLUDED.sl_milestones,  ghost_state.sl_milestones),
-        rr_milestones   = COALESCE(EXCLUDED.rr_milestones,  ghost_state.rr_milestones),
+        sl_milestones   = COALESCE(EXCLUDED.sl_milestones, ghost_state.sl_milestones),
+        rr_milestones   = CASE 
+          WHEN EXCLUDED.rr_milestones IS NOT NULL THEN EXCLUDED.rr_milestones
+          ELSE ghost_state.rr_milestones 
+        END,
         peak_rr_pos     = GREATEST(EXCLUDED.peak_rr_pos, ghost_state.peak_rr_pos),
         peak_rr_neg     = GREATEST(EXCLUDED.peak_rr_neg, ghost_state.peak_rr_neg),
         trade_number    = COALESCE(ghost_state.trade_number, EXCLUDED.trade_number),
@@ -2191,8 +2194,7 @@ async function loadDailyBreakdown() {
         MAX(realized_pnl_eur)                             AS max_win,
         MIN(realized_pnl_eur)                             AS max_loss
       FROM closed_trades
-      WHERE close_reason IN ('tp','sl','sl_gap','manual')
-        AND (exclude_from_ev IS NULL OR exclude_from_ev = FALSE)
+      WHERE (exclude_from_ev IS NULL OR exclude_from_ev = FALSE)
       GROUP BY DATE(opened_at AT TIME ZONE 'Europe/Brussels')
       ORDER BY trade_date DESC
     `);
@@ -2226,8 +2228,31 @@ async function loadDailyBreakdown() {
       LIMIT 10
     `);
 
+    // Supplement with ghost_trades data if closed_trades has no pnl (pnl=null)
+    // This handles the case where syncPositions couldn't fetch deals
+    const days = r.rows;
+    if(days.every(d => !d.day_pnl || parseFloat(d.day_pnl) === 0)) {
+      // Try ghost_trades grouped by day as fallback
+      const gr = await pool.query(`
+        SELECT
+          DATE(opened_at AT TIME ZONE 'Europe/Brussels') AS trade_date,
+          COUNT(*) AS trades,
+          COALESCE(SUM(CAST(lots AS FLOAT)),0) AS total_lots,
+          COALESCE(SUM(realized_pnl_eur),0) AS day_pnl,
+          MAX(peak_rr_pos) AS best_peak_rr,
+          MAX(realized_pnl_eur) AS max_win,
+          MIN(realized_pnl_eur) AS max_loss
+        FROM ghost_trades
+        WHERE closed_at IS NOT NULL OR stop_reason IS NOT NULL
+        GROUP BY DATE(opened_at AT TIME ZONE 'Europe/Brussels')
+        ORDER BY trade_date DESC
+      `).catch(()=>({rows:[]}));
+      if(gr.rows.length > 0) {
+        return { days: gr.rows, bestTrades: topR.rows, worstTrades: botR.rows };
+      }
+    }
     return {
-      days:        r.rows,
+      days:        days,
       bestTrades:  topR.rows,
       worstTrades: botR.rows,
     };
@@ -2369,7 +2394,10 @@ async function saveBlockedGhostState(g) {
         peak_rr_pos     = GREATEST(EXCLUDED.peak_rr_pos, blocked_ghost_state.peak_rr_pos),
         peak_rr_neg     = GREATEST(EXCLUDED.peak_rr_neg, blocked_ghost_state.peak_rr_neg),
         sl_milestones   = COALESCE(EXCLUDED.sl_milestones, blocked_ghost_state.sl_milestones),
-        rr_milestones   = COALESCE(EXCLUDED.rr_milestones, blocked_ghost_state.rr_milestones),
+        rr_milestones   = CASE 
+          WHEN EXCLUDED.rr_milestones IS NOT NULL THEN EXCLUDED.rr_milestones
+          ELSE blocked_ghost_state.rr_milestones 
+        END,
         updated_at      = NOW()
     `, [
       g.id, g.blockType, g.optimizerKey, g.symbol, g.mt5Symbol ?? g.symbol,
