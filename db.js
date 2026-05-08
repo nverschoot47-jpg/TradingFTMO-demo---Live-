@@ -2264,8 +2264,16 @@ async function loadGhostHistoryByPair(from, to) {
         closed_at                                             AS "closedAt"
       FROM ghost_trades
       WHERE vwap_position IN ('above','below')
-        AND ($1 = '2000-01-01' OR closed_at >= $1)
-        AND ($2 = '2099-12-31' OR closed_at <= $2)
+        AND (
+          $1 = '2000-01-01'
+          OR closed_at >= $1
+          OR (closed_at IS NULL AND opened_at >= $1)
+        )
+        AND (
+          $2 = '2099-12-31'
+          OR closed_at <= $2
+          OR (closed_at IS NULL AND opened_at <= $2)
+        )
       ORDER BY optimizer_key ASC, COALESCE(closed_at, opened_at) DESC
     `, [cutoff, ceiling]);
 
