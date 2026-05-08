@@ -222,6 +222,17 @@ async function initDB() {
       CREATE INDEX IF NOT EXISTS idx_ghost_trades_key     ON ghost_trades (optimizer_key);
       CREATE INDEX IF NOT EXISTS idx_ghost_trades_symbol  ON ghost_trades (symbol);
       CREATE INDEX IF NOT EXISTS idx_ghost_trades_closed  ON ghost_trades (closed_at);
+      -- v14.1: ensure closed_at is populated for old ghost_trades that have stop_reason
+      -- This runs once and is idempotent
+      -- Auto-populate closed_at for old ghost trades that have stop_reason but no closed_at
+      UPDATE ghost_trades 
+        SET closed_at = CASE
+          WHEN time_to_sl_min IS NOT NULL THEN opened_at + (time_to_sl_min * INTERVAL '1 minute')
+          ELSE opened_at + INTERVAL '1 hour'
+        END
+        WHERE closed_at IS NULL 
+          AND (phantom_sl_hit = TRUE OR stop_reason IS NOT NULL)
+          AND opened_at IS NOT NULL;
       -- v14.1: Deduplicate ghost_trades BEFORE creating unique index
       -- Keep only the most complete row per position_id (prefer rows with closed_at, then latest id)
       DELETE FROM ghost_trades a USING ghost_trades b
@@ -2266,30 +2277,38 @@ async function loadGhostHistoryByPair(from, to) {
     // from/to zijn optionele ISO strings voor de selectieve datumfilter in het dashboard
     const cutoff  = from ?? '2000-01-01';
     const ceiling = to   ?? '2099-12-31';
+    // v14.1: GEEN vwap_position filter — old data may have 'unknown', we still group it.
+    // Principle: old data without full stats is still shown under the optimizer_key.
+    // Missing fields = shown as — , never hidden/excluded.
     const r = await pool.query(`
       SELECT
         id,
-        optimizer_key                                         AS "optimizerKey",
-        symbol, session, direction,
-        vwap_position                                         AS "vwapPosition",
+        COALESCE(optimizer_key, symbol||'_'||COALESCE(session,'?')||'_'||COALESCE(direction,'?')||'_'||COALESCE(vwap_position,'?'))
+                                                              AS "optimizerKey",
+        symbol,
+        COALESCE(session, '?')                                AS session,
+        COALESCE(direction, '?')                              AS direction,
+        COALESCE(vwap_position, 'unknown')                    AS "vwapPosition",
         CAST(entry            AS FLOAT)                       AS entry,
         CAST(sl               AS FLOAT)                       AS sl,
         CAST(sl_pct           AS FLOAT)                       AS "slPct",
         CAST(tp_rr_used       AS FLOAT)                       AS "tpRRUsed",
-        CAST(max_rr_before_sl AS FLOAT)                       AS "maxRR",
-        CAST(max_sl_pct_used  AS FLOAT)                       AS "maxSlPct",
-        CAST(peak_rr_pos      AS FLOAT)                       AS "peakRRPos",
-        CAST(peak_rr_neg      AS FLOAT)                       AS "peakRRNeg",
+        -- Use best available RR: peak_rr_pos > max_rr_before_sl > 0
+        CAST(COALESCE(peak_rr_pos, max_rr_before_sl, 0) AS FLOAT) AS "peakRRPos",
+        CAST(COALESCE(peak_rr_neg, max_sl_pct_used, 0)  AS FLOAT) AS "peakRRNeg",
+        CAST(COALESCE(max_rr_before_sl, peak_rr_pos, 0) AS FLOAT) AS "maxRR",
+        CAST(COALESCE(max_sl_pct_used, peak_rr_neg, 0)  AS FLOAT) AS "maxSlPct",
         phantom_sl_hit                                        AS "phantomSLHit",
         stop_reason                                           AS "stopReason",
         time_to_sl_min                                        AS "timeToSL",
         rr_milestones                                         AS "rrMilestones",
         sl_milestones                                         AS "slMilestones",
+        realized_pnl_eur                                      AS "realizedPnlEUR",
+        lots                                                  AS lots,
         opened_at                                             AS "openedAt",
         closed_at                                             AS "closedAt"
       FROM ghost_trades
-      WHERE vwap_position IN ('above','below')
-        AND (
+      WHERE (
           $1 = '2000-01-01'
           OR closed_at >= $1
           OR (closed_at IS NULL AND opened_at >= $1)
@@ -2302,43 +2321,83 @@ async function loadGhostHistoryByPair(from, to) {
       ORDER BY optimizer_key ASC, COALESCE(closed_at, opened_at) DESC
     `, [cutoff, ceiling]);
 
-    // Groepeer per optimizer_key
+    // v14.1 PRINCIPLE: Group ALL trades. Old data = partial stats, new data = full stats.
+    // We NEVER discard old trades — they still contribute to n, nSLHit, maxPeakPos etc.
     const grouped = {};
     for (const row of r.rows) {
-      const key = row.optimizerKey;
-      if (!grouped[key]) grouped[key] = {
-        optimizerKey: key,
-        symbol: row.symbol, session: row.session,
-        direction: row.direction, vwapPosition: row.vwapPosition,
-        trades: [],
-        n: 0, nSLHit: 0, nMaxRR15: 0, nMaxDays: 0,
-        sumPeakPos: 0, sumPeakNeg: 0,
-        maxPeakPos: 0, maxPeakNeg: 0,
-      };
+      const key = row.optimizerKey || (row.symbol + '_unknown');
+      if (!grouped[key]) {
+        grouped[key] = {
+          optimizerKey: key,
+          // Use first seen values for display — prefer known over 'unknown'/'?'
+          symbol:      row.symbol,
+          session:     row.session !== '?' ? row.session : null,
+          direction:   row.direction !== '?' ? row.direction : null,
+          vwapPosition: row.vwapPosition !== 'unknown' ? row.vwapPosition : null,
+          trades: [],
+          n: 0,
+          // Counters — only increment when we KNOW the stop reason
+          nSLHit: 0, nMaxRR15: 0, nMaxDays: 0,
+          nWithMilestones: 0,   // trades that have rr_milestones data
+          nWithPeakRR: 0,       // trades that have meaningful peak_rr_pos > 0
+          sumPeakPos: 0, sumPeakNeg: 0,
+          maxPeakPos: 0, maxPeakNeg: 0,
+          sumPnl: 0, nWithPnl: 0,
+        };
+      }
       const g = grouped[key];
+
+      // Fill missing group-level fields from newer trades that have them
+      if (g.session     === null && row.session     !== '?')       g.session     = row.session;
+      if (g.direction   === null && row.direction   !== '?')       g.direction   = row.direction;
+      if (g.vwapPosition=== null && row.vwapPosition!== 'unknown') g.vwapPosition= row.vwapPosition;
+
       g.trades.push(row);
       g.n++;
-      if (row.stopReason === 'phantom_sl' || row.phantomSLHit) g.nSLHit++;
+
+      // Stop reason counters — only when explicitly known
+      if (row.stopReason === 'phantom_sl' || row.stopReason === 'gap_stop' || row.phantomSLHit === true) g.nSLHit++;
       if (row.stopReason === 'max_rr_15')  g.nMaxRR15++;
-      if (row.stopReason === 'timeout_2w') g.nMaxDays++;
+      if (row.stopReason === 'timeout_14d' || row.stopReason === 'timeout_2w') g.nMaxDays++;
+
+      // Peak RR — use best available value, skip 0 for averages
       const pp = parseFloat(row.peakRRPos ?? row.maxRR ?? 0);
       const pn = parseFloat(row.peakRRNeg ?? row.maxSlPct ?? 0);
-      g.sumPeakPos += pp;
-      g.sumPeakNeg += pn;
+      if (pp > 0) { g.sumPeakPos += pp; g.nWithPeakRR++; }
+      if (pn > 0)   g.sumPeakNeg += pn;
       if (pp > g.maxPeakPos) g.maxPeakPos = pp;
       if (pn > g.maxPeakNeg) g.maxPeakNeg = pn;
+
+      // Milestones presence
+      if (row.rrMilestones && Object.keys(row.rrMilestones).length > 0) g.nWithMilestones++;
+
+      // P&L
+      if (row.realizedPnlEUR != null) {
+        g.sumPnl   += parseFloat(row.realizedPnlEUR);
+        g.nWithPnl++;
+      }
     }
 
-    // Finaliseer averages
+    // Finaliseer — averages only over trades that HAVE the data
     for (const g of Object.values(grouped)) {
-      g.avgPeakPos = g.n > 0 ? parseFloat((g.sumPeakPos / g.n).toFixed(3)) : 0;
-      g.avgPeakNeg = g.n > 0 ? parseFloat((g.sumPeakNeg / g.n).toFixed(3)) : 0;
+      // Average peak RR: only over trades with meaningful data
+      g.avgPeakPos = g.nWithPeakRR > 0
+        ? parseFloat((g.sumPeakPos / g.nWithPeakRR).toFixed(3)) : 0;
+      // Average adverse: over all trades (0 = trade never went adverse = valid data)
+      g.avgPeakNeg = g.n > 0
+        ? parseFloat((g.sumPeakNeg / g.n).toFixed(3)) : 0;
       g.maxPeakPos = parseFloat(g.maxPeakPos.toFixed(3));
       g.maxPeakNeg = parseFloat(g.maxPeakNeg.toFixed(3));
-      // v14.1: avgSlPct — average max_sl_pct_used across all trades (was showing 0.0% before)
-      const slPcts = (g.trades||[]).map(t => parseFloat(t.maxSlPctUsed ?? 0)).filter(v => v > 0);
-      g.avgSlPct = slPcts.length ? parseFloat((slPcts.reduce((s,v)=>s+v,0)/slPcts.length).toFixed(1)) : 0;
-      delete g.sumPeakPos; delete g.sumPeakNeg;
+      // avgSlPct: only over trades that have max_sl_pct_used > 0
+      const slPcts = (g.trades).map(t => parseFloat(t.maxSlPct ?? 0)).filter(v => v > 0);
+      g.avgSlPct   = slPcts.length ? parseFloat((slPcts.reduce((s,v)=>s+v,0)/slPcts.length).toFixed(1)) : 0;
+      // P&L sum
+      g.totalPnl   = g.nWithPnl > 0 ? parseFloat(g.sumPnl.toFixed(2)) : null;
+      // Data completeness indicator: % of trades with full milestone data
+      g.pctComplete = g.n > 0 ? Math.round((g.nWithMilestones / g.n) * 100) : 0;
+      // Cleanup
+      delete g.sumPeakPos; delete g.sumPeakNeg; delete g.sumPnl;
+      delete g.nWithPeakRR; delete g.nWithPnl; delete g.nWithMilestones;
     }
 
     return Object.values(grouped).sort((a, b) => b.n - a.n);
