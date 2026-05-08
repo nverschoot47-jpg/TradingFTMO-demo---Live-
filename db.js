@@ -2194,48 +2194,52 @@ async function loadGhostComboAnalysis(optimizerKey = null) {
 // ── loadDailyBreakdown (v12.6: per-dag KPI's voor Overview tab) ──
 async function loadDailyBreakdown() {
   try {
-    // v14.0: Simplified — only peak RR+, P&L, total lots. No win/loss/streak/drawdown.
+    // v14.1: closed_trades as base, LEFT JOIN ghost_trades for peak_rr enrichment
     const r = await pool.query(`
       SELECT
-        DATE(opened_at AT TIME ZONE 'Europe/Brussels')   AS trade_date,
-        COUNT(*)                                          AS trades,
-        COALESCE(SUM(lots), 0)                           AS total_lots,
-        COALESCE(SUM(realized_pnl_eur), 0)               AS day_pnl,
-        MAX(true_max_rr)                                  AS best_peak_rr,
-        MAX(realized_pnl_eur)                             AS max_win,
-        MIN(realized_pnl_eur)                             AS max_loss
-      FROM closed_trades
-      WHERE (exclude_from_ev IS NULL OR exclude_from_ev = FALSE)
-      GROUP BY DATE(opened_at AT TIME ZONE 'Europe/Brussels')
+        DATE(ct.opened_at AT TIME ZONE 'Europe/Brussels')  AS trade_date,
+        COUNT(*)                                            AS trades,
+        COALESCE(SUM(CAST(ct.lots AS FLOAT)), 0)            AS total_lots,
+        COALESCE(SUM(ct.realized_pnl_eur), 0)               AS day_pnl,
+        MAX(COALESCE(gt.peak_rr_pos, ct.true_max_rr, ct.max_rr, 0)) AS best_peak_rr,
+        MAX(ct.realized_pnl_eur)                            AS max_win,
+        MIN(ct.realized_pnl_eur)                            AS max_loss
+      FROM closed_trades ct
+      LEFT JOIN ghost_trades gt ON gt.position_id = ct.position_id
+      WHERE (ct.exclude_from_ev IS NULL OR ct.exclude_from_ev = FALSE)
+      GROUP BY DATE(ct.opened_at AT TIME ZONE 'Europe/Brussels')
       ORDER BY trade_date DESC
     `);
 
-    // Best 10 / Worst 10 from ghost_trades by peak_rr_pos (PEAK+RR — not realized pnl)
+    // Best/Worst 10: use closed_trades as base, enrich with ghost peak_rr_pos
+    // This covers ALL 5000+ historical trades, not just the ones with ghost data
     const topR = await pool.query(`
       SELECT
-        symbol, direction, session, vwap_position AS vwapPosition,
-        CAST(peak_rr_pos AS FLOAT)        AS peakRRPos,
-        CAST(realized_pnl_eur AS FLOAT)   AS pnl,
-        stop_reason AS stopReason,
-        opened_at AS openedAt
-      FROM ghost_trades
-      WHERE peak_rr_pos IS NOT NULL
-        AND peak_rr_pos > 0
-      ORDER BY peak_rr_pos DESC
+        ct.symbol, ct.direction, ct.session,
+        ct.vwap_position                                       AS "vwapPosition",
+        CAST(COALESCE(gt.peak_rr_pos, ct.true_max_rr, ct.max_rr, 0) AS FLOAT) AS "peakRRPos",
+        CAST(ct.realized_pnl_eur AS FLOAT)                     AS pnl,
+        COALESCE(gt.stop_reason, ct.close_reason)              AS "stopReason",
+        ct.opened_at                                           AS "openedAt"
+      FROM closed_trades ct
+      LEFT JOIN ghost_trades gt ON gt.position_id = ct.position_id
+      WHERE (ct.exclude_from_ev IS NULL OR ct.exclude_from_ev = FALSE)
+      ORDER BY COALESCE(gt.peak_rr_pos, ct.true_max_rr, ct.max_rr, 0) DESC
       LIMIT 10
     `);
 
     const botR = await pool.query(`
       SELECT
-        symbol, direction, session, vwap_position AS vwapPosition,
-        CAST(peak_rr_pos AS FLOAT)        AS peakRRPos,
-        CAST(realized_pnl_eur AS FLOAT)   AS pnl,
-        stop_reason AS stopReason,
-        opened_at AS openedAt
-      FROM ghost_trades
-      WHERE peak_rr_pos IS NOT NULL
-        AND peak_rr_pos > 0
-      ORDER BY peak_rr_pos ASC
+        ct.symbol, ct.direction, ct.session,
+        ct.vwap_position                                       AS "vwapPosition",
+        CAST(COALESCE(gt.peak_rr_pos, ct.true_max_rr, ct.max_rr, 0) AS FLOAT) AS "peakRRPos",
+        CAST(ct.realized_pnl_eur AS FLOAT)                     AS pnl,
+        COALESCE(gt.stop_reason, ct.close_reason)              AS "stopReason",
+        ct.opened_at                                           AS "openedAt"
+      FROM closed_trades ct
+      LEFT JOIN ghost_trades gt ON gt.position_id = ct.position_id
+      WHERE (ct.exclude_from_ev IS NULL OR ct.exclude_from_ev = FALSE)
+      ORDER BY COALESCE(gt.peak_rr_pos, ct.true_max_rr, ct.max_rr, 0) ASC
       LIMIT 10
     `);
 
