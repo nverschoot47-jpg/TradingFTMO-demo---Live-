@@ -2539,6 +2539,11 @@ async function loadBlockedGhostHistory(blockType, from, to) {
   try {
     const cutoff  = from ?? '2000-01-01';
     const ceiling = to   ?? '2099-12-31';
+    // OUTSIDE_WINDOW covers both overnight and stock-outside-market blocks
+    const safeType = (blockType||'NY_DEAD_ZONE').replace(/'/g,"''");
+    const blockFilter = blockType === 'OUTSIDE_WINDOW'
+      ? `block_type IN ('OUTSIDE_WINDOW','STOCK_OUTSIDE_MARKET')`
+      : `block_type = '${safeType}'`;
     const r = await pool.query(`
       SELECT
         id,
@@ -2564,12 +2569,12 @@ async function loadBlockedGhostHistory(blockType, from, to) {
         opened_at                                     AS "openedAt",
         closed_at                                     AS "closedAt"
       FROM blocked_ghost_tracker
-      WHERE block_type = $1
-        AND opened_at >= $2
-        AND opened_at <= $3
+      WHERE ${blockFilter}
+        AND opened_at >= $1
+        AND opened_at <= $2
         AND closed_at IS NOT NULL
       ORDER BY optimizer_key ASC, opened_at DESC
-    `, [blockType, cutoff, ceiling]);
+    `, [cutoff, ceiling]);
 
     // Groepeer per optimizer_key
     const grouped = {};
