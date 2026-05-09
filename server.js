@@ -677,25 +677,42 @@ app.post("/webhook", async (req, res) => {
 
   const { allowed, reason: mktReason } = canOpenNewTrade(symbol);
   if (!allowed) {
-    db.logSignal({ symbol, direction, outcome: "REJECTED", rejectReason: mktReason,
-      session: getSession(), latencyMs: Date.now() - t0 }).catch(() => {});
-    // ── v13.4: NY_DEAD_ZONE → maak invisible blocked ghost tracker ──
-    if (dbReady && mktReason && mktReason.includes('NY_DEAD_ZONE')) {
-      // Pine Script sends 'entry' OR 'close' — accept both
+    const sesForLog = getSession();
+    db.logSignal({ symbol, direction, outcome: 'REJECTED', rejectReason: mktReason,
+      session: sesForLog, latencyMs: Date.now() - t0 }).catch(() => {});
+
+    // ── Shadow Playbook: ALL tradeable-but-blocked signals get a ghost tracker ──
+    // NY_DEAD_ZONE: outside 15:30-18:00 Brussels (forex/stocks blocked at NYSE open)
+    // OUTSIDE_WINDOW: outside 21:00-02:00 Brussels (market closed overnight)
+    // STOCK_OUTSIDE_MARKET: stocks outside 16:00-21:00 Brussels
+    // These are trades that WOULD have been valid setups — we track them for EV analysis
+    const isTrackableBlock = mktReason && (
+      mktReason.includes('NY_DEAD_ZONE') ||
+      mktReason.includes('OUTSIDE_WINDOW') ||
+      mktReason.includes('STOCK_OUTSIDE_MARKET')
+    );
+
+    if (dbReady && isTrackableBlock) {
       const tvEntryB = parseFloat(req.body?.entry ?? req.body?.close ?? 0) || null;
       const slPctB   = parseFloat(req.body?.sl_pct ?? 0.003);
       if (tvEntryB && slPctB && direction) {
         const symInfoB = getSymbolInfo(symbol);
         const mt5B     = symInfoB?.mt5 ?? symbol;
-        const sesB     = getSession();
+        const sesB     = sesForLog;
         const vwapB    = req.body?.vwap ? parseFloat(req.body.vwap) : null;
         const vwapPosB = getVwapPosition(tvEntryB, vwapB);
         const optKeyB  = buildOptimizerKey(symbol, sesB, direction, vwapPosB);
         const slBuf    = symInfoB?.type === 'stock' ? STOCK_SL_BUFFER_MULT : SL_BUFFER_MULT;
         const slDistB  = slPctB * slBuf * tvEntryB;
         const slPriceB = direction === 'buy' ? tvEntryB - slDistB : tvEntryB + slDistB;
+
+        // Determine block type
+        let blockType = 'NY_DEAD_ZONE';
+        if (mktReason.includes('OUTSIDE_WINDOW'))      blockType = 'OUTSIDE_WINDOW';
+        if (mktReason.includes('STOCK_OUTSIDE_MARKET'))blockType = 'OUTSIDE_WINDOW';
+
         const bg = initBlockedGhost({
-          blockType: 'NY_DEAD_ZONE', symbol, mt5Symbol: mt5B,
+          blockType, symbol, mt5Symbol: mt5B,
           session: sesB, direction, vwapPosition: vwapPosB,
           entry: tvEntryB, sl: slPriceB, slPct: slPctB,
           tpRRUsed: tpConfigs[optKeyB]?.lockedRR ?? 2.0,
@@ -703,7 +720,7 @@ app.post("/webhook", async (req, res) => {
         });
         blockedPositions.set(bg.id, bg);
         db.saveBlockedGhostState(bg).catch(() => {});
-        console.log(`[BlockedGhost] NY_DEAD_ZONE tracker created: ${bg.id} ${symbol} ${direction}`);
+        console.log(`[BlockedGhost] ${blockType} tracker created: ${bg.id} ${symbol} ${direction} entry=${tvEntryB}`);
       }
     }
     return res.json({ ok: false, reason: mktReason });
@@ -1984,9 +2001,10 @@ tr:hover td{background:var(--bg4)}
     <!-- Sub-tabs voor 3 block types -->
     <div class="card">
       <div style="display:flex;border-bottom:1px solid var(--bdr);background:var(--bg3)">
-        <div id="bgt-tab-ny"   class="ntab on"  onclick="setBGTTab('ny')"   style="color:var(--o);border-bottom:2px solid var(--o)">⏰ NY Dead Zone</div>
-        <div id="bgt-tab-dup"  class="ntab"     onclick="setBGTTab('dup')"  style="">📌 Duplicate Position</div>
-        <div id="bgt-tab-vwap" class="ntab"     onclick="setBGTTab('vwap')" style="">📊 VWAP Exhaustion</div>
+        <div id="bgt-tab-ny"   class="ntab on" onclick="setBGTTab('ny')"  style="color:var(--o);border-bottom:2px solid var(--o)">⏰ NY Dead Zone</div>
+        <div id="bgt-tab-ow"   class="ntab"    onclick="setBGTTab('ow')"  style="">🌙 Outside Hours (21–02)</div>
+        <div id="bgt-tab-dup"  class="ntab"    onclick="setBGTTab('dup')" style="">📌 Duplicate Position</div>
+        <div id="bgt-tab-vwap" class="ntab"    onclick="setBGTTab('vwap')" style="">📊 VWAP Exhaustion</div>
       </div>
 
       <!-- NY DEAD ZONE -->
@@ -2020,6 +2038,34 @@ tr:hover td{background:var(--bg4)}
           </tr></thead>
           <tbody id="bgt-ny-body"><tr><td colspan="13" class="nd"><span class="spin">⟳</span></td></tr></tbody>
         </table></div>
+      </div>
+
+      <!-- OUTSIDE HOURS (21:00–02:00) -->
+      <div id="bgt-pane-ow" style="display:none">
+        <div style="padding:8px 14px;background:rgba(255,152,0,.05);border-bottom:1px solid rgba(255,152,0,.15);font-size:10px;color:var(--ink3)">
+          <strong style="color:var(--o)">🌙 Outside Hours (21:00–02:00 Brussels)</strong>: Alle signalen buiten het handelvenster. Markt gesloten — zelfde als NY Dead Zone maar voor de nachtperiode.
+          Track hier of bepaalde setups ook 's nachts handelen zouden moeten.
+        </div>
+        <div style="padding:6px 14px;display:flex;gap:8px;flex-wrap:wrap;border-bottom:1px solid var(--bdr)">
+          <span style="font-size:9px;color:var(--ink3)">SESSION:</span>
+          <button class="fb on" onclick="setBGTFilter('ow','sess','all',this)">All</button>
+          <button class="fb" onclick="setBGTFilter('ow','sess','ny',this)">NY</button>
+          <button class="fb" onclick="setBGTFilter('ow','sess','london',this)">London</button>
+          <span style="font-size:9px;color:var(--ink3);margin-left:8px">DIR:</span>
+          <button class="fb on" onclick="setBGTFilter('ow','dir','all',this)">All</button>
+          <button class="fb" onclick="setBGTFilter('ow','dir','buy',this)">Buy</button>
+          <button class="fb" onclick="setBGTFilter('ow','dir','sell',this)">Sell</button>
+          <span style="font-size:9px;color:var(--ink3);margin-left:8px">TYPE:</span>
+          <button class="fb on" onclick="setBGTFilter('ow','type','all',this)">All</button>
+          <button class="fb" onclick="setBGTFilter('ow','type','forex',this)">Forex</button>
+          <button class="fb" onclick="setBGTFilter('ow','type','stock',this)">Stock</button>
+          <button class="fb" onclick="setBGTFilter('ow','type','index',this)">Index</button>
+          <button class="fb" onclick="setBGTFilter('ow','type','commodity',this)">Comm</button>
+        </div>
+        <div class="tw"><table id="bgt-tbl-ow"><thead><tr>
+          <th>Symbol</th><th>Type</th><th>Session</th><th>Dir</th><th>VWAP</th>
+          <th># Blocked</th><th>SL Hits</th><th>15R Hits</th><th>Avg Peak+RR</th><th>Max Peak+RR</th><th>Avg Peak−RR%</th><th>Verdict</th>
+        </tr></thead><tbody id="bgt-body-ow"><tr><td colspan="12" class="nd">Geen blocked ghost data</td></tr></tbody></table></div>
       </div>
 
       <!-- DUPLICATE POSITION -->
@@ -2413,9 +2459,9 @@ async function loadPositions(){
       ? parseFloat(((p.direction==='buy' ? p.currentPrice - p.entry : p.entry - p.currentPrice) / slDist).toFixed(2))
       : null;
     return '<tr>'+
-      // v14.0: Symbol sticky | Dir | VWAP | Sess | RR metrics | Prices | Opened
-      '<td class="cb fw" style="position:sticky;left:0;background:var(--bg3);font-size:11px;z-index:1">'+
-        p.symbol+'<br><span style="font-size:8px;color:var(--ink3)">'+tBadge(symType(p.symbol))+'</span></td>'+
+      // Symbol sticky | Type | Dir | VWAP | Sess
+      '<td class="cb fw" style="position:sticky;left:0;background:var(--bg3);font-size:11px;z-index:1">'+p.symbol+'</td>'+
+      '<td>'+tBadge(symType(p.symbol))+'</td>'+
       '<td>'+dBadge(p.direction)+'</td>'+
       '<td>'+vBadge(p.vwapPosition)+'</td>'+
       '<td>'+sBadge(p.session)+'</td>'+
@@ -3104,20 +3150,21 @@ async function loadBand(){
 let _bgtTab = 'ny';
 let _bgtFilters = {
   ny:   { sess: 'all', dir: 'all', type: 'all' },
+  ow:   { sess: 'all', dir: 'all', type: 'all' },
   dup:  { sess: 'all', dir: 'all', type: 'all' },
   vwap: { sess: 'all', dir: 'all', band: 'all' },
 };
-let _bgtData = { ny: [], dup: [], vwap: [] };
+let _bgtData = { ny: [], ow: [], dup: [], vwap: [] };
 
 function setBGTTab(tab) {
   _bgtTab = tab;
-  ['ny','dup','vwap'].forEach(t => {
+  ['ny','ow','dup','vwap'].forEach(t => {
     const pane = document.getElementById('bgt-pane-'+t);
     const tabEl= document.getElementById('bgt-tab-'+t);
     if(pane) pane.style.display = t === tab ? '' : 'none';
     if(tabEl){
       tabEl.classList.toggle('on', t === tab);
-      const col = t==='ny'?'var(--o)':t==='dup'?'var(--y)':'var(--r)';
+      const col = t==='ny'||t==='ow'?'var(--o)':t==='dup'?'var(--y)':'var(--p)';
       tabEl.style.borderBottomColor = t === tab ? col : 'transparent';
       tabEl.style.color = t === tab ? col : 'var(--ink3)';
     }
@@ -3322,12 +3369,14 @@ async function loadShadowPlaybook() {
     if(toFull) url += '&to='+encodeURIComponent(toFull);
     return url;
   };
-  const [nyData, dupData, vwapData] = await Promise.all([
+  const [nyData, owData, dupData, vwapData] = await Promise.all([
     api(buildUrl('NY_DEAD_ZONE'))   || [],
+    api(buildUrl('OUTSIDE_WINDOW')) || [],
     api(buildUrl('DUPLICATE'))      || [],
     api(buildUrl('VWAP_EXHAUSTION'))|| [],
   ]);
   _bgtData.ny   = nyData;
+  _bgtData.ow   = owData;
   _bgtData.dup  = dupData;
   _bgtData.vwap = vwapData;
 
