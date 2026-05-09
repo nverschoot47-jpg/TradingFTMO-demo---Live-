@@ -110,21 +110,56 @@ function checkSecret(req, res) {
 }
 
 // ── MetaAPI helpers ───────────────────────────────────────────────
-async function metaFetch(path, method = "GET", body = null) {
+// Circuit breaker for MetaAPI — tracks consecutive failures
+let _metaFailCount = 0;
+let _metaCircuitOpen = false;
+let _metaCircuitOpenAt = 0;
+const META_CIRCUIT_THRESHOLD = 5;    // open after 5 consecutive failures
+const META_CIRCUIT_RESET_MS  = 60000; // try again after 60s
+
+async function metaFetch(path, method = "GET", body = null, retries = 2) {
+  // Circuit breaker: if MetaAPI is known-down, fail fast
+  if (_metaCircuitOpen) {
+    if (Date.now() - _metaCircuitOpenAt > META_CIRCUIT_RESET_MS) {
+      _metaCircuitOpen = false; _metaFailCount = 0;
+      console.log('[MetaAPI] Circuit breaker reset — retrying');
+    } else {
+      throw new Error('MetaAPI circuit open — skipping call');
+    }
+  }
   const url = `${META_BASE}${path}`;
   const opts = {
     method,
     headers: { "auth-token": META_API_TOKEN, "Content-Type": "application/json" },
-    signal: AbortSignal.timeout(15000),
+    signal: AbortSignal.timeout(12000), // 12s — leaves buffer for 30s cron
   };
   if (body) opts.body = JSON.stringify(body);
-  const res = await fetch(url, opts);
-  if (!res.ok) {
-    let errBody = "";
-    try { errBody = await res.text(); } catch {}
-    throw new Error(`MetaAPI ${method} ${path} → ${res.status} ${errBody.slice(0, 200)}`);
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(url, opts);
+      if (!res.ok) {
+        let errBody = "";
+        try { errBody = await res.text(); } catch {}
+        throw new Error(`MetaAPI ${method} ${path} → ${res.status} ${errBody.slice(0, 200)}`);
+      }
+      // Success — reset failure counter
+      _metaFailCount = 0;
+      return res.json().catch(() => null);
+    } catch (e) {
+      if (attempt < retries) {
+        await new Promise(r => setTimeout(r, 1000 * (attempt + 1))); // backoff: 1s, 2s
+        continue;
+      }
+      // All retries failed
+      _metaFailCount++;
+      if (_metaFailCount >= META_CIRCUIT_THRESHOLD) {
+        _metaCircuitOpen = true;
+        _metaCircuitOpenAt = Date.now();
+        recordError(`MetaAPI circuit OPEN after ${_metaFailCount} failures`);
+      }
+      throw e;
+    }
   }
-  return res.json().catch(() => null);
 }
 
 async function getAccountInfo() {
@@ -210,6 +245,8 @@ function initGhost(pos) {
 }
 
 function updateGhost(ghost, price) {
+  // Don't update after ghost is finalized (phantom SL hit or TP reached)
+  if (ghost.phantomSLHit || ghost.stopReason === 'max_rr_15') return;
   price = parseFloat(price);
   const entry   = ghost.entry;
   const sl      = ghost.sl;
@@ -267,15 +304,18 @@ async function closePosition(positionId, reason = "manual", pnl = null) {
       realPnl = await db.fetchRealizedPnl(positionId) ?? pnl;
     } catch (e) { recordError(`closePos deals: ${e.message}`); }
   }
+  // Store for gap detection reuse (avoids second fetchHistoryDeals call)
+  const dealsForGap = reason === 'sl' && dbReady
+    ? await fetchHistoryDeals(positionId).catch(() => [])
+    : [];
 
-  // v14.1: Gap detection — mark if trade was stopped out via opening gap
-  // Conditions: SL hit + closing deal price went BEYOND SL (not at SL) + opened near market open
+  // v14.2: Gap detection — reuses dealsForGap (fetched once above, no duplicate call)
   let gapStop = false;
   if (reason === 'sl' && pos) {
     try {
       const slDist = Math.abs(pos.entry - pos.sl);
-      // Re-fetch closing deal price for gap check
-      const deals = await fetchHistoryDeals(positionId).catch(() => []);
+      // dealsForGap passed from the deals already fetched in closePosition above
+      const deals = dealsForGap || [];
       const closingDeal = deals
         .filter(d => d.entryType === 'DEAL_ENTRY_OUT' || (d.type||'').includes('OUT'))
         .sort((a,b) => new Date(b.time||0) - new Date(a.time||0))[0];
@@ -302,6 +342,12 @@ async function closePosition(positionId, reason = "manual", pnl = null) {
     ghost.stopReason = gapStop ? 'gap_stop' : (ghost.stopReason ?? reason);
     await db.saveGhostTrade({ ...ghost, maxRRBeforeSL: ghost.maxRR }).catch(e => recordError(e.message));
     db.computeAndSaveGhostComboAnalysis(ghost.optimizerKey).catch(() => {});
+    // v14.2: Check if this ghost pushed us over the TP lock threshold
+    // Don't wait for the hourly cron — recompute TP immediately
+    const gcCount = await db.countGhostsByKey(ghost.optimizerKey).catch(() => 0);
+    if (gcCount >= 10) {
+      setTimeout(() => runTPOptimizer().catch(() => {}), 2000); // async, 2s delay
+    }
   }
 
   if (dbReady) {
@@ -450,8 +496,10 @@ async function adoptPosition(lp) {
 }
 
 // ── Position sync (cron) ─────────────────────────────────────────
-let _syncRunning = false;
-let latestEquity = 50000;  // updated by pollStatus / placeOrder
+let _syncRunning  = false;
+let _syncCount    = 0;
+let latestEquity  = 50000;   // updated by pollStatus / placeOrder
+let _lastEquityRecord = 0;   // timestamp of last equity_curve insert
 async function syncPositions() {
   if (!isMonitoringActive() || !dbReady) return;
   if (_syncRunning) {
@@ -467,6 +515,14 @@ async function syncPositions() {
 }
 async function _doSyncPositions() {
   if (!isMonitoringActive() || !dbReady) return;
+  // Update equity from account info every 5 syncs (~2.5 min)
+  _syncCount = (_syncCount || 0) + 1;
+  if (_syncCount % 5 === 1) {
+    try {
+      const acct = await getAccountInfo();
+      if (acct?.equity && acct.equity > 0) latestEquity = parseFloat(acct.equity);
+    } catch {} // non-critical
+  }
   const live = await getPositions();
   const liveIds = new Set(live.map(p => String(p.id)));
 
@@ -510,16 +566,26 @@ async function _doSyncPositions() {
       await adoptPosition(lp);
     } else if (lp.currentPrice) {
       // Sync live MT5 data to pos (lots, sl, tp, profit)
-      if (lp.volume)      pos.lots       = parseFloat(lp.volume);
+      if (lp.volume != null) pos.lots = Math.max(0, parseFloat(lp.volume));
       if (lp.stopLoss)    pos.sl         = parseFloat(lp.stopLoss);
       if (lp.takeProfit)  pos.tp         = parseFloat(lp.takeProfit) || null;
       if (lp.profit!=null)pos.liveProfitMT5 = parseFloat(lp.profit);
       pos.currentPrice = lp.currentPrice;
-      // Recalculate risk based on actual lots and balance
+      // Recalculate riskPct/riskEUR from live lots + sl every sync
+      // This corrects any corrupted values from previous deploys
       if (pos.lots && pos.entry && pos.sl) {
-        const slDist = Math.abs(pos.entry - pos.sl);
-        // riskEUR = lots × (100000 for forex, price for stocks, 1 for index) × slDist
-        // We store the original riskEUR from order placement — keep it, just show lots
+        const slDistSync = Math.abs(pos.entry - pos.sl);
+        const assetTypeSync = getSymbolInfo(pos.symbol)?.type ?? 'forex';
+        let riskEURSync = 0;
+        if (assetTypeSync === 'forex')      riskEURSync = pos.lots * 100000 * slDistSync;
+        else if (assetTypeSync === 'index') riskEURSync = pos.lots * slDistSync;
+        else if (assetTypeSync === 'stock') riskEURSync = pos.lots * slDistSync;
+        else                                riskEURSync = pos.lots * 100 * slDistSync;
+        const eqSync = latestEquity || 50000;
+        if (riskEURSync > 0) {
+          pos.riskEUR = parseFloat(riskEURSync.toFixed(2));
+          pos.riskPct = riskEURSync / eqSync;
+        }
       }
       if (pos.ghost) {
         if (!pos.ghost.direction || !pos.ghost.entry || !pos.ghost.sl) {
@@ -582,14 +648,23 @@ async function runTPOptimizer() {
       const ev = await db.computeEVStats(g.optimizerKey).catch(() => null);
       if (!ev || ev.count < 10 || !ev.bestRR) continue;
       const km  = keyRiskMults[g.optimizerKey] ?? { streak: 0, evMult: 1.0, dayMult: 1.0 };
-      const mul = ev.bestEV > 0 ? Math.min(1.5, 1 + ev.bestEV) : Math.max(0.5, 1 + ev.bestEV);
+      // Conservative multiplier: requires 20+ ghosts, capped at 1.25× (not 1.5×)
+      // Prevents over-betting on small sample sizes
+      if (ev.count < 20) continue; // skip multiplier update with < 20 data points
+      const mul = ev.bestEV > 0
+        ? Math.min(1.25, 1 + ev.bestEV * 0.5)   // positive EV: max +25% increase
+        : Math.max(0.6,  1 + ev.bestEV * 0.8);  // negative EV: max -40% decrease
       keyRiskMults[g.optimizerKey] = { streak: km.streak, evMult: parseFloat(mul.toFixed(4)), dayMult: km.dayMult ?? 1.0 };
       db.saveKeyRiskMult(g.optimizerKey, keyRiskMults[g.optimizerKey]).catch(() => {});
       const existing = tpConfigs[g.optimizerKey];
-      if (!existing || g.n >= (existing.lockedGhosts ?? 0) * 2) {
+      // Relock if: never locked, doubled since last lock, OR best RR changed by 0.5R+
+      const rrChanged = existing?.lockedRR != null && Math.abs(ev.bestRR - existing.lockedRR) >= 0.5;
+      const doubledData = g.n >= (existing?.lockedGhosts ?? 0) * 2;
+      if (!existing || doubledData || rrChanged) {
         await db.saveTPConfig(g.optimizerKey, g.symbol, g.session, g.direction,
           g.vwapPosition, ev.bestRR, g.n, ev.bestEV, existing?.lockedRR ?? null).catch(() => {});
         tpConfigs[g.optimizerKey] = { ...existing, lockedRR: ev.bestRR, lockedGhosts: g.n };
+        if (rrChanged) console.log(`[TP] ${g.optimizerKey}: TP updated ${existing?.lockedRR}R → ${ev.bestRR}R (${g.n} ghosts, EV=${ev.bestEV?.toFixed(3)})`);
       }
     }
   } catch (e) { recordError(`TPOptimizer: ${e.message}`); }
@@ -613,7 +688,17 @@ app.get("/dashboard", (req, res) => {
 
 // ── Health ────────────────────────────────────────────────────────
 app.get("/health", (req, res) => {
-  res.json({ ok: true, version: VERSION, dbReady, ts: new Date().toISOString() });
+  res.json({
+    ok: true, version: VERSION, dbReady,
+    openPositions: openPositions.size,
+    blockedPositions: blockedPositions.size,
+    latestEquity,
+    metaCircuitOpen: _metaCircuitOpen,
+    metaFailCount: _metaFailCount,
+    uptime: Math.round(process.uptime()),
+    memMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+    ts: new Date().toISOString(),
+  });
 });
 
 // ── Status (always fast) ──────────────────────────────────────────
@@ -631,7 +716,16 @@ app.get("/status", async (req, res) => {
     getAccountInfo(),
     new Promise(r => setTimeout(() => r(null), 10000)),
   ]);
-  if (acct?.equity) latestEquity = parseFloat(acct.equity);
+  if (acct?.equity) {
+    latestEquity = parseFloat(acct.equity);
+    // Record equity curve every 5 min
+    const nowMs = Date.now();
+    if (dbReady && acct.balance && (!_lastEquityRecord || nowMs - _lastEquityRecord > 300_000)) {
+      _lastEquityRecord = nowMs;
+      pool.query('INSERT INTO equity_curve (balance,equity,open_pnl,open_pos) VALUES ($1,$2,$3,$4)',
+        [acct.balance, acct.equity, (acct.equity-acct.balance), openPositions.size]).catch(()=>{});
+    }
+  }
   res.json({
     ...base,
     account: acct ? { balance: acct.balance, equity: acct.equity,
@@ -747,8 +841,12 @@ app.post("/webhook", async (req, res) => {
       vwapBandPct = parseFloat(((dist / halfBand) * 100).toFixed(2));
     }
   }
-  if (vwapBandPct !== null && vwapBandPct >= 150) {
-    const rejectReason = `VWAP_EXHAUSTION: band_pct=${vwapBandPct.toFixed(1)}% (max 150%)`;
+  // VWAP exhaustion threshold — configurable per asset type
+  // Stocks: wider bands (higher volatility) → higher threshold
+  // Forex/Index: tighter bands → lower threshold  
+  const vwapThreshold = assetType === 'stock' ? 200 : assetType === 'index' ? 130 : 150;
+  if (vwapBandPct !== null && vwapBandPct >= vwapThreshold) {
+    const rejectReason = `VWAP_EXHAUSTION: band_pct=${vwapBandPct.toFixed(1)}% (max ${vwapThreshold}% for ${assetType})`;
     db.logSignal({ symbol, direction, session, vwapPosition: vwapPos, optimizerKey: optKey,
       tvEntry, slPct, vwapBandPct, outcome: "REJECTED", rejectReason,
       latencyMs: Date.now() - t0 }).catch(() => {});
@@ -769,6 +867,14 @@ app.post("/webhook", async (req, res) => {
       console.log(`[BlockedGhost] VWAP_EXHAUSTION tracker created: ${bg.id} ${symbol} band=${vwapBandPct}%`);
     }
     return res.json({ ok: false, reason: rejectReason, vwapBandPct });
+  }
+
+  // ── v14.2: MAX POSITIONS SAFETY LIMIT ─────────────────────────
+  const MAX_OPEN_POSITIONS = 50;
+  if (openPositions.size >= MAX_OPEN_POSITIONS) {
+    const rejectReason = `MAX_POSITIONS: ${openPositions.size} positions open (limit ${MAX_OPEN_POSITIONS})`;
+    db.logSignal({ symbol, direction, session, outcome: 'REJECTED', rejectReason, latencyMs: Date.now() - t0 }).catch(() => {});
+    return res.json({ ok: false, reason: rejectReason });
   }
 
   // ── FIX 1b: Duplicate check — max 1 open positie per optimizerKey ──
@@ -979,6 +1085,7 @@ function apiGet(path, fn, empty = []) {
 apiGet("/api/trades",              r  => db.loadAllTrades({ since: r.query.since??null, until: r.query.until??null, openFrom: r.query.openFrom??null, openTo: r.query.openTo??null }), []);
 apiGet("/api/ghost-trades",        r  => db.loadGhostTrades(r.query.key??null, parseInt(r.query.limit)||200), []);
 apiGet("/api/ghost-grouped",       () => db.loadGhostGrouped(),                []);
+apiGet("/api/performance",         () => db.loadPerformanceStats(),             null);
 // ── Manual position recovery ──────────────────────────────────────
 // POST /api/recover-positions [secret]
 // Scant MT5 live posities en adopteert alles wat niet in memory zit.
@@ -1039,6 +1146,7 @@ apiGet("/api/ghost-combo-analysis",r  => db.loadGhostComboAnalysis(r.query.key??
 apiGet("/api/shadow-analysis",     () => db.loadAllShadowAnalysis(),           []);
 apiGet("/api/shadow-winners",      () => db.loadShadowWinners(),               {});
 apiGet("/api/mae-stats",           r  => db.loadMAEStats(r.query.since??null), []);
+apiGet("/api/equity-curve",        () => db.loadEquityCurve(200),               []);
 apiGet("/api/signal-stats",        r  => db.loadSignalStats({ since: r.query.since??null, until: r.query.until??null }), { total:0, placed:0, conversionPct:0 });
 apiGet("/api/signal-rejects",      r  => db.loadSignalRejects({ since: r.query.since??null, until: r.query.until??null }), []);
 apiGet("/api/signal-log",          r  => db.loadSignalLog({ since: r.query.since??null, until: r.query.until??null }), []);
@@ -1407,7 +1515,10 @@ tr:hover td{background:var(--bg4)}
 
 
 <!-- ═══════════════════════ NAV ════════════════════════════════ -->
-<nav id="main-nav">
+    <!-- FTMO Drawdown Warning + MetaAPI Circuit Warning -->
+    <div id="dd-warning" style="display:none;padding:6px 16px;font-size:10px;font-weight:700;color:var(--o);border-bottom:1px solid rgba(230,81,0,.3);text-align:center"></div>
+    <div id="h-circuit" style="display:none;padding:4px 16px;font-size:9px;color:var(--r);background:rgba(183,28,28,.1);border-bottom:1px solid rgba(183,28,28,.2);text-align:center">⚡ MetaAPI connection issues — live data may be delayed. Retrying automatically.</div>
+    <nav id="main-nav">
   <div class="ntab on"  data-page="overview">Overview</div>
   <div class="ntab"     data-page="positions">Open Positions<span class="nbadge" id="nb-pos" style="pointer-events:none">—</span></div>
   <div class="ntab"     data-page="ghosts">Ghost Tracker<span class="nbadge" id="nb-gh" style="pointer-events:none">—</span></div>
@@ -1447,6 +1558,24 @@ tr:hover td{background:var(--bg4)}
         <div class="ov-card"><div class="ov-lbl">% Gain (compliance+)</div><div class="ov-val cy" id="ov-gain">—</div><div class="ov-sub" id="ov-gain-sub">realized P&amp;L / balance</div></div>
         <div class="ov-card"><div class="ov-lbl">Open Trades</div><div class="ov-val cg" id="ov-open">—</div><div class="ov-sub" id="ov-open-sub">live positions</div></div>
         <div class="ov-card"><div class="ov-lbl">Compliance Trades</div><div class="ov-val" id="ov-comp">—</div><div class="ov-sub">closed after compliance date</div></div>
+      </div>
+    </div>
+
+    <!-- Performance Statistics KPIs -->
+    <div class="card">
+      <div class="card-hdr">
+        <div class="card-title"><div class="dot cg"></div>Performance Statistics</div>
+        <div class="cmeta" id="perf-meta">loading…</div>
+      </div>
+      <div style="display:flex;flex-wrap:wrap;gap:0;border-bottom:1px solid var(--bdr)">
+        <div class="ks"><div class="ksl">Win Rate</div><div class="ksv cy" id="p-wr">—</div></div>
+        <div class="ks"><div class="ksl">Profit Factor</div><div class="ksv" id="p-pf">—</div></div>
+        <div class="ks"><div class="ksl">Expectancy</div><div class="ksv" id="p-exp">—</div></div>
+        <div class="ks"><div class="ksl">Sharpe Ratio</div><div class="ksv" id="p-sharpe">—</div></div>
+        <div class="ks"><div class="ksl">Max Drawdown</div><div class="ksv cr" id="p-dd">—</div></div>
+        <div class="ks"><div class="ksl">Calmar Ratio</div><div class="ksv" id="p-calmar">—</div></div>
+        <div class="ks"><div class="ksl">Avg Win</div><div class="ksv cg" id="p-avgwin">—</div></div>
+        <div class="ks"><div class="ksl">Avg Loss</div><div class="ksv cr" id="p-avgloss">—</div></div>
       </div>
     </div>
 
@@ -1583,7 +1712,7 @@ tr:hover td{background:var(--bg4)}
         <table id="pos-tbl">
           <thead><tr>
             <th style="position:sticky;left:0;background:var(--bg3);z-index:2;min-width:90px">Symbol</th>
-            <th>Dir</th><th>VWAP</th><th>Sess</th>
+            <th>Type</th><th>Dir</th><th>VWAP</th><th>Sess</th>
             <th title="Current RR vs entry">RR Now</th>
             <th title="Best favorable RR reached">Peak+RR</th>
             <th title="Worst adverse % of SL used">Peak−RR%</th>
@@ -1592,7 +1721,7 @@ tr:hover td{background:var(--bg4)}
             <th>P&amp;L €</th><th>Lots</th><th>Risk %</th>
             <th>Opened</th>
           </tr></thead>
-          <tbody id="pos-body"><tr><td colspan="16" class="nd"><span class="spin">⟳</span></td></tr></tbody>
+          <tbody id="pos-body"><tr><td colspan="17" class="nd"><span class="spin">⟳</span></td></tr></tbody>
         </table>
       </div>
     </div>
@@ -1990,7 +2119,7 @@ tr:hover td{background:var(--bg4)}
             <th class="fav-th bgt-ms-col" style="display:none" colspan="150">Favorable →</th>
           </tr><tr>
             <th colspan="12"></th>
-            ${[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0].map(v=>'<th class="adv-th bgt-ms-col" style="display:none;font-size:7px">-'+v.toFixed(1)+'</th>').join('')}
+            ${[1.0,0.9,0.8,0.7,0.6,0.5,0.4,0.3,0.2,0.1].map(v=>'<th class="adv-th bgt-ms-col" style="display:none;font-size:7px">-'+v.toFixed(1)+'</th>').join('')}
             ${(()=>{let s='';for(let v=0.1;v<=15.0+1e-9;v=Math.round((v+0.1)*10)/10)s+='<th class="fav-th bgt-ms-col" style="display:none;font-size:7px">+'+v.toFixed(1)+'</th>';return s;})()}
           </tr></thead>
           <tbody id="bgt-active-body"><tr><td colspan="170" class="nd">Geen actieve blocked ghosts</td></tr></tbody>
@@ -2384,9 +2513,23 @@ async function pollStatus(){
     setText('ov-pnl',(live>=0?'+':'')+'€'+live.toFixed(2));
     setClass('ov-pnl','ov-val '+(live>=0?'cg':'cr'));
     setText('ov-pnl-sub',(live>=0?'+':'')+live.toFixed(2)+' on open trades');
+    // FTMO daily drawdown warning — 5% daily limit, warn at 4%
+    const dailyPnlPct = live < 0 ? Math.abs(live)/bal*100 : 0;
+    const ddWarn = document.getElementById('dd-warning');
+    if(ddWarn) {
+      if(dailyPnlPct > 4.0) {
+        ddWarn.style.display='';
+        ddWarn.innerHTML='⚠ DAILY DRAWDOWN: <strong>'+dailyPnlPct.toFixed(2)+'%</strong> — FTMO limit 5%. '+(dailyPnlPct>4.5?'<strong style="color:var(--r)">CRITICAL — stop trading now!</strong>':'Close positions soon.');
+        ddWarn.style.background = dailyPnlPct>4.5?'rgba(183,28,28,0.4)':'rgba(230,81,0,0.2)';
+      } else {
+        ddWarn.style.display='none';
+      }
+    }
   }
   if(d.openPositions!=null){ setText('h-pos',d.openPositions); setText('nb-pos',d.openPositions); }
-  // v13.3: compliance bar verborgen — datum restriction verwijderd
+  // Show circuit breaker state if open
+  const cbEl = document.getElementById('h-circuit');
+  if(cbEl) cbEl.style.display = d.metaCircuitOpen ? '' : 'none';
   const cbar=document.getElementById('cbar'); if(cbar) cbar.style.display='none';
 }
 
@@ -2465,12 +2608,14 @@ async function loadPositions(){
       '<td>'+dBadge(p.direction)+'</td>'+
       '<td>'+vBadge(p.vwapPosition)+'</td>'+
       '<td>'+sBadge(p.session)+'</td>'+
-      '<td class="'+(currentRR!=null?(currentRR>=1?'cg fw':currentRR>0?'cy':'cr'):'cd')+'">'+
-        (currentRR!=null?currentRR.toFixed(2)+'R':'—')+'</td>'+
+      '<td class="'+(currentRR!=null?(currentRR>=1?'cg fw':currentRR>0?'cy':currentRR<-0.5?'cr fw':'cr'):'cd')+'">'+
+        (currentRR!=null?currentRR.toFixed(2)+'R':
+          (!p.currentPrice&&(Date.now()-new Date(p.openedAt||0).getTime())<60000)?
+          '<span style="font-size:8px;color:var(--ink3)" title="Syncing with MT5...">⟳</span>':'—')+'</td>'+
       '<td class="'+(peakPos>=2?'cg fw':peakPos>=1?'cg':peakPos>0?'cy':'cd')+' fw">'+f2(peakPos)+'R</td>'+
       '<td class="'+(peakNeg>80?'cr fw':peakNeg>50?'cr':peakNeg>25?'co':'cd')+'">'+
         (peakNeg>0?'-'+f1(peakNeg)+'% ('+f2(peakNeg/100)+'R)':'—')+'</td>'+
-      '<td class="cy">'+(tpRR!=null?f2(tpRR)+'R':'—')+'</td>'+
+      '<td class="cy" title="Distance to TP in RR multiples">'+(tpRR!=null?f2(tpRR)+'R':'—')+'</td>'+
       '<td class="cd" style="font-size:9px">'+fPrice(p.entry,p.symbol)+'</td>'+
       '<td class="cr" style="font-size:9px">'+fPrice(p.sl,p.symbol)+'</td>'+
       '<td class="cg" style="font-size:9px">'+(p.tp?fPrice(p.tp,p.symbol):'—')+'</td>'+
@@ -2539,7 +2684,9 @@ async function loadGhostTrackers(){
         return msT(favMs[v.toFixed(1)]||null, g.openedAt, true);
       }).join('')+
       '<td class="cd">'+msFmt(elapsed)+'</td>'+
-      '<td class="cd" style="font-size:9px">'+dt(g.openedAt)+'</td>'+
+      '<td class="cd" style="font-size:9px">'+
+        (g.tradeNumber?'<span style="color:var(--ink3);font-size:8px">#'+g.tradeNumber+'</span> ':'')+
+        dt(g.openedAt)+'</td>'+
     '</tr>';
   }).join('');
 }
@@ -2564,6 +2711,11 @@ function renderOverview(trades, daily, ghGrouped){
   setText('ov-comp',total);
   setText('wr-meta',total+' trades · compliance+');
   setText('dist-meta',total+' trades · compliance+');
+  // Data quality: how many trades have ghost data?
+  const withGhost = (_allTrades||[]).filter(t=>t.ghostStopReason||t.ghostFinalizedAt).length;
+  const qualPct = total > 0 ? Math.round(withGhost/total*100) : 0;
+  const qualEl = document.getElementById('ov-data-quality');
+  if(qualEl) qualEl.textContent = qualPct+'% with ghost data';
 
   // Summary strip
   const buys=trades.filter(t=>t.direction==='buy').length;
@@ -2605,13 +2757,16 @@ function renderOverview(trades, daily, ghGrouped){
   const ixT=trades.filter(t=>symType(t.symbol)==='index');
   const cmT=trades.filter(t=>symType(t.symbol)==='commodity');
   setText('d-tot',total); setText('d-fx',fxT.length); setText('d-sk',skT.length);
+  // Note: skT may include old trades from before stock session restriction (pre-v13)
+  // These were placed in London/Asia before the 16:00-21:00 Brussels rule was added
   setText('d-ix',ixT.length); setText('d-cm',cmT.length);
   setText('d-buy',buys); setText('d-sell',total-buys);
 
   let ba_t=0,bb_t=0,sa_t=0,sb_t=0;
   const typeGroups=[
     {label:'Forex',    arr:fxT, cls:'bd-fx', sessions:['asia','london','ny']},
-    {label:'Stock',    arr:skT, cls:'bd-sk', sessions:['ny']},
+    {label:'Stock',    arr:skT, cls:'bd-sk', sessions:['ny'],
+      note:'Stocks only tradeable 16:00–21:00 Brussels (NY session)'},
     {label:'Index',    arr:ixT, cls:'bd-ix', sessions:['asia','london','ny']},
     {label:'Commodity',arr:cmT, cls:'bd-cm', sessions:['asia','london','ny']},
   ];
@@ -2687,8 +2842,13 @@ function renderBW(){
     '<td>'+dBadge(t.direction)+'</td>'+
     '<td>'+sBadge(t.session)+'</td>'+
     '<td>'+vBadge(t.vwapPosition)+'</td>'+
-    '<td class="cg fw" style="font-size:10px">'+f2(t.peakRRPos)+'R</td>'+
-    '<td class="'+((+(t.pnl||0))>=0?'cg':'cr')+' fw" style="font-size:10px">'+eu(t.pnl)+'</td>'+
+    '<td>'+dBadge(t.direction)+'</td>'+
+    '<td>'+sBadge(t.session)+'</td>'+
+    '<td>'+vBadge(t.vwapPosition)+'</td>'+
+    '<td class="'+(t.peakRRPos>0?'cg fw':'cd')+'" style="font-size:10px">'+
+      (t.peakRRPos>0 ? f2(t.peakRRPos)+'R' : '<span style="font-size:8px;color:var(--ink3)">—</span>')+'</td>'+
+    '<td class="'+((+(t.pnl||0))>=0?'cg':'cr')+' fw" style="font-size:10px">'+
+      (t.pnl!=null ? eu(t.pnl) : '—')+'</td>'+
     '<td class="cd" style="font-size:9px">'+dtS(t.openedAt)+'</td>'+
   '</tr>';
   setHtml('best-body',  (best||[]).map(row).join('')  || emptyRow(7,'No ghost history yet'));
@@ -2713,50 +2873,9 @@ async function loadGhostHistory(){
   if(from) params.push('from='+encodeURIComponent(from));
   if(to)   params.push('to='  +encodeURIComponent(to+'T23:59:59'));
   if(params.length) url+='?'+params.join('&');
-  // Fetch both closed ghost_trades AND active open positions (with live ghost data)
-  const [closedData, activePosData] = await Promise.all([
-    api(url),
-    api('/api/open-positions'),
-  ]);
-  const d = closedData || [];
-
-  // Merge active ghost trackers into grouped view
-  const activeGhosts = (activePosData||[]).filter(p=>p.ghost!=null);
-  for(const p of activeGhosts) {
-    const key = p.optimizerKey || '';
-    let group = d.find(g=>g.optimizerKey===key);
-    if(!group) {
-      group = { optimizerKey: key, symbol: p.symbol, session: p.session,
-        direction: p.direction, vwapPosition: p.vwapPosition,
-        n: 0, nSLHit: 0, nMaxRR15: 0, nMaxDays: 0,
-        avgPeakPos: 0, avgPeakNeg: 0, maxPeakPos: 0, maxPeakNeg: 0, avgSlPct: 0,
-        trades: [] };
-      d.push(group);
-    }
-    if(!group.trades.find(t=>t.id===p.positionId)) {
-      const ghost = p.ghost;
-      group.trades.push({
-        id: p.positionId, optimizerKey: key,
-        symbol: p.symbol, session: p.session,
-        direction: p.direction, vwapPosition: p.vwapPosition,
-        entry: p.entry, sl: p.sl, tpRRUsed: ghost.tpRRUsed ?? null,
-        maxRR: ghost.maxRR ?? 0, maxSlPct: ghost.maxSlPctUsed ?? 0,
-        peakRRPos: ghost.peakRRPos ?? ghost.maxRR ?? 0,
-        peakRRNeg: ghost.peakRRNeg ?? ghost.maxSlPctUsed ?? 0,
-        phantomSLHit: ghost.phantomSLHit ?? false,
-        stopReason: ghost.stopReason ?? null,
-        rrMilestones: ghost.rrMilestones ?? {},
-        slMilestones: ghost.slMilestones ?? {},
-        realizedPnlEUR: p.liveProfitMT5 ?? null,
-        lots: p.lots ?? null,
-        openedAt: p.openedAt, closedAt: null, _active: true,
-      });
-      group.n++;
-      const pp = ghost.peakRRPos ?? 0;
-      if(pp > group.maxPeakPos) group.maxPeakPos = pp;
-      group.avgPeakPos = group.trades.reduce((s,t)=>s+(t.peakRRPos||0),0)/group.n;
-    }
-  }
+  // Ghost History = ONLY finished/closed ghost trades from ghost_trades DB table
+  // Active (still-running) ghosts belong in Ghost Tracker, NOT Ghost History
+  const d = await api(url) || [];
 
   _ghhData = d;
   const total = d.reduce((s,g)=>s+(g.n||0),0);
@@ -2821,7 +2940,7 @@ function renderGhostHistory(){
           '</tr>'+
           '<tr>'+
             '<th colspan="5"></th>'+
-            [0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0].map(v=>'<th class="adv-th ghh-ms-col" style="display:none;font-size:8px">-'+v.toFixed(1)+'</th>').join('')+
+            [1.0,0.9,0.8,0.7,0.6,0.5,0.4,0.3,0.2,0.1].map(v=>'<th class="adv-th ghh-ms-col" style="display:none;font-size:8px">-'+v.toFixed(1)+'</th>').join('')+
             (()=>{let s='';for(let v=0.1;v<=15.0+1e-9;v=Math.round((v+0.1)*10)/10)s+='<th class="fav-th ghh-ms-col" style="display:none;font-size:8px">+'+v.toFixed(1)+'</th>';return s;})()
           +'</tr></thead><tbody>'+
           (g.trades||[]).map((t,i)=>{
@@ -2852,7 +2971,7 @@ function renderGhostHistory(){
               '<td class="'+(t.realizedPnlEUR!=null?(t.realizedPnlEUR>=0?'cg':'cr'):'cd')+'" style="font-size:9px">'+
                 (t.realizedPnlEUR!=null?eu(t.realizedPnlEUR):'—')+'</td>'+
               // ADV milestones -0.1 to -1.0 (hidden until ± Milestones clicked)
-              [0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0].map(v=>{
+              [1.0,0.9,0.8,0.7,0.6,0.5,0.4,0.3,0.2,0.1].map(v=>{
                 const key='-'+v.toFixed(1);
                 let iso=rrMs[key]||null;
                 if(!iso&&isSLHit&&Math.abs(v-1.0)<1e-9) iso=t.closedAt||null;
@@ -2957,8 +3076,13 @@ function renderEV(){
   setText('ev-data',rows.filter(r=>r.n>0).length);
   setText('ev-lock',rows.filter(r=>r.tpLocked?.lockedRR).length);
   setText('ev-meta',rows.length+' combos shown · ≥'+minN+' ghosts required for EV lock');
-  // Compute total P&L from all EV trades visible
+  // Compute total realized P&L
   const totalPnl = (_allTrades||[]).reduce((s,t)=>s+(t.realizedPnlEUR||0),0);
+  // Show avg latency from recent signals
+  const recentSigs = (_allTrades||[]).filter(t=>t.latencyMs>0).slice(0,50);
+  const avgLat = recentSigs.length ? Math.round(recentSigs.reduce((s,t)=>s+(t.latencyMs||0),0)/recentSigs.length) : null;
+  const latEl = document.getElementById('ev-latency');
+  if(latEl && avgLat!=null) latEl.textContent = avgLat+'ms avg';
   const pnlEl = document.getElementById('ev-pnl');
   if(pnlEl){ pnlEl.textContent=(totalPnl>=0?'+':'')+'\u20AC'+totalPnl.toFixed(2); pnlEl.className='ksv '+(totalPnl>=0?'cg':'cr'); }
   const tbody=document.getElementById('ev-body'); if(!tbody) return;
@@ -3068,6 +3192,10 @@ async function loadSignals(){
     if(oc==='ORDER_NOT_CONFIRMED')
       return {label:'⚠ Niet bevestigd', cls:'cy',
               badge:'<span style="color:var(--y)">UNCONF</span>'};
+    // Outside window / stock outside market
+    if((r.reason||'').includes('OUTSIDE_WINDOW')||(r.reason||'').includes('OUTSIDE_MARKET'))
+      return {label:'🌙 Outside Hours', cls:'co',
+              badge:'<span style="background:#e65100;color:#fff;padding:1px 5px;border-radius:3px;font-size:9px">OUTSIDE</span>'};
     return {label:'✗ '+(r.reason||oc).slice(0,25), cls:'cr',
             badge:'<span style="background:#b71c1c;color:#fff;padding:1px 5px;border-radius:3px;font-size:9px">REJECT</span>'};
   };
@@ -3084,7 +3212,8 @@ async function loadSignals(){
       '<td class="cd">'+(r.band_pct!=null?pct(r.band_pct):'—')+'</td>'+
       '<td>'+dest.badge+'</td>'+
       '<td class="'+dest.cls+'" style="font-size:9px">'+dest.label+'</td>'+
-      '<td class="cd">'+(r.latency_ms!=null?r.latency_ms+'ms':'—')+'</td>'+
+      (()=>{ const lms=r.latency_ms; const lc=lms==null?'cd':lms<500?'cg':lms<2000?'cy':'cr';
+        return '<td class="'+lc+'">'+( lms!=null?lms+'ms':'—')+'</td>'; })()+
     '</tr>';
   }).join('') : emptyRow(11,'Geen signalen gevonden · pas filter aan of wacht op nieuwe webhooks'));
 }
@@ -3254,7 +3383,7 @@ function renderBGTTable(tab) {
             '<th>Stop</th><th>Peak+RR</th><th>Peak−RR%</th>'+
             '<th>Elapsed</th>'+
             // ADV milestones -0.1 to -1.0
-            [0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0].map(v=>'<th class="adv-th" style="font-size:8px">-'+v.toFixed(1)+'</th>').join('')+
+            [1.0,0.9,0.8,0.7,0.6,0.5,0.4,0.3,0.2,0.1].map(v=>'<th class="adv-th" style="font-size:8px">-'+v.toFixed(1)+'</th>').join('')+
             // FAV milestones +0.1 to +5.0 (beperkt voor leesbaarheid)
             (()=>{let s='';for(let v=0.1;v<=5.0+1e-9;v=Math.round((v+0.1)*10)/10)s+='<th class="fav-th" style="font-size:8px">+'+v.toFixed(1)+'</th>';return s;})()
           +'</tr></thead><tbody>'+
@@ -3286,7 +3415,7 @@ function renderBGTTable(tab) {
               '<td class="cg fw">'+f2(t.peakRRPos)+'R</td>'+
               '<td class="cr">'+(isSLHit?'100%':f1(t.peakRRNeg)+'%')+'</td>'+
               '<td class="cd">'+msFmt(elapsed)+'</td>'+
-              [0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0].map(v=>{
+              [1.0,0.9,0.8,0.7,0.6,0.5,0.4,0.3,0.2,0.1].map(v=>{
                 const key='-'+v.toFixed(1);
                 let iso=rrMs[key]||null;
                 if(!iso&&isSLHit&&Math.abs(v-1.0)<1e-9) iso=t.closedAt||null;
@@ -3357,7 +3486,7 @@ async function loadShadowPlaybook() {
       extraCell+
       '<td class="cd" style="font-size:9px">'+dt(bg.openedAt)+'</td>'+
       '<td class="cd">'+msFmt(elapsed)+'</td>'+
-      [0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0].map(v=>msBgt(rrMs['-'+v.toFixed(1)]||null,false)).join('')+
+      [1.0,0.9,0.8,0.7,0.6,0.5,0.4,0.3,0.2,0.1].map(v=>msBgt(rrMs['-'+v.toFixed(1)]||null,false)).join('')+
       (()=>{let s='';for(let v=0.1;v<=15.0+1e-9;v=Math.round((v+0.1)*10)/10)s+=msBgt(rrMs[v.toFixed(1)]||null,true);return s;})()
     +'</tr>';
   }).join('') : emptyRow(170, 'Geen actieve blocked ghosts'));
@@ -3397,13 +3526,32 @@ async function loadAll(){
     ov.closeTo   ? 'until='     + encodeURIComponent(ov.closeTo + 'T23:59:59')  : '',
   ].filter(Boolean).join('&');
   const ovQ = ovQs ? '?' + ovQs : '';
-  const [trades,daily,ghGrouped]=await Promise.all([
+  const [trades,daily,ghGrouped,perfStats]=await Promise.all([
     api('/api/trades' + ovQ),
     api('/api/daily-breakdown'),
     api('/api/ghost-grouped'),
+    api('/api/performance'),
   ]);
+  // Render performance KPIs
+  if(perfStats) {
+    const pf = perfStats.profitFactor;
+    setText('p-wr',   (perfStats.winRate||0).toFixed(1)+'%');
+    setHtml('p-pf',   pf!=null ? '<span class="'+(pf>=1.5?'cg fw':pf>=1?'cy':'cr')+'">'+(pf||0).toFixed(2)+'</span>' : '—');
+    setText('p-exp',  eu(perfStats.expectancy));
+    const sh = perfStats.sharpe;
+    setHtml('p-sharpe', sh!=null ? '<span class="'+(sh>=1?'cg':sh>=0?'cy':'cr')+'">'+(sh||0).toFixed(2)+'</span>' : '—');
+    setText('p-dd',   eu(perfStats.maxDrawdown));
+    const cal = perfStats.calmar;
+    setHtml('p-calmar', cal!=null ? '<span class="'+(cal>=1?'cg':cal>=0?'cy':'cr')+'">'+(cal||0).toFixed(2)+'</span>' : '—');
+    setText('p-avgwin',  eu(perfStats.avgWin));
+    setText('p-avgloss', eu(perfStats.avgLoss));
+    setText('perf-meta', perfStats.total+' trades · PF: '+(pf??'—')+'· WR: '+perfStats.winRate+'%');
+  }
   _allTrades=(trades||[]);
   renderOverview(_allTrades,daily,ghGrouped);
+  // Update last-refresh timestamp
+  const lrEl = document.getElementById('last-refresh');
+  if(lrEl) lrEl.textContent = 'Updated ' + new Date().toLocaleTimeString('nl-BE',{timeZone:'Europe/Brussels',hour:'2-digit',minute:'2-digit',second:'2-digit'});
 }
 
 async function waitForDBAndLoad() {
