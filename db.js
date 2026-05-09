@@ -114,10 +114,13 @@ const { Pool } = require("pg");
 const pool = new Pool({
   connectionString:        process.env.DATABASE_URL,
   ssl:                     { rejectUnauthorized: false },
+  max:                     8,     // explicit pool size (Railway free: max 10 connections)
   connectionTimeoutMillis: 5000,
-  idleTimeoutMillis:       10000,
-  statement_timeout:       8000,
+  idleTimeoutMillis:       30000, // keep connections alive longer
+  statement_timeout:       10000, // 10s query timeout
 });
+// Log pool errors (e.g. connection drops)
+pool.on('error', (err) => console.error('[DB Pool] Unexpected error:', err.message));
 
 async function initDB() {
   const client = await pool.connect();
@@ -241,6 +244,12 @@ async function initDB() {
           AND a.id < b.id;
       -- Now safe to create unique index
       CREATE UNIQUE INDEX IF NOT EXISTS idx_ghost_trades_pos_id ON ghost_trades (position_id) WHERE position_id IS NOT NULL;
+      -- Performance indexes for common queries
+      CREATE INDEX IF NOT EXISTS idx_closed_trades_opened  ON closed_trades (opened_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_closed_trades_session ON closed_trades (session, symbol);
+      CREATE INDEX IF NOT EXISTS idx_ghost_trades_opened   ON ghost_trades (opened_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_ghost_trades_optkey   ON ghost_trades (optimizer_key);
+      CREATE INDEX IF NOT EXISTS idx_blocked_ghost_opened  ON blocked_ghost_state (opened_at DESC);
     `);
 
     // ── ghost_state (persists ghost tracking across restarts) ─────
@@ -401,6 +410,19 @@ async function initDB() {
       ALTER TABLE webhook_history ADD COLUMN IF NOT EXISTS execution_price  NUMERIC;
       ALTER TABLE webhook_history ADD COLUMN IF NOT EXISTS slippage         NUMERIC;
       ALTER TABLE webhook_history ADD COLUMN IF NOT EXISTS vwap_band_pct    NUMERIC;
+    `);
+
+    // ── equity_curve ─────────────────────────────────────────
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS equity_curve (
+        id          SERIAL      PRIMARY KEY,
+        balance     NUMERIC     NOT NULL,
+        equity      NUMERIC     NOT NULL,
+        open_pnl    NUMERIC     DEFAULT 0,
+        open_pos    INTEGER     DEFAULT 0,
+        recorded_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_equity_curve_time ON equity_curve (recorded_at DESC);
     `);
 
     // ── signal_log ───────────────────────────────────────────────
@@ -1357,7 +1379,8 @@ async function computeEVStats(optimizerKey) {
     const avgRR          = arr.length      ? parseFloat((arr.reduce((s,v)=>s+v,0)/arr.length).toFixed(3)) : null;
 
     const levels = [];
-    for (let rr = 0.5; rr <= 15.01; rr = parseFloat((rr + 0.1).toFixed(1))) {
+    // v14.2: Start EV analysis from 0.1R — catches tight TP setups
+    for (let rr = 0.1; rr <= 15.01; rr = parseFloat((rr + 0.1).toFixed(1))) {
       const wins = arr.filter(v => v >= rr).length;
       const wr   = wins / arr.length;
       const ev   = parseFloat((wr * rr - (1 - wr)).toFixed(4));
@@ -1996,7 +2019,7 @@ async function loadSignalRejects({ since = null, until = null } = {}) {
 // Retourneert alle signalen (geplaatst + geblokkeerd) uit signal_log.
 // Elke rij heeft: outcome → bepaalt bestemming (Ghost Tracker vs Shadow Playbook).
 // Exclude puur technische errors (geen symbol of outcome = null).
-async function loadSignalLog({ since = null, until = null } = {}) {
+async function loadSignalLog({ since = null, until = null, limit = 500 } = {}) {
   try {
     const cutoff  = since ?? '2000-01-01';
     const ceiling = until ?? '2099-12-31';
@@ -2224,7 +2247,7 @@ async function loadDailyBreakdown() {
       FROM closed_trades ct
       LEFT JOIN ghost_trades gt ON gt.position_id = ct.position_id
       WHERE (ct.exclude_from_ev IS NULL OR ct.exclude_from_ev = FALSE)
-      ORDER BY COALESCE(gt.peak_rr_pos, ct.true_max_rr, ct.max_rr, 0) DESC
+      ORDER BY COALESCE(gt.peak_rr_pos, ct.true_max_rr, ct.max_rr, 0) DESC NULLS LAST
       LIMIT 10
     `);
 
@@ -2239,7 +2262,8 @@ async function loadDailyBreakdown() {
       FROM closed_trades ct
       LEFT JOIN ghost_trades gt ON gt.position_id = ct.position_id
       WHERE (ct.exclude_from_ev IS NULL OR ct.exclude_from_ev = FALSE)
-      ORDER BY COALESCE(gt.peak_rr_pos, ct.true_max_rr, ct.max_rr, 0) ASC
+        AND ct.realized_pnl_eur IS NOT NULL  -- only trades with actual P&L data
+      ORDER BY ct.realized_pnl_eur ASC  -- worst by actual P&L
       LIMIT 10
     `);
 
@@ -2301,6 +2325,8 @@ async function loadGhostHistoryByPair(from, to) {
         CAST(COALESCE(peak_rr_pos, max_rr_before_sl, 0) AS FLOAT) AS "peakRRPos",
         CAST(COALESCE(peak_rr_neg, max_sl_pct_used, 0)  AS FLOAT) AS "peakRRNeg",
         CAST(COALESCE(max_rr_before_sl, peak_rr_pos, 0) AS FLOAT) AS "maxRR",
+        CAST(realized_pnl_eur AS FLOAT)                            AS "realizedPnlEUR",
+        CAST(lots AS FLOAT)                                         AS lots,
         CAST(COALESCE(max_sl_pct_used, peak_rr_neg, 0)  AS FLOAT) AS "maxSlPct",
         phantom_sl_hit                                        AS "phantomSLHit",
         stop_reason                                           AS "stopReason",
@@ -2363,6 +2389,9 @@ async function loadGhostHistoryByPair(from, to) {
       if (row.stopReason === 'phantom_sl' || row.stopReason === 'gap_stop' || row.phantomSLHit === true) g.nSLHit++;
       if (row.stopReason === 'max_rr_15')  g.nMaxRR15++;
       if (row.stopReason === 'timeout_14d' || row.stopReason === 'timeout_2w') g.nMaxDays++;
+      // Track most common stop reason for the group
+      if (row.stopReason) g._stopReasons = g._stopReasons || {};
+      if (row.stopReason) g._stopReasons[row.stopReason] = (g._stopReasons[row.stopReason]||0)+1;
 
       // Peak RR — use best available value, skip 0 for averages
       const pp = parseFloat(row.peakRRPos ?? row.maxRR ?? 0);
@@ -2399,6 +2428,11 @@ async function loadGhostHistoryByPair(from, to) {
       g.totalPnl   = g.nWithPnl > 0 ? parseFloat(g.sumPnl.toFixed(2)) : null;
       // Data completeness indicator: % of trades with full milestone data
       g.pctComplete = g.n > 0 ? Math.round((g.nWithMilestones / g.n) * 100) : 0;
+      // Top stop reason for this group
+      if (g._stopReasons) {
+        g.topStopReason = Object.entries(g._stopReasons).sort((a,b)=>b[1]-a[1])[0]?.[0] ?? null;
+        delete g._stopReasons;
+      }
       // Cleanup
       delete g.sumPeakPos; delete g.sumPeakNeg; delete g.sumPnl;
       delete g.nWithPeakRR; delete g.nWithPnl; delete g.nWithMilestones;
@@ -2655,12 +2689,70 @@ async function loadComplianceDate() {
   } catch (e) { return null; }
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// loadPerformanceStats — Sharpe, Profit Factor, Expectancy, Max Drawdown
+// ═══════════════════════════════════════════════════════════════════
+async function loadPerformanceStats(since = null) {
+  try {
+    const cutoff = since ?? '2000-01-01';
+    const r = await pool.query(`
+      SELECT
+        COUNT(*)                                                    AS total,
+        COUNT(*) FILTER (WHERE realized_pnl_eur > 0)               AS wins,
+        COUNT(*) FILTER (WHERE realized_pnl_eur < 0)               AS losses,
+        COUNT(*) FILTER (WHERE realized_pnl_eur = 0)               AS breakeven,
+        COALESCE(SUM(realized_pnl_eur), 0)                         AS total_pnl,
+        COALESCE(SUM(realized_pnl_eur) FILTER (WHERE realized_pnl_eur > 0), 0) AS gross_win,
+        COALESCE(ABS(SUM(realized_pnl_eur) FILTER (WHERE realized_pnl_eur < 0)), 0) AS gross_loss,
+        COALESCE(AVG(realized_pnl_eur), 0)                         AS avg_pnl,
+        COALESCE(STDDEV(realized_pnl_eur), 0)                      AS stddev_pnl,
+        COALESCE(MAX(realized_pnl_eur), 0)                         AS best_trade,
+        COALESCE(MIN(realized_pnl_eur), 0)                         AS worst_trade,
+        COALESCE(AVG(realized_pnl_eur) FILTER (WHERE realized_pnl_eur > 0), 0) AS avg_win,
+        COALESCE(ABS(AVG(realized_pnl_eur) FILTER (WHERE realized_pnl_eur < 0)), 0) AS avg_loss
+      FROM closed_trades
+      WHERE opened_at >= $1
+        AND realized_pnl_eur IS NOT NULL
+        AND (exclude_from_ev IS NULL OR exclude_from_ev = FALSE)
+    `, [cutoff]);
+    const s = r.rows[0];
+    const total = parseInt(s.total)||0, wins = parseInt(s.wins)||0, losses = parseInt(s.losses)||0;
+    const grossWin = parseFloat(s.gross_win)||0, grossLoss = parseFloat(s.gross_loss)||0;
+    const avgPnl = parseFloat(s.avg_pnl)||0, stddevPnl = parseFloat(s.stddev_pnl)||0;
+    const profitFactor = grossLoss > 0 ? parseFloat((grossWin/grossLoss).toFixed(3)) : null;
+    const winRate = total > 0 ? parseFloat((wins/total*100).toFixed(2)) : 0;
+    const avgWin = parseFloat(s.avg_win)||0, avgLoss = parseFloat(s.avg_loss)||0;
+    const winR = wins/Math.max(total,1), lossR = losses/Math.max(total,1);
+    const expectancy = parseFloat(((winR*avgWin)-(lossR*avgLoss)).toFixed(2));
+    const sharpe = stddevPnl > 0 ? parseFloat((avgPnl/stddevPnl*Math.sqrt(252)).toFixed(3)) : null;
+    const ddR = await pool.query(`
+      WITH daily AS (
+        SELECT DATE(opened_at AT TIME ZONE 'Europe/Brussels') AS d, SUM(realized_pnl_eur) AS day_pnl
+        FROM closed_trades WHERE opened_at>=$1 AND realized_pnl_eur IS NOT NULL
+          AND (exclude_from_ev IS NULL OR exclude_from_ev=FALSE) GROUP BY d ORDER BY d
+      ), cumulative AS (SELECT d, SUM(day_pnl) OVER (ORDER BY d) AS cum_pnl FROM daily),
+      peak AS (SELECT d, cum_pnl, MAX(cum_pnl) OVER (ORDER BY d ROWS UNBOUNDED PRECEDING) AS running_peak FROM cumulative)
+      SELECT COALESCE(MIN(cum_pnl-running_peak),0) AS max_drawdown FROM peak
+    `, [cutoff]);
+    const maxDrawdown = parseFloat(ddR.rows[0]?.max_drawdown||0);
+    const totalPnl = parseFloat(s.total_pnl)||0;
+    const calmar = maxDrawdown < 0 ? parseFloat((totalPnl/Math.abs(maxDrawdown)).toFixed(3)) : null;
+    return { total, wins, losses, breakeven: parseInt(s.breakeven)||0, winRate,
+      grossWin: parseFloat(grossWin.toFixed(2)), grossLoss: parseFloat(grossLoss.toFixed(2)),
+      profitFactor, expectancy, sharpe, maxDrawdown: parseFloat(maxDrawdown.toFixed(2)),
+      calmar, totalPnl: parseFloat(totalPnl.toFixed(2)),
+      bestTrade: parseFloat(s.best_trade||0), worstTrade: parseFloat(s.worst_trade||0),
+      avgWin: parseFloat(avgWin.toFixed(2)), avgLoss: parseFloat(avgLoss.toFixed(2)) };
+  } catch (e) { console.warn('[!] loadPerformanceStats:', e.message); return null; }
+}
+
 module.exports = {
   pool,
   initDB,
   // Trades
   saveTrade,
   loadAllTrades,
+  loadPerformanceStats,
   // Ghost optimizer
   saveGhostTrade,
   loadGhostTrades,
@@ -2711,6 +2803,7 @@ module.exports = {
   loadSignalLog,        // v14.0: volledige signaallijst voor Signals tab
   // EV stats
   computeEVStats,
+  loadPerformanceStats,
   // Shadow winners
   loadShadowWinners,
   // v12.5.1: trade numbering + ghost combo analysis
@@ -2735,6 +2828,14 @@ module.exports = {
   loadGhostGrouped,
   // v12.6: daily breakdown, ghost history per pair, blocked raw
   loadDailyBreakdown,
+  loadEquityCurve: async (limit=200) => {
+    try {
+      const r = await pool.query(
+        'SELECT balance,equity,open_pnl AS "openPnl",open_pos AS "openPos",recorded_at AS "recordedAt" FROM equity_curve ORDER BY recorded_at DESC LIMIT $1',
+        [limit]);
+      return r.rows.reverse(); // oldest first for chart
+    } catch { return []; }
+  },
   loadGhostHistoryByPair,
   loadBlockedRaw,
 }; 
