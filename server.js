@@ -1085,7 +1085,13 @@ function apiGet(path, fn, empty = []) {
 apiGet("/api/trades",              r  => db.loadAllTrades({ since: r.query.since??null, until: r.query.until??null, openFrom: r.query.openFrom??null, openTo: r.query.openTo??null }), []);
 apiGet("/api/ghost-trades",        r  => db.loadGhostTrades(r.query.key??null, parseInt(r.query.limit)||200), []);
 apiGet("/api/ghost-grouped",       () => db.loadGhostGrouped(),                []);
-apiGet("/api/performance",         () => db.loadPerformanceStats(),             null);
+app.get("/api/performance", async (req, res) => {
+  if (!dbReady) return res.json(null);
+  try {
+    const stats = await db.loadPerformanceStats();
+    res.json(stats);
+  } catch (e) { res.json(null); }
+});
 // ── Manual position recovery ──────────────────────────────────────
 // POST /api/recover-positions [secret]
 // Scant MT5 live posities en adopteert alles wat niet in memory zit.
@@ -1191,13 +1197,8 @@ app.get("/api/open-positions", (req, res) => {
 
 app.get("/api/tp-config", (req, res) => res.json(tpConfigs));
 
-app.get("/api/performance", async (req, res) => {
-  const empty = { total: 0, tpCount: 0, slCount: 0, winRate: 0, avgWinner: 0,
-    avgLoser: 0, grossWins: 0, grossLosses: 0, profitFactor: null,
-    totalPnl: 0, avgPnlPerTrade: 0, maxDrawdown: 0, pnlCurve: [] };
-  if (!dbReady) return res.json(empty);
-  res.json(await dbCall(db.loadPerformanceSummary(), empty));
-});
+// /api/performance — served by apiGet above (loadPerformanceStats)
+// Old loadPerformanceSummary route removed to avoid duplicate registration
 
 app.get("/api/daily-breakdown", async (req, res) => {
   const empty = { days: [], bestTrades: [], worstTrades: [] };
@@ -1549,6 +1550,9 @@ tr:hover td{background:var(--bg4)}
     <span id="ov-df-active" style="display:none;font-size:9px;color:var(--y);font-weight:700;margin-left:4px">⚠ Gefilterd</span>
   </div>
   <div id="ov-filter-hint" style="display:none;padding:6px 14px;background:rgba(210,153,34,.1);border-bottom:1px solid rgba(210,153,34,.2);font-size:10px;color:var(--y)"></div>
+  <div id="ov-db-loading" style="display:none;padding:8px 14px;background:rgba(59,130,246,.08);border-bottom:1px solid rgba(59,130,246,.2);font-size:10px;color:#60a5fa">
+    ⟳ Database initialiseert — data wordt opgehaald... (max 30 seconden)
+  </div>
 
     <!-- KPI Row -->
     <div class="card" style="overflow:hidden">
@@ -2708,6 +2712,9 @@ function renderOverview(trades, daily, ghGrouped){
       filterHint.style.display='none';
     }
   }
+  // DB loading indicator — show when 0 trades and no filter active
+  const dbLoadEl = document.getElementById('ov-db-loading');
+  if(dbLoadEl) dbLoadEl.style.display = (total===0&&!filterActive) ? '' : 'none';
   setText('ov-comp',total);
   setText('wr-meta',total+' trades · compliance+');
   setText('dist-meta',total+' trades · compliance+');
@@ -3532,8 +3539,8 @@ async function loadAll(){
     api('/api/ghost-grouped'),
     api('/api/performance'),
   ]);
-  // Render performance KPIs
-  if(perfStats) {
+  // Render performance KPIs (perfStats may be null if DB not ready yet)
+  if(perfStats && perfStats.total != null) {
     const pf = perfStats.profitFactor;
     setText('p-wr',   (perfStats.winRate||0).toFixed(1)+'%');
     setHtml('p-pf',   pf!=null ? '<span class="'+(pf>=1.5?'cg fw':pf>=1?'cy':'cr')+'">'+(pf||0).toFixed(2)+'</span>' : '—');
@@ -3561,9 +3568,24 @@ async function waitForDBAndLoad() {
   document.querySelectorAll('input[type="date"]').forEach(el => { el.value = ''; });
   document.querySelectorAll('[id$="-df-active"]').forEach(el => { el.style.display = 'none'; });
 
-  // Load immediately — don't wait for DB ready poll (avoids 60s freeze)
-  // The 30s interval will catch up if first load is empty (DB still starting)
+  // First load — try immediately
   await loadAll();
+
+  // If DB was not ready yet (trades=0 but server is up), retry with backoff
+  // Checks: if we have 0 trades after first load, keep retrying every 3s for up to 30s
+  let retries = 0;
+  const retryInterval = setInterval(async () => {
+    if (retries >= 10) { clearInterval(retryInterval); return; } // give up after 30s
+    const s = await api('/status', 3000);
+    if (s && s.dbReady && (_allTrades||[]).length === 0) {
+      console.log('[Dashboard] DB now ready, reloading data (retry '+(retries+1)+')');
+      await loadAll();
+    }
+    if ((_allTrades||[]).length > 0) clearInterval(retryInterval); // got data, stop
+    retries++;
+  }, 3000);
+
+  // Normal 30s refresh
   setInterval(loadAll, 30000);
 }
 
