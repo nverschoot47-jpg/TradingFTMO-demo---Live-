@@ -695,9 +695,11 @@ async function initDB() {
   await safeAlter(`CREATE SEQUENCE IF NOT EXISTS trade_number_seq START 1`);
   await safeAlter(`ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS trade_number INTEGER`);
   // ghost_trades: trade_number + peak RR columns
-  await safeAlter(`ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS trade_number    INTEGER`);
-  await safeAlter(`ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS peak_rr_pos     NUMERIC DEFAULT 0`);
-  await safeAlter(`ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS peak_rr_neg     NUMERIC DEFAULT 0`);
+  await safeAlter(`ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS trade_number      INTEGER`);
+  await safeAlter(`ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS peak_rr_pos       NUMERIC DEFAULT 0`);
+  await safeAlter(`ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS peak_rr_neg       NUMERIC DEFAULT 0`);
+  await safeAlter(`ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS realized_pnl_eur  NUMERIC`);
+  await safeAlter(`ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS lots              NUMERIC`);
   // ghost_state: trade_number + peak RR + rr_milestones
   await safeAlter(`ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS trade_number     INTEGER`);
   await safeAlter(`ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS lots             NUMERIC`);
@@ -848,8 +850,9 @@ async function saveGhostTrade(g) {
          max_price, max_rr_before_sl, phantom_sl_hit, stop_reason,
          time_to_sl_min, max_sl_pct_used, sl_milestones, rr_milestones,
          trade_number, peak_rr_pos, peak_rr_neg,
+         realized_pnl_eur, lots,
          opened_at, closed_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
       ON CONFLICT (position_id) WHERE position_id IS NOT NULL
       DO UPDATE SET
         max_price        = EXCLUDED.max_price,
@@ -862,6 +865,9 @@ async function saveGhostTrade(g) {
         rr_milestones    = EXCLUDED.rr_milestones,
         peak_rr_pos      = EXCLUDED.peak_rr_pos,
         peak_rr_neg      = EXCLUDED.peak_rr_neg,
+        realized_pnl_eur = COALESCE(EXCLUDED.realized_pnl_eur, ghost_trades.realized_pnl_eur),
+        lots             = COALESCE(EXCLUDED.lots, ghost_trades.lots),
+        trade_number     = COALESCE(EXCLUDED.trade_number, ghost_trades.trade_number),
         closed_at        = EXCLUDED.closed_at
     `, [
       g.positionId      ?? null,
@@ -883,6 +889,8 @@ async function saveGhostTrade(g) {
       g.tradeNumber     ?? null,
       g.peakRRPos       ?? g.maxRRBeforeSL ?? 0,
       g.peakRRNeg       ?? g.maxSlPctUsed  ?? 0,
+      g.realizedPnlEUR  ?? null,
+      g.lots            ?? null,
       g.openedAt        ?? null,
       g.closedAt        ?? null,
     ]);
