@@ -2330,12 +2330,20 @@ async function loadGhostHistoryByPair(from, to) {
         CAST(sl               AS FLOAT)                       AS sl,
         CAST(sl_pct           AS FLOAT)                       AS "slPct",
         CAST(tp_rr_used       AS FLOAT)                       AS "tpRRUsed",
-        CAST(COALESCE(peak_rr_pos, max_rr_before_sl, 0) AS FLOAT) AS "peakRRPos",
-        CAST(COALESCE(peak_rr_neg, max_sl_pct_used, 0)  AS FLOAT) AS "peakRRNeg",
-        CAST(COALESCE(max_rr_before_sl, peak_rr_pos, 0) AS FLOAT) AS "maxRR",
-        CAST(COALESCE(max_sl_pct_used, peak_rr_neg, 0)  AS FLOAT) AS "maxSlPct",
-        CAST(COALESCE(realized_pnl_eur, 0) AS FLOAT)          AS "realizedPnlEUR",
-        CAST(lots AS FLOAT)                                    AS lots,
+        CAST(COALESCE(
+          NULLIF(peak_rr_pos, 0),
+          max_rr_before_sl,
+          -- Reconstruct from max_price if available
+          CASE WHEN max_price IS NOT NULL AND entry IS NOT NULL AND sl IS NOT NULL AND ABS(entry-sl)>0
+               THEN ABS(max_price - entry) / ABS(entry - sl)
+               ELSE NULL END,
+          0
+        ) AS FLOAT) AS "peakRRPos",
+        CAST(COALESCE(NULLIF(peak_rr_neg, 0), max_sl_pct_used, 0) AS FLOAT) AS "peakRRNeg",
+        CAST(COALESCE(NULLIF(max_rr_before_sl, 0), NULLIF(peak_rr_pos, 0), 0) AS FLOAT) AS "maxRR",
+        CAST(COALESCE(max_sl_pct_used, peak_rr_neg, 0) AS FLOAT) AS "maxSlPct",
+        CAST(COALESCE(realized_pnl_eur, 0) AS FLOAT)             AS "realizedPnlEUR",
+        CAST(lots AS FLOAT)                                        AS lots,
         CAST(time_to_sl_min AS FLOAT)                          AS "timeToSL",
         phantom_sl_hit                                         AS "phantomSLHit",
         stop_reason                                            AS "stopReason",
