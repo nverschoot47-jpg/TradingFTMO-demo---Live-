@@ -2683,6 +2683,148 @@ async function loadComplianceDate() {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// loadAllGhostsCombined — ghost_trades (closed) + ghost_state (active)
+// This gives a complete picture of ALL ghost tracking ever done
+// ═══════════════════════════════════════════════════════════════════
+async function loadAllGhostsCombined(from, to) {
+  try {
+    const cutoff  = from ?? '2000-01-01';
+    const ceiling = to   ?? '2099-12-31';
+    // Get finished ghost trades
+    const closedR = await pool.query(`
+      SELECT
+        position_id AS "positionId",
+        COALESCE(optimizer_key, symbol||'_'||COALESCE(session,'?')||'_'||COALESCE(direction,'?')||'_'||COALESCE(vwap_position,'unknown'))
+                                                              AS "optimizerKey",
+        symbol, COALESCE(session,'?') AS session,
+        COALESCE(direction,'?') AS direction,
+        COALESCE(vwap_position,'unknown') AS "vwapPosition",
+        CAST(entry AS FLOAT) AS entry, CAST(sl AS FLOAT) AS sl,
+        CAST(tp_rr_used AS FLOAT) AS "tpRRUsed",
+        CAST(COALESCE(
+          NULLIF(peak_rr_pos,0), max_rr_before_sl,
+          CASE WHEN max_price IS NOT NULL AND entry IS NOT NULL AND sl IS NOT NULL AND ABS(entry-sl)>0
+               THEN ABS(max_price-entry)/ABS(entry-sl) ELSE NULL END, 0
+        ) AS FLOAT) AS "peakRRPos",
+        CAST(COALESCE(NULLIF(peak_rr_neg,0), max_sl_pct_used, 0) AS FLOAT) AS "peakRRNeg",
+        CAST(COALESCE(max_rr_before_sl, NULLIF(peak_rr_pos,0), 0) AS FLOAT) AS "maxRR",
+        CAST(COALESCE(max_sl_pct_used, 0) AS FLOAT) AS "maxSlPct",
+        CAST(COALESCE(realized_pnl_eur,0) AS FLOAT) AS "realizedPnlEUR",
+        CAST(lots AS FLOAT) AS lots,
+        phantom_sl_hit AS "phantomSLHit",
+        stop_reason AS "stopReason",
+        rr_milestones AS "rrMilestones",
+        sl_milestones AS "slMilestones",
+        opened_at AS "openedAt",
+        closed_at AS "closedAt",
+        FALSE AS "_active"
+      FROM ghost_trades
+      WHERE (
+        $1 = '2000-01-01' OR closed_at >= $1
+        OR (closed_at IS NULL AND opened_at >= $1)
+      ) AND (
+        $2 = '2099-12-31' OR closed_at <= $2
+        OR (closed_at IS NULL AND opened_at <= $2)
+      )
+    `, [cutoff, ceiling]);
+
+    // Get active ghost state entries (still running)
+    const activeR = await pool.query(`
+      SELECT
+        position_id AS "positionId",
+        COALESCE(optimizer_key, symbol||'_'||COALESCE(session,'?')||'_'||COALESCE(direction,'?')||'_'||COALESCE(vwap_position,'unknown'))
+                                                              AS "optimizerKey",
+        symbol, COALESCE(session,'?') AS session,
+        COALESCE(direction,'?') AS direction,
+        COALESCE(vwap_position,'unknown') AS "vwapPosition",
+        CAST(entry AS FLOAT) AS entry, CAST(sl AS FLOAT) AS sl,
+        CAST(tp_rr_used AS FLOAT) AS "tpRRUsed",
+        CAST(COALESCE(NULLIF(peak_rr_pos,0), max_rr, 0) AS FLOAT) AS "peakRRPos",
+        CAST(COALESCE(NULLIF(peak_rr_neg,0), max_sl_pct_used, 0) AS FLOAT) AS "peakRRNeg",
+        CAST(COALESCE(max_rr, 0) AS FLOAT) AS "maxRR",
+        CAST(COALESCE(max_sl_pct_used, 0) AS FLOAT) AS "maxSlPct",
+        NULL AS "realizedPnlEUR",
+        CAST(lots AS FLOAT) AS lots,
+        phantom_sl_hit AS "phantomSLHit",
+        stop_reason AS "stopReason",
+        rr_milestones AS "rrMilestones",
+        sl_milestones AS "slMilestones",
+        opened_at AS "openedAt",
+        NULL AS "closedAt",
+        TRUE AS "_active"
+      FROM ghost_state
+      WHERE opened_at >= $1 AND opened_at <= $2
+    `, [cutoff, ceiling]);
+
+    // Combine: closed first, then active (closed have priority for data quality)
+    const allRows = [...closedR.rows, ...activeR.rows];
+
+    // Group by optimizer_key
+    const grouped = {};
+    for (const row of allRows) {
+      const key = row.optimizerKey || (row.symbol + '_unknown');
+      if (!grouped[key]) {
+        grouped[key] = {
+          optimizerKey: key,
+          symbol: row.symbol,
+          session: row.session !== '?' ? row.session : null,
+          direction: row.direction !== '?' ? row.direction : null,
+          vwapPosition: row.vwapPosition !== 'unknown' ? row.vwapPosition : null,
+          trades: [], n: 0, nActive: 0,
+          nSLHit: 0, nMaxRR15: 0, nMaxDays: 0,
+          nWithPeakRR: 0, nWithPnl: 0, nWithMilestones: 0,
+          sumPeakPos: 0, sumPeakNeg: 0, maxPeakPos: 0, maxPeakNeg: 0,
+          sumPnl: 0, _stopReasons: {},
+        };
+      }
+      const g = grouped[key];
+      if (!g.session     && row.session     !== '?')        g.session     = row.session;
+      if (!g.direction   && row.direction   !== '?')        g.direction   = row.direction;
+      if (!g.vwapPosition && row.vwapPosition !== 'unknown') g.vwapPosition = row.vwapPosition;
+
+      g.trades.push(row);
+      g.n++;
+      if (row._active) g.nActive++;
+      if (row.stopReason === 'phantom_sl' || row.stopReason === 'gap_stop' || row.phantomSLHit) g.nSLHit++;
+      if (row.stopReason === 'max_rr_15') g.nMaxRR15++;
+      if ((row.stopReason||'').includes('timeout')) g.nMaxDays++;
+      if (row.stopReason) g._stopReasons[row.stopReason] = (g._stopReasons[row.stopReason]||0)+1;
+      if (row.rrMilestones && Object.keys(row.rrMilestones).length > 0) g.nWithMilestones++;
+      const pp = parseFloat(row.peakRRPos ?? 0);
+      const pn = parseFloat(row.peakRRNeg ?? 0);
+      if (pp > 0) { g.sumPeakPos += pp; g.nWithPeakRR++; }
+      if (pn > 0)   g.sumPeakNeg += pn;
+      if (pp > g.maxPeakPos) g.maxPeakPos = pp;
+      if (pn > g.maxPeakNeg) g.maxPeakNeg = pn;
+      if (row.realizedPnlEUR != null && row.realizedPnlEUR !== 0) {
+        g.sumPnl += parseFloat(row.realizedPnlEUR); g.nWithPnl++;
+      }
+    }
+
+    for (const g of Object.values(grouped)) {
+      g.avgPeakPos  = g.nWithPeakRR > 0 ? parseFloat((g.sumPeakPos/g.nWithPeakRR).toFixed(3)) : 0;
+      g.avgPeakNeg  = g.n > 0 ? parseFloat((g.sumPeakNeg/g.n).toFixed(3)) : 0;
+      g.maxPeakPos  = parseFloat(g.maxPeakPos.toFixed(3));
+      g.maxPeakNeg  = parseFloat(g.maxPeakNeg.toFixed(3));
+      g.totalPnl    = g.nWithPnl > 0 ? parseFloat(g.sumPnl.toFixed(2)) : null;
+      g.pctComplete = g.n > 0 ? Math.round(g.nWithMilestones/g.n*100) : 0;
+      g.topStopReason = Object.entries(g._stopReasons).sort((a,b)=>b[1]-a[1])[0]?.[0] ?? null;
+      if (g.n >= 3) {
+        const winRate = (g.n - g.nSLHit) / g.n;
+        const bestTP  = g.avgPeakPos > 0 ? g.avgPeakPos : 1.0;
+        g.evEstimate  = parseFloat(((winRate*bestTP)-(1-winRate)).toFixed(3));
+      } else { g.evEstimate = null; }
+      const slPcts = g.trades.map(t=>parseFloat(t.maxSlPct??0)).filter(v=>v>0);
+      g.avgSlPct = slPcts.length ? parseFloat((slPcts.reduce((s,v)=>s+v,0)/slPcts.length).toFixed(1)) : 0;
+      delete g.sumPeakPos; delete g.sumPeakNeg; delete g.sumPnl;
+      delete g.nWithPeakRR; delete g.nWithPnl; delete g.nWithMilestones;
+      delete g._stopReasons;
+    }
+    return Object.values(grouped).sort((a,b) => b.n - a.n);
+  } catch(e) { console.warn('[!] loadAllGhostsCombined:', e.message); return []; }
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // loadPerformanceStats — Sharpe, Profit Factor, Expectancy, Max Drawdown
 // ═══════════════════════════════════════════════════════════════════
 async function loadPerformanceStats(since = null) {
@@ -2745,6 +2887,7 @@ module.exports = {
   // Trades
   saveTrade,
   loadAllTrades,
+  loadAllGhostsCombined,
   loadPerformanceStats,
   // Ghost optimizer
   saveGhostTrade,
