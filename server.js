@@ -726,7 +726,7 @@ app.get("/status", async (req, res) => {
     const nowMs = Date.now();
     if (dbReady && acct.balance && (!_lastEquityRecord || nowMs - _lastEquityRecord > 300_000)) {
       _lastEquityRecord = nowMs;
-      pool.query('INSERT INTO equity_curve (balance,equity,open_pnl,open_pos) VALUES ($1,$2,$3,$4)',
+      db.pool.query('INSERT INTO equity_curve (balance,equity,open_pnl,open_pos) VALUES ($1,$2,$3,$4)',
         [acct.balance, acct.equity, (acct.equity-acct.balance), openPositions.size]).catch(()=>{});
     }
   }
