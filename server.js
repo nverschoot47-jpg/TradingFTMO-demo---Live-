@@ -515,7 +515,8 @@ let _syncCount    = 0;
 let latestEquity  = 50000;   // updated by pollStatus / placeOrder
 let _lastEquityRecord = 0;   // timestamp of last equity_curve insert
 async function syncPositions() {
-  if (!isMonitoringActive() || !dbReady) return;
+  // Always sync — weekends included. Market may be closed but positions exist.
+  if (!dbReady) return;
   if (_syncRunning) {
     console.warn('[Sync] Skipping — previous sync still running');
     return;
@@ -528,7 +529,9 @@ async function syncPositions() {
   }
 }
 async function _doSyncPositions() {
-  if (!isMonitoringActive() || !dbReady) return;
+  // Run sync ALWAYS — even weekends. Positions stay open over weekend.
+  // isMonitoringActive() only affects NEW trade signals, not position tracking.
+  if (!dbReady) return;
   // Update equity from account info every 5 syncs (~2.5 min)
   _syncCount = (_syncCount || 0) + 1;
   if (_syncCount % 5 === 1) {
@@ -1692,13 +1695,13 @@ tr:hover td{background:var(--bg4)}
           <div>
             <div style="font-size:9px;color:var(--g);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;font-weight:700">🏆 Best 10 Setups — Peak+RR</div>
             <table style="font-size:10px"><thead><tr>
-              <th>Symbol</th><th>Type</th><th>Dir</th><th>Sess</th><th>VWAP</th><th>Peak+RR</th><th>P&amp;L</th><th>Date</th>
+              <th>Symbol</th><th>Type</th><th>Dir</th><th>Sess</th><th>VWAP</th><th>Peak+RR</th><th>Peak-RR%</th><th>P&amp;L</th><th>Date</th>
             </tr></thead><tbody id="best-body"></tbody></table>
           </div>
           <div>
             <div style="font-size:9px;color:var(--r);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;font-weight:700">💀 Worst 10 Setups — Peak+RR</div>
             <table style="font-size:10px"><thead><tr>
-              <th>Symbol</th><th>Type</th><th>Dir</th><th>Sess</th><th>VWAP</th><th>Peak+RR</th><th>P&amp;L</th><th>Date</th>
+              <th>Symbol</th><th>Type</th><th>Dir</th><th>Sess</th><th>VWAP</th><th>Peak+RR</th><th>Peak-RR%</th><th>P&amp;L</th><th>Date</th>
             </tr></thead><tbody id="worst-body"></tbody></table>
           </div>
         </div>
@@ -2796,11 +2799,11 @@ function renderOverview(trades, daily, ghGrouped){
 
   let ba_t=0,bb_t=0,sa_t=0,sb_t=0;
   const typeGroups=[
-    {label:'Forex',    arr:fxT, cls:'bd-fx', sessions:['asia','london','ny']},
+    {label:'Forex',    arr:fxT, cls:'bd-fx', sessions:['asia','london','ny','outside']},
     {label:'Stock',    arr:skT, cls:'bd-sk', sessions:['ny'], anomalyCheck: true,
       note:'Stocks only tradeable 16:00–21:00 Brussels (NY session). Asia/London entries = historical data before session restriction.'},
-    {label:'Index',    arr:ixT, cls:'bd-ix', sessions:['asia','london','ny']},
-    {label:'Commodity',arr:cmT, cls:'bd-cm', sessions:['asia','london','ny']},
+    {label:'Index',    arr:ixT, cls:'bd-ix', sessions:['asia','london','ny','outside']},
+    {label:'Commodity',arr:cmT, cls:'bd-cm', sessions:['asia','london','ny','outside']},
   ];
   const dRows=[];
   // Build all sessions including anomalous ones (stock in asia/london = pre-restriction data)
@@ -2818,8 +2821,9 @@ function renderOverview(trades, daily, ghGrouped){
       ba_t+=ba; bb_t+=bb; sa_t+=sa; sb_t+=sb;
       // Flag stock in non-NY session as anomaly (old data / possible index misclassification)
       const isAnomalous = tg.label==='Stock' && sess!=='ny';
-      const anomalyNote = isAnomalous ? ' <span title="Pre-restriction data or possible index misclassification" style="color:var(--y);font-size:8px">⚠</span>' : '';
-      const rowStyle = isAnomalous ? ' style="opacity:0.7"' : '';
+      if(isAnomalous && (ba+bb+sa+sb)===0) continue; // skip empty anomaly rows
+      const anomalyNote = isAnomalous ? ' <span title="Historical data: stocks were traded before session restriction. May include misclassified indexes." style="color:var(--y);font-size:8px">⚠ old</span>' : '';
+      const rowStyle = isAnomalous ? ' style="opacity:0.55;font-style:italic"' : '';
       dRows.push('<tr'+rowStyle+'><td><span class="bd '+tg.cls+'">'+tg.label+'</span>'+anomalyNote+'</td><td>'+sBadge(sess)+'</td><td class="cg fw">'+ba+'</td><td class="cg">'+bb+'</td><td class="cr fw">'+sa+'</td><td class="cr">'+sb+'</td><td class="cb fw">'+(ba+bb+sa+sb)+'</td></tr>');
     }
   }
@@ -2861,7 +2865,10 @@ function renderWRTable(typeFilter){
   const filtered=typeFilter==='all'?trades:trades.filter(t=>symType(t.symbol)===typeFilter);
   const combos={};
   for(const t of filtered){
-    const k=(t.session||'?')+'|'+(t.direction||'?')+'|'+(t.vwapPosition||'?')+'|'+symType(t.symbol);
+    // Skip stock trades in Asia/London (historical anomaly pre-session-restriction)
+    const tp = symType(t.symbol);
+    if(tp==='stock' && t.session !== 'ny') continue;
+    const k=(t.session||'?')+'|'+(t.direction||'?')+'|'+(t.vwapPosition||'?')+'|'+tp;
     combos[k]=(combos[k]||0)+1;
   }
   const rows=Object.entries(combos).sort((a,b)=>b[1]-a[1]).map(([k,n])=>{
@@ -2878,20 +2885,26 @@ function renderBW(){
   // Fields: symbol, direction, session, vwapPosition, peakRRPos, pnl, stopReason, openedAt
   const best  = window._bestTrades  || [];
   const worst = window._worstTrades || [];
-  const row = t => '<tr>'+
-    '<td class="cb fw" style="font-size:10px">'+t.symbol+'</td>'+
-    '<td>'+tBadge(symType(t.symbol))+'</td>'+
-    '<td>'+dBadge(t.direction)+'</td>'+
-    '<td>'+sBadge(t.session)+'</td>'+
-    '<td>'+vBadge(t.vwapPosition)+'</td>'+
-    '<td class="'+(t.peakRRPos>0?'cg fw':'cd')+'" style="font-size:10px">'+
-      (t.peakRRPos>0 ? f2(t.peakRRPos)+'R' : '—')+'</td>'+
-    '<td class="'+((+(t.pnl||0))>=0?'cg':'cr')+' fw" style="font-size:10px">'+
-      (t.pnl!=null ? eu(t.pnl) : '—')+'</td>'+
-    '<td class="cd" style="font-size:9px">'+dtS(t.openedAt)+'</td>'+
-  '</tr>';
-  setHtml('best-body',  (best||[]).map(row).join('')  || emptyRow(8,'No ghost history yet'));
-  setHtml('worst-body', (worst||[]).map(row).join('') || emptyRow(8,'No ghost history yet'));
+  // peakNegPct: from ghost max_sl_pct_used or peak_rr_neg
+  const row = t => {
+    const peakNegPct = t.peakRRNeg ?? t.maxSlPct ?? null;
+    return '<tr>'+
+      '<td class="cb fw" style="font-size:10px">'+t.symbol+'</td>'+
+      '<td>'+tBadge(symType(t.symbol))+'</td>'+
+      '<td>'+dBadge(t.direction)+'</td>'+
+      '<td>'+sBadge(t.session)+'</td>'+
+      '<td>'+vBadge(t.vwapPosition)+'</td>'+
+      '<td class="'+(t.peakRRPos>0?'cg fw':'cd')+'" style="font-size:10px">'+
+        (t.peakRRPos>0 ? f2(t.peakRRPos)+'R' : '—')+'</td>'+
+      '<td class="cr" style="font-size:10px">'+
+        (peakNegPct>0 ? '-'+f1(peakNegPct)+'%' : '—')+'</td>'+
+      '<td class="'+((+(t.pnl||0))>=0?'cg':'cr')+' fw" style="font-size:10px">'+
+        (t.pnl!=null ? eu(t.pnl) : '—')+'</td>'+
+      '<td class="cd" style="font-size:9px">'+dtS(t.openedAt)+'</td>'+
+    '</tr>';
+  };
+  setHtml('best-body',  (best||[]).map(row).join('')  || emptyRow(9,'No ghost history yet'));
+  setHtml('worst-body', (worst||[]).map(row).join('') || emptyRow(9,'No ghost history yet'));
 }
 
 // ── Ghost History (by pair, expandable) ──────────────────────────
@@ -2924,12 +2937,18 @@ async function loadGhostHistory(){
 }
 function renderGhostHistory(){
   const data=_ghhData.filter(g=>{
-    if(_ghhF.sess!=='all'&&g.session!==_ghhF.sess) return false;
-    if(_ghhF.dir!=='all'&&g.direction!==_ghhF.dir) return false;
-    if(_ghhF.type!=='all'&&symType(g.symbol)!==_ghhF.type) return false;
+    // null session/direction means unknown — show under 'all' filter only
+    if(_ghhF.sess!=='all' && g.session && g.session!==_ghhF.sess) return false;
+    if(_ghhF.dir!=='all'  && g.direction && g.direction!==_ghhF.dir) return false;
+    if(_ghhF.type!=='all' && symType(g.symbol)!==_ghhF.type) return false;
     return true;
   });
-  if(!data.length){ setHtml('ghh-body',emptyRow(16,'No ghost history')); return; }
+  if(!data.length){
+    const total=_ghhData.length;
+    const emptyMsg = total>0 ? 'No matches ('+total+' combos hidden by filter)' : 'No ghost history — trades appear here after ghost tracker closes';
+    setHtml('ghh-body',emptyRow(16, emptyMsg));
+    return;
+  }
   const tbody=document.getElementById('ghh-body'); if(!tbody) return;
   tbody.innerHTML=data.map(g=>{
     const safeKey=(g.optimizerKey||'').replace(/[^a-z0-9]/gi,'_');
@@ -3703,7 +3722,24 @@ async function initBackground() {
         riskPct: gs.riskPct, riskEUR: gs.riskEUR, openedAt: gs.openedAt,
         optimizerKey: gs.optimizerKey, ghost });
     }
-    console.log(`[DB] Restored ${openPositions.size} open positions`);
+    console.log(`[DB] Restored ${openPositions.size} positions from ghost_state`);
+    // Also immediately sync with MT5 to adopt any positions not in ghost_state
+    // Don't wait — this runs in background
+    setTimeout(async () => {
+      try {
+        const live = await getPositions();
+        let adopted = 0;
+        for (const lp of live) {
+          const id = String(lp.id);
+          if (!openPositions.has(id)) {
+            await adoptPosition(lp);
+            adopted++;
+          }
+        }
+        if (adopted > 0) console.log(`[Startup] Adopted ${adopted} extra MT5 positions not in ghost_state`);
+        console.log(`[Startup] Total open positions: ${openPositions.size}`);
+      } catch(e) { console.error('[Startup] MT5 adopt error:', e.message); }
+    }, 3000); // wait 3s for MetaAPI connection to stabilize
   } catch (e) { console.error("[DB] restorePositions failed:", e.message); }
 
   // Restore blocked ghost trackers
