@@ -1137,7 +1137,7 @@ app.post("/api/recover-positions", async (req, res) => {
   }
 });
 
-apiGet("/api/ghost-history-by-pair", r => db.loadGhostHistoryByPair(r.query.from??null, r.query.to??null), []);
+apiGet("/api/ghost-history-by-pair", r => db.loadAllGhostsCombined(r.query.from??null, r.query.to??null), []);
 // v13.4: blocked ghost tracker routes
 app.get("/api/blocked-ghosts/active", (req, res) => {
   // Serve from in-memory blockedPositions map for live milestone data
@@ -1692,13 +1692,13 @@ tr:hover td{background:var(--bg4)}
           <div>
             <div style="font-size:9px;color:var(--g);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;font-weight:700">🏆 Best 10 Setups — Peak+RR</div>
             <table style="font-size:10px"><thead><tr>
-              <th>Symbol</th><th>Dir</th><th>Sess</th><th>VWAP</th><th>Peak+RR</th><th>P&amp;L</th><th>Date</th>
+              <th>Symbol</th><th>Type</th><th>Dir</th><th>Sess</th><th>VWAP</th><th>Peak+RR</th><th>P&amp;L</th><th>Date</th>
             </tr></thead><tbody id="best-body"></tbody></table>
           </div>
           <div>
             <div style="font-size:9px;color:var(--r);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;font-weight:700">💀 Worst 10 Setups — Peak+RR</div>
             <table style="font-size:10px"><thead><tr>
-              <th>Symbol</th><th>Dir</th><th>Sess</th><th>VWAP</th><th>Peak+RR</th><th>P&amp;L</th><th>Date</th>
+              <th>Symbol</th><th>Type</th><th>Dir</th><th>Sess</th><th>VWAP</th><th>Peak+RR</th><th>P&amp;L</th><th>Date</th>
             </tr></thead><tbody id="worst-body"></tbody></table>
           </div>
         </div>
@@ -2880,20 +2880,18 @@ function renderBW(){
   const worst = window._worstTrades || [];
   const row = t => '<tr>'+
     '<td class="cb fw" style="font-size:10px">'+t.symbol+'</td>'+
-    '<td>'+dBadge(t.direction)+'</td>'+
-    '<td>'+sBadge(t.session)+'</td>'+
-    '<td>'+vBadge(t.vwapPosition)+'</td>'+
+    '<td>'+tBadge(symType(t.symbol))+'</td>'+
     '<td>'+dBadge(t.direction)+'</td>'+
     '<td>'+sBadge(t.session)+'</td>'+
     '<td>'+vBadge(t.vwapPosition)+'</td>'+
     '<td class="'+(t.peakRRPos>0?'cg fw':'cd')+'" style="font-size:10px">'+
-      (t.peakRRPos>0 ? f2(t.peakRRPos)+'R' : '<span style="font-size:8px;color:var(--ink3)">—</span>')+'</td>'+
+      (t.peakRRPos>0 ? f2(t.peakRRPos)+'R' : '—')+'</td>'+
     '<td class="'+((+(t.pnl||0))>=0?'cg':'cr')+' fw" style="font-size:10px">'+
       (t.pnl!=null ? eu(t.pnl) : '—')+'</td>'+
     '<td class="cd" style="font-size:9px">'+dtS(t.openedAt)+'</td>'+
   '</tr>';
-  setHtml('best-body',  (best||[]).map(row).join('')  || emptyRow(7,'No ghost history yet'));
-  setHtml('worst-body', (worst||[]).map(row).join('') || emptyRow(7,'No ghost history yet'));
+  setHtml('best-body',  (best||[]).map(row).join('')  || emptyRow(8,'No ghost history yet'));
+  setHtml('worst-body', (worst||[]).map(row).join('') || emptyRow(8,'No ghost history yet'));
 }
 
 // ── Ghost History (by pair, expandable) ──────────────────────────
@@ -2942,6 +2940,10 @@ function renderGhostHistory(){
     const topReason=reasons.length?Object.entries(reasons.reduce((m,r)=>{m[r]=(m[r]||0)+1;return m;},{})).sort((a,b)=>b[1]-a[1])[0][0]:'—';
     // Data completeness: show partial indicator for old trades missing stats
     const pctC = g.pctComplete ?? (g.trades.filter(t=>t.rrMilestones&&Object.keys(t.rrMilestones).length>0).length / Math.max(g.n,1) * 100);
+    // Active tracker badge (nActive > 0 = still running in Ghost Tracker)
+    const activeBadge = (g.nActive||0) > 0
+      ? '<span style="color:var(--g);font-size:8px" title="'+g.nActive+' active ghost tracker(s) voor deze key"> ●</span>'
+      : '';
     const complBadge = pctC >= 80 ? '' :
       pctC >= 40 ? '<span title="'+Math.round(pctC)+'% trades with full milestone data" style="font-size:8px;color:var(--y)"> ⚠'+Math.round(pctC)+'%</span>' :
       '<span title="'+Math.round(pctC)+'% trades with full milestone data (older data)" style="font-size:8px;color:var(--ink3)"> ◐'+Math.round(pctC)+'%</span>';
@@ -2958,7 +2960,7 @@ function renderGhostHistory(){
       : (g.n>=3?'<span class="cd">calc…</span>':'<span class="cd">need≥3</span>');
     return '<tr style="cursor:pointer;border-left:3px solid '+(g.direction==='buy'?'var(--g)':'var(--r)')+'" onclick="toggleGHHRow('+Q+safeKey+Q+')">'+
       '<td class="cd" style="font-size:9px">▶</td>'+
-      '<td class="cb fw" style="white-space:nowrap">'+g.symbol+complBadge+'</td>'+
+      '<td class="cb fw" style="white-space:nowrap">'+g.symbol+activeBadge+complBadge+'</td>'+
       '<td style="min-width:40px">'+tBadge(symType(g.symbol))+'</td>'+
       '<td>'+(g.session?sBadge(g.session):'<span class="cd">—</span>')+'</td>'+
       '<td>'+(g.direction?dBadge(g.direction):'<span class="cd">—</span>')+'</td>'+
@@ -3006,7 +3008,7 @@ function renderGhostHistory(){
             return '<tr style="border-bottom:1px solid var(--bdr)">'+
               '<td class="cd">'+(i+1)+'</td>'+
               '<td class="cd" style="font-size:8px">'+dt(t.openedAt)+'</td>'+
-              '<td class="cd" style="font-size:8px">'+(t.closedAt?dt(t.closedAt):t._active?'<span class="cg">● LIVE</span>':'<span class="cy">?</span>')+'</td>'+
+              '<td class="cd" style="font-size:8px">'+(t.closedAt?dt(t.closedAt):t._active?'<span class="cg fw">● RUNNING</span>':'<span class="cy">—</span>')+'</td>'+
               '<td class="'+srCls+'" style="font-size:8px">'+
                 (sr==='gap_stop'?'⚡ GAP SL':sr==='phantom_sl'?'SL HIT':sr==='max_rr_15'?'TP 15R':
                  sr==='timeout_14d'?'TIMEOUT':t._active?'<span style="color:var(--g)">● LIVE</span>':
