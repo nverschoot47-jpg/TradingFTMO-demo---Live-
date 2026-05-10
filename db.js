@@ -2249,12 +2249,14 @@ async function loadDailyBreakdown() {
         ct.symbol, ct.direction, ct.session,
         ct.vwap_position                                       AS "vwapPosition",
         CAST(COALESCE(gt.peak_rr_pos, ct.true_max_rr, ct.max_rr, 0) AS FLOAT) AS "peakRRPos",
+        CAST(COALESCE(gt.peak_rr_neg, gt.max_sl_pct_used, 0)  AS FLOAT) AS "peakRRNeg",
         CAST(ct.realized_pnl_eur AS FLOAT)                     AS pnl,
         COALESCE(gt.stop_reason, ct.close_reason)              AS "stopReason",
         ct.opened_at                                           AS "openedAt"
       FROM closed_trades ct
       LEFT JOIN ghost_trades gt ON gt.position_id = ct.position_id
       WHERE (ct.exclude_from_ev IS NULL OR ct.exclude_from_ev = FALSE)
+        AND COALESCE(gt.peak_rr_pos, ct.true_max_rr, ct.max_rr, 0) > 0
       ORDER BY COALESCE(gt.peak_rr_pos, ct.true_max_rr, ct.max_rr, 0) DESC NULLS LAST
       LIMIT 10
     `);
@@ -2264,14 +2266,15 @@ async function loadDailyBreakdown() {
         ct.symbol, ct.direction, ct.session,
         ct.vwap_position                                       AS "vwapPosition",
         CAST(COALESCE(gt.peak_rr_pos, ct.true_max_rr, ct.max_rr, 0) AS FLOAT) AS "peakRRPos",
+        CAST(COALESCE(gt.peak_rr_neg, gt.max_sl_pct_used, 0)  AS FLOAT) AS "peakRRNeg",
         CAST(ct.realized_pnl_eur AS FLOAT)                     AS pnl,
         COALESCE(gt.stop_reason, ct.close_reason)              AS "stopReason",
         ct.opened_at                                           AS "openedAt"
       FROM closed_trades ct
       LEFT JOIN ghost_trades gt ON gt.position_id = ct.position_id
       WHERE (ct.exclude_from_ev IS NULL OR ct.exclude_from_ev = FALSE)
-        AND ct.realized_pnl_eur IS NOT NULL  -- only trades with actual P&L data
-      ORDER BY ct.realized_pnl_eur ASC  -- worst by actual P&L
+        AND ct.realized_pnl_eur IS NOT NULL
+      ORDER BY ct.realized_pnl_eur ASC
       LIMIT 10
     `);
 
@@ -2706,7 +2709,7 @@ async function loadAllGhostsCombined(from, to) {
           CASE WHEN max_price IS NOT NULL AND entry IS NOT NULL AND sl IS NOT NULL AND ABS(entry-sl)>0
                THEN ABS(max_price-entry)/ABS(entry-sl) ELSE NULL END, 0
         ) AS FLOAT) AS "peakRRPos",
-        CAST(COALESCE(NULLIF(peak_rr_neg,0), max_sl_pct_used, 0) AS FLOAT) AS "peakRRNeg",
+        CAST(COALESCE(NULLIF(peak_rr_neg,0), NULLIF(max_sl_pct_used,0), 0) AS FLOAT) AS "peakRRNeg",
         CAST(COALESCE(max_rr_before_sl, NULLIF(peak_rr_pos,0), 0) AS FLOAT) AS "maxRR",
         CAST(COALESCE(max_sl_pct_used, 0) AS FLOAT) AS "maxSlPct",
         CAST(COALESCE(realized_pnl_eur,0) AS FLOAT) AS "realizedPnlEUR",
@@ -2740,7 +2743,7 @@ async function loadAllGhostsCombined(from, to) {
         CAST(entry AS FLOAT) AS entry, CAST(sl AS FLOAT) AS sl,
         CAST(tp_rr_used AS FLOAT) AS "tpRRUsed",
         CAST(COALESCE(NULLIF(peak_rr_pos,0), max_rr, 0) AS FLOAT) AS "peakRRPos",
-        CAST(COALESCE(NULLIF(peak_rr_neg,0), max_sl_pct_used, 0) AS FLOAT) AS "peakRRNeg",
+        CAST(COALESCE(NULLIF(peak_rr_neg,0), NULLIF(max_sl_pct_used,0), 0) AS FLOAT) AS "peakRRNeg",
         CAST(COALESCE(max_rr, 0) AS FLOAT) AS "maxRR",
         CAST(COALESCE(max_sl_pct_used, 0) AS FLOAT) AS "maxSlPct",
         NULL AS "realizedPnlEUR",
