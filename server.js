@@ -466,11 +466,18 @@ async function adoptPosition(lp) {
   // Estimate SL pct from entry/sl distance
   const slPct = entry > 0 && sl > 0 ? Math.abs(entry - sl) / entry : 0.003;
 
-  // Reconstruct risk from actual lots + slDist + equity
-  // riskEUR = lots × slDist × pip_value
-  // For forex: pip_value ≈ 100000 (1 standard lot moves 1 pip = 1 unit of quote)
-  // For index: pip_value ≈ 1 (1 lot = 1 point)
-  // For stocks: pip_value ≈ execPrice (1 share)
+  // Use ALL available MT5 data for adopted positions
+  const liveLots = lp.volume != null ? Math.max(0, parseFloat(lp.volume)) : lots;
+  const liveSL   = lp.stopLoss ? parseFloat(lp.stopLoss) : sl;
+  const liveTP   = lp.takeProfit ? (parseFloat(lp.takeProfit) || null) : tp;
+  const livePnl  = lp.profit != null ? parseFloat(lp.profit) : null;
+  const liveEntry = lp.openPrice ? parseFloat(lp.openPrice) : entry;
+  // Override with live values
+  if (liveLots)  lots  = liveLots;
+  if (liveSL)    sl    = liveSL;
+  if (liveTP)    tp    = liveTP;
+  if (liveEntry) entry = liveEntry;
+
   const assetTypeA = symInfo?.type ?? 'forex';
   const slDistA = Math.abs(entry - sl);
   let riskEURAdopted = null;
@@ -492,6 +499,7 @@ async function adoptPosition(lp) {
     openedAt, optimizerKey: optKey,
     tpRRUsed: tp && sl && entry ? Math.abs(tp - entry) / Math.abs(entry - sl) : null,
     slMultiplier: null, tradeNumber: parsed.tradeNumber,
+    liveProfitMT5: livePnl ?? null,
     ghost: null,
   };
   pos.ghost = initGhost({ ...pos, slPct });
@@ -570,13 +578,14 @@ async function _doSyncPositions() {
     if (!pos) {
       // ── v13.5: positie bestaat in MT5 maar niet in memory → adopteer ──
       await adoptPosition(lp);
-    } else if (lp.currentPrice) {
-      // Sync live MT5 data to pos (lots, sl, tp, profit)
-      if (lp.volume != null) pos.lots = Math.max(0, parseFloat(lp.volume));
-      if (lp.stopLoss)    pos.sl         = parseFloat(lp.stopLoss);
-      if (lp.takeProfit)  pos.tp         = parseFloat(lp.takeProfit) || null;
-      if (lp.profit!=null)pos.liveProfitMT5 = parseFloat(lp.profit);
-      pos.currentPrice = lp.currentPrice;
+    } else {
+      // ALWAYS sync MT5 position data regardless of market state (weekends too)
+      if (lp.volume != null)  pos.lots          = Math.max(0, parseFloat(lp.volume));
+      if (lp.stopLoss)        pos.sl            = parseFloat(lp.stopLoss);
+      if (lp.takeProfit)      pos.tp            = parseFloat(lp.takeProfit) || null;
+      if (lp.profit != null)  pos.liveProfitMT5 = parseFloat(lp.profit);
+      if (lp.currentPrice)    pos.currentPrice  = lp.currentPrice;
+      if (lp.openPrice)       pos.entry         = pos.entry || parseFloat(lp.openPrice);
       // Recalculate riskPct/riskEUR from live lots + sl every sync
       // This corrects any corrupted values from previous deploys
       if (pos.lots && pos.entry && pos.sl) {
@@ -1174,10 +1183,12 @@ app.get("/api/open-positions", (req, res) => {
   // Data is position metadata only; full security would need session auth
   const out = [];
   for (const [id, pos] of openPositions) {
+    // Use ghost.lots as fallback when pos.lots is null (weekend/adopted positions)
+    const lotsOut = pos.lots ?? pos.ghost?.lots ?? null;
     out.push({
       positionId: id, symbol: pos.symbol, direction: pos.direction,
       session: pos.session, vwapPosition: pos.vwapPosition, optimizerKey: pos.optimizerKey,
-      entry: pos.entry, sl: pos.sl, tp: pos.tp, lots: pos.lots,
+      entry: pos.entry, sl: pos.sl, tp: pos.tp, lots: lotsOut,
       riskPct: pos.riskPct, riskEUR: pos.riskEUR, openedAt: pos.openedAt,
       tradeNumber: pos.tradeNumber,
       currentPrice: pos.currentPrice ?? null,
@@ -2903,9 +2914,8 @@ async function loadGhostHistory(){
   if(from) params.push('from='+encodeURIComponent(from));
   if(to)   params.push('to='  +encodeURIComponent(to+'T23:59:59'));
   if(params.length) url+='?'+params.join('&');
-  // Ghost History = ONLY finished/closed ghost trades from ghost_trades DB table
-  // Active (still-running) ghosts belong in Ghost Tracker, NOT Ghost History
   const d = await api(url) || [];
+  console.log('[GhostHistory] Loaded', d.length, 'optimizer key groups, total trades:', d.reduce((s,g)=>s+(g.n||0),0));
 
   _ghhData = d;
   const total = d.reduce((s,g)=>s+(g.n||0),0);
