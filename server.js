@@ -342,8 +342,10 @@ async function closePosition(positionId, reason = "manual", pnl = null) {
   const finalCloseReason = gapStop ? 'sl_gap' : reason;
 
   if (ghost && dbReady) {
-    ghost.closedAt   = now;
-    ghost.stopReason = gapStop ? 'gap_stop' : (ghost.stopReason ?? reason);
+    ghost.closedAt       = now;
+    ghost.stopReason     = gapStop ? 'gap_stop' : (ghost.stopReason ?? reason);
+    ghost.realizedPnlEUR = realPnl ?? null;
+    ghost.lots           = pos.lots ?? null;
     await db.saveGhostTrade({ ...ghost, maxRRBeforeSL: ghost.maxRR }).catch(e => recordError(e.message));
     db.computeAndSaveGhostComboAnalysis(ghost.optimizerKey).catch(() => {});
     // v14.2: Check if this ghost pushed us over the TP lock threshold
