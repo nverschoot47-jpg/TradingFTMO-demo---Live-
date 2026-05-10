@@ -67,11 +67,15 @@ let liveComplianceDate = COMPLIANCE_DATE;
 
 // Rolling error log (1 h window)
 let errorLog = [];
-function recordError(msg) {
+function recordError(msg, ctx = {}) {
   const now = Date.now();
-  errorLog.push({ ts: now, msg: String(msg) });
+  errorLog.push({ ts: now, msg: String(msg).slice(0,500), ...ctx });
   errorLog = errorLog.filter(e => now - e.ts < 3_600_000);
-  console.error("[ERR]", msg);
+  console.error("[ERR]", msg, Object.keys(ctx).length ? JSON.stringify(ctx) : '');
+}
+// Structured event logger for key trading events
+function logEvent(type, data = {}) {
+  console.log(`[${type}]`, JSON.stringify(data));
 }
 function getErrorCount() {
   const now = Date.now();
@@ -369,7 +373,7 @@ async function closePosition(positionId, reason = "manual", pnl = null) {
     }).catch(e => recordError(e.message));
     db.deleteGhostState(positionId).catch(() => {});
   }
-  console.log(`[Pos] Closed ${positionId} ${pos.symbol} ${pos.direction} reason=${reason} pnl=${realPnl}`);
+  logEvent('TRADE_CLOSED', { positionId, symbol: pos.symbol, direction: pos.direction, reason: finalCloseReason, pnl: realPnl, gapStop });
 }
 
 // ── Blocked Ghost helpers ─────────────────────────────────────────
@@ -1177,17 +1181,21 @@ app.get("/api/open-positions", (req, res) => {
       currentPrice: pos.currentPrice ?? null,
       liveProfitMT5: pos.liveProfitMT5 ?? null,
       ghost: pos.ghost ? {
-        maxRR:        pos.ghost.maxRR,
-        maxSlPctUsed: pos.ghost.maxSlPctUsed,
-        peakRRPos:    pos.ghost.peakRRPos,
-        peakRRNeg:    pos.ghost.peakRRNeg,
-        slMilestones: pos.ghost.slMilestones,
-        rrMilestones: pos.ghost.rrMilestones,
-        phantomSLHit: pos.ghost.phantomSLHit,
-        stopReason:   pos.ghost.stopReason,
-        openedAt:     pos.ghost.openedAt,
-        entry:        pos.ghost.entry,
-        sl:           pos.ghost.sl,
+        maxRR:        pos.ghost.maxRR        ?? 0,
+        maxSlPctUsed: pos.ghost.maxSlPctUsed ?? 0,
+        peakRRPos:    pos.ghost.peakRRPos    ?? pos.ghost.maxRR ?? 0,
+        peakRRNeg:    pos.ghost.peakRRNeg    ?? pos.ghost.maxSlPctUsed ?? 0,
+        slMilestones: pos.ghost.slMilestones ?? {},
+        rrMilestones: pos.ghost.rrMilestones ?? {},
+        phantomSLHit: pos.ghost.phantomSLHit ?? false,
+        stopReason:   pos.ghost.stopReason   ?? null,
+        openedAt:     pos.ghost.openedAt     ?? pos.openedAt,
+        entry:        pos.ghost.entry        ?? pos.entry,
+        sl:           pos.ghost.sl           ?? pos.sl,
+        tpRRUsed:     pos.ghost.tpRRUsed     ?? null,
+        lots:         pos.ghost.lots         ?? pos.lots ?? null,
+        optimizerKey: pos.ghost.optimizerKey ?? pos.optimizerKey,
+        maxPrice:     pos.ghost.maxPrice     ?? pos.entry,
       } : null,
     });
   }
@@ -1826,13 +1834,17 @@ tr:hover td{background:var(--bg4)}
         <table id="ghh-tbl">
           <thead><tr>
             <th style="width:16px"></th>
-            <th>Symbol</th><th>Type</th><th>Session</th><th>Dir</th><th>VWAP</th>
-            <th title="Total ghost trades"># Ghosts</th>
-            <th class="cr">SL Hits</th><th class="cg">15R Hits</th><th class="cy">Timeout</th>
-            <th class="cg">Avg Peak+RR</th><th class="cr">Avg Peak−RR%</th><th class="cg">Max Peak+RR</th>
-            <th class="cy">EV TP (last 5)</th>
-            <th class="cd" title="Total realized P&L for this combo">P&amp;L</th>
-            <th>Stop Reason</th>
+            <th>Symbol</th><th>Type</th><th>Sess</th><th>Dir</th><th>VWAP</th>
+            <th title="Total finished ghost trades"># Ghosts</th>
+            <th class="cr" title="Phantom SL hit">SL Hits</th>
+            <th class="cg" title="Reached +15R">15R</th>
+            <th class="cy" title="Timeout 14 days">T/O</th>
+            <th class="cg" title="Average best RR reached">Avg Peak+</th>
+            <th class="cr" title="Average worst adverse RR">Avg Peak−</th>
+            <th class="cg" title="Best single trade peak RR">Max Peak+</th>
+            <th class="cy" title="EV estimate: (WR × avgPeak) − (1−WR)">EV Est.</th>
+            <th class="cd" title="Total realized P&L">P&amp;L</th>
+            <th title="Most common stop reason">Stop</th>
           </tr></thead>
           <tbody id="ghh-body"><tr><td colspan="16" class="nd"><span class="spin">⟳</span></td></tr></tbody>
         </table>
@@ -2772,21 +2784,30 @@ function renderOverview(trades, daily, ghGrouped){
   let ba_t=0,bb_t=0,sa_t=0,sb_t=0;
   const typeGroups=[
     {label:'Forex',    arr:fxT, cls:'bd-fx', sessions:['asia','london','ny']},
-    {label:'Stock',    arr:skT, cls:'bd-sk', sessions:['ny'],
-      note:'Stocks only tradeable 16:00–21:00 Brussels (NY session)'},
+    {label:'Stock',    arr:skT, cls:'bd-sk', sessions:['ny'], anomalyCheck: true,
+      note:'Stocks only tradeable 16:00–21:00 Brussels (NY session). Asia/London entries = historical data before session restriction.'},
     {label:'Index',    arr:ixT, cls:'bd-ix', sessions:['asia','london','ny']},
     {label:'Commodity',arr:cmT, cls:'bd-cm', sessions:['asia','london','ny']},
   ];
   const dRows=[];
+  // Build all sessions including anomalous ones (stock in asia/london = pre-restriction data)
   for(const tg of typeGroups){
-    for(const sess of tg.sessions){
+    // For stock: show all sessions but mark non-NY as anomaly (historical pre-restriction)
+    const allSessions = tg.label==='Stock'
+      ? ['ny','london','asia','outside'].filter(s=>tg.arr.some(t=>t.session===s))
+      : tg.sessions;
+    for(const sess of allSessions){
       const st=tg.arr.filter(t=>t.session===sess); if(!st.length) continue;
       const ba=st.filter(t=>t.direction==='buy'&&t.vwapPosition==='above').length;
       const bb=st.filter(t=>t.direction==='buy'&&t.vwapPosition==='below').length;
       const sa=st.filter(t=>t.direction==='sell'&&t.vwapPosition==='above').length;
       const sb=st.filter(t=>t.direction==='sell'&&t.vwapPosition==='below').length;
       ba_t+=ba; bb_t+=bb; sa_t+=sa; sb_t+=sb;
-      dRows.push('<tr><td><span class="bd '+tg.cls+'">'+tg.label+'</span></td><td>'+sBadge(sess)+'</td><td class="cg fw">'+ba+'</td><td class="cg">'+bb+'</td><td class="cr fw">'+sa+'</td><td class="cr">'+sb+'</td><td class="cb fw">'+(ba+bb+sa+sb)+'</td></tr>');
+      // Flag stock in non-NY session as anomaly (old data / possible index misclassification)
+      const isAnomalous = tg.label==='Stock' && sess!=='ny';
+      const anomalyNote = isAnomalous ? ' <span title="Pre-restriction data or possible index misclassification" style="color:var(--y);font-size:8px">⚠</span>' : '';
+      const rowStyle = isAnomalous ? ' style="opacity:0.7"' : '';
+      dRows.push('<tr'+rowStyle+'><td><span class="bd '+tg.cls+'">'+tg.label+'</span>'+anomalyNote+'</td><td>'+sBadge(sess)+'</td><td class="cg fw">'+ba+'</td><td class="cg">'+bb+'</td><td class="cr fw">'+sa+'</td><td class="cr">'+sb+'</td><td class="cb fw">'+(ba+bb+sa+sb)+'</td></tr>');
     }
   }
   setHtml('dist-body',dRows.join('')||emptyRow(7,'No trades after compliance date'));
@@ -2932,9 +2953,9 @@ function renderGhostHistory(){
       '<td class="cg fw">'+avgRRLabel+'</td>'+
       '<td class="cr">'+(g.avgPeakNeg>0?f1(g.avgPeakNeg)+'%':'—')+'</td>'+
       '<td class="cg fw">'+( g.maxPeakPos>0?f2(g.maxPeakPos)+'R':'—')+'</td>'+
-      '<td class="cy" style="font-size:9px">'+bestTP+'</td>'+
+      '<td style="font-size:9px">'+evLabel+'</td>'+
       '<td>'+pnlLabel+'</td>'+
-      '<td class="cd" style="font-size:9px">'+topReason+'</td>'+
+      '<td class="cd" style="font-size:9px">'+(topReason||'—')+'</td>'+
     '</tr>'+
     '<tr id="ghh-d-'+safeKey+'" style="display:none">'+
       '<td colspan="16" style="padding:0;background:var(--bg3)">'+
