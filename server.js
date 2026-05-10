@@ -2939,6 +2939,11 @@ function renderGhostHistory(){
     const pnlLabel = g.totalPnl != null
       ? '<span class="'+(g.totalPnl>=0?'cg':'cr')+'">'+eu(g.totalPnl)+'</span>'
       : '—';
+    // EV estimate from DB (computed in loadGhostHistoryByPair)
+    const ev = g.evEstimate;
+    const evLabel = ev!=null
+      ? '<span class="'+(ev>0.2?'cg fw':ev>0?'cy':'cr')+'">'+(ev>0?'+':'')+ev.toFixed(2)+'</span>'
+      : (g.n>=3?'<span class="cd">calc…</span>':'<span class="cd">need≥3</span>');
     return '<tr style="cursor:pointer;border-left:3px solid '+(g.direction==='buy'?'var(--g)':'var(--r)')+'" onclick="toggleGHHRow('+Q+safeKey+Q+')">'+
       '<td class="cd" style="font-size:9px">▶</td>'+
       '<td class="cb fw" style="white-space:nowrap">'+g.symbol+complBadge+'</td>'+
