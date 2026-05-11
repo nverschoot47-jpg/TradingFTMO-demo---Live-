@@ -1887,39 +1887,6 @@ tr:hover td{background:var(--bg4)}
       </div>
     </div>
 
-    <!-- Trade Distribution by asset type -->
-    <div class="card">
-      <div class="card-hdr">
-        <div class="card-title"><div class="dot" id="dist-dot"></div>Trade Distribution — by Asset Type</div>
-        <div class="cmeta" id="dist-meta">loading…</div>
-      </div>
-      <div class="kstrip">
-        <div class="ks"><div class="ksl">Total Closed</div><div class="ksv cb" id="d-tot">—</div></div>
-        <div class="ks"><div class="ksl">Forex</div><div class="ksv" style="color:var(--b)" id="d-fx">—</div></div>
-        <div class="ks"><div class="ksl">Stock</div><div class="ksv cp" id="d-sk">—</div></div>
-        <div class="ks"><div class="ksl">Index</div><div class="ksv cc" id="d-ix">—</div></div>
-        <div class="ks"><div class="ksl">Commodity</div><div class="ksv cy" id="d-cm">—</div></div>
-        <div class="ks"><div class="ksl">Buy</div><div class="ksv cg" id="d-buy">—</div></div>
-        <div class="ks"><div class="ksl">Sell</div><div class="ksv cr" id="d-sell">—</div></div>
-      </div>
-      <div class="tw">
-        <table><thead><tr>
-          <th>Asset Type</th><th>Session</th>
-          <th class="cg">Buy / Above</th><th class="cg">Buy / Below</th>
-          <th class="cr">Sell / Above</th><th class="cr">Sell / Below</th>
-          <th>Total</th>
-        </tr></thead>
-        <tbody id="dist-body"><tr><td colspan="7" class="nd"><span class="spin">⟳</span></td></tr></tbody>
-        <tfoot><tr style="background:var(--bg3);font-weight:700">
-          <td class="cy" colspan="2">TOTAL</td>
-          <td id="ft-ba" class="cg">—</td><td id="ft-bb" class="cg">—</td>
-          <td id="ft-sa" class="cr">—</td><td id="ft-sb" class="cr">—</td>
-          <td id="ft-t" class="cb">—</td>
-        </tr></tfoot>
-        </table>
-      </div>
-    </div>
-
     <!-- Trade Activity by Session/VWAP/Direction + asset split -->
     <div class="card">
       <div class="card-hdr">
@@ -1950,6 +1917,39 @@ tr:hover td{background:var(--bg4)}
         <table><thead><tr>
           <th>Session</th><th>Direction</th><th>VWAP</th><th>Asset Type</th><th>Trades</th>
         </tr></thead><tbody id="wr-body"><tr><td colspan="5" class="nd"><span class="spin">⟳</span></td></tr></tbody></table>
+      </div>
+    </div>
+
+    <!-- Trade Distribution by asset type -->
+    <div class="card">
+      <div class="card-hdr">
+        <div class="card-title"><div class="dot" id="dist-dot"></div>Trade Distribution — by Asset Type</div>
+        <div class="cmeta" id="dist-meta">loading…</div>
+      </div>
+      <div class="kstrip">
+        <div class="ks"><div class="ksl">Total Closed</div><div class="ksv cb" id="d-tot">—</div></div>
+        <div class="ks"><div class="ksl">Forex</div><div class="ksv" style="color:var(--b)" id="d-fx">—</div></div>
+        <div class="ks"><div class="ksl">Stock</div><div class="ksv cp" id="d-sk">—</div></div>
+        <div class="ks"><div class="ksl">Index</div><div class="ksv cc" id="d-ix">—</div></div>
+        <div class="ks"><div class="ksl">Commodity</div><div class="ksv cy" id="d-cm">—</div></div>
+        <div class="ks"><div class="ksl">Buy</div><div class="ksv cg" id="d-buy">—</div></div>
+        <div class="ks"><div class="ksl">Sell</div><div class="ksv cr" id="d-sell">—</div></div>
+      </div>
+      <div class="tw">
+        <table><thead><tr>
+          <th>Asset Type</th><th>Session</th>
+          <th class="cg">Buy / Above</th><th class="cg">Buy / Below</th>
+          <th class="cr">Sell / Above</th><th class="cr">Sell / Below</th>
+          <th>Total</th>
+        </tr></thead>
+        <tbody id="dist-body"><tr><td colspan="7" class="nd"><span class="spin">⟳</span></td></tr></tbody>
+        <tfoot><tr style="background:var(--bg3);font-weight:700">
+          <td class="cy" colspan="2">TOTAL</td>
+          <td id="ft-ba" class="cg">—</td><td id="ft-bb" class="cg">—</td>
+          <td id="ft-sa" class="cr">—</td><td id="ft-sb" class="cr">—</td>
+          <td id="ft-t" class="cb">—</td>
+        </tr></tfoot>
+        </table>
       </div>
     </div>
 
@@ -2625,14 +2625,7 @@ const eu  = v => v==null?'—':((+v)>=0?'+':'')+'€'+(+v).toFixed(2);
 const pct = v => v==null?'—':(+v).toFixed(1)+'%';
 const pC  = v => (+v||0)>=0?'cg':'cr';
 const dt  = s => { try{ return new Date(s).toLocaleString('nl-BE',{timeZone:'Europe/Brussels',day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}); }catch{return s||'—';} };
-const dtS = s => {
-  if(!s) return '—';
-  try {
-    const d = new Date(s);
-    if(isNaN(d.getTime())) return '—';
-    return d.toLocaleDateString('nl-BE', {day:'2-digit',month:'2-digit',year:'numeric'});
-  } catch { return '—'; }
-};
+const dtS = s => { try{ return new Date(s).toLocaleDateString('nl-BE'); }catch{return s||'—';} };
 const msFmt = m => { if(!m&&m!==0) return '—'; m=Math.round(+m); const h=Math.floor(m/60),mn=m%60; return h>0?h+'h'+mn+'m':mn+'m'; };
 // fPrice: correct decimal places per asset type
 function fPrice(v, symbol) {
