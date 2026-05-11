@@ -811,6 +811,156 @@ app.post("/api/debug/force-sync", async (req, res) => {
   } catch(e) { res.json({ error: e.message }); }
 });
 
+// ═══════════════════════════════════════════════════════════════
+// DB ANALYSIS — analyse comment formats + backfill missing data
+// ═══════════════════════════════════════════════════════════════
+
+// Analyse comment formats in closed_trades
+app.get("/api/debug/db-analysis", async (req, res) => {
+  if (!dbReady) return res.json({ error: 'DB not ready' });
+  try {
+    const [comments, ghostState, ghostTrades, closedCount] = await Promise.all([
+      db.pool.query(`
+        SELECT 
+          COALESCE(comment, brokerComment, mt5_comment, '') AS comment,
+          direction, session, vwap_position, symbol,
+          COUNT(*) as cnt
+        FROM closed_trades
+        GROUP BY COALESCE(comment, brokerComment, mt5_comment, ''), direction, session, vwap_position, symbol
+        ORDER BY cnt DESC
+        LIMIT 100
+      `),
+      db.pool.query(`SELECT COUNT(*) as cnt, 
+        COUNT(CASE WHEN direction IS NULL THEN 1 END) as no_dir,
+        COUNT(CASE WHEN session IS NULL THEN 1 END) as no_sess,
+        COUNT(CASE WHEN optimizer_key IS NULL THEN 1 END) as no_key
+        FROM ghost_state`),
+      db.pool.query(`SELECT COUNT(*) as cnt,
+        COUNT(CASE WHEN stop_reason IS NULL AND phantom_sl_hit IS FALSE THEN 1 END) as no_close,
+        COUNT(CASE WHEN peak_rr_pos > 0 THEN 1 END) as has_peak
+        FROM ghost_trades`),
+      db.pool.query(`SELECT COUNT(*) as cnt,
+        COUNT(CASE WHEN direction IS NULL THEN 1 END) as no_dir,
+        COUNT(CASE WHEN session IS NULL THEN 1 END) as no_sess
+        FROM closed_trades`),
+    ]);
+    res.json({
+      closedTrades: closedCount.rows[0],
+      commentFormats: comments.rows,
+      ghostState: ghostState.rows[0],
+      ghostTrades: ghostTrades.rows[0],
+    });
+  } catch(e) { res.json({ error: e.message }); }
+});
+
+// Backfill closed_trades direction/session/vwap from comment field
+app.post("/api/debug/backfill-comments", async (req, res) => {
+  if (!checkSecret(req, res)) return;
+  if (!dbReady) return res.json({ error: 'DB not ready' });
+  try {
+    // Get all closed_trades with a comment but missing direction/session
+    const r = await db.pool.query(`
+      SELECT position_id, 
+        COALESCE(comment, broker_comment, '') AS comment,
+        symbol, direction, session, vwap_position
+      FROM closed_trades
+      WHERE (direction IS NULL OR session IS NULL OR vwap_position IS NULL OR vwap_position = 'unknown')
+        AND COALESCE(comment, broker_comment, '') != ''
+    `);
+    
+    let fixed = 0, skipped = 0;
+    for (const row of r.rows) {
+      const parsed = parseMT5Comment(row.comment);
+      if (!parsed.direction && !parsed.session) { skipped++; continue; }
+      
+      const dir  = parsed.direction  ?? row.direction;
+      const sess = parsed.session    ?? row.session;
+      const vwap = parsed.vwapPosition !== 'unknown' ? parsed.vwapPosition : (row.vwap_position ?? 'unknown');
+      
+      // Build optimizer key if we have enough info
+      const sym    = normalizeSymbol(row.symbol) ?? row.symbol;
+      const optKey = dir && sess && vwap ? buildOptimizerKey(sym, sess, dir, vwap) : null;
+      
+      await db.pool.query(`
+        UPDATE closed_trades SET
+          direction     = COALESCE(direction, $1),
+          session       = COALESCE(session, $2),
+          vwap_position = CASE WHEN vwap_position IS NULL OR vwap_position='unknown' THEN $3 ELSE vwap_position END,
+          optimizer_key = COALESCE(optimizer_key, $4)
+        WHERE position_id = $5
+      `, [dir, sess, vwap, optKey, row.position_id]);
+      fixed++;
+    }
+    
+    // Also backfill ghost_state
+    const gs = await db.pool.query(`
+      SELECT position_id, symbol, direction, session, vwap_position, optimizer_key
+      FROM ghost_state
+      WHERE direction IS NULL OR session IS NULL OR optimizer_key IS NULL
+    `);
+    let gsFixed = 0;
+    for (const row of gs.rows) {
+      const sym  = normalizeSymbol(row.symbol) ?? row.symbol;
+      if (row.direction && row.session && !row.optimizer_key) {
+        const vwap   = row.vwap_position ?? 'unknown';
+        const optKey = buildOptimizerKey(sym, row.session, row.direction, vwap);
+        await db.pool.query(`UPDATE ghost_state SET optimizer_key=$1 WHERE position_id=$2`,
+          [optKey, row.position_id]);
+        gsFixed++;
+      }
+    }
+    
+    res.json({ ok: true, closedFixed: fixed, closedSkipped: skipped, ghostStateFixed: gsFixed });
+  } catch(e) { res.json({ error: e.message, stack: e.stack?.slice(0,500) }); }
+});
+
+// Backfill ghost_trades from closed_trades (link via position_id)
+app.post("/api/debug/backfill-ghost-trades", async (req, res) => {
+  if (!checkSecret(req, res)) return;
+  if (!dbReady) return res.json({ error: 'DB not ready' });
+  try {
+    // Find closed_trades that have no matching ghost_trade yet
+    const r = await db.pool.query(`
+      SELECT ct.position_id, ct.symbol, ct.direction, ct.session, ct.vwap_position,
+        ct.entry, ct.sl, ct.sl_pct, ct.lots, ct.realized_pnl_eur,
+        ct.opened_at, ct.closed_at, ct.close_reason, ct.optimizer_key,
+        ct.true_max_rr, ct.max_rr
+      FROM closed_trades ct
+      LEFT JOIN ghost_trades gt ON gt.position_id = ct.position_id
+      WHERE gt.position_id IS NULL
+        AND ct.direction IS NOT NULL
+        AND ct.session IS NOT NULL
+        AND ct.sl IS NOT NULL
+        AND ct.entry IS NOT NULL
+      LIMIT 500
+    `);
+    
+    let inserted = 0;
+    for (const ct of r.rows) {
+      const sym    = normalizeSymbol(ct.symbol) ?? ct.symbol;
+      const vwap   = ct.vwap_position ?? 'unknown';
+      const optKey = ct.optimizer_key ?? buildOptimizerKey(sym, ct.session, ct.direction, vwap);
+      const peakRR = ct.true_max_rr ?? ct.max_rr ?? 0;
+      
+      await db.pool.query(`
+        INSERT INTO ghost_trades
+          (position_id, optimizer_key, symbol, session, direction, vwap_position,
+           entry, sl, realized_pnl_eur, lots, peak_rr_pos,
+           stop_reason, opened_at, closed_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+        ON CONFLICT (position_id) WHERE position_id IS NOT NULL DO NOTHING
+      `, [
+        ct.position_id, optKey, sym, ct.session, ct.direction, vwap,
+        ct.entry, ct.sl, ct.realized_pnl_eur, ct.lots, peakRR,
+        ct.close_reason, ct.opened_at, ct.closed_at
+      ]);
+      inserted++;
+    }
+    
+    res.json({ ok: true, inserted, total: r.rows.length });
+  } catch(e) { res.json({ error: e.message }); }
+});
+
 // Debug: recent errors
 app.get("/api/debug/errors", (req, res) => {
   res.json({ count: errorLog.length, errors: errorLog.slice(-50) });
