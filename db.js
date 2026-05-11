@@ -227,6 +227,24 @@ async function initDB() {
       CREATE INDEX IF NOT EXISTS idx_ghost_trades_closed  ON ghost_trades (closed_at);
       -- v14.1: ensure closed_at is populated for old ghost_trades that have stop_reason
       -- This runs once and is idempotent
+      -- v14.1: Delete stock trades in asia/london sessions — historically impossible
+      -- These were placed before session restriction or are mis-classified indexes
+      -- Symbols: everything that symType returns as 'stock' (not in index/forex/commodity sets)
+      DELETE FROM closed_trades
+      WHERE session IN ('asia', 'london')
+        AND symbol NOT IN (
+          -- Known forex
+          'AUDCAD','AUDCHF','AUDNZD','AUDUSD','CADCHF','EURAUD','EURCHF','EURUSD',
+          'GBPAUD','GBPNZD','GBPUSD','NZDCAD','NZDCHF','NZDUSD','USDCAD','USDCHF',
+          'USDJPY','EURGBP','GBPCHF','EURCAD','AUDCAD','EURNZD',
+          -- Known indexes
+          'DE30EUR','NAS100USD','UK100GBP','US30USD',
+          'GER40.cash','US100.cash','UK100.cash','US30.cash',
+          'NAS100','US100','UK100','US30','GER40','DE30','USTEC','SPX500','DAX',
+          -- Known commodities
+          'XAUUSD','XAGUSD','XAUEUR','GOLD','XAUUSD.cash','WTIUSD','BCOUSD','XTIUSD'
+        );
+
       -- Auto-populate closed_at for old ghost trades that have stop_reason but no closed_at
       UPDATE ghost_trades 
         SET closed_at = CASE
@@ -2756,7 +2774,11 @@ async function loadAllGhostsCombined(from, to) {
         NULL AS "closedAt",
         TRUE AS "_active"
       FROM ghost_state
-      WHERE opened_at >= $1 AND opened_at <= $2
+      WHERE (
+        $1 = '2000-01-01' OR opened_at IS NULL OR opened_at >= $1
+      ) AND (
+        $2 = '2099-12-31' OR opened_at IS NULL OR opened_at <= $2
+      )
     `, [cutoff, ceiling]);
 
     // Combine: closed first, then active (closed have priority for data quality)
