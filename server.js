@@ -423,20 +423,34 @@ async function closeBlockedGhost(id, reason = 'timeout') {
 // niet in memory zit — bv. na een deploy/restart terwijl er een trade open stond.
 // Reconstrueert de positie vanuit MT5 data + comment parsing.
 function parseMT5Comment(comment = '') {
-  // Comment format: "B-LD-ABV #42"  →  dir=buy, sess=london, vwap=above, trade#=42
-  // Parts: [dir]-[sess]-[vwap] #[n]
+  // Two comment formats:
+  // OLD: "S-NY-UNK #10"           → DIR-SESS-VWAP #N
+  // NEW: "EURCHF S-LD-ABV #1"     → SYMBOL DIR-SESS-VWAP #N
+  // NEW: "NZDCHF B-LD-ABV #1"     → SYMBOL DIR-SESS-VWAP #N
   const dirMap  = { B: 'buy',  S: 'sell' };
   const sessMap = { NY: 'ny',  LD: 'london', AS: 'asia', LOND: 'london' };
   const vwapMap = { ABV: 'above', BLW: 'below', UNK: 'unknown' };
   const parts   = comment.trim().toUpperCase().split(/[\s#]+/);
-  const core    = parts[0] || '';
-  const segs    = core.split('-');
-  return {
-    direction:    dirMap[segs[0]]  ?? null,
-    session:      sessMap[segs[1]] ?? null,
-    vwapPosition: vwapMap[segs[2]] ?? 'unknown',
-    tradeNumber:  parts[1] ? parseInt(parts[1]) : null,
-  };
+  
+  // Try each part as the DIR-SESS-VWAP segment
+  for (let i = 0; i < Math.min(parts.length, 2); i++) {
+    const segs = parts[i].split('-');
+    const dir  = dirMap[segs[0]];
+    const sess = sessMap[segs[1]];
+    const vwap = vwapMap[segs[2]] ?? 'unknown';
+    if (dir && sess) {
+      // Found a valid DIR-SESS segment — get trade number from next hash part
+      const numPart = parts.find((p, j) => j > i && /^\d+$/.test(p));
+      return {
+        direction:    dir,
+        session:      sess,
+        vwapPosition: vwap,
+        tradeNumber:  numPart ? parseInt(numPart) : null,
+      };
+    }
+  }
+  // Fallback: try MT5 type field (handled in adoptPosition)
+  return { direction: null, session: null, vwapPosition: 'unknown', tradeNumber: null };
 }
 
 async function adoptPosition(lp) {
@@ -461,7 +475,7 @@ async function adoptPosition(lp) {
   const sl        = parseFloat(lp.stopLoss  ?? 0);
   const tp        = parseFloat(lp.takeProfit ?? 0) || null;
   const lots      = parseFloat(lp.volume ?? 0);
-  const openedAt  = lp.openTime ? new Date(lp.openTime).toISOString() : new Date().toISOString();
+  const openedAt  = (lp.time ?? lp.openTime) ? new Date(lp.time ?? lp.openTime).toISOString() : new Date().toISOString();
   const optKey    = buildOptimizerKey(symbol, session, direction, vwapPos);
 
   // Guard: don't adopt if we can't determine direction reliably — log and skip
@@ -622,6 +636,14 @@ async function _doSyncPositions() {
       // Log first time we get data for a position (debugging)
       if (!pos._synced) {
         pos._synced = true;
+        // Log raw MetaAPI field names so we can debug missing data
+        console.log('[SYNC_RAW] position fields:', Object.keys(lp).join(', '));
+        console.log('[SYNC_RAW] key values:', {
+          id: lp.id, symbol: lp.symbol, volume: lp.volume,
+          profit: lp.profit, currentPrice: lp.currentPrice,
+          openPrice: lp.openPrice, stopLoss: lp.stopLoss,
+          type: lp.type, time: lp.time,
+        });
         logEvent('POS_SYNC', { id: pos.positionId, symbol: pos.symbol,
           lots: pos.lots, profit: pos.liveProfitMT5, price: pos.currentPrice,
           sl: pos.sl, tp: pos.tp });
@@ -747,12 +769,70 @@ app.get("/dashboard", (req, res) => {
 });
 
 // ── Health ────────────────────────────────────────────────────────
-// Debug: show raw MetaAPI data for a position
+// Debug: show raw MetaAPI data + in-memory positions
 app.get("/api/debug/positions", async (req, res) => {
   try {
-    const d = await metaFetch(`/users/current/accounts/${META_ACCOUNT}/positions`);
-    res.json({ count: Array.isArray(d) ? d.length : 0, positions: d });
+    const raw = await metaFetch(`/users/current/accounts/${META_ACCOUNT}/positions`);
+    const mem = [];
+    for (const [id, pos] of openPositions) {
+      mem.push({
+        id, symbol: pos.symbol, direction: pos.direction,
+        lots: pos.lots, entry: pos.entry, sl: pos.sl, tp: pos.tp,
+        liveProfitMT5: pos.liveProfitMT5, currentPrice: pos.currentPrice,
+        riskPct: pos.riskPct, riskEUR: pos.riskEUR,
+        ghostMaxRR: pos.ghost?.maxRR, ghostPeakPos: pos.ghost?.peakRRPos,
+        rrMilestonesCount: pos.ghost ? Object.keys(pos.ghost.rrMilestones||{}).length : 0,
+      });
+    }
+    // Show first raw position's exact field names
+    const firstRaw = Array.isArray(raw) ? raw[0] : null;
+    res.json({
+      rawCount: Array.isArray(raw) ? raw.length : 0,
+      memCount: mem.length,
+      firstRawFieldNames: firstRaw ? Object.keys(firstRaw) : [],
+      firstRaw: firstRaw,
+      memPositions: mem,
+      latestEquity,
+    });
+  } catch(e) { res.json({ error: e.message, stack: e.stack?.slice(0,300) }); }
+});
+
+// Force immediate sync
+app.post("/api/debug/force-sync", async (req, res) => {
+  try {
+    await _doSyncPositions();
+    const mem = [];
+    for (const [id, pos] of openPositions) {
+      mem.push({ id, symbol: pos.symbol, lots: pos.lots,
+        profit: pos.liveProfitMT5, price: pos.currentPrice,
+        ghostRR: pos.ghost?.maxRR, milestones: Object.keys(pos.ghost?.rrMilestones||{}).length });
+    }
+    res.json({ ok: true, positions: mem, count: openPositions.size });
   } catch(e) { res.json({ error: e.message }); }
+});
+
+// Debug: recent errors
+app.get("/api/debug/errors", (req, res) => {
+  res.json({ count: errorLog.length, errors: errorLog.slice(-50) });
+});
+
+// Debug: specific position ghost state
+app.get("/api/debug/ghost/:id", (req, res) => {
+  const pos = openPositions.get(req.params.id);
+  if (!pos) return res.json({ error: 'position not found', ids: [...openPositions.keys()] });
+  res.json({
+    position: { id: req.params.id, symbol: pos.symbol, direction: pos.direction,
+      lots: pos.lots, entry: pos.entry, sl: pos.sl, tp: pos.tp,
+      currentPrice: pos.currentPrice, liveProfitMT5: pos.liveProfitMT5 },
+    ghost: pos.ghost ? {
+      maxRR: pos.ghost.maxRR, peakRRPos: pos.ghost.peakRRPos, peakRRNeg: pos.ghost.peakRRNeg,
+      phantomSLHit: pos.ghost.phantomSLHit, stopReason: pos.ghost.stopReason,
+      rrMilestonesCount: Object.keys(pos.ghost.rrMilestones||{}).length,
+      rrMilestones: pos.ghost.rrMilestones,
+      slMilestones: pos.ghost.slMilestones,
+      openedAt: pos.ghost.openedAt,
+    } : null,
+  });
 });
 
 app.get("/health", (req, res) => {
@@ -1060,7 +1140,7 @@ app.post("/webhook", async (req, res) => {
           // Zoek een positie die matcht: zelfde symbol + direction + recent geopend
           const match = livePosNow.find(lp => {
             const lpDir = lp.type === 'POSITION_TYPE_BUY' || lp.type === 'buy' ? 'buy' : 'sell';
-            const openMs = lp.openTime ? new Date(lp.openTime).getTime() : 0;
+            const openMs = (lp.time ?? lp.openTime) ? new Date(lp.time ?? lp.openTime).getTime() : 0;
             return lp.symbol === mt5Sym && lpDir === direction
               && openMs >= placeTime - 30000
               && !openPositions.has(String(lp.id));
@@ -3903,7 +3983,7 @@ async function initBackground() {
   }
 
   // Start cron jobs
-  cron.schedule("*/30 * * * * *", syncPositions);
+  cron.schedule("*/10 * * * * *", syncPositions); // 10s for responsive P&L + milestones
   cron.schedule("*/5 * * * *",    runShadowSnapshots);
   cron.schedule("0 * * * *",      runTPOptimizer);
   console.log("[PRONTO-AI] Cron jobs active");
