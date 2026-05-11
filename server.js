@@ -1724,6 +1724,7 @@ tr:hover td{background:var(--bg4)}
       <div class="card-hdr">
         <div class="card-title"><div class="dot r" id="pos-dot"></div>Open Positions — Live</div>
         <div style="display:flex;gap:6px;align-items:center">
+          <button class="fb" id="pos-ms-btn" onclick="togglePosMilestones()" title="Toon/verberg milestone kolommen per 0.1R">± Milestones</button>
           <div class="cmeta" id="pos-meta">loading…</div>
         </div>
       </div>
@@ -1747,11 +1748,13 @@ tr:hover td{background:var(--bg4)}
             <th title="Best favorable RR reached">Peak+RR</th>
             <th title="Worst adverse % of SL used">Peak−RR%</th>
             <th title="Distance to TP in RR">→TP</th>
+            <th class="pos-ms-col" style="display:none;font-size:8px;color:var(--g)">+0.1</th><th class="pos-ms-col" style="display:none;font-size:8px;color:var(--g)">+0.2</th><th class="pos-ms-col" style="display:none;font-size:8px;color:var(--g)">+0.3</th><th class="pos-ms-col" style="display:none;font-size:8px;color:var(--g)">+0.4</th><th class="pos-ms-col" style="display:none;font-size:8px;color:var(--g)">+0.5</th><th class="pos-ms-col" style="display:none;font-size:8px;color:var(--g)">+0.6</th><th class="pos-ms-col" style="display:none;font-size:8px;color:var(--g)">+0.7</th><th class="pos-ms-col" style="display:none;font-size:8px;color:var(--g)">+0.8</th><th class="pos-ms-col" style="display:none;font-size:8px;color:var(--g)">+0.9</th><th class="pos-ms-col" style="display:none;font-size:8px;color:var(--g)">+1.0</th><th class="pos-ms-col" style="display:none;font-size:8px;color:var(--g)">+1.5</th><th class="pos-ms-col" style="display:none;font-size:8px;color:var(--g)">+2.0</th><th class="pos-ms-col" style="display:none;font-size:8px;color:var(--g)">+3.0</th>
+            <th class="pos-ms-col" style="display:none;font-size:8px;color:var(--r)">-1.0</th><th class="pos-ms-col" style="display:none;font-size:8px;color:var(--r)">-0.9</th><th class="pos-ms-col" style="display:none;font-size:8px;color:var(--r)">-0.8</th><th class="pos-ms-col" style="display:none;font-size:8px;color:var(--r)">-0.7</th><th class="pos-ms-col" style="display:none;font-size:8px;color:var(--r)">-0.6</th><th class="pos-ms-col" style="display:none;font-size:8px;color:var(--r)">-0.5</th><th class="pos-ms-col" style="display:none;font-size:8px;color:var(--r)">-0.4</th><th class="pos-ms-col" style="display:none;font-size:8px;color:var(--r)">-0.3</th><th class="pos-ms-col" style="display:none;font-size:8px;color:var(--r)">-0.2</th><th class="pos-ms-col" style="display:none;font-size:8px;color:var(--r)">-0.1</th>
             <th>Entry</th><th>SL</th><th>TP</th>
             <th>P&amp;L €</th><th>Lots</th><th>Risk %</th>
             <th>Opened</th>
           </tr></thead>
-          <tbody id="pos-body"><tr><td colspan="17" class="nd"><span class="spin">⟳</span></td></tr></tbody>
+          <tbody id="pos-body"><tr><td colspan="40" class="nd"><span class="spin">⟳</span></td></tr></tbody>
         </table>
       </div>
     </div>
@@ -2657,9 +2660,25 @@ async function loadPositions(){
       '<td class="cd">'+(lots!=null?f2(lots):'—')+'</td>'+
       '<td class="'+(rPct&&+rPct>0.04?'cr fw':rPct&&+rPct>0.025?'co':'cg')+'">'+(rPct!=null?rPct+'%':'—')+'</td>'+
       '<td class="cd" style="font-size:9px">'+dt(p.openedAt)+'</td>'+
+    // Milestone cells — hidden by default, shown when ± Milestones clicked
+    (()=>{
+      const rrMs = p.ghost?.rrMilestones ?? {};
+      const openedTs = p.openedAt ? new Date(p.openedAt).getTime() : null;
+      const favSteps=[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0,1.5,2.0,3.0];
+      const advSteps=[1.0,0.9,0.8,0.7,0.6,0.5,0.4,0.3,0.2,0.1];
+      const fmtMs = ts => {
+        if(!ts||!openedTs) return '—';
+        const mins=Math.round((ts-openedTs)/60000);
+        return mins<60 ? mins+'m' : Math.floor(mins/60)+'h'+(mins%60?String(mins%60).padStart(2,'0')+'m':'');
+      };
+      const f=favSteps.map(v=>'<td class="pos-ms-col" style="display:none;text-align:center;font-size:8px">'+(rrMs['+'+v.toFixed(1)]?'<span style="color:var(--g)">'+fmtMs(rrMs['+'+v.toFixed(1)])+'</span>':'<span style="color:var(--ink3)">—</span>')+'</td>').join('');
+      const a=advSteps.map(v=>'<td class="pos-ms-col" style="display:none;text-align:center;font-size:8px">'+(rrMs['-'+v.toFixed(1)]?'<span style="color:var(--r)">'+fmtMs(rrMs['-'+v.toFixed(1)])+'</span>':'<span style="color:var(--ink3)">—</span>')+'</td>').join('');
+      return f+a;
+    })()+
     '</tr>';
   }).join('');
 }
+
 
 // ── loadGhostTrackers — reuses /api/open-positions ghost data ─────
 async function loadGhostTrackers(){
@@ -2811,9 +2830,9 @@ function renderOverview(trades, daily, ghGrouped){
   // Build all sessions including anomalous ones (stock in asia/london = pre-restriction data)
   for(const tg of typeGroups){
     // For stock: show all sessions but mark non-NY as anomaly (historical pre-restriction)
-    // Include all actual sessions in data (including null/unknown/outside)
+    // For stock: only NY session (Asia/London deleted from DB on startup)
     const knownSessions = tg.label==='Stock'
-      ? ['ny','london','asia','outside']
+      ? ['ny']  // Asia/London stock trades permanently deleted from DB
       : tg.sessions;
     // Find extra sessions that exist in data but aren't in defined list
     const dataSessions = [...new Set(tg.arr.map(t=>t.session||'unknown'))];
@@ -2827,12 +2846,9 @@ function renderOverview(trades, daily, ghGrouped){
       const sb=st.filter(t=>t.direction==='sell'&&t.vwapPosition==='below').length;
       ba_t+=ba; bb_t+=bb; sa_t+=sa; sb_t+=sb;
       // Flag stock in non-NY session as anomaly (old data / possible index misclassification)
-      const isAnomalous = tg.label==='Stock' && sess!=='ny';
-      if(isAnomalous && (ba+bb+sa+sb)===0) continue; // skip empty anomaly rows
-      const anomalyNote = isAnomalous ? ' <span title="Historical data: stocks were traded before session restriction. May include misclassified indexes." style="color:var(--y);font-size:8px">⚠ old</span>' : '';
-      const rowStyle = isAnomalous ? ' style="opacity:0.55;font-style:italic"' : '';
-      const sessLabel = sess==='unknown' ? '<span class="cd" style="font-size:9px">?</span>' : sBadge(sess);
-      dRows.push('<tr'+rowStyle+'><td><span class="bd '+tg.cls+'">'+tg.label+'</span>'+anomalyNote+'</td><td>'+sessLabel+'</td><td class="cg fw">'+ba+'</td><td class="cg">'+bb+'</td><td class="cr fw">'+sa+'</td><td class="cr">'+sb+'</td><td class="cb fw">'+(ba+bb+sa+sb)+'</td></tr>');
+      const sessLabel = sess==='unknown' || sess===null ? '<span class="cd" style="font-size:9px">?sess</span>' : sBadge(sess);
+      if((ba+bb+sa+sb)===0) continue; // skip empty rows
+      dRows.push('<tr><td><span class="bd '+tg.cls+'">'+tg.label+'</span></td><td>'+sessLabel+'</td><td class="cg fw">'+ba+'</td><td class="cg">'+bb+'</td><td class="cr fw">'+sa+'</td><td class="cr">'+sb+'</td><td class="cb fw">'+(ba+bb+sa+sb)+'</td></tr>');
     }
   }
   setHtml('dist-body',dRows.join('')||emptyRow(7,'No trades after compliance date'));
@@ -2925,9 +2941,9 @@ function setGHF(k,v,btn){
   renderGhostHistory();
 }
 async function loadGhostHistory(){
-  // Use closeFrom/closeTo (filter by when ghost was CLOSED)
-  const from = _df.hist.openFrom || _df.hist.closeFrom || null;
-  const to   = _df.hist.openTo   || _df.hist.closeTo   || null;
+  // Ghost History date filter — filter by opened_at (when ghost tracker started)
+  const from = _df.hist.openFrom || null;
+  const to   = _df.hist.openTo   || null;
   let url='/api/ghost-history-by-pair';
   const params=[];
   if(from) params.push('from='+encodeURIComponent(from));
@@ -3075,6 +3091,13 @@ function renderGhostHistory(){
 function toggleGHHRow(key){ 
   const el=document.getElementById('ghh-d-'+key); 
   if(el) el.style.display=el.style.display==='none'?'':'none'; 
+}
+let _posMsVisible=false;
+function togglePosMilestones(){
+  _posMsVisible=!_posMsVisible;
+  document.querySelectorAll('.pos-ms-col').forEach(el=>{el.style.display=_posMsVisible?'':'none';});
+  const btn=document.getElementById('pos-ms-btn');
+  if(btn) btn.textContent=_posMsVisible?'✕ Milestones':'± Milestones';
 }
 let _ghhMsVisible=false;
 let _bgtMsVisible=false;
