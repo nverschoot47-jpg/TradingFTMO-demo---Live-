@@ -1887,39 +1887,6 @@ tr:hover td{background:var(--bg4)}
       </div>
     </div>
 
-    <!-- Trade Activity by Session/VWAP/Direction + asset split -->
-    <div class="card">
-      <div class="card-hdr">
-        <div class="card-title"><div class="dot" id="wr-dot"></div>Trade Activity — Session / VWAP / Direction</div>
-        <div class="cmeta" id="wr-meta">loading…</div>
-      </div>
-      <!-- Summary strip -->
-      <div class="kstrip">
-        <div class="ks"><div class="ksl">Total</div><div class="ksv cb" id="wr-tot">—</div><div class="kss" id="wr-tot-n"></div></div>
-        <div class="ks"><div class="ksl">Buy</div><div class="ksv cg" id="wr-buy">—</div></div>
-        <div class="ks"><div class="ksl">Sell</div><div class="ksv cr" id="wr-sell">—</div></div>
-        <div class="ks"><div class="ksl">Above VWAP</div><div class="ksv cb" id="wr-ab">—</div></div>
-        <div class="ks"><div class="ksl">Below VWAP</div><div class="ksv cp" id="wr-bw">—</div></div>
-        <div class="ks"><div class="ksl">Asia</div><div class="ksv cc" id="wr-asia">—</div></div>
-        <div class="ks"><div class="ksl">London</div><div class="ksv cg" id="wr-lon">—</div></div>
-        <div class="ks"><div class="ksl">New York</div><div class="ksv co" id="wr-ny">—</div></div>
-      </div>
-      <!-- Table per combo per asset type -->
-      <div id="wr-type-tabs" style="display:flex;gap:4px;padding:6px 12px;border-bottom:1px solid var(--bdr)">
-        <span class="fl">Asset:</span>
-        <button class="fb on" onclick="setWRType('all',this)">All</button>
-        <button class="fb" onclick="setWRType('forex',this)">Forex</button>
-        <button class="fb" onclick="setWRType('stock',this)">Stock</button>
-        <button class="fb" onclick="setWRType('index',this)">Index</button>
-        <button class="fb" onclick="setWRType('commodity',this)">Commodity</button>
-      </div>
-      <div class="tw">
-        <table><thead><tr>
-          <th>Session</th><th>Direction</th><th>VWAP</th><th>Asset Type</th><th>Trades</th>
-        </tr></thead><tbody id="wr-body"><tr><td colspan="5" class="nd"><span class="spin">⟳</span></td></tr></tbody></table>
-      </div>
-    </div>
-
     <!-- Trade Distribution by asset type -->
     <div class="card">
       <div class="card-hdr">
@@ -1950,6 +1917,39 @@ tr:hover td{background:var(--bg4)}
           <td id="ft-t" class="cb">—</td>
         </tr></tfoot>
         </table>
+      </div>
+    </div>
+
+    <!-- Trade Activity by Session/VWAP/Direction + asset split -->
+    <div class="card">
+      <div class="card-hdr">
+        <div class="card-title"><div class="dot" id="wr-dot"></div>Trade Activity — Session / VWAP / Direction</div>
+        <div class="cmeta" id="wr-meta">loading…</div>
+      </div>
+      <!-- Summary strip -->
+      <div class="kstrip">
+        <div class="ks"><div class="ksl">Total</div><div class="ksv cb" id="wr-tot">—</div><div class="kss" id="wr-tot-n"></div></div>
+        <div class="ks"><div class="ksl">Buy</div><div class="ksv cg" id="wr-buy">—</div></div>
+        <div class="ks"><div class="ksl">Sell</div><div class="ksv cr" id="wr-sell">—</div></div>
+        <div class="ks"><div class="ksl">Above VWAP</div><div class="ksv cb" id="wr-ab">—</div></div>
+        <div class="ks"><div class="ksl">Below VWAP</div><div class="ksv cp" id="wr-bw">—</div></div>
+        <div class="ks"><div class="ksl">Asia</div><div class="ksv cc" id="wr-asia">—</div></div>
+        <div class="ks"><div class="ksl">London</div><div class="ksv cg" id="wr-lon">—</div></div>
+        <div class="ks"><div class="ksl">New York</div><div class="ksv co" id="wr-ny">—</div></div>
+      </div>
+      <!-- Table per combo per asset type -->
+      <div id="wr-type-tabs" style="display:flex;gap:4px;padding:6px 12px;border-bottom:1px solid var(--bdr)">
+        <span class="fl">Asset:</span>
+        <button class="fb on" onclick="setWRType('all',this)">All</button>
+        <button class="fb" onclick="setWRType('forex',this)">Forex</button>
+        <button class="fb" onclick="setWRType('stock',this)">Stock</button>
+        <button class="fb" onclick="setWRType('index',this)">Index</button>
+        <button class="fb" onclick="setWRType('commodity',this)">Commodity</button>
+      </div>
+      <div class="tw">
+        <table><thead><tr>
+          <th>Session</th><th>Direction</th><th>VWAP</th><th>Asset Type</th><th>Trades</th>
+        </tr></thead><tbody id="wr-body"><tr><td colspan="5" class="nd"><span class="spin">⟳</span></td></tr></tbody></table>
       </div>
     </div>
 
@@ -2625,7 +2625,14 @@ const eu  = v => v==null?'—':((+v)>=0?'+':'')+'€'+(+v).toFixed(2);
 const pct = v => v==null?'—':(+v).toFixed(1)+'%';
 const pC  = v => (+v||0)>=0?'cg':'cr';
 const dt  = s => { try{ return new Date(s).toLocaleString('nl-BE',{timeZone:'Europe/Brussels',day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}); }catch{return s||'—';} };
-const dtS = s => { try{ return new Date(s).toLocaleDateString('nl-BE'); }catch{return s||'—';} };
+const dtS = s => {
+  if(!s) return '—';
+  try {
+    const d = new Date(s);
+    if(isNaN(d.getTime())) return '—';
+    return d.toLocaleDateString('nl-BE', {day:'2-digit',month:'2-digit',year:'numeric'});
+  } catch { return '—'; }
+};
 const msFmt = m => { if(!m&&m!==0) return '—'; m=Math.round(+m); const h=Math.floor(m/60),mn=m%60; return h>0?h+'h'+mn+'m':mn+'m'; };
 // fPrice: correct decimal places per asset type
 function fPrice(v, symbol) {
