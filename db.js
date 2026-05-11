@@ -2270,7 +2270,7 @@ async function loadDailyBreakdown() {
         CAST(COALESCE(gt.peak_rr_neg, gt.max_sl_pct_used, 0)  AS FLOAT) AS "peakRRNeg",
         CAST(ct.realized_pnl_eur AS FLOAT)                     AS pnl,
         COALESCE(gt.stop_reason, ct.close_reason)              AS "stopReason",
-        COALESCE(ct.opened_at, ct.closed_at)::text          AS "openedAt"
+        ct.opened_at                                           AS "openedAt"
       FROM closed_trades ct
       LEFT JOIN ghost_trades gt ON gt.position_id = ct.position_id
       WHERE (ct.exclude_from_ev IS NULL OR ct.exclude_from_ev = FALSE)
@@ -2287,7 +2287,7 @@ async function loadDailyBreakdown() {
         CAST(COALESCE(gt.peak_rr_neg, gt.max_sl_pct_used, 0)  AS FLOAT) AS "peakRRNeg",
         CAST(ct.realized_pnl_eur AS FLOAT)                     AS pnl,
         COALESCE(gt.stop_reason, ct.close_reason)              AS "stopReason",
-        COALESCE(ct.opened_at, ct.closed_at)::text          AS "openedAt"
+        ct.opened_at                                           AS "openedAt"
       FROM closed_trades ct
       LEFT JOIN ghost_trades gt ON gt.position_id = ct.position_id
       WHERE (ct.exclude_from_ev IS NULL OR ct.exclude_from_ev = FALSE)
