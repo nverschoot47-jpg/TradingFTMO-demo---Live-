@@ -47,7 +47,7 @@ const {
 } = require("./session");
 
 // ── Version ──────────────────────────────────────────────────────
-const VERSION = "14.0.0";
+const VERSION = "14.1.0"; // weekend sync + ghost history combined + stock fix
 
 // ── Config ───────────────────────────────────────────────────────
 const PORT           = process.env.PORT           || 3000;
@@ -88,6 +88,8 @@ app.use(helmet({ contentSecurityPolicy: false }));
 app.use(express.json({ limit: "1mb" }));
 
 const server = app.listen(PORT, () => {
+  console.log(`[PRONTO-AI v${VERSION}] Server running on port ${PORT}`);
+  console.log('[FIXES] weekend-sync | ghost-combined | stock-session | peak-rr-neg');
   console.log(`[PRONTO-AI] Listening on port ${PORT} — DB init starting…`);
 });
 
@@ -2809,11 +2811,16 @@ function renderOverview(trades, daily, ghGrouped){
   // Build all sessions including anomalous ones (stock in asia/london = pre-restriction data)
   for(const tg of typeGroups){
     // For stock: show all sessions but mark non-NY as anomaly (historical pre-restriction)
-    const allSessions = tg.label==='Stock'
-      ? ['ny','london','asia','outside'].filter(s=>tg.arr.some(t=>t.session===s))
+    // Include all actual sessions in data (including null/unknown/outside)
+    const knownSessions = tg.label==='Stock'
+      ? ['ny','london','asia','outside']
       : tg.sessions;
+    // Find extra sessions that exist in data but aren't in defined list
+    const dataSessions = [...new Set(tg.arr.map(t=>t.session||'unknown'))];
+    const extraSessions = dataSessions.filter(s=>!knownSessions.includes(s));
+    const allSessions = [...knownSessions, ...extraSessions];
     for(const sess of allSessions){
-      const st=tg.arr.filter(t=>t.session===sess); if(!st.length) continue;
+      const st=tg.arr.filter(t=>(t.session||'unknown')===sess); if(!st.length) continue;
       const ba=st.filter(t=>t.direction==='buy'&&t.vwapPosition==='above').length;
       const bb=st.filter(t=>t.direction==='buy'&&t.vwapPosition==='below').length;
       const sa=st.filter(t=>t.direction==='sell'&&t.vwapPosition==='above').length;
@@ -2824,7 +2831,8 @@ function renderOverview(trades, daily, ghGrouped){
       if(isAnomalous && (ba+bb+sa+sb)===0) continue; // skip empty anomaly rows
       const anomalyNote = isAnomalous ? ' <span title="Historical data: stocks were traded before session restriction. May include misclassified indexes." style="color:var(--y);font-size:8px">⚠ old</span>' : '';
       const rowStyle = isAnomalous ? ' style="opacity:0.55;font-style:italic"' : '';
-      dRows.push('<tr'+rowStyle+'><td><span class="bd '+tg.cls+'">'+tg.label+'</span>'+anomalyNote+'</td><td>'+sBadge(sess)+'</td><td class="cg fw">'+ba+'</td><td class="cg">'+bb+'</td><td class="cr fw">'+sa+'</td><td class="cr">'+sb+'</td><td class="cb fw">'+(ba+bb+sa+sb)+'</td></tr>');
+      const sessLabel = sess==='unknown' ? '<span class="cd" style="font-size:9px">?</span>' : sBadge(sess);
+      dRows.push('<tr'+rowStyle+'><td><span class="bd '+tg.cls+'">'+tg.label+'</span>'+anomalyNote+'</td><td>'+sessLabel+'</td><td class="cg fw">'+ba+'</td><td class="cg">'+bb+'</td><td class="cr fw">'+sa+'</td><td class="cr">'+sb+'</td><td class="cb fw">'+(ba+bb+sa+sb)+'</td></tr>');
     }
   }
   setHtml('dist-body',dRows.join('')||emptyRow(7,'No trades after compliance date'));
