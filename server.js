@@ -271,15 +271,20 @@ function updateGhost(ghost, price) {
   for (const p of [25, 50, 75, 90, 100])
     if (slUsed >= p && !ghost.slMilestones[p]) ghost.slMilestones[p] = new Date().toISOString();
   // FAV milestones: 0.1R steps from 0.1 to 15.0
+  // Key format: '+0.1', '+0.2', ... '+15.0' (dashboard expects '+' prefix)
   for (let rv = 0.1; rv <= 15.0 + 1e-9; rv = Math.round((rv + 0.1) * 10) / 10) {
-    const key = rv.toFixed(1);
-    if (rr >= rv - 1e-9 && !ghost.rrMilestones[key]) ghost.rrMilestones[key] = new Date().toISOString();
+    const key = '+' + rv.toFixed(1);
+    if (rr >= rv - 1e-9 && !ghost.rrMilestones[key]) {
+      ghost.rrMilestones[key] = Date.now(); // timestamp in ms for elapsed time calc
+    }
   }
-  // ADV milestones: 0.1 steps from 0.1 to 1.0 (stored as negative: -0.1 to -1.0)
+  // ADV milestones: 0.1 steps from 0.1 to 1.0 (stored as -0.1 to -1.0)
   const advRR = isBuy ? (entry - price) / slRange : (price - entry) / slRange;
   for (let rv = 0.1; rv <= 1.0 + 1e-9; rv = Math.round((rv + 0.1) * 10) / 10) {
     const key = '-' + rv.toFixed(1);
-    if (advRR >= rv - 1e-9 && !ghost.rrMilestones[key]) ghost.rrMilestones[key] = new Date().toISOString();
+    if (advRR >= rv - 1e-9 && !ghost.rrMilestones[key]) {
+      ghost.rrMilestones[key] = Date.now(); // timestamp in ms
+    }
   }
   const hitSL = isBuy ? price <= sl : price >= sl;
   if (hitSL && !ghost.phantomSLHit) {
@@ -468,12 +473,19 @@ async function adoptPosition(lp) {
   // Estimate SL pct from entry/sl distance
   const slPct = entry > 0 && sl > 0 ? Math.abs(entry - sl) / entry : 0.003;
 
-  // Use ALL available MT5 data for adopted positions
-  const liveLots = lp.volume != null ? Math.max(0, parseFloat(lp.volume)) : lots;
-  const liveSL   = lp.stopLoss ? parseFloat(lp.stopLoss) : sl;
-  const liveTP   = lp.takeProfit ? (parseFloat(lp.takeProfit) || null) : tp;
-  const livePnl  = lp.profit != null ? parseFloat(lp.profit) : null;
+  // Use ALL available MT5 data for adopted positions — handle all field variants
+  const lpVol2    = lp.volume ?? lp.currentVolume ?? lp.size;
+  const lpSL2     = lp.stopLoss ?? lp.currentStopLoss;
+  const lpTP2     = lp.takeProfit ?? lp.currentTakeProfit;
+  const lpProfit2 = lp.profit ?? lp.unrealizedProfit ?? lp.currentProfit;
+  const lpPrice2  = lp.currentPrice ?? lp.currentBid ?? lp.currentAsk ?? lp.openPrice;
+  const liveLots  = lpVol2 != null ? Math.max(0, parseFloat(lpVol2)) : lots;
+  const liveSL    = lpSL2 ? parseFloat(lpSL2) : sl;
+  const liveTP    = lpTP2 ? (parseFloat(lpTP2) || null) : tp;
+  const livePnl   = lpProfit2 != null ? parseFloat(lpProfit2) : null;
   const liveEntry = lp.openPrice ? parseFloat(lp.openPrice) : entry;
+  const livePrice = lpPrice2 ? parseFloat(lpPrice2) : null;
+  logEvent('ADOPT', { id: lp.id, symbol: lp.symbol, lots: liveLots, profit: livePnl, price: livePrice });
   // Override with live values
   if (liveLots)  lots  = liveLots;
   if (liveSL)    sl    = liveSL;
@@ -502,6 +514,7 @@ async function adoptPosition(lp) {
     tpRRUsed: tp && sl && entry ? Math.abs(tp - entry) / Math.abs(entry - sl) : null,
     slMultiplier: null, tradeNumber: parsed.tradeNumber,
     liveProfitMT5: livePnl ?? null,
+    currentPrice:  livePrice ?? null,
     ghost: null,
   };
   pos.ghost = initGhost({ ...pos, slPct });
@@ -584,13 +597,35 @@ async function _doSyncPositions() {
       // ── v13.5: positie bestaat in MT5 maar niet in memory → adopteer ──
       await adoptPosition(lp);
     } else {
-      // ALWAYS sync MT5 position data regardless of market state (weekends too)
-      if (lp.volume != null)  pos.lots          = Math.max(0, parseFloat(lp.volume));
-      if (lp.stopLoss)        pos.sl            = parseFloat(lp.stopLoss);
-      if (lp.takeProfit)      pos.tp            = parseFloat(lp.takeProfit) || null;
-      if (lp.profit != null)  pos.liveProfitMT5 = parseFloat(lp.profit);
-      if (lp.currentPrice)    pos.currentPrice  = lp.currentPrice;
-      if (lp.openPrice)       pos.entry         = pos.entry || parseFloat(lp.openPrice);
+      // ALWAYS sync MT5 position data — handle multiple MetaAPI field name variants
+      // Lots: volume / currentVolume / size
+      const lpVol = lp.volume ?? lp.currentVolume ?? lp.size;
+      if (lpVol != null) pos.lots = Math.max(0, parseFloat(lpVol));
+
+      // SL / TP: currentStopLoss fallback
+      const lpSL = lp.stopLoss ?? lp.currentStopLoss;
+      const lpTP = lp.takeProfit ?? lp.currentTakeProfit;
+      if (lpSL) pos.sl = parseFloat(lpSL);
+      if (lpTP) pos.tp = parseFloat(lpTP) || null;
+
+      // P&L: profit / unrealizedProfit / currentProfit / swap included
+      const lpProfit = lp.profit ?? lp.unrealizedProfit ?? lp.currentProfit;
+      if (lpProfit != null) pos.liveProfitMT5 = parseFloat(lpProfit);
+
+      // Current price: currentPrice / currentBid / currentAsk / openPrice fallback
+      const lpPrice = lp.currentPrice ?? lp.currentBid ?? lp.currentAsk ?? lp.openPrice;
+      if (lpPrice) pos.currentPrice = parseFloat(lpPrice);
+
+      // Entry price: openPrice
+      if (lp.openPrice) pos.entry = pos.entry || parseFloat(lp.openPrice);
+
+      // Log first time we get data for a position (debugging)
+      if (!pos._synced) {
+        pos._synced = true;
+        logEvent('POS_SYNC', { id: pos.positionId, symbol: pos.symbol,
+          lots: pos.lots, profit: pos.liveProfitMT5, price: pos.currentPrice,
+          sl: pos.sl, tp: pos.tp });
+      }
       // Recalculate riskPct/riskEUR from live lots + sl every sync
       // This corrects any corrupted values from previous deploys
       if (pos.lots && pos.entry && pos.sl) {
@@ -612,7 +647,12 @@ async function _doSyncPositions() {
           console.warn(`[Sync] Skipping ghost ${id} ${pos.symbol} — missing direction/entry/sl`);
           continue;
         }
-        updateGhost(pos.ghost, lp.currentPrice);
+        // Use best available price for ghost tracking
+        const priceForGhost = lp.currentPrice ?? lp.currentBid ?? lp.currentAsk ?? lp.openPrice;
+        if (priceForGhost) {
+          updateGhost(pos.ghost, priceForGhost);
+          pos.ghost.lastPriceTs = Date.now();
+        }
         if (dbReady) db.saveGhostState(pos.ghost).catch(() => {});
       }
     }
@@ -707,6 +747,14 @@ app.get("/dashboard", (req, res) => {
 });
 
 // ── Health ────────────────────────────────────────────────────────
+// Debug: show raw MetaAPI data for a position
+app.get("/api/debug/positions", async (req, res) => {
+  try {
+    const d = await metaFetch(`/users/current/accounts/${META_ACCOUNT}/positions`);
+    res.json({ count: Array.isArray(d) ? d.length : 0, positions: d });
+  } catch(e) { res.json({ error: e.message }); }
+});
+
 app.get("/health", (req, res) => {
   res.json({
     ok: true, version: VERSION, dbReady,
@@ -2668,8 +2716,12 @@ async function loadPositions(){
       const advSteps=[1.0,0.9,0.8,0.7,0.6,0.5,0.4,0.3,0.2,0.1];
       const fmtMs = ts => {
         if(!ts||!openedTs) return '—';
-        const mins=Math.round((ts-openedTs)/60000);
-        return mins<60 ? mins+'m' : Math.floor(mins/60)+'h'+(mins%60?String(mins%60).padStart(2,'0')+'m':'');
+        // Handle both ms timestamp (number) and ISO string
+        const tsMs = typeof ts === 'number' ? ts : new Date(ts).getTime();
+        if(!tsMs || isNaN(tsMs)) return '—';
+        const mins = Math.round((tsMs - openedTs) / 60000);
+        if(mins < 0) return '—';
+        return mins < 60 ? mins+'m' : Math.floor(mins/60)+'h'+(mins%60 ? String(mins%60).padStart(2,'0')+'m' : '');
       };
       const f=favSteps.map(v=>'<td class="pos-ms-col" style="display:none;text-align:center;font-size:8px">'+(rrMs['+'+v.toFixed(1)]?'<span style="color:var(--g)">'+fmtMs(rrMs['+'+v.toFixed(1)])+'</span>':'<span style="color:var(--ink3)">—</span>')+'</td>').join('');
       const a=advSteps.map(v=>'<td class="pos-ms-col" style="display:none;text-align:center;font-size:8px">'+(rrMs['-'+v.toFixed(1)]?'<span style="color:var(--r)">'+fmtMs(rrMs['-'+v.toFixed(1)])+'</span>':'<span style="color:var(--ink3)">—</span>')+'</td>').join('');
@@ -2704,9 +2756,14 @@ async function loadGhostTrackers(){
   setText('gh-el',msFmt(avgEl));
 
   const msT=(ms,opened,isFav)=>{
-    const cls='td class="'+(isFav?'ms-fav cg':'ms-adv cr')+'" style="font-size:8px"';
+    const cls='td class="'+(isFav?'ms-fav cg':'ms-adv cr')+'" style="font-size:8px;min-width:30px"';
     if(!ms||!opened) return '<'+cls+'>—</td>';
-    const mins=Math.round((new Date(ms)-new Date(opened))/60000);
+    // Handle both ms (number) and ISO string timestamps
+    const tsMs  = typeof ms     === 'number' ? ms     : new Date(ms).getTime();
+    const opMs  = typeof opened === 'number' ? opened : new Date(opened).getTime();
+    if(isNaN(tsMs)||isNaN(opMs)) return '<'+cls+'>—</td>';
+    const mins=Math.round((tsMs-opMs)/60000);
+    if(mins<0) return '<'+cls+'>—</td>';
     return '<'+cls+'>'+msFmt(mins)+'</td>';
   };
   const tbody=document.getElementById('gh-body');
@@ -2733,8 +2790,9 @@ async function loadGhostTrackers(){
         return msT(favMs['-'+v.toFixed(1)]||null, g.openedAt, false);
       }).join('')+
       FAV_STEPS.map(v=>{
-        // Keys always stored as strings like "0.1","1.1" etc — direct lookup only
-        return msT(favMs[v.toFixed(1)]||null, g.openedAt, true);
+        // Support both old format ('0.1') and new format ('+0.1')
+        const key = v.toFixed(1);
+        return msT(favMs['+'+key] ?? favMs[key] ?? null, g.openedAt, true);
       }).join('')+
       '<td class="cd">'+msFmt(elapsed)+'</td>'+
       '<td class="cd" style="font-size:9px">'+
@@ -3584,7 +3642,10 @@ async function loadShadowPlaybook() {
       '<td class="cd" style="font-size:9px">'+dt(bg.openedAt)+'</td>'+
       '<td class="cd">'+msFmt(elapsed)+'</td>'+
       [1.0,0.9,0.8,0.7,0.6,0.5,0.4,0.3,0.2,0.1].map(v=>msBgt(rrMs['-'+v.toFixed(1)]||null,false)).join('')+
-      (()=>{let s='';for(let v=0.1;v<=15.0+1e-9;v=Math.round((v+0.1)*10)/10)s+=msBgt(rrMs[v.toFixed(1)]||null,true);return s;})()
+      (()=>{let s='';for(let v=0.1;v<=15.0+1e-9;v=Math.round((v+0.1)*10)/10){
+        const k=v.toFixed(1);
+        s+=msBgt(rrMs['+'+k]??rrMs[k]??null,true);
+      }return s;})()
     +'</tr>';
   }).join('') : emptyRow(170, 'Geen actieve blocked ghosts'));
 
