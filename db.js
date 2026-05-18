@@ -111,8 +111,12 @@ function setComplianceDateLive(isoStr) {
 
 const { Pool } = require("pg");
 
+// DATABASE_URL priority: env var (Railway injects this) → hardcoded fallback (nieuwe DB)
+const DB_URL = process.env.DATABASE_URL
+  || 'postgresql://postgres:fjugQtTywQsHUkMnmUfWxIaQBIYfelyb@postgres-4ncl.railway.internal:5432/railway';
+
 const pool = new Pool({
-  connectionString:        process.env.DATABASE_URL,
+  connectionString:        DB_URL,
   ssl:                     { rejectUnauthorized: false },
   max:                     8,     // explicit pool size (Railway free: max 10 connections)
   connectionTimeoutMillis: 5000,
@@ -733,7 +737,45 @@ async function initDB() {
   await safeAlter(`ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS ev_mult   NUMERIC DEFAULT 1.0`);
   await safeAlter(`ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS day_mult  NUMERIC DEFAULT 1.0`);
   await safeAlter(`ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS sl_milestones JSONB DEFAULT '{}'::jsonb`);
-  console.log('[DB] Safe migrations complete');
+  // ── v14.2 migrations ─────────────────────────────────────────────────────
+  // ghost_trades: all columns needed for full MT5 + milestone data storage
+  await safeAlter(`ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS sl_hit_at        TIMESTAMPTZ`);
+  await safeAlter(`ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS key_count         INTEGER DEFAULT 1`);
+  await safeAlter(`ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS vwap_band_pct    NUMERIC`);
+  await safeAlter(`ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS sl_milestones    JSONB`);
+  await safeAlter(`ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS rr_milestones    JSONB`);
+  await safeAlter(`ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS peak_rr_pos      NUMERIC DEFAULT 0`);
+  await safeAlter(`ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS peak_rr_neg      NUMERIC DEFAULT 0`);
+  await safeAlter(`ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS mt5_symbol       TEXT`);
+  await safeAlter(`ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS type             TEXT`);
+  await safeAlter(`ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS sub_session      TEXT`);
+  // ghost_state: same new fields
+  await safeAlter(`ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS sl_hit_at       TIMESTAMPTZ`);
+  await safeAlter(`ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS key_count        INTEGER DEFAULT 1`);
+  await safeAlter(`ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS vwap_band_pct   NUMERIC`);
+  await safeAlter(`ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS sub_session      TEXT`);
+  await safeAlter(`ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS mt5_symbol       TEXT`);
+  await safeAlter(`ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS type             TEXT`);
+  // blocked_ghost_tracker: block_types TEXT[] for multi-block (VWAP+DUP at same time)
+  // v14.2 stap1: NY_NIGHT and ASIA_MORNING are now stored as separate block types
+  await safeAlter(`ALTER TABLE blocked_ghost_tracker ADD COLUMN IF NOT EXISTS block_types      TEXT[] DEFAULT '{}'::text[]`);
+  // sub_session: NY_DEAD_ZONE|NY_NIGHT|ASIA_MORNING|VWAP_EXHAUSTION|DUPLICATE_POSITION
+  await safeAlter(`ALTER TABLE blocked_ghost_tracker ADD COLUMN IF NOT EXISTS sub_session      TEXT`);
+  await safeAlter(`ALTER TABLE blocked_ghost_tracker ADD COLUMN IF NOT EXISTS sl_hit_at        TIMESTAMPTZ`);
+  await safeAlter(`ALTER TABLE blocked_ghost_tracker ADD COLUMN IF NOT EXISTS key_count         INTEGER DEFAULT 1`);
+  await safeAlter(`ALTER TABLE blocked_ghost_tracker ADD COLUMN IF NOT EXISTS realized_pnl_eur  NUMERIC`);
+  await safeAlter(`ALTER TABLE blocked_ghost_tracker ADD COLUMN IF NOT EXISTS lots              NUMERIC`);
+  // blocked_ghost_state: same new fields
+  await safeAlter(`ALTER TABLE blocked_ghost_state ADD COLUMN IF NOT EXISTS block_types      TEXT[] DEFAULT '{}'::text[]`);
+  await safeAlter(`ALTER TABLE blocked_ghost_state ADD COLUMN IF NOT EXISTS sl_hit_at        TIMESTAMPTZ`);
+  await safeAlter(`ALTER TABLE blocked_ghost_state ADD COLUMN IF NOT EXISTS key_count         INTEGER DEFAULT 1`);
+  await safeAlter(`ALTER TABLE blocked_ghost_state ADD COLUMN IF NOT EXISTS lots              NUMERIC`);
+  // signal_log: key_count + block_types for multi-block logging
+  await safeAlter(`ALTER TABLE signal_log ADD COLUMN IF NOT EXISTS key_count    INTEGER DEFAULT 1`);
+  await safeAlter(`ALTER TABLE signal_log ADD COLUMN IF NOT EXISTS block_types  TEXT[] DEFAULT '{}'::text[]`);
+  await safeAlter(`ALTER TABLE signal_log ADD COLUMN IF NOT EXISTS sub_session  TEXT`);
+  await safeAlter(`ALTER TABLE signal_log ADD COLUMN IF NOT EXISTS asset_type   TEXT`);
+  console.log('[DB] Safe migrations complete — v14.2');
 }
 
 // ── closed_trades ──────────────────────────────────────────────
@@ -2490,14 +2532,17 @@ async function loadBlockedRaw(since, until) {
 // Sla een actieve blocked ghost op (persist over restart)
 async function saveBlockedGhostState(g) {
   try {
+    // blockTypes: array of all block reasons (a signal can be VWAP+DUP simultaneously)
+    const blockTypes = g.blockTypes ?? (g.blockType ? [g.blockType] : []);
     await pool.query(`
       INSERT INTO blocked_ghost_state
-        (id, block_type, optimizer_key, symbol, mt5_symbol, session, direction,
+        (id, block_type, block_types, optimizer_key, symbol, mt5_symbol, session, direction,
          vwap_position, entry, sl, sl_pct, tp_rr_used,
          max_price, max_rr, max_sl_pct_used, peak_rr_pos, peak_rr_neg,
          sl_milestones, rr_milestones, vwap_band_pct, block_reason,
+         sl_hit_at, key_count, lots,
          opened_at, updated_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,NOW())
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,NOW())
       ON CONFLICT (id) DO UPDATE SET
         max_price       = EXCLUDED.max_price,
         max_rr          = EXCLUDED.max_rr,
@@ -2505,13 +2550,18 @@ async function saveBlockedGhostState(g) {
         peak_rr_pos     = GREATEST(EXCLUDED.peak_rr_pos, blocked_ghost_state.peak_rr_pos),
         peak_rr_neg     = GREATEST(EXCLUDED.peak_rr_neg, blocked_ghost_state.peak_rr_neg),
         sl_milestones   = COALESCE(EXCLUDED.sl_milestones, blocked_ghost_state.sl_milestones),
-        rr_milestones   = CASE 
+        rr_milestones   = CASE
           WHEN EXCLUDED.rr_milestones IS NOT NULL THEN EXCLUDED.rr_milestones
-          ELSE blocked_ghost_state.rr_milestones 
+          ELSE blocked_ghost_state.rr_milestones
         END,
+        block_types     = EXCLUDED.block_types,
+        sl_hit_at       = COALESCE(EXCLUDED.sl_hit_at, blocked_ghost_state.sl_hit_at),
+        key_count       = EXCLUDED.key_count,
+        lots            = COALESCE(EXCLUDED.lots, blocked_ghost_state.lots),
         updated_at      = NOW()
     `, [
-      g.id, g.blockType, g.optimizerKey, g.symbol, g.mt5Symbol ?? g.symbol,
+      g.id, g.blockType, blockTypes,
+      g.optimizerKey, g.symbol, g.mt5Symbol ?? g.symbol,
       g.session, g.direction, g.vwapPosition ?? 'unknown',
       g.entry, g.sl, g.slPct ?? null, g.tpRRUsed ?? null,
       g.maxPrice ?? g.entry, g.maxRR ?? 0, g.maxSlPctUsed ?? 0,
@@ -2519,6 +2569,7 @@ async function saveBlockedGhostState(g) {
       g.slMilestones && Object.keys(g.slMilestones).length > 0 ? JSON.stringify(g.slMilestones) : null,
       g.rrMilestones && Object.keys(g.rrMilestones).length > 0 ? JSON.stringify(g.rrMilestones) : null,
       g.vwapBandPct ?? null, g.blockReason ?? null,
+      g.slHitAt ?? null, g.keyCount ?? 1, g.lots ?? null,
       g.openedAt,
     ]);
   } catch (e) { console.warn('[!] saveBlockedGhostState:', e.message); }
@@ -2528,7 +2579,8 @@ async function loadAllBlockedGhostStates() {
   try {
     const r = await pool.query(`
       SELECT
-        id, block_type AS "blockType", optimizer_key AS "optimizerKey",
+        id, block_type AS "blockType", block_types AS "blockTypes",
+        optimizer_key AS "optimizerKey",
         symbol, mt5_symbol AS "mt5Symbol", session, direction,
         vwap_position AS "vwapPosition",
         CAST(entry AS FLOAT) AS entry, CAST(sl AS FLOAT) AS sl,
@@ -2543,6 +2595,9 @@ async function loadAllBlockedGhostStates() {
         rr_milestones AS "rrMilestones",
         CAST(vwap_band_pct AS FLOAT) AS "vwapBandPct",
         block_reason AS "blockReason",
+        sl_hit_at AS "slHitAt",
+        key_count AS "keyCount",
+        CAST(lots AS FLOAT) AS lots,
         opened_at AS "openedAt"
       FROM blocked_ghost_state
     `);
@@ -2559,16 +2614,20 @@ async function deleteBlockedGhostState(id) {
 // Sla een afgesloten blocked ghost op in de history tabel
 async function saveBlockedGhostTrade(g) {
   try {
+    const blockTypes = g.blockTypes ?? (g.blockType ? [g.blockType] : []);
     await pool.query(`
       INSERT INTO blocked_ghost_tracker
-        (block_type, optimizer_key, symbol, mt5_symbol, session, direction,
+        (block_type, block_types, optimizer_key, symbol, mt5_symbol, session, direction,
          vwap_position, entry, sl, sl_pct, tp_rr_used,
          max_price, max_rr, max_sl_pct_used, peak_rr_pos, peak_rr_neg,
          sl_milestones, rr_milestones, phantom_sl_hit, stop_reason,
-         time_to_sl_min, vwap_band_pct, block_reason, opened_at, closed_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
+         time_to_sl_min, vwap_band_pct, block_reason,
+         sl_hit_at, key_count, lots, realized_pnl_eur,
+         opened_at, closed_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30)
     `, [
-      g.blockType, g.optimizerKey, g.symbol, g.mt5Symbol ?? g.symbol,
+      g.blockType, blockTypes,
+      g.optimizerKey, g.symbol, g.mt5Symbol ?? g.symbol,
       g.session, g.direction, g.vwapPosition ?? 'unknown',
       g.entry, g.sl, g.slPct ?? null, g.tpRRUsed ?? null,
       g.maxPrice ?? null, g.maxRR ?? 0, g.maxSlPctUsed ?? 0,
@@ -2577,7 +2636,9 @@ async function saveBlockedGhostTrade(g) {
       g.rrMilestones ? JSON.stringify(g.rrMilestones) : null,
       g.phantomSLHit ?? false, g.stopReason ?? null,
       g.timeToSLMin ?? null, g.vwapBandPct ?? null,
-      g.blockReason ?? null, g.openedAt, g.closedAt ?? new Date().toISOString(),
+      g.blockReason ?? null,
+      g.slHitAt ?? null, g.keyCount ?? 1, g.lots ?? null, g.realizedPnlEUR ?? null,
+      g.openedAt, g.closedAt ?? new Date().toISOString(),
     ]);
   } catch (e) { console.warn('[!] saveBlockedGhostTrade:', e.message); }
 }
@@ -2587,15 +2648,29 @@ async function loadBlockedGhostHistory(blockType, from, to) {
   try {
     const cutoff  = from ?? '2000-01-01';
     const ceiling = to   ?? '2099-12-31';
-    // OUTSIDE_WINDOW covers both overnight and stock-outside-market blocks
+    // NY block includes NY_DEAD_ZONE + OUTSIDE_WINDOW (session is always 'ny' now)
     const safeType = (blockType||'NY_DEAD_ZONE').replace(/'/g,"''");
-    const blockFilter = blockType === 'OUTSIDE_WINDOW'
-      ? `block_type IN ('OUTSIDE_WINDOW','STOCK_OUTSIDE_MARKET')`
+    // STAP 6 FIX: explicit text casts + include NY_NIGHT and ASIA_MORNING in timezone filter
+    const blockFilter = (blockType === 'NY_DEAD_ZONE' || blockType === 'OUTSIDE_WINDOW'
+                      || blockType === 'NY_NIGHT'     || blockType === 'ASIA_MORNING'
+                      || blockType === 'TIMEZONE')
+      ? `(block_type IN ('NY_DEAD_ZONE','NY_NIGHT','ASIA_MORNING','OUTSIDE_WINDOW','STOCK_OUTSIDE_MARKET')
+          OR 'NY_DEAD_ZONE'::text   = ANY(COALESCE(block_types, ARRAY[block_type]::text[]))
+          OR 'NY_NIGHT'::text       = ANY(COALESCE(block_types, ARRAY[block_type]::text[]))
+          OR 'ASIA_MORNING'::text   = ANY(COALESCE(block_types, ARRAY[block_type]::text[]))
+          OR 'OUTSIDE_WINDOW'::text = ANY(COALESCE(block_types, ARRAY[block_type]::text[])))`
+      : blockType === 'DUPLICATE_POSITION'
+      ? `(block_type = 'DUPLICATE_POSITION'
+          OR 'DUPLICATE_POSITION'::text = ANY(COALESCE(block_types, ARRAY[block_type]::text[])))`
+      : blockType === 'VWAP_EXHAUSTION'
+      ? `(block_type = 'VWAP_EXHAUSTION'
+          OR 'VWAP_EXHAUSTION'::text = ANY(COALESCE(block_types, ARRAY[block_type]::text[])))`
       : `block_type = '${safeType}'`;
     const r = await pool.query(`
       SELECT
         id,
         block_type                                    AS "blockType",
+        COALESCE(block_types, ARRAY[block_type])      AS "blockTypes",
         optimizer_key                                 AS "optimizerKey",
         symbol, session, direction,
         vwap_position                                 AS "vwapPosition",
@@ -2614,6 +2689,10 @@ async function loadBlockedGhostHistory(blockType, from, to) {
         sl_milestones                                 AS "slMilestones",
         CAST(vwap_band_pct   AS FLOAT)                AS "vwapBandPct",
         block_reason                                  AS "blockReason",
+        sl_hit_at                                     AS "slHitAt",
+        key_count                                     AS "keyCount",
+        CAST(lots            AS FLOAT)                AS lots,
+        CAST(realized_pnl_eur AS FLOAT)               AS "realizedPnlEUR",
         opened_at                                     AS "openedAt",
         closed_at                                     AS "closedAt"
       FROM blocked_ghost_tracker
