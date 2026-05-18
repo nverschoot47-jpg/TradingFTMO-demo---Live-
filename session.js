@@ -94,8 +94,12 @@ const STOCK_SL_BUFFER_MULT = 3.0;   // stocks: 2× de standaard buffer
 // in de openingsperiode van de NYSE.
 // Indexes zijn NIET geblokkeerd — die volgen eigen NYSE open dynamiek.
 // ================================================================
-const NY_DEAD_ZONE_START = 1530;  // 15:30 Brussels (hhmm formaat)
-const NY_DEAD_ZONE_END   = 1800;  // 18:00 Brussels (hhmm formaat)
+const NY_DEAD_ZONE_START  = 1530;  // 15:30 Brussels — NY dead zone start
+const NY_DEAD_ZONE_END    = 1800;  // 18:00 Brussels — NY dead zone end
+const NY_NIGHT_START      = 2100;  // 21:00 Brussels — NY night start
+const NY_NIGHT_END        = 2400;  // 00:00 Brussels — NY night end (midnight)
+const ASIA_MORNING_START  =    0;  // 00:00 Brussels — Asia morning start
+const ASIA_MORNING_END    =  200;  // 02:00 Brussels — Asia morning end / Asia proper start
 
 // ── Approved symbol catalog ─────────────────────────────────────
 // ONLY these symbols are accepted. type determines lot/risk calc.
@@ -166,6 +170,7 @@ const SYMBOL_CATALOG = {
   DE30EUR:   { type: "index",     mt5: "GER40.cash"   },
   NAS100USD: { type: "index",     mt5: "US100.cash"   },
   UK100GBP:  { type: "index",     mt5: "UK100.cash"   },
+  // ── Stocks (US30 = Dow Jones, treated as stock for NY-hours / 15-18u dead zone) ──
   US30USD:   { type: "index",     mt5: "US30.cash"    },
   // ── Commodities ───────────────────────────────────────────────
   XAUUSD:    { type: "commodity", mt5: "XAUUSD"    },
@@ -226,12 +231,31 @@ function getBrusselsDateOnly(date) {
 }
 
 // ── Session detection ────────────────────────────────────────────
-function getSession(date) {
-  const { hhmm } = getBrusselsComponents(date);
-  if (hhmm >= 200  && hhmm < 800)  return "asia";
-  if (hhmm >= 800  && hhmm < 1530) return "london";
-  if (hhmm >= 1530 && hhmm < 2100) return "ny";
-  return "outside";
+function getSession(date = null) {
+  // FIX stap1: null-safe, correct 3-session logic
+  const d = date ?? new Date();
+  const { hhmm } = getBrusselsComponents(d);
+  // 3 sessions only — no 4th "outside":
+  //   ASIA:   02:00–08:00 Brussels
+  //   LONDON: 08:00–15:30 Brussels
+  //   NY:     15:30–24:00 + 00:00–02:00 Brussels (incl. dead/night/asia-morning sub-blocks)
+  if (hhmm >= 200 && hhmm < 800)  return "asia";
+  if (hhmm >= 800 && hhmm < 1530) return "london";
+  return "ny"; // 15:30–24:00 AND 00:00–02:00 → all ny
+}
+
+// Fine-grained sub-session for shadow tracker routing
+// Returns block type string used for shadow categorisation
+function getSubSession(date = null) {
+  const d = date ?? new Date();
+  const { hhmm } = getBrusselsComponents(d);
+  if (hhmm >= 800  && hhmm < 1530) return "LONDON";
+  if (hhmm >= 1530 && hhmm < 1800) return "NY_DEAD_ZONE";    // 15:30–18:00 blocked
+  if (hhmm >= 1800 && hhmm < 2100) return "NY_ACTIVE";       // 18:00–21:00 trading
+  if (hhmm >= 2100 && hhmm < 2400) return "NY_NIGHT";        // 21:00–00:00 blocked
+  if (hhmm >= 0    && hhmm < 200)  return "ASIA_MORNING";    // 00:00–02:00 blocked
+  if (hhmm >= 200  && hhmm < 800)  return "ASIA";             // 02:00–08:00 trading
+  return "NY"; // fallback
 }
 
 // ── Market open check (kept for backward compat / monitoring) ────
@@ -251,6 +275,7 @@ function isMarketOpen(date = null) {
 // Indexes:             02:00–21:00 Brussels mon-fri (geen dead zone)
 //
 // NY DEAD ZONE (v10.9): 15:30–18:00 Brussels = 13:30–16:00 UTC
+// OUTSIDE NIGHT: 21:00–02:00 Brussels — no new signals, overnight positions tracked
 // = NYSE open tot 2,5u daarna. Hoge spread, lage liquiditeit voor
 // forex + commodities + stocks. Indexes uitgezonderd.
 //
@@ -285,27 +310,25 @@ function canOpenNewTrade(rawSymbol, date = null) {
       };
     }
   } else if (type === "index") {
-    // Indexes: 02:00–21:00 — GEEN dead zone
+    // Indexes: 02:00–21:00 — GEEN dead zone, GEEN night block
     if (hhmm < 200 || hhmm >= 2100) {
-      return {
-        allowed: false,
-        reason:  `OUTSIDE_WINDOW: ${hhmm} (need 0200–2100 Brussels)`,
-      };
+      const sub = getSubSession(date);
+      return { allowed: false, reason: `${sub}: ${hhmm} (indexes need 0200–2100 Brussels)` };
     }
   } else if (type === "forex" || type === "commodity") {
-    // Forex + commodity: 02:00–21:00 met NY dead zone 15:30–18:00
-    if (hhmm < 200 || hhmm >= 2100) {
-      return {
-        allowed: false,
-        reason:  `OUTSIDE_WINDOW: ${hhmm} (need 0200–2100 Brussels)`,
-      };
+    // Forex + commodity: blocked tijden (sub-session gebaseerd):
+    //   NY_DEAD_ZONE  15:30–18:00 → shadow timezone
+    //   NY_NIGHT      21:00–00:00 → shadow timezone  
+    //   ASIA_MORNING  00:00–02:00 → shadow timezone
+    const sub = getSubSession(date);
+    if (sub === "NY_DEAD_ZONE") {
+      return { allowed: false, reason: `NY_DEAD_ZONE: ${hhmm} (${type} geblokkeerd 1530–1800 Brussels)` };
     }
-    // NY dead zone: blokkeer forex en commodity 15:30–18:00
-    if (hhmm >= NY_DEAD_ZONE_START && hhmm < NY_DEAD_ZONE_END) {
-      return {
-        allowed: false,
-        reason:  `NY_DEAD_ZONE: ${hhmm} (${type} geblokkeerd 1530–1800 Brussels — hoge spread NYSE open)`,
-      };
+    if (sub === "NY_NIGHT") {
+      return { allowed: false, reason: `NY_NIGHT: ${hhmm} (${type} geblokkeerd 2100–0000 Brussels)` };
+    }
+    if (sub === "ASIA_MORNING") {
+      return { allowed: false, reason: `ASIA_MORNING: ${hhmm} (${type} geblokkeerd 0000–0200 Brussels)` };
     }
   } else {
     // Onbekend symbooltype — niet in catalog gevonden.
@@ -361,11 +384,27 @@ function buildOptimizerKey(symbol, session, direction, vwapPos) {
 }
 
 const SESSION_LABELS = {
-  asia:    "Asia (02:00–08:00)",
-  london:  "London (08:00–15:30)",
-  ny:      "New York (15:30–21:00)",
-  outside: "Outside window",
+  asia:         "Asia (02:00–08:00)",
+  london:       "London (08:00–15:30)",
+  ny:           "New York (15:30–02:00)",
 };
+
+// Sub-session labels for shadow tracker UI
+const SUB_SESSION_LABELS = {
+  LONDON:       "London (08:00–15:30)",
+  NY_DEAD_ZONE: "NY Dead Zone (15:30–18:00)",
+  NY_ACTIVE:    "NY Active (18:00–21:00)",
+  NY_NIGHT:     "NY Night (21:00–00:00)",
+  ASIA_MORNING: "Asia Morning (00:00–02:00)",
+  ASIA:         "Asia (02:00–08:00)",
+};
+
+// Which sub-sessions are blocked (no new trades allowed)
+const BLOCKED_SUB_SESSIONS = new Set([
+  "NY_DEAD_ZONE",
+  "NY_NIGHT",
+  "ASIA_MORNING",
+]);
 
 // ── Data quality compliance date (FIX 8: single source of truth) ────
 // Alle stats (EV, ghost, shadow, signals) filteren op opened_at/closed_at >= deze datum.
@@ -387,6 +426,13 @@ module.exports = {
   STOCK_SL_BUFFER_MULT,
   NY_DEAD_ZONE_START,
   NY_DEAD_ZONE_END,
+  NY_NIGHT_START,
+  NY_NIGHT_END,
+  ASIA_MORNING_START,
+  ASIA_MORNING_END,
+  SUB_SESSION_LABELS,
+  BLOCKED_SUB_SESSIONS,
+  getSubSession,
   getBrusselsComponents,
   getBrusselsDateStr,
   getBrusselsDateOnly,
