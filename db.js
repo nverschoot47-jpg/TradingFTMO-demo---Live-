@@ -126,7 +126,7 @@ const pool = new Pool({
   connectionString:        DB_URL,
   ssl:                     { rejectUnauthorized: false },
   max:                     8,     // explicit pool size (Railway free: max 10 connections)
-  connectionTimeoutMillis: 5000,
+  connectionTimeoutMillis: 15000, // 15s — Railway internal DNS can be slow on cold start
   idleTimeoutMillis:       30000, // keep connections alive longer
   statement_timeout:       10000, // 10s query timeout
 });
