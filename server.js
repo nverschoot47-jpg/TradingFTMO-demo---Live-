@@ -47,7 +47,7 @@ const {
 } = require("./session");
 
 // ── Version ──────────────────────────────────────────────────────
-const VERSION = "14.6.4"; // v14.6.4: fix symInfoB undefined crash, META_BASE global URL fix DB connection timeout 5s→15s, retry backoff 3s→5s, META_BASE london TP default 1.5R, session_high/low/day_high/low from webhook, vwapBandPct in all ghost saves MetaAPI 429 fix (60s cache), SL TV vs MT5 log, vwapBandPct everywhere, circuit open skip (1 aandeel=1lot, P&L=lots×move) // v14.3: bugs fixed (const→let adoptPosition, dupNumber, blockTypes, duplicate fetchHistoryDeals, NY_NIGHT/ASIA_MORNING shadow tracking) all milestone gaps fixed, outside night 21-02h, daily open log, ghost finalized fix, slHitAt EOD keep
+const VERSION = "14.6.5"; // v14.6.5: MetaAPI auto-deploy on startup, stock timing 15:30-18:00, symInfoB crash fix fix symInfoB undefined crash, META_BASE global URL fix DB connection timeout 5s→15s, retry backoff 3s→5s, META_BASE london TP default 1.5R, session_high/low/day_high/low from webhook, vwapBandPct in all ghost saves MetaAPI 429 fix (60s cache), SL TV vs MT5 log, vwapBandPct everywhere, circuit open skip (1 aandeel=1lot, P&L=lots×move) // v14.3: bugs fixed (const→let adoptPosition, dupNumber, blockTypes, duplicate fetchHistoryDeals, NY_NIGHT/ASIA_MORNING shadow tracking) all milestone gaps fixed, outside night 21-02h, daily open log, ghost finalized fix, slHitAt EOD keep
 
 // ── Config ───────────────────────────────────────────────────────
 const PORT           = process.env.PORT           || 3000;
@@ -2912,21 +2912,39 @@ async function initBackground() {
   dbReady = true;
   console.log("[PRONTO-AI] ✅ DB ready — all systems operational");
 
-  // MetaAPI connectivity check
+  // MetaAPI connectivity check + auto-deploy
   if (META_API_TOKEN && META_ACCOUNT) {
     console.log(`[MetaAPI] Checking connectivity — account ${META_ACCOUNT.slice(0,8)}…`);
     try {
+      // Step 1: Try to deploy the account (idempotent — safe to call even if already deployed)
+      try {
+        await metaFetch(`/users/current/accounts/${META_ACCOUNT}/deploy`, "POST");
+        console.log("[MetaAPI] Deploy request sent — waiting 5s for account to come online…");
+        await new Promise(r => setTimeout(r, 5000));
+      } catch (deployErr) {
+        // Deploy may fail if already deployed — that's fine
+        console.log(`[MetaAPI] Deploy note: ${deployErr.message.slice(0, 80)}`);
+      }
+
+      // Step 2: Fetch account info to verify connection
       const acct = await Promise.race([
         metaFetch(`/users/current/accounts/${META_ACCOUNT}/account-information`),
-        new Promise((_, rej) => setTimeout(() => rej(new Error("timeout 15s")), 15000)),
+        new Promise((_, rej) => setTimeout(() => rej(new Error("timeout 20s")), 20000)),
       ]);
-      if (acct) {
+      if (acct && acct.balance !== undefined) {
+        latestEquity = parseFloat(acct.equity ?? acct.balance ?? 50000);
+        _acctCache = acct; _acctCacheTs = Date.now();
         console.log(`[MetaAPI] ✅ Connected — balance: ${acct.balance} ${acct.currency}`);
       } else {
         console.warn("[MetaAPI] ⚠️ Response empty — account may still be deploying");
       }
     } catch (e) {
       console.error(`[MetaAPI] ❌ Connection failed: ${e.message}`);
+      // If 404: wrong region URL — log helpful message
+      if (e.message.includes("404")) {
+        console.error("[MetaAPI] ❌ 404 = wrong region URL. Check META_BASE in Railway Variables.");
+        console.error("[MetaAPI] Possible URLs: london / new-york / singapore / us-east");
+      }
       recordError(`MetaAPI startup check: ${e.message}`);
     }
   } else {
