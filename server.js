@@ -47,7 +47,7 @@ const {
 } = require("./session");
 
 // ── Version ──────────────────────────────────────────────────────
-const VERSION = "14.4.1"; // v14.4.1: stock lots=riskEUR/slDist (1 aandeel=1lot, P&L=lots×move) // v14.3: bugs fixed (const→let adoptPosition, dupNumber, blockTypes, duplicate fetchHistoryDeals, NY_NIGHT/ASIA_MORNING shadow tracking) all milestone gaps fixed, outside night 21-02h, daily open log, ghost finalized fix, slHitAt EOD keep
+const VERSION = "14.6.0"; // v14.6: TP default 1.5R, session_high/low/day_high/low from webhook, vwapBandPct in all ghost saves MetaAPI 429 fix (60s cache), SL TV vs MT5 log, vwapBandPct everywhere, circuit open skip (1 aandeel=1lot, P&L=lots×move) // v14.3: bugs fixed (const→let adoptPosition, dupNumber, blockTypes, duplicate fetchHistoryDeals, NY_NIGHT/ASIA_MORNING shadow tracking) all milestone gaps fixed, outside night 21-02h, daily open log, ghost finalized fix, slHitAt EOD keep
 
 // ── Config ───────────────────────────────────────────────────────
 const PORT           = process.env.PORT           || 3000;
@@ -120,8 +120,10 @@ function checkSecret(req, res) {
 let _metaFailCount = 0;
 let _metaCircuitOpen = false;
 let _metaCircuitOpenAt = 0;
-const META_CIRCUIT_THRESHOLD = 5;    // open after 5 consecutive failures
-const META_CIRCUIT_RESET_MS  = 60000; // try again after 60s
+const META_CIRCUIT_THRESHOLD = 5;     // open after 5 consecutive failures
+const META_CIRCUIT_RESET_MS  = 120000; // wait 120s — MetaAPI 429 needs time to clear rate limit
+// Helper: readable circuit state for other functions
+const circuitOpen = () => _metaCircuitOpen && (Date.now() - _metaCircuitOpenAt < META_CIRCUIT_RESET_MS);
 
 async function metaFetch(path, method = "GET", body = null, retries = 2) {
   // Circuit breaker: if MetaAPI is known-down, fail fast
@@ -168,16 +170,33 @@ async function metaFetch(path, method = "GET", body = null, retries = 2) {
   }
 }
 
+// ── getAccountInfo: 60s cache — prevents TooManyRequests 429 on MetaAPI ──
+// MetaAPI has strict rate limits. Calling this every 10s sync causes 429 storms.
+// Cache ensures max 1 real call per 60s across ALL callers (sync, /status, webhook).
+let _acctCache   = null;
+let _acctCacheTs = 0;
+const ACCT_CACHE_TTL = 60000; // 60 seconds
+
 async function getAccountInfo() {
+  const now = Date.now();
+  if (_acctCache && (now - _acctCacheTs) < ACCT_CACHE_TTL) {
+    return _acctCache; // return cached — no MetaAPI call
+  }
   if (!META_API_TOKEN || !META_ACCOUNT) {
     console.warn("[MetaAPI] getAccountInfo: TOKEN or ACCOUNT not set");
     return null;
   }
   try {
-    return await metaFetch(`/users/current/accounts/${META_ACCOUNT}/account-information`);
+    const data = await metaFetch(`/users/current/accounts/${META_ACCOUNT}/account-information`);
+    if (data?.balance !== undefined) {
+      _acctCache   = data;
+      _acctCacheTs = now;
+      console.log(`[MetaAPI] getAccountInfo: balance=${data.balance} equity=${data.equity} (cached 60s)`);
+    }
+    return data;
   } catch (e) {
     recordError(`getAccountInfo: ${e.message}`);
-    return null;
+    return _acctCache ?? null; // return stale cache on error rather than null
   }
 }
 
@@ -583,9 +602,10 @@ async function _doSyncPositions() {
   if (!dbReady) return;
   // Update equity from account info every 5 syncs (~2.5 min)
   _syncCount = (_syncCount || 0) + 1;
-  if (_syncCount % 5 === 1) {
+  // Update equity from account info every 10 syncs (~100s) — avoid 429 TooManyRequests
+  if (_syncCount % 10 === 1 && !circuitOpen()) {
     try {
-      const acct = await getAccountInfo();
+      const acct = await getAccountInfo(); // has 60s internal cache
       if (acct?.equity && acct.equity > 0) latestEquity = parseFloat(acct.equity);
     } catch {} // non-critical
   }
@@ -1066,10 +1086,10 @@ app.get("/status", async (req, res) => {
     errorCount:     getErrorCount(),
     ts:             new Date().toISOString(),
   };
-  // Account info: try with 10 s timeout — never block
-  const acct = await Promise.race([
+  // Account info: use cached value (60s TTL) — never hammer MetaAPI on /status polls
+  const acct = circuitOpen() ? _acctCache : await Promise.race([
     getAccountInfo(),
-    new Promise(r => setTimeout(() => r(null), 10000)),
+    new Promise(r => setTimeout(() => r(null), 8000)),
   ]);
   if (acct?.equity) {
     latestEquity = parseFloat(acct.equity);
@@ -1109,7 +1129,19 @@ app.post("/webhook", async (req, res) => {
   if (!dbReady) return res.status(503).json({ error: "DB not ready yet, retry in a moment" });
 
   const { symbol: rawSym, direction: _dir, action: _action, sl_pct, vwap, vwap_upper, vwap_upper2,
-          vwap_lower, vwap_lower2, close: tvClose } = req.body ?? {};
+          vwap_lower, vwap_lower2, close: tvClose,
+          session_high: wh_session_high, session_low: wh_session_low,
+          day_high: wh_day_high, day_low: wh_day_low,
+          bull_breaks: wh_bull_breaks, bear_breaks: wh_bear_breaks,
+          sl_points: wh_sl_points } = req.body ?? {};
+  // Informatieve velden vanuit webhook — geen filters, alleen opslaan
+  const sessionHigh  = wh_session_high  ? parseFloat(wh_session_high)  : null;
+  const sessionLow   = wh_session_low   ? parseFloat(wh_session_low)   : null;
+  const dayHigh      = wh_day_high      ? parseFloat(wh_day_high)      : null;
+  const dayLow       = wh_day_low       ? parseFloat(wh_day_low)       : null;
+  const bullBreaks   = wh_bull_breaks   ? parseInt(wh_bull_breaks)     : null;
+  const bearBreaks   = wh_bear_breaks   ? parseInt(wh_bear_breaks)     : null;
+  const slPoints     = wh_sl_points     ? parseFloat(wh_sl_points)     : null;
   // Pine Script sends "action":"buy"/"sell" — normalize to direction
   const direction = (_dir ?? _action ?? '').toLowerCase().trim() || null;
   if (!direction || (direction !== 'buy' && direction !== 'sell')) {
@@ -1187,7 +1219,7 @@ app.post("/webhook", async (req, res) => {
           blockType, blockTypes, symbol, mt5Symbol: mt5B,
           session: sesB, direction, vwapPosition: vwapPosB,
           entry: tvEntryB, sl: slPriceB, slPct: slPctB,
-          tpRRUsed: tpConfigs[optKeyB]?.lockedRR ?? 2.0,
+          tpRRUsed: tpConfigs[optKeyB]?.lockedRR ?? 1.5,
           optimizerKey: optKeyB, blockReason: mktReason,
           keyCount, subSession: subSessB,
           type: symInfoB?.type ?? 'unknown',
@@ -1241,7 +1273,7 @@ app.post("/webhook", async (req, res) => {
         symbol, mt5Symbol: mt5Sym,
         session, direction, vwapPosition: vwapPos,
         entry: tvEntry, sl: slPriceVE, slPct,
-        tpRRUsed: tpConfigs[optKey]?.lockedRR ?? 2.0,
+        tpRRUsed: tpConfigs[optKey]?.lockedRR ?? 1.5,
         optimizerKey: optKey, vwapBandPct, blockReason: rejectReason,
         keyCount: [...openPositions.values()].filter(p=>(p.ghost?.optimizerKey??p.optimizerKey)===optKey).length +
                   [...blockedPositions.values()].filter(b=>b.optimizerKey===optKey).length + 1,
@@ -1288,7 +1320,7 @@ app.post("/webhook", async (req, res) => {
           symbol, mt5Symbol: mt5Sym,
           session, direction, vwapPosition: vwapPos,
           entry: tvEntry, sl: slPriceD, slPct,
-          tpRRUsed: tpConfigs[optKey]?.lockedRR ?? 2.0,
+          tpRRUsed: tpConfigs[optKey]?.lockedRR ?? 1.5,
           optimizerKey: optKey, blockReason: rejectReason,
           vwapBandPct,
           keyCount: keyCountDup,
@@ -1302,9 +1334,12 @@ app.post("/webhook", async (req, res) => {
     }
   }
 
-  let equity = 10000;
-  const acct = await Promise.race([getAccountInfo(), new Promise(r => setTimeout(() => r(null), 8000))]);
-  if (acct?.equity) { equity = parseFloat(acct.equity); latestEquity = equity; }
+  // Use cached equity — if circuit is open or cache fresh, avoid extra MetaAPI call
+  let equity = latestEquity || 10000;
+  if (!circuitOpen()) {
+    const acct = await Promise.race([getAccountInfo(), new Promise(r => setTimeout(() => r(null), 5000))]);
+    if (acct?.equity) { equity = parseFloat(acct.equity); latestEquity = equity; }
+  }
 
   const baseRisk = symbolRiskMap[symbol] ?? DEFAULT_RISK_BY_TYPE[assetType] ?? DEFAULT_RISK_BY_TYPE.forex;
   const km       = keyRiskMults[optKey] ?? { evMult: 1.0, dayMult: 1.0 };
@@ -1322,16 +1357,30 @@ app.post("/webhook", async (req, res) => {
 
   const slippage    = tvEntry && execPrice ? parseFloat(Math.abs(execPrice - tvEntry).toFixed(6)) : null;
   const slBuf       = assetType === "stock" ? STOCK_SL_BUFFER_MULT : SL_BUFFER_MULT;
-  const slDist      = (slPct * slBuf) * execPrice;
-  // Risk calculation log for verification:
-  // TV signal: entry=${tvEntry}, sl_pct=${slPct} (${(slPct*100).toFixed(3)}% from entry)
-  // MT5 exec:  execPrice=${execPrice}, slippage=${slippage}
-  // slDist = ${slPct} × ${slBuf}× (buf) × ${execPrice} = ${slDist.toFixed(6)}
-  // Applied to MT5 price — SL moves with execution price, not TV entry
+
+  // SL PLACEMENT LOGIC:
+  // Step 1: TV sends sl_pct = raw % distance from TV entry (e.g. 0.003 = 0.3%)
+  // Step 2: We apply SL_BUFFER_MULT to give extra room (1.5× forex, 3.0× stock)
+  // Step 3: We apply the buffered % to MT5 EXECUTION price (not TV entry)
+  //         This ensures the SL is always correctly placed relative to where we filled
+  // Verification:
+  //   slDistTV  = sl_pct × slBuf × tvEntry   (what TV would place)
+  //   slDistMT5 = sl_pct × slBuf × execPrice (what we actually place — CORRECT)
+  //   Difference = slippage × slBuf (small, expected)
+  const slDistTV    = tvEntry ? parseFloat((slPct * slBuf * tvEntry).toFixed(6)) : null;
+  const slDist      = parseFloat((slPct * slBuf * execPrice).toFixed(6));
+  const slPctFinal  = parseFloat((slDist / execPrice * 100).toFixed(4)); // actual % on MT5
+
+  console.log(`[SL-CALC] ${symbol} ${direction.toUpperCase()}`
+    + ` | TV entry=${tvEntry} sl_pct=${(slPct*100).toFixed(3)}% buf=${slBuf}x`
+    + ` | MT5 exec=${execPrice} slippage=${slippage}`
+    + ` | slDist=${slDist.toFixed(6)} (${slPctFinal}% of execPrice)`
+    + (slDistTV ? ` | TV slDist would have been=${slDistTV.toFixed(6)}` : ''));
+
   const slPrice     = direction === "buy"
     ? parseFloat((execPrice - slDist).toFixed(6))
     : parseFloat((execPrice + slDist).toFixed(6));
-  const tpRR        = tpConfigs[optKey]?.lockedRR ?? 2.0;
+  const tpRR        = tpConfigs[optKey]?.lockedRR ?? 1.5;
   const tpPrice     = direction === "buy"
     ? parseFloat((execPrice + slDist * tpRR).toFixed(6))
     : parseFloat((execPrice - slDist * tpRR).toFixed(6));
@@ -1421,17 +1470,23 @@ app.post("/webhook", async (req, res) => {
     vwapPosition: vwapPos, session, entry: execPrice, sl: slPrice, tp: tpPrice, lots,
     riskPct, riskEUR, openedAt: new Date().toISOString(), optimizerKey: optKey,
     tpRRUsed: tpRR, slMultiplier: slBuf, vwapAtEntry: vwapMid, tvEntry, executionPrice: execPrice,
-    slippage, spreadAtEntry, vwapBandPct, tradeNumber, ghost: null };
+    slippage, spreadAtEntry, vwapBandPct, tradeNumber,
+    slDistTV, slDist, slPctFinal, assetType,  // SL verification fields
+    // Informatieve velden vanuit webhook (geen filters — enkel opslaan voor analyse)
+    sessionHigh, sessionLow, dayHigh, dayLow, bullBreaks, bearBreaks, slPoints,
+    ghost: null };
   pos.ghost = initGhost({ ...pos, slPct, evMult: km.evMult, dayMult: km.dayMult });
   openPositions.set(positionId, pos);
 
   if (dbReady) {
     db.saveGhostState(pos.ghost).catch(() => {});
     db.logSignal({ symbol, direction, session, vwapPosition: vwapPos, optimizerKey: optKey,
-      tvEntry, slPct, vwapBandPct, outcome: "PLACED", latencyMs: Date.now() - t0, positionId }).catch(() => {});
+      tvEntry, slPct, vwapBandPct, outcome: "PLACED", latencyMs: Date.now() - t0, positionId,
+      sessionHigh, sessionLow, dayHigh, dayLow, bullBreaks, bearBreaks }).catch(() => {});
     db.logWebhook({ symbol, direction, session, vwapPos, action: "place", status: "OK",
       positionId, entry: execPrice, sl: slPrice, tp: tpPrice, lots, riskPct, optimizerKey: optKey,
-      latencyMs: Date.now() - t0, tvEntry, executionPrice: execPrice, slippage, vwapBandPct }).catch(() => {});
+      latencyMs: Date.now() - t0, tvEntry, executionPrice: execPrice, slippage, vwapBandPct,
+      sessionHigh, sessionLow, dayHigh, dayLow, bullBreaks, bearBreaks, slPoints }).catch(() => {});
     if (bid && ask) db.saveSpreadLog({ symbol, mt5Symbol: mt5Sym, session,
       hourBrussels: getBrusselsComponents().hour, minuteBrussels: getBrusselsComponents().minute,
       dayOfWeek: getBrusselsComponents().day,
@@ -1573,7 +1628,10 @@ app.get("/api/open-positions", (req, res) => {
       positionId: id, symbol: pos.symbol, direction: pos.direction,
       session: pos.session, vwapPosition: pos.vwapPosition, optimizerKey: pos.optimizerKey,
       entry: pos.entry, sl: pos.sl, tp: pos.tp, lots: lotsOut,
-      riskPct: pos.riskPct, riskEUR: pos.riskEUR, openedAt: pos.openedAt,
+      riskPct: pos.riskPct, riskEUR: pos.riskEUR, vwapBandPct: pos.vwapBandPct ?? null,
+      slDistTV: pos.slDistTV ?? null, slDist: pos.slDist ?? null, slPctFinal: pos.slPctFinal ?? null,
+      slMultiplier: pos.slMultiplier ?? null, tvEntry: pos.tvEntry ?? null,
+      openedAt: pos.openedAt,
       tradeNumber: pos.tradeNumber,
       currentPrice: pos.currentPrice ?? null,
       liveProfitMT5: pos.liveProfitMT5 ?? null,
@@ -2027,7 +2085,7 @@ tr:last-child td{border-bottom:none}tr:hover td{background:var(--bg4)}
       <thead><tr>
         <th>Status</th><th>Symbol</th><th>Type</th><th>Dir</th><th>VWAP</th><th>Sess</th><th>#Key</th>
         <th style="color:var(--b)">RR Now</th><th style="color:var(--g)">Peak+RR</th><th style="color:var(--r)">Peak−%</th>
-        <th>→TP</th><th>Band%</th>
+        <th>→TP</th><th>Band%</th><th>TV Entry</th><th>SL%×buf</th><th>SL Dist</th>
         <th class="adv-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">-1.0</th><th class="adv-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">-0.9</th><th class="adv-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">-0.8</th><th class="adv-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">-0.7</th><th class="adv-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">-0.6</th><th class="adv-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">-0.5</th><th class="adv-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">-0.4</th><th class="adv-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">-0.3</th><th class="adv-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">-0.2</th><th class="adv-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">-0.1</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+0.1</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+0.2</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+0.3</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+0.4</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+0.5</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+0.6</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+0.7</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+0.8</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+0.9</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+1.0</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+1.1</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+1.2</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+1.3</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+1.4</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+1.5</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+1.6</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+1.7</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+1.8</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+1.9</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+2.0</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+2.1</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+2.2</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+2.3</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+2.4</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+2.5</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+2.6</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+2.7</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+2.8</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+2.9</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+3.0</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+3.1</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+3.2</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+3.3</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+3.4</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+3.5</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+3.6</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+3.7</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+3.8</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+3.9</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+4.0</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+4.1</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+4.2</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+4.3</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+4.4</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+4.5</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+4.6</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+4.7</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+4.8</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+4.9</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+5.0</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+5.1</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+5.2</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+5.3</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+5.4</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+5.5</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+5.6</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+5.7</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+5.8</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+5.9</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+6.0</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+6.1</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+6.2</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+6.3</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+6.4</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+6.5</th>
         <th>Entry</th><th>SL</th><th>TP</th><th>P&amp;L €</th><th>Lots</th><th>Opened</th>
       </tr></thead>
@@ -2526,6 +2584,9 @@ async function loadGhost(){
         <td class="\${(g.peakRRNeg||0)<-50?'cr fw':'cr'}">\${g.peakRRNeg!=null?fmtP(g.peakRRNeg):'—'}</td>
         <td class="cy">\${g.tpRRUsed!=null?fmtR(g.tpRRUsed):'—'}</td>
         <td class="\${(p.vwapBandPct||0)>150?'co fw':'cd'}">\${p.vwapBandPct!=null?fmtP(p.vwapBandPct):'—'}</td>
+        <td class="cd" style="font-size:8px">\${p.tvEntry!=null?fmt(p.tvEntry,5):'—'}</td>
+        <td class="cd" style="font-size:8px">\${p.slPctFinal!=null?p.slPctFinal.toFixed(3)+'%':'—'}<span style="font-size:7px;color:var(--ink3)">×\${p.slMultiplier||'—'}</span></td>
+        <td class="cd" style="font-size:8px">\${p.slDist!=null?fmt(p.slDist,5):'—'}</td>
         \${msCells(allMs)}
         <td class="cd" style="font-size:8.5px">\${fmt(p.entry,5)}</td>
         <td class="cr" style="font-size:8.5px">\${fmt(p.sl,5)}</td>
