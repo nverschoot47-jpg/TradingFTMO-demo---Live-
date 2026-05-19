@@ -47,14 +47,14 @@ const {
 } = require("./session");
 
 // ── Version ──────────────────────────────────────────────────────
-const VERSION = "14.6.3"; // v14.6.3: db initDB fix orphaned index blocked_ghost_state fix DB connection timeout 5s→15s, retry backoff 3s→5s, META_BASE london TP default 1.5R, session_high/low/day_high/low from webhook, vwapBandPct in all ghost saves MetaAPI 429 fix (60s cache), SL TV vs MT5 log, vwapBandPct everywhere, circuit open skip (1 aandeel=1lot, P&L=lots×move) // v14.3: bugs fixed (const→let adoptPosition, dupNumber, blockTypes, duplicate fetchHistoryDeals, NY_NIGHT/ASIA_MORNING shadow tracking) all milestone gaps fixed, outside night 21-02h, daily open log, ghost finalized fix, slHitAt EOD keep
+const VERSION = "14.6.4"; // v14.6.4: fix symInfoB undefined crash, META_BASE global URL fix DB connection timeout 5s→15s, retry backoff 3s→5s, META_BASE london TP default 1.5R, session_high/low/day_high/low from webhook, vwapBandPct in all ghost saves MetaAPI 429 fix (60s cache), SL TV vs MT5 log, vwapBandPct everywhere, circuit open skip (1 aandeel=1lot, P&L=lots×move) // v14.3: bugs fixed (const→let adoptPosition, dupNumber, blockTypes, duplicate fetchHistoryDeals, NY_NIGHT/ASIA_MORNING shadow tracking) all milestone gaps fixed, outside night 21-02h, daily open log, ghost finalized fix, slHitAt EOD keep
 
 // ── Config ───────────────────────────────────────────────────────
 const PORT           = process.env.PORT           || 3000;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
 const META_API_TOKEN = process.env.META_API_TOKEN || "";
 const META_ACCOUNT   = process.env.META_ACCOUNT   || "";
-const META_BASE      = process.env.META_BASE || "https://mt-client-api-v1.london.agiliumtrade.ai";
+const META_BASE      = process.env.META_BASE || "https://mt-client-api-v1.agiliumtrade.agiliumtrade.ai";
 
 // ── App state ────────────────────────────────────────────────────
 let dbReady          = false;   // true once initDB() succeeds
@@ -1184,7 +1184,7 @@ app.post("/webhook", async (req, res) => {
         const vwapB    = req.body?.vwap ? parseFloat(req.body.vwap) : null;
         const vwapPosB = getVwapPosition(tvEntryB, vwapB);
         const optKeyB  = buildOptimizerKey(symbol, sesB, direction, vwapPosB);
-        const slBuf    = symInfoB?.type === 'stock' ? STOCK_SL_BUFFER_MULT : SL_BUFFER_MULT;
+        const slBuf    = symInfo?.type === 'stock' ? STOCK_SL_BUFFER_MULT : SL_BUFFER_MULT;
         const slDistB  = slPctB * slBuf * tvEntryB;
         const slPriceB = direction === 'buy' ? tvEntryB - slDistB : tvEntryB + slDistB;
 
@@ -1216,13 +1216,13 @@ app.post("/webhook", async (req, res) => {
         // Get sub_session for shadow tracker routing (stap 1)
         const subSessB = getSubSession ? getSubSession() : 'NY_DEAD_ZONE';
         const bg = initBlockedGhost({
-          blockType, blockTypes, symbol, mt5Symbol: mt5B,
+          blockType, blockTypes, symbol, mt5Symbol: mt5Sym,
           session: sesB, direction, vwapPosition: vwapPosB,
           entry: tvEntryB, sl: slPriceB, slPct: slPctB,
           tpRRUsed: tpConfigs[optKeyB]?.lockedRR ?? 1.5,
           optimizerKey: optKeyB, blockReason: mktReason,
           keyCount, subSession: subSessB,
-          type: symInfoB?.type ?? 'unknown',
+          type: symInfo?.type ?? 'unknown',
         });
         blockedPositions.set(bg.id, bg);
         db.saveBlockedGhostState(bg).catch(() => {});
