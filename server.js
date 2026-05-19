@@ -47,14 +47,14 @@ const {
 } = require("./session");
 
 // ── Version ──────────────────────────────────────────────────────
-const VERSION = "14.6.0"; // v14.6: TP default 1.5R, session_high/low/day_high/low from webhook, vwapBandPct in all ghost saves MetaAPI 429 fix (60s cache), SL TV vs MT5 log, vwapBandPct everywhere, circuit open skip (1 aandeel=1lot, P&L=lots×move) // v14.3: bugs fixed (const→let adoptPosition, dupNumber, blockTypes, duplicate fetchHistoryDeals, NY_NIGHT/ASIA_MORNING shadow tracking) all milestone gaps fixed, outside night 21-02h, daily open log, ghost finalized fix, slHitAt EOD keep
+const VERSION = "14.6.1"; // v14.6.1: fix initDB crash (ALTER TABLE in transaction), META_BASE london TP default 1.5R, session_high/low/day_high/low from webhook, vwapBandPct in all ghost saves MetaAPI 429 fix (60s cache), SL TV vs MT5 log, vwapBandPct everywhere, circuit open skip (1 aandeel=1lot, P&L=lots×move) // v14.3: bugs fixed (const→let adoptPosition, dupNumber, blockTypes, duplicate fetchHistoryDeals, NY_NIGHT/ASIA_MORNING shadow tracking) all milestone gaps fixed, outside night 21-02h, daily open log, ghost finalized fix, slHitAt EOD keep
 
 // ── Config ───────────────────────────────────────────────────────
 const PORT           = process.env.PORT           || 3000;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
 const META_API_TOKEN = process.env.META_API_TOKEN || "";
 const META_ACCOUNT   = process.env.META_ACCOUNT   || "";
-const META_BASE      = process.env.META_BASE || "https://mt-client-api-v1.agiliumtrade.agiliumtrade.ai";
+const META_BASE      = process.env.META_BASE || "https://mt-client-api-v1.london.agiliumtrade.ai";
 
 // ── App state ────────────────────────────────────────────────────
 let dbReady          = false;   // true once initDB() succeeds
