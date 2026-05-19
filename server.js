@@ -47,7 +47,7 @@ const {
 } = require("./session");
 
 // ── Version ──────────────────────────────────────────────────────
-const VERSION = "14.6.6"; // v14.6.6: fix bdSess template literal, add assetType/keyCount to shadow API MetaAPI auto-deploy on startup, stock timing 15:30-18:00, symInfoB crash fix fix symInfoB undefined crash, META_BASE global URL fix DB connection timeout 5s→15s, retry backoff 3s→5s, META_BASE london TP default 1.5R, session_high/low/day_high/low from webhook, vwapBandPct in all ghost saves MetaAPI 429 fix (60s cache), SL TV vs MT5 log, vwapBandPct everywhere, circuit open skip (1 aandeel=1lot, P&L=lots×move) // v14.3: bugs fixed (const→let adoptPosition, dupNumber, blockTypes, duplicate fetchHistoryDeals, NY_NIGHT/ASIA_MORNING shadow tracking) all milestone gaps fixed, outside night 21-02h, daily open log, ghost finalized fix, slHitAt EOD keep
+const VERSION = "14.6.7"; // v14.6.7: fix isTrackableBlock (no STOCK_OOH in shadow), bdSess fix fix bdSess template literal, add assetType/keyCount to shadow API MetaAPI auto-deploy on startup, stock timing 15:30-18:00, symInfoB crash fix fix symInfoB undefined crash, META_BASE global URL fix DB connection timeout 5s→15s, retry backoff 3s→5s, META_BASE london TP default 1.5R, session_high/low/day_high/low from webhook, vwapBandPct in all ghost saves MetaAPI 429 fix (60s cache), SL TV vs MT5 log, vwapBandPct everywhere, circuit open skip (1 aandeel=1lot, P&L=lots×move) // v14.3: bugs fixed (const→let adoptPosition, dupNumber, blockTypes, duplicate fetchHistoryDeals, NY_NIGHT/ASIA_MORNING shadow tracking) all milestone gaps fixed, outside night 21-02h, daily open log, ghost finalized fix, slHitAt EOD keep
 
 // ── Config ───────────────────────────────────────────────────────
 const PORT           = process.env.PORT           || 3000;
@@ -1167,12 +1167,14 @@ app.post("/webhook", async (req, res) => {
     // OUTSIDE_WINDOW: outside 21:00-02:00 Brussels (market closed overnight)
     // STOCK_OUTSIDE_MARKET: stocks outside 16:00-21:00 Brussels
     // These are trades that WOULD have been valid setups — we track them for EV analysis
+    // Shadow tracker: ONLY block reasons where market IS open but we chose not to trade
+    // STOCK_OUTSIDE_MARKET = market closed → NOT tracked in shadow
+    // WEEKEND = market closed → NOT tracked in shadow
     const isTrackableBlock = mktReason && (
       mktReason.includes('NY_DEAD_ZONE') ||
       mktReason.includes('NY_NIGHT') ||
       mktReason.includes('ASIA_MORNING') ||
-      mktReason.includes('OUTSIDE_WINDOW') ||     // legacy compat
-      mktReason.includes('STOCK_OUTSIDE_MARKET')
+      mktReason.includes('OUTSIDE_WINDOW')        // legacy compat only
     );
 
     if (dbReady && isTrackableBlock) {
