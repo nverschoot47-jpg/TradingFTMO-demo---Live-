@@ -111,9 +111,16 @@ function setComplianceDateLive(isoStr) {
 
 const { Pool } = require("pg");
 
-// DATABASE_URL priority: env var (Railway injects this) → hardcoded fallback (nieuwe DB)
+// DATABASE_URL: Railway injects this from the linked Postgres service.
+// If the env var is the OLD database → auth fails → update DATABASE_URL in Railway Variables
+// to point to Postgres-4ncL. The hardcoded string below is the fallback (internal Railway network).
+// ⚠️  If you see "password authentication failed" → fix DATABASE_URL in Railway Variables tab.
 const DB_URL = process.env.DATABASE_URL
   || 'postgresql://postgres:fjugQtTywQsHUkMnmUfWxIaQBIYfelyb@postgres-4ncl.railway.internal:5432/railway';
+
+// Log which DB we're connecting to (mask password for security)
+const _dbUrlMasked = DB_URL.replace(/:([^:@]+)@/, ':***@');
+console.log(`[DB] Connecting to: ${_dbUrlMasked}`);
 
 const pool = new Pool({
   connectionString:        DB_URL,
@@ -742,6 +749,20 @@ async function initDB() {
   await safeAlter(`ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS sl_hit_at        TIMESTAMPTZ`);
   await safeAlter(`ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS key_count         INTEGER DEFAULT 1`);
   await safeAlter(`ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS vwap_band_pct    NUMERIC`);
+  // v14.6: session/day context columns in webhook_history + signal_log
+  await safeAlter(`ALTER TABLE webhook_history ADD COLUMN IF NOT EXISTS session_high  NUMERIC`);
+  await safeAlter(`ALTER TABLE webhook_history ADD COLUMN IF NOT EXISTS session_low   NUMERIC`);
+  await safeAlter(`ALTER TABLE webhook_history ADD COLUMN IF NOT EXISTS day_high      NUMERIC`);
+  await safeAlter(`ALTER TABLE webhook_history ADD COLUMN IF NOT EXISTS day_low       NUMERIC`);
+  await safeAlter(`ALTER TABLE webhook_history ADD COLUMN IF NOT EXISTS bull_breaks   INTEGER`);
+  await safeAlter(`ALTER TABLE webhook_history ADD COLUMN IF NOT EXISTS bear_breaks   INTEGER`);
+  await safeAlter(`ALTER TABLE webhook_history ADD COLUMN IF NOT EXISTS sl_points     NUMERIC`);
+  await safeAlter(`ALTER TABLE signal_log ADD COLUMN IF NOT EXISTS session_high       NUMERIC`);
+  await safeAlter(`ALTER TABLE signal_log ADD COLUMN IF NOT EXISTS session_low        NUMERIC`);
+  await safeAlter(`ALTER TABLE signal_log ADD COLUMN IF NOT EXISTS day_high           NUMERIC`);
+  await safeAlter(`ALTER TABLE signal_log ADD COLUMN IF NOT EXISTS day_low            NUMERIC`);
+  await safeAlter(`ALTER TABLE signal_log ADD COLUMN IF NOT EXISTS bull_breaks        INTEGER`);
+  await safeAlter(`ALTER TABLE signal_log ADD COLUMN IF NOT EXISTS bear_breaks        INTEGER`);
   await safeAlter(`ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS sl_milestones    JSONB`);
   await safeAlter(`ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS rr_milestones    JSONB`);
   await safeAlter(`ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS peak_rr_pos      NUMERIC DEFAULT 0`);
@@ -910,9 +931,9 @@ async function saveGhostTrade(g) {
          max_price, max_rr_before_sl, phantom_sl_hit, stop_reason,
          time_to_sl_min, max_sl_pct_used, sl_milestones, rr_milestones,
          trade_number, peak_rr_pos, peak_rr_neg,
-         realized_pnl_eur, lots,
+         realized_pnl_eur, lots, vwap_band_pct,
          opened_at, closed_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)
       ON CONFLICT (position_id) WHERE position_id IS NOT NULL
       DO UPDATE SET
         max_price        = EXCLUDED.max_price,
@@ -928,6 +949,7 @@ async function saveGhostTrade(g) {
         realized_pnl_eur = COALESCE(EXCLUDED.realized_pnl_eur, ghost_trades.realized_pnl_eur),
         lots             = COALESCE(EXCLUDED.lots, ghost_trades.lots),
         trade_number     = COALESCE(EXCLUDED.trade_number, ghost_trades.trade_number),
+        vwap_band_pct    = COALESCE(EXCLUDED.vwap_band_pct, ghost_trades.vwap_band_pct),
         closed_at        = EXCLUDED.closed_at
     `, [
       g.positionId      ?? null,
@@ -951,6 +973,7 @@ async function saveGhostTrade(g) {
       g.peakRRNeg       ?? g.maxSlPctUsed  ?? 0,
       g.realizedPnlEUR  ?? null,
       g.lots            ?? null,
+      g.vwapBandPct     ?? null,
       g.openedAt        ?? null,
       g.closedAt        ?? null,
     ]);
@@ -1257,8 +1280,9 @@ async function logWebhook(w) {
       INSERT INTO webhook_history
         (symbol, direction, session, vwap_pos, action, status, reason, position_id,
          entry, sl, tp, lots, risk_pct, optimizer_key,
-         latency_ms, tv_entry, execution_price, slippage, vwap_band_pct)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+         latency_ms, tv_entry, execution_price, slippage, vwap_band_pct,
+         session_high, session_low, day_high, day_low, bull_breaks, bear_breaks, sl_points)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
     `, [
       w.symbol        ?? null, w.direction    ?? null, w.session    ?? null, w.vwapPos      ?? null,
       w.action        ?? null, w.status       ?? null, w.reason     ?? null, w.positionId   ?? null,
@@ -1266,6 +1290,9 @@ async function logWebhook(w) {
       w.riskPct       ?? null, w.optimizerKey ?? null,
       w.latencyMs     ?? null, w.tvEntry      ?? null, w.executionPrice ?? null,
       w.slippage      ?? null, w.vwapBandPct  ?? null,
+      w.sessionHigh   ?? null, w.sessionLow   ?? null,
+      w.dayHigh       ?? null, w.dayLow       ?? null,
+      w.bullBreaks    ?? null, w.bearBreaks   ?? null, w.slPoints ?? null,
     ]);
   } catch (e) { /* non-critical */ }
 }
@@ -1277,8 +1304,9 @@ async function logSignal(s) {
       INSERT INTO signal_log
         (symbol, direction, session, vwap_position, optimizer_key,
          tv_entry, sl_pct, sl_pct_human, vwap, vwap_upper, vwap_lower,
-         vwap_band_pct, outcome, reject_reason, latency_ms, position_id)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+         vwap_band_pct, outcome, reject_reason, latency_ms, position_id,
+         session_high, session_low, day_high, day_low, bull_breaks, bear_breaks)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
     `, [
       s.symbol         ?? null, s.direction    ?? null, s.session      ?? null,
       s.vwapPosition   ?? null, s.optimizerKey ?? null,
@@ -1286,6 +1314,9 @@ async function logSignal(s) {
       s.vwap           ?? null, s.vwapUpper    ?? null, s.vwapLower    ?? null,
       s.vwapBandPct    ?? null, s.outcome      ?? null, s.rejectReason ?? null,
       s.latencyMs      ?? null, s.positionId   ?? null,
+      s.sessionHigh    ?? null, s.sessionLow   ?? null,
+      s.dayHigh        ?? null, s.dayLow       ?? null,
+      s.bullBreaks     ?? null, s.bearBreaks   ?? null,
     ]);
   } catch (e) { /* non-critical */ }
 }
@@ -1872,9 +1903,9 @@ async function saveGhostState(g) {
          risk_pct, risk_eur, ev_mult, day_mult,
          sl_milestones, rr_milestones,
          trade_number, peak_rr_pos, peak_rr_neg,
-         phantom_sl_hit, stop_reason,
+         phantom_sl_hit, stop_reason, vwap_band_pct,
          updated_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,NOW())
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,NOW())
       ON CONFLICT (position_id) DO UPDATE SET
         max_price       = EXCLUDED.max_price,
         max_rr          = EXCLUDED.max_rr,
@@ -1893,6 +1924,7 @@ async function saveGhostState(g) {
         trade_number    = COALESCE(ghost_state.trade_number, EXCLUDED.trade_number),
         phantom_sl_hit  = EXCLUDED.phantom_sl_hit,
         stop_reason     = EXCLUDED.stop_reason,
+        vwap_band_pct   = COALESCE(EXCLUDED.vwap_band_pct, ghost_state.vwap_band_pct),
         updated_at      = NOW()
     `, [
       g.positionId, g.optimizerKey, g.symbol, g.mt5Symbol ?? g.symbol,
@@ -1911,6 +1943,7 @@ async function saveGhostState(g) {
       g.peakRRNeg ?? g.maxSlPctUsed ?? 0,
       g.phantomSLHit ?? false,
       g.stopReason ?? null,
+      g.vwapBandPct ?? null,
     ]);
   } catch (e) { console.warn('[!] saveGhostState:', e.message); }
 }
