@@ -47,7 +47,7 @@ const {
 } = require("./session");
 
 // ── Version ──────────────────────────────────────────────────────
-const VERSION = "14.6.2"; // v14.6.2: fix DB connection timeout 5s→15s, retry backoff 3s→5s, META_BASE london TP default 1.5R, session_high/low/day_high/low from webhook, vwapBandPct in all ghost saves MetaAPI 429 fix (60s cache), SL TV vs MT5 log, vwapBandPct everywhere, circuit open skip (1 aandeel=1lot, P&L=lots×move) // v14.3: bugs fixed (const→let adoptPosition, dupNumber, blockTypes, duplicate fetchHistoryDeals, NY_NIGHT/ASIA_MORNING shadow tracking) all milestone gaps fixed, outside night 21-02h, daily open log, ghost finalized fix, slHitAt EOD keep
+const VERSION = "14.6.3"; // v14.6.3: db initDB fix orphaned index blocked_ghost_state fix DB connection timeout 5s→15s, retry backoff 3s→5s, META_BASE london TP default 1.5R, session_high/low/day_high/low from webhook, vwapBandPct in all ghost saves MetaAPI 429 fix (60s cache), SL TV vs MT5 log, vwapBandPct everywhere, circuit open skip (1 aandeel=1lot, P&L=lots×move) // v14.3: bugs fixed (const→let adoptPosition, dupNumber, blockTypes, duplicate fetchHistoryDeals, NY_NIGHT/ASIA_MORNING shadow tracking) all milestone gaps fixed, outside night 21-02h, daily open log, ghost finalized fix, slHitAt EOD keep
 
 // ── Config ───────────────────────────────────────────────────────
 const PORT           = process.env.PORT           || 3000;
