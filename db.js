@@ -278,7 +278,6 @@ async function initDB() {
       CREATE INDEX IF NOT EXISTS idx_closed_trades_session ON closed_trades (session, symbol);
       CREATE INDEX IF NOT EXISTS idx_ghost_trades_opened   ON ghost_trades (opened_at DESC);
       CREATE INDEX IF NOT EXISTS idx_ghost_trades_optkey   ON ghost_trades (optimizer_key);
-      CREATE INDEX IF NOT EXISTS idx_blocked_ghost_opened  ON blocked_ghost_state (opened_at DESC);
     `);
 
     // ── ghost_state (persists ghost tracking across restarts) ─────
