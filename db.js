@@ -417,28 +417,35 @@ async function initDB() {
     // ── webhook_history ──────────────────────────────────────────
     await client.query(`
       CREATE TABLE IF NOT EXISTS webhook_history (
-        id            SERIAL      PRIMARY KEY,
-        ts            TIMESTAMPTZ DEFAULT NOW(),
-        symbol        TEXT,
-        direction     TEXT,
-        session       TEXT,
-        vwap_pos      TEXT,
-        action        TEXT,
-        status        TEXT,
-        reason        TEXT,
-        position_id   TEXT,
-        entry         NUMERIC,
-        sl            NUMERIC,
-        tp            NUMERIC,
-        lots          NUMERIC,
-        risk_pct      NUMERIC,
-        optimizer_key TEXT
+        id              SERIAL      PRIMARY KEY,
+        ts              TIMESTAMPTZ DEFAULT NOW(),
+        symbol          TEXT,
+        direction       TEXT,
+        session         TEXT,
+        vwap_pos        TEXT,
+        action          TEXT,
+        status          TEXT,
+        reason          TEXT,
+        position_id     TEXT,
+        entry           NUMERIC,
+        sl              NUMERIC,
+        tp              NUMERIC,
+        lots            NUMERIC,
+        risk_pct        NUMERIC,
+        optimizer_key   TEXT,
+        latency_ms      INTEGER,
+        tv_entry        NUMERIC,
+        execution_price NUMERIC,
+        slippage        NUMERIC,
+        vwap_band_pct   NUMERIC,
+        session_high    NUMERIC,
+        session_low     NUMERIC,
+        day_high        NUMERIC,
+        day_low         NUMERIC,
+        bull_breaks     INTEGER,
+        bear_breaks     INTEGER,
+        sl_points       NUMERIC
       );
-      ALTER TABLE webhook_history ADD COLUMN IF NOT EXISTS latency_ms       INTEGER;
-      ALTER TABLE webhook_history ADD COLUMN IF NOT EXISTS tv_entry         NUMERIC;
-      ALTER TABLE webhook_history ADD COLUMN IF NOT EXISTS execution_price  NUMERIC;
-      ALTER TABLE webhook_history ADD COLUMN IF NOT EXISTS slippage         NUMERIC;
-      ALTER TABLE webhook_history ADD COLUMN IF NOT EXISTS vwap_band_pct    NUMERIC;
     `);
 
     // ── equity_curve ─────────────────────────────────────────
@@ -474,7 +481,13 @@ async function initDB() {
         outcome         TEXT,
         reject_reason   TEXT,
         latency_ms      INTEGER,
-        position_id     TEXT
+        position_id     TEXT,
+        session_high    NUMERIC,
+        session_low     NUMERIC,
+        day_high        NUMERIC,
+        day_low         NUMERIC,
+        bull_breaks     INTEGER,
+        bear_breaks     INTEGER
       );
       CREATE INDEX IF NOT EXISTS idx_signal_log_ts     ON signal_log (received_at DESC);
       CREATE INDEX IF NOT EXISTS idx_signal_log_sym    ON signal_log (symbol);
