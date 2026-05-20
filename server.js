@@ -47,7 +47,7 @@ const {
 } = require("./session");
 
 // ── Version ──────────────────────────────────────────────────────
-const VERSION = "14.6.7"; // v14.6.7: fix isTrackableBlock (no STOCK_OOH in shadow), bdSess fix fix bdSess template literal, add assetType/keyCount to shadow API MetaAPI auto-deploy on startup, stock timing 15:30-18:00, symInfoB crash fix fix symInfoB undefined crash, META_BASE global URL fix DB connection timeout 5s→15s, retry backoff 3s→5s, META_BASE london TP default 1.5R, session_high/low/day_high/low from webhook, vwapBandPct in all ghost saves MetaAPI 429 fix (60s cache), SL TV vs MT5 log, vwapBandPct everywhere, circuit open skip (1 aandeel=1lot, P&L=lots×move) // v14.3: bugs fixed (const→let adoptPosition, dupNumber, blockTypes, duplicate fetchHistoryDeals, NY_NIGHT/ASIA_MORNING shadow tracking) all milestone gaps fixed, outside night 21-02h, daily open log, ghost finalized fix, slHitAt EOD keep
+const VERSION = "14.7.3"; // v14.7.3: ghost restore assetType+vwapBandPct, all display fixes complete ghost restore assetType, ghost peakRRNeg display, signal log session cols, fin ghost realizedPnl fix startBalance fix, peakRRNeg display fix, exitPrice in trades, force adoption on startup, session fallback assetType everywhere, unrealizedPnl, signal outcomes, signal stats fixed correct signal outcomes, unrealizedPnl, assetType in API, signal stats per outcome /api/performance returns balance/equity/startBalance from latestEquity fix isTrackableBlock (no STOCK_OOH in shadow), bdSess fix fix bdSess template literal, add assetType/keyCount to shadow API MetaAPI auto-deploy on startup, stock timing 15:30-18:00, symInfoB crash fix fix symInfoB undefined crash, META_BASE global URL fix DB connection timeout 5s→15s, retry backoff 3s→5s, META_BASE london TP default 1.5R, session_high/low/day_high/low from webhook, vwapBandPct in all ghost saves MetaAPI 429 fix (60s cache), SL TV vs MT5 log, vwapBandPct everywhere, circuit open skip (1 aandeel=1lot, P&L=lots×move) // v14.3: bugs fixed (const→let adoptPosition, dupNumber, blockTypes, duplicate fetchHistoryDeals, NY_NIGHT/ASIA_MORNING shadow tracking) all milestone gaps fixed, outside night 21-02h, daily open log, ghost finalized fix, slHitAt EOD keep
 
 // ── Config ───────────────────────────────────────────────────────
 const PORT           = process.env.PORT           || 3000;
@@ -399,6 +399,16 @@ async function closePosition(positionId, reason = "manual", pnl = null) {
   }
 
   if (dbReady) {
+    // Extract exit price from deals (the actual fill price at close)
+    let exitPrice = null;
+    try {
+      const closeDeals = await fetchHistoryDeals(positionId).catch(() => []);
+      const closingDeal = closeDeals
+        .filter(d => d.entryType === 'DEAL_ENTRY_OUT' || (d.type||'').includes('OUT'))
+        .sort((a,b) => new Date(b.time||0) - new Date(a.time||0))[0];
+      if (closingDeal) exitPrice = parseFloat(closingDeal.price ?? closingDeal.executionPrice ?? 0) || null;
+    } catch(e) { /* non-critical */ }
+
     await db.saveTrade({
       positionId, symbol: pos.symbol, mt5Symbol: pos.mt5Symbol,
       direction: pos.direction, vwapPosition: pos.vwapPosition,
@@ -411,9 +421,12 @@ async function closePosition(positionId, reason = "manual", pnl = null) {
       openedAt: pos.openedAt, closedAt: now,
       slMultiplier: pos.slMultiplier ?? 1.0,
       realizedPnlEUR: realPnl, hitTP: reason === 'tp',
-      closeReason: finalCloseReason,  // 'sl' or 'sl_gap'
+      closeReason: finalCloseReason,
       spreadAtEntry: pos.spreadAtEntry, vwapBandPct: pos.vwapBandPct,
       executionPrice: pos.executionPrice, tvEntry: pos.tvEntry, slippage: pos.slippage,
+      exitPrice: exitPrice ?? pos.tp ?? null,
+      assetType: pos.assetType ?? null,
+      tradeNumber: pos.tradeNumber ?? null,
     }).catch(e => recordError(e.message));
     db.deleteGhostState(positionId).catch(() => {});
   }
@@ -567,7 +580,10 @@ async function adoptPosition(lp) {
     tpRRUsed: tp && sl && entry ? Math.abs(tp - entry) / Math.abs(entry - sl) : null,
     slMultiplier: null, tradeNumber: parsed.tradeNumber,
     liveProfitMT5: livePnl ?? null,
+    unrealizedPnl: livePnl ?? null,
     currentPrice:  livePrice ?? null,
+    assetType: symInfo?.type ?? null,
+    type: symInfo?.type ?? null,
     ghost: null,
   };
   pos.ghost = initGhost({ ...pos, slPct });
@@ -664,7 +680,16 @@ async function _doSyncPositions() {
 
       // P&L: profit / unrealizedProfit / currentProfit / swap included
       const lpProfit = lp.profit ?? lp.unrealizedProfit ?? lp.currentProfit;
-      if (lpProfit != null) pos.liveProfitMT5 = parseFloat(lpProfit);
+      if (lpProfit != null) {
+        pos.liveProfitMT5  = parseFloat(lpProfit);
+        pos.unrealizedPnl  = parseFloat(lpProfit);
+      }
+      // Keep assetType in sync
+      if (!pos.assetType && pos.symbol) {
+        const _si = getSymbolInfo(pos.symbol);
+        pos.assetType = _si?.type ?? null;
+        pos.type = pos.assetType;
+      }
 
       // Current price: currentPrice / currentBid / currentAsk / openPrice fallback
       const lpPrice = lp.currentPrice ?? lp.currentBid ?? lp.currentAsk ?? lp.openPrice;
@@ -956,6 +981,7 @@ app.post("/api/debug/backfill-comments", async (req, res) => {
       
       // Build optimizer key if we have enough info
       const sym    = normalizeSymbol(row.symbol) ?? row.symbol;
+      const symInf = getSymbolInfo ? getSymbolInfo(sym) : null;
       const optKey = dir && sess && vwap ? buildOptimizerKey(sym, sess, dir, vwap) : null;
       
       await db.pool.query(`
@@ -1159,8 +1185,20 @@ app.post("/webhook", async (req, res) => {
   const { allowed, reason: mktReason } = canOpenNewTrade(symbol);
   if (!allowed) {
     const sesForLog = getSession();
-    db.logSignal({ symbol, direction, outcome: 'REJECTED', rejectReason: mktReason,
-      session: sesForLog, latencyMs: Date.now() - t0 }).catch(() => {});
+    const _sigOutcome = mktReason?.includes('NY_NIGHT') ? 'NY_NIGHT' :
+      mktReason?.includes('ASIA_MORNING') ? 'ASIA_MORNING' :
+      mktReason?.includes('NY_DEAD_ZONE') ? 'NY_DEAD_ZONE' :
+      mktReason?.includes('STOCK_OUTSIDE_MARKET') ? 'STOCK_OOH' :
+      mktReason?.includes('WEEKEND') ? 'WEEKEND' :
+      mktReason?.includes('UNKNOWN_SYMBOL_TYPE') ? 'UNKNOWN_SYMBOL' :
+      mktReason?.includes('MAX_POSITIONS') ? 'MAX_POSITIONS' : 'REJECTED';
+    const _tvEntryLog = parseFloat(req.body?.entry ?? req.body?.close ?? 0) || null;
+    const _vwapLog    = req.body?.vwap ? parseFloat(req.body.vwap) : null;
+    const _vwapPosLog = (_tvEntryLog && _vwapLog) ? getVwapPosition(_tvEntryLog, _vwapLog) : null;
+    db.logSignal({ symbol, direction, outcome: _sigOutcome, rejectReason: mktReason,
+      session: sesForLog, vwapPosition: _vwapPosLog,
+      tvEntry: _tvEntryLog, slPct: parseFloat(req.body?.sl_pct ?? 0.003),
+      latencyMs: Date.now() - t0 }).catch(() => {});
 
     // ── Shadow Playbook: ALL tradeable-but-blocked signals get a ghost tracker ──
     // NY_DEAD_ZONE: outside 15:30-18:00 Brussels (forex/stocks blocked at NYSE open)
@@ -1545,7 +1583,20 @@ app.get("/api/performance", async (req, res) => {
   if (!dbReady) return res.json(null);
   try {
     const stats = await db.loadPerformanceStats();
-    res.json(stats);
+    // Add live balance/equity from MetaAPI cache + ACCOUNT_BALANCE env var
+    const acctBalance = parseFloat(process.env.ACCOUNT_BALANCE || 0);
+    const equity = latestEquity || acctBalance || 0;
+    const realizedPnl = stats?.totalPnl ?? 0;
+    // balance = equity - unrealized (we don't have unrealized here so use equity)
+    // startBalance = first known balance = ACCOUNT_BALANCE env var
+    res.json({
+      ...(stats ?? {}),
+      balance:      equity,
+      equity:       equity,
+      realizedPnl:  realizedPnl,
+      totalPnl:     realizedPnl,
+      startBalance: acctBalance,
+    });
   } catch (e) { res.json(null); }
 });
 // ── Manual position recovery ──────────────────────────────────────
@@ -1586,7 +1637,8 @@ app.get("/api/blocked-ghosts/active", (req, res) => {
   if(blockedPositions.size > 0) {
     return res.json([...blockedPositions.values()].map(bg => ({
       id: bg.id, blockType: bg.blockType, optimizerKey: bg.optimizerKey,
-      symbol: bg.symbol, mt5Symbol: bg.mt5Symbol, session: bg.session,
+      symbol: bg.symbol, mt5Symbol: bg.mt5Symbol,
+      session: bg.session || bg.subSession || 'ny',
       direction: bg.direction, vwapPosition: bg.vwapPosition,
       entry: bg.entry, sl: bg.sl, slPct: bg.slPct,
       maxRR: bg.maxRR, maxSlPctUsed: bg.maxSlPctUsed,
@@ -1640,6 +1692,10 @@ app.get("/api/open-positions", (req, res) => {
       tradeNumber: pos.tradeNumber,
       currentPrice: pos.currentPrice ?? null,
       liveProfitMT5: pos.liveProfitMT5 ?? null,
+      unrealizedPnl: pos.liveProfitMT5 ?? null,
+      assetType: pos.assetType ?? null,
+      type: pos.assetType ?? null,
+      exitPrice: pos.exitPrice ?? null,
       ghost: pos.ghost ? {
         maxRR:        pos.ghost.maxRR        ?? 0,
         maxSlPctUsed: pos.ghost.maxSlPctUsed ?? 0,
@@ -2340,8 +2396,9 @@ async function loadHeader(){
     api('/api/blocked-ghosts/active'),
   ]);
   const ghosts=ghostG||[];
-  const active=ghosts.filter(g=>!g.stopReason&&!g.stop_reason);
-  const fin=ghosts.filter(g=>g.stopReason||g.stop_reason);
+  // Active = from open-positions (live data), finalized = from ghost-grouped
+  const active=pos; // open-positions IS the active ghost list
+  const fin=ghosts.filter(g=>g.stopReason||g.stop_reason||g.finalizedAt||g.finalized_at);
   if(el('h-ghost')){el('h-ghost').textContent=active.length;}
   if(el('h-fin')){el('h-fin').textContent=fin.length;}
   if(el('nb-gh')) el('nb-gh').textContent=active.length;
@@ -2382,7 +2439,9 @@ async function loadOverview(){
   for(const p of pos){
     const g=p.ghost||{};
     if(g.peakRRPos!=null&&(bestP===null||g.peakRRPos>bestP))bestP=g.peakRRPos;
-    if(g.peakRRNeg!=null&&(worstP===null||g.peakRRNeg<worstP))worstP=g.peakRRNeg;
+    // peakRRNeg stored as % of SL used (0-100+), convert to negative RR for display
+    const _pneg = g.peakRRNeg!=null ? -(g.peakRRNeg/100) : null;
+    if(_pneg!=null&&(worstP===null||_pneg<worstP))worstP=_pneg;
     if(g.tpRRUsed!=null&&(maxRR===null||g.tpRRUsed>maxRR))maxRR=g.tpRRUsed;
     totLots+=parseFloat(p.lots||g.lots||0);
   }
@@ -2394,9 +2453,9 @@ async function loadOverview(){
   // Balance card
   if(perf){
     const bal=perf.balance||0,eq=perf.equity||0,rp=perf.totalPnl||perf.realizedPnl||0;
-    const startBal=bal-rp;
+    const startBal=perf.startBalance||50000;
     const cashBal=startBal+rp;
-    if(s('ov-startbal'))s('ov-startbal').textContent='\\u20ac'+Math.round(startBal);
+    if(s('ov-startbal'))s('ov-startbal').textContent='\\u20ac'+Math.round(startBal).toLocaleString();
     if(s('ov-realbal')){s('ov-realbal').textContent=fmtE(rp);s('ov-realbal').className='ovv '+(rp>=0?'cg':'cr');}
     if(s('ov-tradecount'))s('ov-tradecount').textContent=(trades||[]).length+' gesloten trades';
     if(s('ov-cashbal'))s('ov-cashbal').textContent='\\u20ac'+Math.round(cashBal);
@@ -2414,7 +2473,8 @@ async function loadOverview(){
       const wr2=total?((wins2/total)*100).toFixed(0)+'%':'—';
       const wrC=total&&wins2/total>=0.6?'cg fw':'cy';
       const bpC=d.peakRRPos>1?'cg fw':d.peakRRPos>0?'cg':'cd';
-      const wpC=d.peakRRNeg<-0.5?'cr fw':'cr';
+      const _wn=d.peakRRNeg!=null?-(d.peakRRNeg/100):null;
+      const wpC=_wn!=null&&_wn<-0.5?'cr fw':'cr';
       const pnl=d.pnl||d.totalPnl||0;
       return \`<tr>
         <td class="cd fw">\${d.date||'—'}</td>
@@ -2422,7 +2482,7 @@ async function loadOverview(){
         <td class="\${wrC}">\${wr2}</td>
         <td class="\${bpC}">\${d.peakRRPos!=null?fmtR(d.peakRRPos):'—'}</td>
         <td class="cd" style="font-size:8px">\${d.peakPosTime||'—'}</td>
-        <td class="\${wpC}">\${d.peakRRNeg!=null?fmtR(d.peakRRNeg):'—'}</td>
+        <td class="\${wpC}">\${_wn!=null?fmtR(_wn):'—'}</td>
         <td class="cd" style="font-size:8px">\${d.peakNegTime||'—'}</td>
         <td class="\${(d.maxDD||0)>0.4?'cr fw':'cr'}">\${d.maxDD!=null?'-'+fmtP(d.maxDD):'—'}</td>
         <td class="cd">\${fmt(d.lots||0,2)}</td>
@@ -2506,7 +2566,10 @@ async function loadSignals(){
         <td>\${bdDir(s.direction)}</td>
         <td>\${bdSess(s.session)}</td>
         <td>\${bdVwap(s.vwapPosition||s.vwap_position)}</td>
-        <td class="cd">\${fmt(s.entry,5)}</td>
+        <td class="cd" style="font-size:8px">\${fmt(s.tvEntry||s.tv_entry||s.entry,5)}</td>
+        <td class="cd" style="font-size:8px">\${s.sessionHigh||s.session_high?fmt(s.sessionHigh||s.session_high,5):'—'}</td>
+        <td class="cd" style="font-size:8px">\${s.sessionLow||s.session_low?fmt(s.sessionLow||s.session_low,5):'—'}</td>
+        <td class="\${(s.bullBreaks||s.bull_breaks||0)>=8?'cg fw':'cd'}">\${s.bullBreaks||s.bull_breaks||'—'}</td>
         <td class="\${(band||0)>150?'cr fw':'cd'}">\${band!=null?fmtP(band):'—'}</td>
         <td>\${keyBdg(s.keyCount||s.key_count||1)}</td>
         <td class="\${outcome==='PLACED'?'cg fw':'co fw'}">\${outcomeBdg(outcome)}</td>
@@ -2586,7 +2649,7 @@ async function loadGhost(){
         <td>\${keyBdg(p.keyCount||g.keyCount||1)}</td>
         <td class="\${cRR(rrNow)}">\${rrNow!=null?fmtR(rrNow):'—'}</td>
         <td class="\${cRR(g.peakRRPos)}">\${fmtR(g.peakRRPos)}</td>
-        <td class="\${(g.peakRRNeg||0)<-50?'cr fw':'cr'}">\${g.peakRRNeg!=null?fmtP(g.peakRRNeg):'—'}</td>
+        <td class="\${(g.peakRRNeg||0)>=80?'cr fw':(g.peakRRNeg||0)>=50?'cr':'cd'}">\${g.peakRRNeg!=null?'-'+fmtP(g.peakRRNeg):'—'}</td>
         <td class="cy">\${g.tpRRUsed!=null?fmtR(g.tpRRUsed):'—'}</td>
         <td class="\${(p.vwapBandPct||0)>150?'co fw':'cd'}">\${p.vwapBandPct!=null?fmtP(p.vwapBandPct):'—'}</td>
         <td class="cd" style="font-size:8px">\${p.tvEntry!=null?fmt(p.tvEntry,5):'—'}</td>
@@ -2620,10 +2683,10 @@ async function loadGhost(){
         <td>\${stopBdg(g.stopReason||g.stop_reason)}</td>
         <td class="cd">\${g.tpRRUsed!=null?fmtR(g.tpRRUsed):'—'}</td>
         <td class="\${cRR(g.peakRRPos)}">\${fmtR(g.peakRRPos)}</td>
-        <td class="\${(g.peakRRNeg||0)<-50?'cr fw':'cr'}">\${g.peakRRNeg!=null?fmtP(g.peakRRNeg):'—'}</td>
+        <td class="\${(g.peakRRNeg||0)>=80?'cr fw':(g.peakRRNeg||0)>=50?'cr':'cd'}">\${g.peakRRNeg!=null?'-'+fmtP(g.peakRRNeg):'—'}</td>
         <td class="\${(g.vwapBandPct||0)>150?'co fw':'cd'}">\${g.vwapBandPct!=null?fmtP(g.vwapBandPct):'—'}</td>
         <td>\${keyBdg(g.keyCount||1)}</td>
-        <td class="\${cE(g.realizedPnl||g.realized_pnl)} fw">\${fmtE(g.realizedPnl||g.realized_pnl)}</td>
+        <td class="\${cE(g.realizedPnlEUR||g.realized_pnl_eur||g.realizedPnl||g.realized_pnl)} fw">\${fmtE(g.realizedPnlEUR||g.realized_pnl_eur||g.realizedPnl||g.realized_pnl)}</td>
         <td class="cd">\${fmt(g.lots,2)}</td>
         <td class="cd" style="font-size:8px">\${fmtTs(g.openedAt||g.opened_at)}</td>
         <td class="cd">\${fmtEl(g.openedAt||g.opened_at,g.finalizedAt||g.finalized_at)}</td>
@@ -2653,7 +2716,7 @@ async function loadShadow(){
       <td>\${bdVwap(b.vwapPosition||b.vwap_position)}</td>
       \${showStop?\`<td>\${stopBdg(b.stopReason||b.stop_reason)}</td>\`:'<td>\${bdSess(b.session)}</td>'}
       <td class="\${cRR(b.peakRRPos)}">\${fmtR(b.peakRRPos)}</td>
-      <td class="\${(b.peakRRNeg||0)<-50?'cr fw':'cr'}">\${b.peakRRNeg!=null?fmtP(b.peakRRNeg):'—'}</td>
+      <td class="\${(b.peakRRNeg||0)>=80?'cr fw':(b.peakRRNeg||0)>=50?'cr':'cd'}">\${b.peakRRNeg!=null?'-'+fmtP(b.peakRRNeg):'—'}</td>
       <td class="\${(b.vwapBandPct||0)>150?'co fw':'cd'}">\${b.vwapBandPct!=null?fmtP(b.vwapBandPct):'—'}</td>
       \${msCells({...slMs,...rrMs})}
       <td class="cd" style="font-size:8.5px">\${fmt(b.entry,5)}</td>
@@ -2843,12 +2906,18 @@ async function initBackground() {
             ? gs.entry + _slDist * gs.tpRRUsed
             : gs.entry - _slDist * gs.tpRRUsed).toFixed(6))
         : null;
+      const _gsSymInfo = getSymbolInfo ? getSymbolInfo(normalizeSymbol(gs.symbol)??gs.symbol) : null;
       openPositions.set(gs.positionId, {
         positionId: gs.positionId, symbol: gs.symbol, mt5Symbol: gs.mt5Symbol??gs.symbol,
         direction: gs.direction, vwapPosition: gs.vwapPosition,
         session: gs.session, entry: gs.entry, sl: gs.sl, tp: _tp, lots: gs.lots ?? null,
         riskPct: gs.riskPct, riskEUR: gs.riskEUR, openedAt: gs.openedAt,
-        optimizerKey: gs.optimizerKey, ghost });
+        optimizerKey: gs.optimizerKey,
+        vwapBandPct: gs.vwapBandPct ?? null,
+        assetType: _gsSymInfo?.type ?? null,
+        type: _gsSymInfo?.type ?? null,
+        tradeNumber: gs.tradeNumber ?? null,
+        ghost });
     }
     console.log(`[DB] Restored ${openPositions.size} positions from ghost_state`);
     // Also immediately sync with MT5 to adopt any positions not in ghost_state
@@ -2867,7 +2936,19 @@ async function initBackground() {
         if (adopted > 0) console.log(`[Startup] Adopted ${adopted} extra MT5 positions not in ghost_state`);
         console.log(`[Startup] Total open positions: ${openPositions.size}`);
       } catch(e) { console.error('[Startup] MT5 adopt error:', e.message); }
-    }, 3000); // wait 3s for MetaAPI connection to stabilize
+    }, 8000); // wait 8s for MetaAPI to fully connect + deploy account
+    // Second adoption attempt after 20s — catches positions missed in first attempt
+    setTimeout(async () => {
+      try {
+        const live2 = await getPositions();
+        let late = 0;
+        for (const lp of (live2||[])) {
+          if (!openPositions.has(String(lp.id))) { await adoptPosition(lp); late++; }
+        }
+        if (late > 0) console.log(`[Startup] Late-adopted ${late} MT5 positions (20s retry)`);
+        else console.log(`[Startup] 20s check: all ${openPositions.size} positions tracked ✓`);
+      } catch(e) { console.warn('[Startup] 20s retry failed:', e.message); }
+    }, 20000);
   } catch (e) { console.error("[DB] restorePositions failed:", e.message); }
 
   // Restore blocked ghost trackers
