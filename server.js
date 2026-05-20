@@ -47,7 +47,7 @@ const {
 } = require("./session");
 
 // ── Version ──────────────────────────────────────────────────────
-const VERSION = "14.7.7"; // v14.7.7: fmtMs global helper, no inline functions in templates, browser syntax error fixed auto currency detection EUR/USD, correct conversion, currency symbol in dashboard USD→EUR conversion, verbose logs removed, complete API fields, mt5Comment shadowRow bdSess fix, milestone format fix, ghost active count fix, signal stats fix, data from 20/05 10:00 ghost restore assetType+vwapBandPct, all display fixes complete ghost restore assetType, ghost peakRRNeg display, signal log session cols, fin ghost realizedPnl fix startBalance fix, peakRRNeg display fix, exitPrice in trades, force adoption on startup, session fallback assetType everywhere, unrealizedPnl, signal outcomes, signal stats fixed correct signal outcomes, unrealizedPnl, assetType in API, signal stats per outcome /api/performance returns balance/equity/startBalance from latestEquity fix isTrackableBlock (no STOCK_OOH in shadow), bdSess fix fix bdSess template literal, add assetType/keyCount to shadow API MetaAPI auto-deploy on startup, stock timing 15:30-18:00, symInfoB crash fix fix symInfoB undefined crash, META_BASE global URL fix DB connection timeout 5s→15s, retry backoff 3s→5s, META_BASE london TP default 1.5R, session_high/low/day_high/low from webhook, vwapBandPct in all ghost saves MetaAPI 429 fix (60s cache), SL TV vs MT5 log, vwapBandPct everywhere, circuit open skip (1 aandeel=1lot, P&L=lots×move) // v14.3: bugs fixed (const→let adoptPosition, dupNumber, blockTypes, duplicate fetchHistoryDeals, NY_NIGHT/ASIA_MORNING shadow tracking) all milestone gaps fixed, outside night 21-02h, daily open log, ghost finalized fix, slHitAt EOD keep
+const VERSION = "14.7.8"; // v14.7.8: asset_type in signal_log, daily log from open pos, mt5 comment in ghost, slDist/tvEntry in adopt fmtMs global helper, no inline functions in templates, browser syntax error fixed auto currency detection EUR/USD, correct conversion, currency symbol in dashboard USD→EUR conversion, verbose logs removed, complete API fields, mt5Comment shadowRow bdSess fix, milestone format fix, ghost active count fix, signal stats fix, data from 20/05 10:00 ghost restore assetType+vwapBandPct, all display fixes complete ghost restore assetType, ghost peakRRNeg display, signal log session cols, fin ghost realizedPnl fix startBalance fix, peakRRNeg display fix, exitPrice in trades, force adoption on startup, session fallback assetType everywhere, unrealizedPnl, signal outcomes, signal stats fixed correct signal outcomes, unrealizedPnl, assetType in API, signal stats per outcome /api/performance returns balance/equity/startBalance from latestEquity fix isTrackableBlock (no STOCK_OOH in shadow), bdSess fix fix bdSess template literal, add assetType/keyCount to shadow API MetaAPI auto-deploy on startup, stock timing 15:30-18:00, symInfoB crash fix fix symInfoB undefined crash, META_BASE global URL fix DB connection timeout 5s→15s, retry backoff 3s→5s, META_BASE london TP default 1.5R, session_high/low/day_high/low from webhook, vwapBandPct in all ghost saves MetaAPI 429 fix (60s cache), SL TV vs MT5 log, vwapBandPct everywhere, circuit open skip (1 aandeel=1lot, P&L=lots×move) // v14.3: bugs fixed (const→let adoptPosition, dupNumber, blockTypes, duplicate fetchHistoryDeals, NY_NIGHT/ASIA_MORNING shadow tracking) all milestone gaps fixed, outside night 21-02h, daily open log, ghost finalized fix, slHitAt EOD keep
 
 // ── Config ───────────────────────────────────────────────────────
 const PORT           = process.env.PORT           || 3000;
@@ -580,6 +580,10 @@ async function adoptPosition(lp) {
     openedAt, optimizerKey: optKey,
     tpRRUsed: tp && sl && entry ? Math.abs(tp - entry) / Math.abs(entry - sl) : null,
     slMultiplier: null, tradeNumber: parsed.tradeNumber,
+    // Reconstruct SL metrics from MT5 data for ghost display
+    slDist: sl && entry ? parseFloat(Math.abs(entry - sl).toFixed(6)) : null,
+    slPctFinal: sl && entry && entry > 0 ? parseFloat((Math.abs(entry - sl) / entry * 100).toFixed(4)) : null,
+    tvEntry: entry, // use MT5 openPrice as tvEntry approximation for adopted positions
     liveProfitMT5: livePnl ?? null,
     unrealizedPnl: livePnl ?? null,
     currentPrice:  livePrice ?? (lp.currentPrice ? parseFloat(lp.currentPrice) : null),
@@ -1210,10 +1214,20 @@ app.post("/webhook", async (req, res) => {
       mktReason?.includes('MAX_POSITIONS') ? 'MAX_POSITIONS' : 'REJECTED';
     const _tvEntryLog = parseFloat(req.body?.entry ?? req.body?.close ?? 0) || null;
     const _vwapLog    = req.body?.vwap ? parseFloat(req.body.vwap) : null;
+    const _slPctLog   = parseFloat(req.body?.sl_pct ?? 0.003);
     const _vwapPosLog = (_tvEntryLog && _vwapLog) ? getVwapPosition(_tvEntryLog, _vwapLog) : null;
+    // Compute vwapBandPct for signal log
+    let _bandLog = null;
+    if (_tvEntryLog && _vwapLog && req.body?.vwap_upper) {
+      const _hb = Math.abs(parseFloat(req.body.vwap_upper) - _vwapLog);
+      if (_hb > 0) _bandLog = parseFloat((Math.abs(_tvEntryLog - _vwapLog) / _hb * 100).toFixed(2));
+    }
     db.logSignal({ symbol, direction, outcome: _sigOutcome, rejectReason: mktReason,
       session: sesForLog, vwapPosition: _vwapPosLog,
-      tvEntry: _tvEntryLog, slPct: parseFloat(req.body?.sl_pct ?? 0.003),
+      tvEntry: _tvEntryLog, slPct: _slPctLog, vwapBandPct: _bandLog,
+      assetType: symInfo?.type ?? null,
+      sessionHigh: sessionHigh, sessionLow: sessionLow,
+      dayHigh: dayHigh, dayLow: dayLow, bullBreaks: bullBreaks,
       latencyMs: Date.now() - t0 }).catch(() => {});
 
     // ── Shadow Playbook: ALL tradeable-but-blocked signals get a ghost tracker ──
@@ -1604,17 +1618,23 @@ app.get("/api/performance", async (req, res) => {
     const equity = latestEquity || acctBalance || 0;
     const realizedPnl = stats?.totalPnl ?? 0;
     // Unrealized = sum of all open position P&L
+    // Calculate from components for consistency
     const unrealizedPnl = [...openPositions.values()]
       .reduce((s, p) => s + (p.unrealizedPnl ?? p.liveProfitMT5 ?? 0), 0);
+    // cashBalance = startBalance + realized (what we've earned and closed)
+    const cashBalance = parseFloat((acctBalance + realizedPnl).toFixed(2));
+    // equity = cash + unrealized
+    const equityCalc  = parseFloat((cashBalance + unrealizedPnl).toFixed(2));
     res.json({
       ...(stats ?? {}),
-      balance:       equity,
-      equity:        parseFloat((equity + unrealizedPnl - realizedPnl).toFixed(2)),
+      balance:       cashBalance,
+      equity:        equityCalc,
       realizedPnl:   realizedPnl,
       totalPnl:      realizedPnl,
       unrealizedPnl: parseFloat(unrealizedPnl.toFixed(2)),
       startBalance:  acctBalance,
       currency:      latestAccountCurrency,
+      mt5Balance:    latestEquity, // raw MT5 value for reference
     });
   } catch (e) { res.json(null); }
 });
@@ -2452,7 +2472,7 @@ async function loadOverview(){
   const [openPos,daily,trades,perf] = await Promise.all([
     api('/api/open-positions'),
     api('/api/daily-breakdown'),
-    api('/api/trades?openFrom=2026-05-20T10:00:00Z'),
+    api('/api/trades'),
     api('/api/performance'),
   ]);
 
@@ -2504,9 +2524,24 @@ async function loadOverview(){
   // Daily log
   const dEl=$('ov-daily');
   const days=(daily&&daily.days)||[];
-  if(!days.length){dEl.innerHTML=nd(12,'Geen data — wacht op eerste trades');}
+  // If no closed trade data, build daily log from open positions
+  let _dailyRows = days;
+  if(!_dailyRows.length && pos && pos.length) {
+    // Group open positions by open date (Brussels time)
+    const _today = new Date().toLocaleDateString('nl-BE',{timeZone:'Europe/Brussels',day:'2-digit',month:'2-digit'});
+    const _todayWins = pos.filter(p=>(p.unrealizedPnl||p.liveProfitMT5||0)>0).length;
+    const _todayLoss = pos.filter(p=>(p.unrealizedPnl||p.liveProfitMT5||0)<0).length;
+    const _bestPeak = pos.reduce((b,p)=>Math.max(b,p.ghost?.peakRRPos||p.peakRRPos||0),0);
+    const _worstPeak = pos.reduce((b,p)=>Math.max(b,p.ghost?.peakRRNeg||p.peakRRNeg||0),0);
+    const _totalLots = pos.reduce((s,p)=>s+(p.lots||0),0);
+    const _totalPnl = pos.reduce((s,p)=>s+(p.unrealizedPnl||p.liveProfitMT5||0),0);
+    _dailyRows = [{date:_today,total:pos.length,wins:_todayWins,losses:_todayLoss,
+      peakRRPos:_bestPeak,peakRRNeg:_worstPeak*100,peakPosTime:'open',peakNegTime:'open',
+      maxDD:_worstPeak>0?_worstPeak:null,lots:_totalLots,pnl:_totalPnl}];
+  }
+  if(!_dailyRows.length){dEl.innerHTML=nd(12,'Geen data — wacht op eerste trades');}
   else {
-    dEl.innerHTML=days.slice(0,14).map(d=>{
+    dEl.innerHTML=_dailyRows.slice(0,14).map(d=>{
       const total=d.total||0,wins2=d.wins||0,loss2=d.losses||0;
       const wr2=total?((wins2/total)*100).toFixed(0)+'%':'—';
       const wrC=total&&wins2/total>=0.6?'cg fw':'cy';
@@ -2605,13 +2640,13 @@ async function loadSignals(){
       return \`<tr>
         <td class="cd">\${fmtT(s.receivedAt||s.received_at||s.createdAt||s.created_at)}</td>
         <td class="cb fw">\${s.symbol||'—'}</td>
-        <td>\${bdType(s.assetType||s.asset_type)}</td>
+        <td>\${bdType(s.assetType||s.asset_type||s.type)}</td>
         <td>\${bdDir(s.direction)}</td>
         <td>\${bdSess(s.session)}</td>
         <td>\${bdVwap(s.vwapPosition||s.vwap_position)}</td>
         <td class="cd" style="font-size:8px">\${fmt(s.tvEntry||s.tv_entry||s.entry,5)}</td>
-        <td class="cd" style="font-size:8px">\${s.sessionHigh||s.session_high?fmt(s.sessionHigh||s.session_high,5):'—'}</td>
-        <td class="cd" style="font-size:8px">\${s.sessionLow||s.session_low?fmt(s.sessionLow||s.session_low,5):'—'}</td>
+        <td class="cd" style="font-size:8px">\${(s.sessionHigh||s.session_high)?fmt(s.sessionHigh||s.session_high,5):'—'}</td>
+        <td class="cd" style="font-size:8px">\${(s.sessionLow||s.session_low)?fmt(s.sessionLow||s.session_low,5):'—'}</td>
         <td class="\${(s.bullBreaks||s.bull_breaks||0)>=8?'cg fw':'cd'}">\${s.bullBreaks||s.bull_breaks||'—'}</td>
         <td class="\${(band||0)>150?'cr fw':'cd'}">\${band!=null?fmtP(band):'—'}</td>
         <td>\${keyBdg(s.keyCount||s.key_count||1)}</td>
@@ -2689,6 +2724,7 @@ async function loadGhost(){
       return \`<tr class="\${slHit?'sl-row':''}">
         <td>\${stateBdg}</td>
         <td class="cb fw">\${p.symbol||'—'}</td>
+        <td style="font-size:7.5px;color:var(--ink3);max-width:90px;overflow:hidden">\${p.mt5Comment||p.orderComment||p.comment||'—'}</td>
         <td>\${bdType(p.assetType||p.type)}</td>
         <td>\${bdDir(p.direction)}</td>
         <td>\${bdVwap(p.vwapPosition||p.vwap_position)}</td>
