@@ -47,7 +47,7 @@ const {
 } = require("./session");
 
 // ── Version ──────────────────────────────────────────────────────
-const VERSION = "14.7.4"; // v14.7.4: shadowRow bdSess fix, milestone format fix, ghost active count fix, signal stats fix, data from 20/05 10:00 ghost restore assetType+vwapBandPct, all display fixes complete ghost restore assetType, ghost peakRRNeg display, signal log session cols, fin ghost realizedPnl fix startBalance fix, peakRRNeg display fix, exitPrice in trades, force adoption on startup, session fallback assetType everywhere, unrealizedPnl, signal outcomes, signal stats fixed correct signal outcomes, unrealizedPnl, assetType in API, signal stats per outcome /api/performance returns balance/equity/startBalance from latestEquity fix isTrackableBlock (no STOCK_OOH in shadow), bdSess fix fix bdSess template literal, add assetType/keyCount to shadow API MetaAPI auto-deploy on startup, stock timing 15:30-18:00, symInfoB crash fix fix symInfoB undefined crash, META_BASE global URL fix DB connection timeout 5s→15s, retry backoff 3s→5s, META_BASE london TP default 1.5R, session_high/low/day_high/low from webhook, vwapBandPct in all ghost saves MetaAPI 429 fix (60s cache), SL TV vs MT5 log, vwapBandPct everywhere, circuit open skip (1 aandeel=1lot, P&L=lots×move) // v14.3: bugs fixed (const→let adoptPosition, dupNumber, blockTypes, duplicate fetchHistoryDeals, NY_NIGHT/ASIA_MORNING shadow tracking) all milestone gaps fixed, outside night 21-02h, daily open log, ghost finalized fix, slHitAt EOD keep
+const VERSION = "14.7.6"; // v14.7.6: auto currency detection EUR/USD, correct conversion, currency symbol in dashboard USD→EUR conversion, verbose logs removed, complete API fields, mt5Comment shadowRow bdSess fix, milestone format fix, ghost active count fix, signal stats fix, data from 20/05 10:00 ghost restore assetType+vwapBandPct, all display fixes complete ghost restore assetType, ghost peakRRNeg display, signal log session cols, fin ghost realizedPnl fix startBalance fix, peakRRNeg display fix, exitPrice in trades, force adoption on startup, session fallback assetType everywhere, unrealizedPnl, signal outcomes, signal stats fixed correct signal outcomes, unrealizedPnl, assetType in API, signal stats per outcome /api/performance returns balance/equity/startBalance from latestEquity fix isTrackableBlock (no STOCK_OOH in shadow), bdSess fix fix bdSess template literal, add assetType/keyCount to shadow API MetaAPI auto-deploy on startup, stock timing 15:30-18:00, symInfoB crash fix fix symInfoB undefined crash, META_BASE global URL fix DB connection timeout 5s→15s, retry backoff 3s→5s, META_BASE london TP default 1.5R, session_high/low/day_high/low from webhook, vwapBandPct in all ghost saves MetaAPI 429 fix (60s cache), SL TV vs MT5 log, vwapBandPct everywhere, circuit open skip (1 aandeel=1lot, P&L=lots×move) // v14.3: bugs fixed (const→let adoptPosition, dupNumber, blockTypes, duplicate fetchHistoryDeals, NY_NIGHT/ASIA_MORNING shadow tracking) all milestone gaps fixed, outside night 21-02h, daily open log, ghost finalized fix, slHitAt EOD keep
 
 // ── Config ───────────────────────────────────────────────────────
 const PORT           = process.env.PORT           || 3000;
@@ -191,7 +191,8 @@ async function getAccountInfo() {
     if (data?.balance !== undefined) {
       _acctCache   = data;
       _acctCacheTs = now;
-      console.log(`[MetaAPI] getAccountInfo: balance=${data.balance} equity=${data.equity} (cached 60s)`);
+      if (data.currency) latestAccountCurrency = data.currency;
+      console.log(`[MetaAPI] getAccountInfo: balance=${data.balance} equity=${data.equity} currency=${data.currency} (cached 60s)`);
     }
     return data;
   } catch (e) {
@@ -581,9 +582,13 @@ async function adoptPosition(lp) {
     slMultiplier: null, tradeNumber: parsed.tradeNumber,
     liveProfitMT5: livePnl ?? null,
     unrealizedPnl: livePnl ?? null,
-    currentPrice:  livePrice ?? null,
+    currentPrice:  livePrice ?? (lp.currentPrice ? parseFloat(lp.currentPrice) : null),
     assetType: symInfo?.type ?? null,
     type: symInfo?.type ?? null,
+    exchangeRate: latestAccountCurrency === 'EUR' ? 1.0 : parseFloat(lp.accountCurrencyExchangeRate ?? 1.0),
+    accountCurrency: latestAccountCurrency,
+    lots: parseFloat(lp.volume ?? lp.lots ?? 0),
+    mt5Comment: lp.comment ?? lp.brokerComment ?? null,
     ghost: null,
   };
   pos.ghost = initGhost({ ...pos, slPct });
@@ -597,6 +602,7 @@ async function adoptPosition(lp) {
 let _syncRunning  = false;
 let _syncCount    = 0;
 let latestEquity  = 50000;   // updated by pollStatus / placeOrder
+let latestAccountCurrency = process.env.ACCOUNT_CURRENCY || 'USD'; // auto-detected from MetaAPI
 let _lastEquityRecord = 0;   // timestamp of last equity_curve insert
 async function syncPositions() {
   // Always sync — weekends included. Market may be closed but positions exist.
@@ -681,8 +687,16 @@ async function _doSyncPositions() {
       // P&L: profit / unrealizedProfit / currentProfit / swap included
       const lpProfit = lp.profit ?? lp.unrealizedProfit ?? lp.currentProfit;
       if (lpProfit != null) {
-        pos.liveProfitMT5  = parseFloat(lpProfit);
-        pos.unrealizedPnl  = parseFloat(lpProfit);
+        // Currency conversion: EUR account = no conversion, USD = use exchange rate
+        const _rawProfit = parseFloat(lpProfit);
+        const _exRate = latestAccountCurrency === 'EUR' ? 1.0
+          : parseFloat(lp.accountCurrencyExchangeRate ?? 1.0);
+        const _profitDisplay = parseFloat((_rawProfit * _exRate).toFixed(2));
+        pos.liveProfitMT5  = _profitDisplay;
+        pos.unrealizedPnl  = _profitDisplay;
+        pos.profitRaw      = _rawProfit;
+        pos.exchangeRate   = _exRate;
+        pos.accountCurrency = latestAccountCurrency;
       }
       // Keep assetType in sync
       if (!pos.assetType && pos.symbol) {
@@ -690,6 +704,8 @@ async function _doSyncPositions() {
         pos.assetType = _si?.type ?? null;
         pos.type = pos.assetType;
       }
+      // Keep currentPrice in sync
+      if (lp.currentPrice) pos.currentPrice = parseFloat(lp.currentPrice);
 
       // Current price: currentPrice / currentBid / currentAsk / openPrice fallback
       const lpPrice = lp.currentPrice ?? lp.currentBid ?? lp.currentAsk ?? lp.openPrice;
@@ -1587,15 +1603,18 @@ app.get("/api/performance", async (req, res) => {
     const acctBalance = parseFloat(process.env.ACCOUNT_BALANCE || 0);
     const equity = latestEquity || acctBalance || 0;
     const realizedPnl = stats?.totalPnl ?? 0;
-    // balance = equity - unrealized (we don't have unrealized here so use equity)
-    // startBalance = first known balance = ACCOUNT_BALANCE env var
+    // Unrealized = sum of all open position P&L
+    const unrealizedPnl = [...openPositions.values()]
+      .reduce((s, p) => s + (p.unrealizedPnl ?? p.liveProfitMT5 ?? 0), 0);
     res.json({
       ...(stats ?? {}),
-      balance:      equity,
-      equity:       equity,
-      realizedPnl:  realizedPnl,
-      totalPnl:     realizedPnl,
-      startBalance: acctBalance,
+      balance:       equity,
+      equity:        parseFloat((equity + unrealizedPnl - realizedPnl).toFixed(2)),
+      realizedPnl:   realizedPnl,
+      totalPnl:      realizedPnl,
+      unrealizedPnl: parseFloat(unrealizedPnl.toFixed(2)),
+      startBalance:  acctBalance,
+      currency:      latestAccountCurrency,
     });
   } catch (e) { res.json(null); }
 });
@@ -1690,12 +1709,15 @@ app.get("/api/open-positions", (req, res) => {
       slMultiplier: pos.slMultiplier ?? null, tvEntry: pos.tvEntry ?? null,
       openedAt: pos.openedAt,
       tradeNumber: pos.tradeNumber,
-      currentPrice: pos.currentPrice ?? null,
+      currentPrice:  pos.currentPrice ?? null,
       liveProfitMT5: pos.liveProfitMT5 ?? null,
       unrealizedPnl: pos.liveProfitMT5 ?? null,
-      assetType: pos.assetType ?? null,
-      type: pos.assetType ?? null,
-      exitPrice: pos.exitPrice ?? null,
+      profitUSD:     pos.profitUSD ?? null,
+      exchangeRate:  pos.exchangeRate ?? 1.0,
+      assetType:     pos.assetType ?? symInfo?.type ?? null,
+      type:          pos.assetType ?? symInfo?.type ?? null,
+      exitPrice:     pos.exitPrice ?? null,
+      lots:          pos.lots ?? null,
       ghost: pos.ghost ? {
         maxRR:        pos.ghost.maxRR        ?? 0,
         maxSlPctUsed: pos.ghost.maxSlPctUsed ?? 0,
@@ -2382,7 +2404,7 @@ async function loadHeader(){
   if(el('h-upnl')){el('h-upnl').textContent=fmtE(upnl);el('h-upnl').className='kv '+(upnl>0?'cg':upnl<0?'cr':'cd');}
 
   if(perf){
-    if(el('h-bal')){el('h-bal').textContent=perf.balance?'\\u20ac'+Math.round(perf.balance):'—';}
+    const _cs=perf.currency==='EUR'?'\\u20ac':perf.currency==='USD'?'$':(perf.currency||'\\u20ac');if(el('h-bal')){el('h-bal').textContent=perf.balance?_cs+Math.round(perf.balance).toLocaleString():'—';}
     if(el('h-eq')){el('h-eq').textContent=perf.equity?'\\u20ac'+Math.round(perf.equity):'—';}
     if(el('h-rpnl')){
       const rp=perf.totalPnl||perf.realizedPnl||0;
@@ -3035,7 +3057,8 @@ async function initBackground() {
       if (acct && acct.balance !== undefined) {
         latestEquity = parseFloat(acct.equity ?? acct.balance ?? 50000);
         _acctCache = acct; _acctCacheTs = Date.now();
-        console.log(`[MetaAPI] ✅ Connected — balance: ${acct.balance} ${acct.currency}`);
+        latestAccountCurrency = acct.currency ?? 'USD';
+        console.log(`[MetaAPI] ✅ Connected — balance: ${acct.balance} ${acct.currency} (display currency: ${latestAccountCurrency})`);
       } else {
         console.warn("[MetaAPI] ⚠️ Response empty — account may still be deploying");
       }
