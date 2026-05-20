@@ -778,6 +778,7 @@ async function initDB() {
   await safeAlter(`ALTER TABLE signal_log ADD COLUMN IF NOT EXISTS day_high           NUMERIC`);
   await safeAlter(`ALTER TABLE signal_log ADD COLUMN IF NOT EXISTS day_low            NUMERIC`);
   await safeAlter(`ALTER TABLE signal_log ADD COLUMN IF NOT EXISTS bull_breaks        INTEGER`);
+  await safeAlter(`ALTER TABLE signal_log ADD COLUMN IF NOT EXISTS asset_type         TEXT`);
   await safeAlter(`ALTER TABLE signal_log ADD COLUMN IF NOT EXISTS bear_breaks        INTEGER`);
   await safeAlter(`ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS sl_milestones    JSONB`);
   await safeAlter(`ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS rr_milestones    JSONB`);
@@ -1331,8 +1332,8 @@ async function logSignal(s) {
         (symbol, direction, session, vwap_position, optimizer_key,
          tv_entry, sl_pct, sl_pct_human, vwap, vwap_upper, vwap_lower,
          vwap_band_pct, outcome, reject_reason, latency_ms, position_id,
-         session_high, session_low, day_high, day_low, bull_breaks, bear_breaks)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+         session_high, session_low, day_high, day_low, bull_breaks, bear_breaks, asset_type)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
     `, [
       s.symbol         ?? null, s.direction    ?? null, s.session      ?? null,
       s.vwapPosition   ?? null, s.optimizerKey ?? null,
@@ -1343,6 +1344,7 @@ async function logSignal(s) {
       s.sessionHigh    ?? null, s.sessionLow   ?? null,
       s.dayHigh        ?? null, s.dayLow       ?? null,
       s.bullBreaks     ?? null, s.bearBreaks   ?? null,
+      s.assetType      ?? null,
     ]);
   } catch (e) { /* non-critical */ }
 }
@@ -2180,7 +2182,9 @@ async function loadSignalLog({ since = null, until = null, limit = 500 } = {}) {
         outcome,
         reject_reason                AS reason,
         latency_ms,
-        position_id
+        position_id,
+        asset_type,
+        session_high, session_low, day_high, day_low, bull_breaks
       FROM signal_log
       WHERE received_at >= $1
         AND received_at <= $2
