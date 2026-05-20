@@ -2755,7 +2755,7 @@ async function loadShadow(){
       <td class="\${cRR(b.peakRRPos)}">\${fmtR(b.peakRRPos)}</td>
       <td class="\${(b.peakRRNeg||0)>=80?'cr fw':(b.peakRRNeg||0)>=50?'cr':'cd'}">\${b.peakRRNeg!=null?'-'+fmtP(b.peakRRNeg):'—'}</td>
       <td class="\${(b.vwapBandPct||0)>150?'co fw':'cd'}">\${b.vwapBandPct!=null?fmtP(b.vwapBandPct):'—'}</td>
-      \${msCells({..._slFF,..._rrFF}))}
+      \${msCells({..._slFF,..._rrFF})}
       <td class="cd" style="font-size:8.5px">\${fmt(b.entry,5)}</td>
       <td class="cd" style="font-size:8px">\${fmtTs(b.openedAt||b.opened_at)}</td>
       <td class="cd">\${fmtEl(b.openedAt||b.opened_at,b.finalizedAt||b.finalized_at||null)}</td>\`;
