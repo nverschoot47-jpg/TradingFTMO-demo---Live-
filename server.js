@@ -47,7 +47,7 @@ const {
 } = require("./session");
 
 // ── Version ──────────────────────────────────────────────────────
-const VERSION = "14.7.3"; // v14.7.3: ghost restore assetType+vwapBandPct, all display fixes complete ghost restore assetType, ghost peakRRNeg display, signal log session cols, fin ghost realizedPnl fix startBalance fix, peakRRNeg display fix, exitPrice in trades, force adoption on startup, session fallback assetType everywhere, unrealizedPnl, signal outcomes, signal stats fixed correct signal outcomes, unrealizedPnl, assetType in API, signal stats per outcome /api/performance returns balance/equity/startBalance from latestEquity fix isTrackableBlock (no STOCK_OOH in shadow), bdSess fix fix bdSess template literal, add assetType/keyCount to shadow API MetaAPI auto-deploy on startup, stock timing 15:30-18:00, symInfoB crash fix fix symInfoB undefined crash, META_BASE global URL fix DB connection timeout 5s→15s, retry backoff 3s→5s, META_BASE london TP default 1.5R, session_high/low/day_high/low from webhook, vwapBandPct in all ghost saves MetaAPI 429 fix (60s cache), SL TV vs MT5 log, vwapBandPct everywhere, circuit open skip (1 aandeel=1lot, P&L=lots×move) // v14.3: bugs fixed (const→let adoptPosition, dupNumber, blockTypes, duplicate fetchHistoryDeals, NY_NIGHT/ASIA_MORNING shadow tracking) all milestone gaps fixed, outside night 21-02h, daily open log, ghost finalized fix, slHitAt EOD keep
+const VERSION = "14.7.4"; // v14.7.4: shadowRow bdSess fix, milestone format fix, ghost active count fix, signal stats fix, data from 20/05 10:00 ghost restore assetType+vwapBandPct, all display fixes complete ghost restore assetType, ghost peakRRNeg display, signal log session cols, fin ghost realizedPnl fix startBalance fix, peakRRNeg display fix, exitPrice in trades, force adoption on startup, session fallback assetType everywhere, unrealizedPnl, signal outcomes, signal stats fixed correct signal outcomes, unrealizedPnl, assetType in API, signal stats per outcome /api/performance returns balance/equity/startBalance from latestEquity fix isTrackableBlock (no STOCK_OOH in shadow), bdSess fix fix bdSess template literal, add assetType/keyCount to shadow API MetaAPI auto-deploy on startup, stock timing 15:30-18:00, symInfoB crash fix fix symInfoB undefined crash, META_BASE global URL fix DB connection timeout 5s→15s, retry backoff 3s→5s, META_BASE london TP default 1.5R, session_high/low/day_high/low from webhook, vwapBandPct in all ghost saves MetaAPI 429 fix (60s cache), SL TV vs MT5 log, vwapBandPct everywhere, circuit open skip (1 aandeel=1lot, P&L=lots×move) // v14.3: bugs fixed (const→let adoptPosition, dupNumber, blockTypes, duplicate fetchHistoryDeals, NY_NIGHT/ASIA_MORNING shadow tracking) all milestone gaps fixed, outside night 21-02h, daily open log, ghost finalized fix, slHitAt EOD keep
 
 // ── Config ───────────────────────────────────────────────────────
 const PORT           = process.env.PORT           || 3000;
@@ -2414,7 +2414,7 @@ async function loadOverview(){
   const [openPos,daily,trades,perf] = await Promise.all([
     api('/api/open-positions'),
     api('/api/daily-breakdown'),
-    api('/api/trades'),
+    api('/api/trades?openFrom=2026-05-20T10:00:00Z'),
     api('/api/performance'),
   ]);
 
@@ -2525,8 +2525,8 @@ async function loadOverview(){
 // ── SIGNALS ──
 async function loadSignals(){
   const [stats,log,rejects] = await Promise.all([
-    api('/api/signal-stats'),
-    api('/api/signal-log'),
+    api('/api/signal-stats?since=2026-05-20T10:00:00Z'),
+    api('/api/signal-log?since=2026-05-20T10:00:00Z'),
     api('/api/signal-rejects'),
   ]);
 
@@ -2535,7 +2535,7 @@ async function loadSignals(){
     f('sg-total',   stats.total||0);
     f('sg-placed',  stats.placed||0);
     f('sg-conv',    stats.conversionPct!=null?fmtP(stats.conversionPct):'—');
-    f('sg-shadow',  stats.shadow||stats.blocked||0);
+    f('sg-shadow',  (stats.nyDead||0)+(stats.nyNight||0)+(stats.asiaMorning||0)+(stats.vwapExhaustion||0)+(stats.duplicate||0)||stats.shadow||0);
     f('sg-nydead',  stats.nyDead||stats.ny_dead||0);
     f('sg-nynight', stats.nyNight||stats.ny_night||0);
     f('sg-asia',    stats.asiaMorning||stats.asia_morning||0);
@@ -2544,7 +2544,12 @@ async function loadSignals(){
     f('sg-wknd',    stats.weekend||0);
     f('sg-ooh',     stats.stockOOH||stats.stock_ooh||0);
     f('sg-unk',     stats.unknownSymbol||stats.unknown_symbol||0);
-    f('sg-err',     stats.errors||0);
+    // Errors = real system errors only (ORDER_NOT_CONFIRMED, MetaAPI, etc)
+    // NOT rejected signals (those are NY_NIGHT/STOCK_OOH/etc)
+    const _realErrors = (stats.byOutcome||[])
+      .filter(o=>o.outcome&&(o.outcome.includes('ERROR')||o.outcome.includes('NO_POS')||o.outcome.includes('TIMEOUT')||o.outcome.includes('CIRCUIT')))
+      .reduce((s,o)=>s+(o.count||0),0);
+    f('sg-err', _realErrors||stats.errors||0);
     if($('nb-sig'))$('nb-sig').textContent=stats.total||0;
   }
 
@@ -2616,7 +2621,7 @@ async function loadGhost(){
     if(g.tpRRUsed&&(g.peakRRPos||0)>=g.tpRRUsed)tpCnt++;
   }
   const f=(id,v,cls)=>{const e=$(id);if(!e)return;e.textContent=v;if(cls)e.className=cls;};
-  f('gh-active-cnt', active.length, 'ksv cp');
+  f('gh-active-cnt', pos.length, 'ksv cp');  // use open-positions count
   f('gh-sl-today',   slToday,       'ksv cr fw');
   f('gh-best-peak',  bestP!=null?fmtR(bestP):'—', 'ksv cg fw');
   f('gh-avg-peak',   active.length?fmtR(sumP/active.length):'—', 'ksv cy');
@@ -2638,7 +2643,10 @@ async function loadGhost(){
       const stateBdg=slHit?'<span class="dg-stop">SL HIT</span>':'<span class="dg-live">● LIVE</span>';
       const slMs=g.slMilestones||g.sl_milestones||{};
       const rrMs=g.rrMilestones||g.rr_milestones||{};
-      const allMs={...slMs,...rrMs};
+      const _otsA=p.openedAt||g.openedAt?new Date(p.openedAt||g.openedAt).getTime():null;
+      function _mA(v){if(v==null)return null;const n=typeof v==='number'&&v>1000000000000?v:typeof v==='string'&&v.length>10?new Date(v).getTime():null;if(n&&_otsA){const el=Math.round((n-_otsA)/60000);return el<0?'0m':el<60?el+'m':(Math.floor(el/60)+'h'+(el%60?String(el%60).padStart(2,'0')+'m':''));}return typeof v==='number'&&v<100000?v+'m':String(v);}
+      const _slA={},_rrA={};for(const k in slMs)_slA[k]=_mA(slMs[k]);for(const k in rrMs)_rrA[k]=_mA(rrMs[k]);
+      const allMs={..._slA,..._rrA};
       return \`<tr class="\${slHit?'sl-row':''}">
         <td>\${stateBdg}</td>
         <td class="cb fw">\${p.symbol||'—'}</td>
@@ -2673,6 +2681,9 @@ async function loadGhost(){
     fBody.innerHTML=fin.slice(0,300).map((g,i)=>{
       const slMs=g.slMilestones||g.sl_milestones||{};
       const rrMs=g.rrMilestones||g.rr_milestones||{};
+      const _otsF=g.openedAt||g.opened_at?new Date(g.openedAt||g.opened_at).getTime():null;
+      function _mFmtFin(v){if(v==null)return null;const n=typeof v==='number'&&v>1000000000000?v:typeof v==='string'&&v.length>10?new Date(v).getTime():null;if(n&&_otsF){const el=Math.round((n-_otsF)/60000);return el<0?'0m':el<60?el+'m':(Math.floor(el/60)+'h'+(el%60?String(el%60).padStart(2,'0')+'m':''));}return typeof v==='number'&&v<10000?v+'m':v;}
+      const _slFF={},_rrFF={};for(const k in slMs)_slFF[k]=_mFmtFin(slMs[k]);for(const k in rrMs)_rrFF[k]=_mFmtFin(rrMs[k]);
       return \`<tr>
         <td class="cd">\${i+1}</td>
         <td class="cb fw">\${g.symbol||'—'}</td>
@@ -2690,7 +2701,7 @@ async function loadGhost(){
         <td class="cd">\${fmt(g.lots,2)}</td>
         <td class="cd" style="font-size:8px">\${fmtTs(g.openedAt||g.opened_at)}</td>
         <td class="cd">\${fmtEl(g.openedAt||g.opened_at,g.finalizedAt||g.finalized_at)}</td>
-        \${msCells({...slMs,...rrMs})}
+        \${msCells({..._slF,..._rrF})}
       </tr>\`;
     }).join('');
   }
@@ -2707,6 +2718,10 @@ async function loadShadow(){
     const bt=b.blockType||b.block_type||'';
     const slMs=b.slMilestones||b.sl_milestones||{};
     const rrMs=b.rrMilestones||b.rr_milestones||{};
+    // Pre-compute conditional cell to avoid nested template literal issues
+    const _sessOrStop = showStop
+      ? '<td>'+stopBdg(b.stopReason||b.stop_reason)+'</td>'
+      : '<td>'+bdSess(b.session||b.sub_session||'ny')+'</td>';
     const base = \`
       <td>\${blockBdg(bt)}</td>
       <td class="cb fw">\${b.symbol||'—'}</td>
@@ -2714,11 +2729,11 @@ async function loadShadow(){
       <td>\${keyBdg(b.keyCount||b.key_count||1)}</td>
       <td>\${bdDir(b.direction)}</td>
       <td>\${bdVwap(b.vwapPosition||b.vwap_position)}</td>
-      \${showStop?\`<td>\${stopBdg(b.stopReason||b.stop_reason)}</td>\`:'<td>\${bdSess(b.session)}</td>'}
+      \${_sessOrStop}
       <td class="\${cRR(b.peakRRPos)}">\${fmtR(b.peakRRPos)}</td>
       <td class="\${(b.peakRRNeg||0)>=80?'cr fw':(b.peakRRNeg||0)>=50?'cr':'cd'}">\${b.peakRRNeg!=null?'-'+fmtP(b.peakRRNeg):'—'}</td>
       <td class="\${(b.vwapBandPct||0)>150?'co fw':'cd'}">\${b.vwapBandPct!=null?fmtP(b.vwapBandPct):'—'}</td>
-      \${msCells({...slMs,...rrMs})}
+      \${msCells({..._slFF,..._rrFF}))}
       <td class="cd" style="font-size:8.5px">\${fmt(b.entry,5)}</td>
       <td class="cd" style="font-size:8px">\${fmtTs(b.openedAt||b.opened_at)}</td>
       <td class="cd">\${fmtEl(b.openedAt||b.opened_at,b.finalizedAt||b.finalized_at||null)}</td>\`;
