@@ -47,7 +47,7 @@ const {
 } = require("./session");
 
 // ── Version ──────────────────────────────────────────────────────
-const VERSION = "14.7.8"; // v14.7.8: asset_type in signal_log, daily log from open pos, mt5 comment in ghost, slDist/tvEntry in adopt fmtMs global helper, no inline functions in templates, browser syntax error fixed auto currency detection EUR/USD, correct conversion, currency symbol in dashboard USD→EUR conversion, verbose logs removed, complete API fields, mt5Comment shadowRow bdSess fix, milestone format fix, ghost active count fix, signal stats fix, data from 20/05 10:00 ghost restore assetType+vwapBandPct, all display fixes complete ghost restore assetType, ghost peakRRNeg display, signal log session cols, fin ghost realizedPnl fix startBalance fix, peakRRNeg display fix, exitPrice in trades, force adoption on startup, session fallback assetType everywhere, unrealizedPnl, signal outcomes, signal stats fixed correct signal outcomes, unrealizedPnl, assetType in API, signal stats per outcome /api/performance returns balance/equity/startBalance from latestEquity fix isTrackableBlock (no STOCK_OOH in shadow), bdSess fix fix bdSess template literal, add assetType/keyCount to shadow API MetaAPI auto-deploy on startup, stock timing 15:30-18:00, symInfoB crash fix fix symInfoB undefined crash, META_BASE global URL fix DB connection timeout 5s→15s, retry backoff 3s→5s, META_BASE london TP default 1.5R, session_high/low/day_high/low from webhook, vwapBandPct in all ghost saves MetaAPI 429 fix (60s cache), SL TV vs MT5 log, vwapBandPct everywhere, circuit open skip (1 aandeel=1lot, P&L=lots×move) // v14.3: bugs fixed (const→let adoptPosition, dupNumber, blockTypes, duplicate fetchHistoryDeals, NY_NIGHT/ASIA_MORNING shadow tracking) all milestone gaps fixed, outside night 21-02h, daily open log, ghost finalized fix, slHitAt EOD keep
+const VERSION = "14.7.9"; // v14.7.9: mt5Comment in trades, ghost stop labels, outcome badges, what-if comment, SYNC_RAW removed asset_type in signal_log, daily log from open pos, mt5 comment in ghost, slDist/tvEntry in adopt fmtMs global helper, no inline functions in templates, browser syntax error fixed auto currency detection EUR/USD, correct conversion, currency symbol in dashboard USD→EUR conversion, verbose logs removed, complete API fields, mt5Comment shadowRow bdSess fix, milestone format fix, ghost active count fix, signal stats fix, data from 20/05 10:00 ghost restore assetType+vwapBandPct, all display fixes complete ghost restore assetType, ghost peakRRNeg display, signal log session cols, fin ghost realizedPnl fix startBalance fix, peakRRNeg display fix, exitPrice in trades, force adoption on startup, session fallback assetType everywhere, unrealizedPnl, signal outcomes, signal stats fixed correct signal outcomes, unrealizedPnl, assetType in API, signal stats per outcome /api/performance returns balance/equity/startBalance from latestEquity fix isTrackableBlock (no STOCK_OOH in shadow), bdSess fix fix bdSess template literal, add assetType/keyCount to shadow API MetaAPI auto-deploy on startup, stock timing 15:30-18:00, symInfoB crash fix fix symInfoB undefined crash, META_BASE global URL fix DB connection timeout 5s→15s, retry backoff 3s→5s, META_BASE london TP default 1.5R, session_high/low/day_high/low from webhook, vwapBandPct in all ghost saves MetaAPI 429 fix (60s cache), SL TV vs MT5 log, vwapBandPct everywhere, circuit open skip (1 aandeel=1lot, P&L=lots×move) // v14.3: bugs fixed (const→let adoptPosition, dupNumber, blockTypes, duplicate fetchHistoryDeals, NY_NIGHT/ASIA_MORNING shadow tracking) all milestone gaps fixed, outside night 21-02h, daily open log, ghost finalized fix, slHitAt EOD keep
 
 // ── Config ───────────────────────────────────────────────────────
 const PORT           = process.env.PORT           || 3000;
@@ -425,9 +425,10 @@ async function closePosition(positionId, reason = "manual", pnl = null) {
       closeReason: finalCloseReason,
       spreadAtEntry: pos.spreadAtEntry, vwapBandPct: pos.vwapBandPct,
       executionPrice: pos.executionPrice, tvEntry: pos.tvEntry, slippage: pos.slippage,
-      exitPrice: exitPrice ?? pos.tp ?? null,
+      exitPrice: exitPrice ?? (reason === 'tp' ? pos.tp : pos.sl) ?? null,
       assetType: pos.assetType ?? null,
       tradeNumber: pos.tradeNumber ?? null,
+      mt5Comment: pos.orderComment ?? pos.mt5Comment ?? pos.comment ?? null,
     }).catch(e => recordError(e.message));
     db.deleteGhostState(positionId).catch(() => {});
   }
@@ -719,36 +720,7 @@ async function _doSyncPositions() {
       if (lp.openPrice) pos.entry = pos.entry || parseFloat(lp.openPrice);
 
       // Log first time we get data for a position (debugging)
-      if (!pos._synced) {
-        pos._synced = true;
-        // Log raw MetaAPI field names so we can debug missing data
-        console.log('[SYNC_RAW] position fields:', Object.keys(lp).join(', '));
-        console.log('[SYNC_RAW] key values:', {
-          id: lp.id, symbol: lp.symbol, volume: lp.volume,
-          profit: lp.profit, currentPrice: lp.currentPrice,
-          openPrice: lp.openPrice, stopLoss: lp.stopLoss,
-          type: lp.type, time: lp.time,
-        });
-        logEvent('POS_SYNC', { id: pos.positionId, symbol: pos.symbol,
-          lots: pos.lots, profit: pos.liveProfitMT5, price: pos.currentPrice,
-          sl: pos.sl, tp: pos.tp });
-      }
-      // Recalculate riskPct/riskEUR from live lots + sl every sync
-      // This corrects any corrupted values from previous deploys
-      if (pos.lots && pos.entry && pos.sl) {
-        const slDistSync = Math.abs(pos.entry - pos.sl);
-        const assetTypeSync = getSymbolInfo(pos.symbol)?.type ?? 'forex';
-        let riskEURSync = 0;
-        if (assetTypeSync === 'forex')      riskEURSync = pos.lots * 100000 * slDistSync;
-        else if (assetTypeSync === 'index') riskEURSync = pos.lots * slDistSync;
-        else if (assetTypeSync === 'stock') riskEURSync = pos.lots * slDistSync; // 1 share × price_move = EUR
-        else                                riskEURSync = pos.lots * 100 * slDistSync;
-        const eqSync = latestEquity || 50000;
-        if (riskEURSync > 0) {
-          pos.riskEUR = parseFloat(riskEURSync.toFixed(2));
-          pos.riskPct = riskEURSync / eqSync;
-        }
-      }
+      pos._synced = true; // position data received}
       if (pos.ghost) {
         if (!pos.ghost.direction || !pos.ghost.entry || !pos.ghost.sl) {
           console.warn(`[Sync] Skipping ghost ${id} ${pos.symbol} — missing direction/entry/sl`);
@@ -2117,7 +2089,7 @@ tr:last-child td{border-bottom:none}tr:hover td{background:var(--bg4)}
       <thead><tr>
         <th>Close</th><th>Symbol</th><th>Type</th><th>Dir</th><th>VWAP</th><th>Sess</th>
         <th>Entry</th><th>SL</th><th>TP</th><th>Exit</th>
-        <th>Realized €</th><th>Lots</th><th>Ghost Stop</th><th>Opened</th><th>Closed</th>
+        <th>Realized €</th><th>Lots</th><th>Ghost Stop</th><th style="font-size:7px">MT5 Comment</th><th>Geopend</th><th>Gesloten</th>
       </tr></thead>
       <tbody id="ov-trades"><tr><td colspan="15" class="nd waiting">⏳ Laden…</td></tr></tbody>
     </table></div>
@@ -2356,18 +2328,23 @@ function blockBdg(bt){
 }
 function outcomeBdg(o){
   if(!o) return '—';
-  if(o==='PLACED') return '<span style="background:var(--g2);color:var(--g);padding:1px 5px;border-radius:2px;font-size:8px;font-weight:700">PLACED</span>';
-  if(o.includes('NY_DEAD'))  return '<span class="bt-ny">⏰ NY Dead</span>';
-  if(o.includes('NY_NIGHT')) return '<span class="bt-ny">⏰ NY Night</span>';
-  if(o.includes('ASIA'))     return '<span class="bt-ny">⏰ Asia Morning</span>';
-  if(o.includes('VWAP'))     return '<span class="bt-vx">📊 VWAP Exh</span>';
-  if(o.includes('DUPLIC')||o.includes('DUP')) return '<span class="bt-dp">📌 Duplicate</span>';
-  if(o.includes('WEEKEND'))  return '<span style="color:var(--ink3);font-size:8px">🏖 Weekend</span>';
-  if(o.includes('STOCK_OUTSIDE')||o.includes('OOH')) return '<span style="color:var(--r);font-size:8px">📈 Stk OOH</span>';
-  if(o.includes('UNKNOWN'))  return '<span style="color:var(--r);font-size:8px">❓ Unk Sym</span>';
-  if(o.includes('MAX_POS'))  return '<span style="color:var(--r);font-size:8px">🚫 Max Pos</span>';
-  if(o.includes('DB_WAIT'))  return '<span style="color:var(--r);font-size:8px">🔴 DB Wait</span>';
-  return \`<span style="color:var(--r);font-size:8px">\${o}</span>\`;
+  const _map={
+    PLACED:{l:'PLACED',c:'rgba(63,185,80,.2)',t:'#3fb950',b:'rgba(63,185,80,.4)'},
+    NY_DEAD_ZONE:{l:'NY Dead 15:30-18h',c:'rgba(240,136,62,.15)',t:'#f0883e',b:'rgba(240,136,62,.4)'},
+    NY_NIGHT:{l:'NY Night 21-02h',c:'rgba(240,136,62,.15)',t:'#f0883e',b:'rgba(240,136,62,.4)'},
+    ASIA_MORNING:{l:'Asia Morning 0-2h',c:'rgba(240,136,62,.15)',t:'#f0883e',b:'rgba(240,136,62,.4)'},
+    VWAP_EXHAUSTION:{l:'VWAP Exhaustion',c:'rgba(188,140,255,.15)',t:'#bc8cff',b:'rgba(188,140,255,.4)'},
+    DUPLICATE_POSITION:{l:'Duplicate',c:'rgba(210,153,34,.15)',t:'#d29922',b:'rgba(210,153,34,.4)'},
+    REJECTED:{l:'REJECTED',c:'rgba(248,81,73,.15)',t:'#f85149',b:'rgba(248,81,73,.4)'},
+    ERROR:{l:'ERROR',c:'rgba(248,81,73,.3)',t:'#ff4444',b:'#f85149'},
+    ORDER_NOT_CONFIRMED:{l:'No Position',c:'rgba(248,81,73,.2)',t:'#f85149',b:'#f85149'},
+    STOCK_OOH:{l:'Stk OOH',c:'rgba(139,148,158,.1)',t:'#8b949e',b:'rgba(139,148,158,.3)'},
+    WEEKEND:{l:'Weekend',c:'rgba(139,148,158,.1)',t:'#8b949e',b:'rgba(139,148,158,.3)'},
+    UNKNOWN_SYMBOL:{l:'Unknown Sym',c:'rgba(248,81,73,.1)',t:'#f85149',b:'rgba(248,81,73,.3)'},
+    MAX_POSITIONS:{l:'Max Pos',c:'rgba(210,153,34,.1)',t:'#d29922',b:'rgba(210,153,34,.3)'},
+  };
+  const m=_map[o]||{l:o,c:'rgba(139,148,158,.1)',t:'#8b949e',b:'rgba(139,148,158,.3)'};
+  return \`<span style="background:\${m.c};color:\${m.t};border:1px solid \${m.b};padding:1px 5px;border-radius:2px;font-size:8px;font-weight:600;white-space:nowrap">\${m.l}</span>\`;
 }
 
 // Milestone cells — exact match to original table structure
@@ -2587,7 +2564,13 @@ async function loadOverview(){
         <td class="cy" style="font-size:8.5px">\${fmt(t.exitPrice||t.exit_price,5)}</td>
         <td class="\${cE(pnl)} fw">\${fmtE(pnl)}</td>
         <td class="cd">\${fmt(t.lots,2)}</td>
-        <td style="font-size:8px">\${stopBdg(gr)}</td>
+        <td style="font-size:8px;white-space:nowrap">\${
+          gr==='phantom_sl'||gr==='sl'||gr==='gap_stop'?stopBdg(gr):
+          gr==='tp_hit'||gr==='tp'?stopBdg(gr):
+          !gr||gr===''?'<span style="color:var(--g);font-size:8px">● Still Live</span>':
+          stopBdg(gr)
+        }</td>
+        <td class="cd" style="font-size:7.5px">\${t.mt5Comment||t.mt5_comment||'—'}</td>
         <td class="cd" style="font-size:8px">\${fmtTs(t.openedAt||t.opened_at)}</td>
         <td class="cd" style="font-size:8px">\${fmtTs(t.closedAt||t.closed_at)}</td>
       </tr>\`;
@@ -2632,8 +2615,17 @@ async function loadSignals(){
   else {
     lb.innerHTML=logs.slice(0,100).map(s=>{
       const outcome=s.outcome||s.blockReason||s.block_reason||'PLACED';
-      const dest=s.ghostId||s.ghost_id
-        ?\`<span style="background:var(--g2);color:var(--g);padding:1px 5px;border-radius:2px;font-size:8px;font-weight:700">→ Ghost #\${s.ghostId||s.ghost_id}</span>\`
+      // Compute "what if" MT5 comment for display
+      const _dir2 = s.direction==='buy'?'B':'S';
+      const _sessMap={ny:'NY',london:'LD',asia:'AS'};
+      const _sess2 = _sessMap[(s.session||'ny').toLowerCase()]||'NY';
+      const _vwap2 = (s.vwapPosition||s.vwap_position||'').toUpperCase()==='ABOVE'?'ABV':'BLW';
+      const _posId = s.positionId||s.position_id;
+      const _whatif = \`\${(s.symbol||'').slice(0,7)} \${_dir2}-\${_sess2}-\${_vwap2}\`;
+      const dest=_posId
+        ?\`<span style="background:rgba(63,185,80,.15);color:#3fb950;padding:1px 6px;border-radius:2px;font-size:8px;font-weight:700;border:1px solid rgba(63,185,80,.3)">→ Ghost #\${s.tradeNumber||s.trade_number||_posId.slice(-4)}</span>\`
+        :outcome==='STOCK_OOH'||outcome==='WEEKEND'
+        ?\`<span style="color:var(--ink3);font-size:8px">📋 \${_whatif} (OOH)</span>\`
         :outcomeBdg(outcome);
       const lat=s.latencyMs||s.latency_ms;
       const band=s.vwapBandPct||s.vwap_band_pct;
