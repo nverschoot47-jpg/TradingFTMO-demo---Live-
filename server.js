@@ -47,7 +47,7 @@ const {
 } = require("./session");
 
 // ── Version ──────────────────────────────────────────────────────
-const VERSION = "14.7.9"; // v14.7.9: mt5Comment in trades, ghost stop labels, outcome badges, what-if comment, SYNC_RAW removed asset_type in signal_log, daily log from open pos, mt5 comment in ghost, slDist/tvEntry in adopt fmtMs global helper, no inline functions in templates, browser syntax error fixed auto currency detection EUR/USD, correct conversion, currency symbol in dashboard USD→EUR conversion, verbose logs removed, complete API fields, mt5Comment shadowRow bdSess fix, milestone format fix, ghost active count fix, signal stats fix, data from 20/05 10:00 ghost restore assetType+vwapBandPct, all display fixes complete ghost restore assetType, ghost peakRRNeg display, signal log session cols, fin ghost realizedPnl fix startBalance fix, peakRRNeg display fix, exitPrice in trades, force adoption on startup, session fallback assetType everywhere, unrealizedPnl, signal outcomes, signal stats fixed correct signal outcomes, unrealizedPnl, assetType in API, signal stats per outcome /api/performance returns balance/equity/startBalance from latestEquity fix isTrackableBlock (no STOCK_OOH in shadow), bdSess fix fix bdSess template literal, add assetType/keyCount to shadow API MetaAPI auto-deploy on startup, stock timing 15:30-18:00, symInfoB crash fix fix symInfoB undefined crash, META_BASE global URL fix DB connection timeout 5s→15s, retry backoff 3s→5s, META_BASE london TP default 1.5R, session_high/low/day_high/low from webhook, vwapBandPct in all ghost saves MetaAPI 429 fix (60s cache), SL TV vs MT5 log, vwapBandPct everywhere, circuit open skip (1 aandeel=1lot, P&L=lots×move) // v14.3: bugs fixed (const→let adoptPosition, dupNumber, blockTypes, duplicate fetchHistoryDeals, NY_NIGHT/ASIA_MORNING shadow tracking) all milestone gaps fixed, outside night 21-02h, daily open log, ghost finalized fix, slHitAt EOD keep
+const VERSION = "14.7.9"; // v14.7.9: FX/STK/IDX/COM labels, ghost stopReason never manual, realPnl EUR, mt5Comment at placement FX/STK labels, ghost col cleanup, close reason SL/TP only mt5Comment in trades, ghost stop labels, outcome badges, what-if comment, SYNC_RAW removed asset_type in signal_log, daily log from open pos, mt5 comment in ghost, slDist/tvEntry in adopt fmtMs global helper, no inline functions in templates, browser syntax error fixed auto currency detection EUR/USD, correct conversion, currency symbol in dashboard USD→EUR conversion, verbose logs removed, complete API fields, mt5Comment shadowRow bdSess fix, milestone format fix, ghost active count fix, signal stats fix, data from 20/05 10:00 ghost restore assetType+vwapBandPct, all display fixes complete ghost restore assetType, ghost peakRRNeg display, signal log session cols, fin ghost realizedPnl fix startBalance fix, peakRRNeg display fix, exitPrice in trades, force adoption on startup, session fallback assetType everywhere, unrealizedPnl, signal outcomes, signal stats fixed correct signal outcomes, unrealizedPnl, assetType in API, signal stats per outcome /api/performance returns balance/equity/startBalance from latestEquity fix isTrackableBlock (no STOCK_OOH in shadow), bdSess fix fix bdSess template literal, add assetType/keyCount to shadow API MetaAPI auto-deploy on startup, stock timing 15:30-18:00, symInfoB crash fix fix symInfoB undefined crash, META_BASE global URL fix DB connection timeout 5s→15s, retry backoff 3s→5s, META_BASE london TP default 1.5R, session_high/low/day_high/low from webhook, vwapBandPct in all ghost saves MetaAPI 429 fix (60s cache), SL TV vs MT5 log, vwapBandPct everywhere, circuit open skip (1 aandeel=1lot, P&L=lots×move) // v14.3: bugs fixed (const→let adoptPosition, dupNumber, blockTypes, duplicate fetchHistoryDeals, NY_NIGHT/ASIA_MORNING shadow tracking) all milestone gaps fixed, outside night 21-02h, daily open log, ghost finalized fix, slHitAt EOD keep
 
 // ── Config ───────────────────────────────────────────────────────
 const PORT           = process.env.PORT           || 3000;
@@ -354,7 +354,10 @@ async function closePosition(positionId, reason = "manual", pnl = null) {
           type: d.type, profit: d.profit ?? 0, commission: d.commission ?? 0,
           swap: d.swap ?? 0, volume: d.volume, price: d.price, time: d.time });
       }
-      realPnl = await db.fetchRealizedPnl(positionId) ?? pnl;
+      const _rawPnl = await db.fetchRealizedPnl(positionId) ?? pnl;
+      // Convert to EUR if USD account
+      const _posExRate = pos?.exchangeRate ?? (latestAccountCurrency === 'EUR' ? 1.0 : 1.0);
+      realPnl = _rawPnl != null ? parseFloat((_rawPnl * _posExRate).toFixed(2)) : pnl;
     } catch (e) { recordError(`closePos deals: ${e.message}`); }
   }
   // v14.2 FIX: Gap detection — uses deals already fetched above (no second call)
@@ -386,7 +389,12 @@ async function closePosition(positionId, reason = "manual", pnl = null) {
 
   if (ghost && dbReady) {
     ghost.closedAt       = now;
-    ghost.stopReason     = gapStop ? 'gap_stop' : (ghost.stopReason ?? reason);
+    // stopReason: never "manual" — use the close reason (sl/tp) as fallback
+    const _finalGhostStop = gapStop ? 'gap_stop' 
+      : ghost.stopReason && ghost.stopReason !== 'manual' ? ghost.stopReason
+      : reason === 'manual' ? 'sl'  // fallback: manual close treated as SL
+      : reason;
+    ghost.stopReason = _finalGhostStop;
     ghost.realizedPnlEUR = realPnl ?? null;
     ghost.lots           = pos.lots ?? null;
     await db.saveGhostTrade({ ...ghost, maxRRBeforeSL: ghost.maxRR }).catch(e => recordError(e.message));
@@ -588,8 +596,8 @@ async function adoptPosition(lp) {
     liveProfitMT5: livePnl ?? null,
     unrealizedPnl: livePnl ?? null,
     currentPrice:  livePrice ?? (lp.currentPrice ? parseFloat(lp.currentPrice) : null),
-    assetType: symInfo?.type ?? null,
-    type: symInfo?.type ?? null,
+    assetType: symInfo?.type ?? getSymbolInfo(normalizeSymbol(rawSym)??rawSym)?.type ?? null,
+    type: symInfo?.type ?? getSymbolInfo(normalizeSymbol(rawSym)??rawSym)?.type ?? null,
     exchangeRate: latestAccountCurrency === 'EUR' ? 1.0 : parseFloat(lp.accountCurrencyExchangeRate ?? 1.0),
     accountCurrency: latestAccountCurrency,
     lots: parseFloat(lp.volume ?? lp.lots ?? 0),
@@ -660,13 +668,22 @@ async function _doSyncPositions() {
           const pos = openPositions.get(id);
           if (closeReason === 'manual' && pos && closingDeal.profit != null) {
             const profit = parseFloat(closingDeal.profit);
-            // Negatief profit + ghost hit phantom SL = SL
-            if (profit < 0 && pos.ghost?.phantomSLHit) closeReason = 'sl';
-            // Positief profit + ghost stopReason max_rr_15 = TP area
-            else if (profit > 0 && pos.ghost?.stopReason === 'max_rr_15') closeReason = 'tp';
+            const currentPrice = parseFloat(closingDeal.price ?? 0);
+            // Use price vs SL/TP to determine close reason
+            if (pos.sl && pos.tp && currentPrice > 0) {
+              const slDist = Math.abs(currentPrice - parseFloat(pos.sl));
+              const tpDist = Math.abs(currentPrice - parseFloat(pos.tp));
+              closeReason = slDist <= tpDist ? 'sl' : 'tp';
+            } else if (profit < 0) {
+              closeReason = 'sl';
+            } else if (profit > 0) {
+              closeReason = 'tp';
+            } else {
+              closeReason = 'sl'; // fallback - never show "manual"
+            }
           }
         }
-      } catch (e) { /* gebruik 'manual' als fallback */ }
+      } catch (e) { closeReason = 'sl'; /* fallback is always SL, never manual */ }
       await closePosition(id, closeReason, null);
     }
   }
@@ -703,11 +720,13 @@ async function _doSyncPositions() {
         pos.exchangeRate   = _exRate;
         pos.accountCurrency = latestAccountCurrency;
       }
-      // Keep assetType in sync
-      if (!pos.assetType && pos.symbol) {
-        const _si = getSymbolInfo(pos.symbol);
-        pos.assetType = _si?.type ?? null;
-        pos.type = pos.assetType;
+      // Always resolve assetType from symbol catalog
+      if (pos.symbol) {
+        const _si = getSymbolInfo(normalizeSymbol(pos.symbol) ?? pos.symbol);
+        if (_si?.type) {
+          pos.assetType = _si.type;
+          pos.type = _si.type;
+        }
       }
       // Keep currentPrice in sync
       if (lp.currentPrice) pos.currentPrice = parseFloat(lp.currentPrice);
@@ -1516,6 +1535,8 @@ app.post("/webhook", async (req, res) => {
     slDistTV, slDist, slPctFinal, assetType,  // SL verification fields
     // Informatieve velden vanuit webhook (geen filters — enkel opslaan voor analyse)
     sessionHigh, sessionLow, dayHigh, dayLow, bullBreaks, bearBreaks, slPoints,
+    mt5Comment: orderComment,  // "EURUSD S-NY-BLW #5" — saved for display
+    orderComment: orderComment,
     ghost: null };
   pos.ghost = initGhost({ ...pos, slPct, evMult: km.evMult, dayMult: km.dayMult });
   openPositions.set(positionId, pos);
@@ -2155,12 +2176,12 @@ tr:last-child td{border-bottom:none}tr:hover td{background:var(--bg4)}
   </div>
 
   <div class="card">
-    <div class="chdr"><div class="ctitle"><div class="dot p"></div>Active Ghost Tracker — Live Milestones</div><div class="cm">scroll →</div></div>
-    <div class="tw"><table>
+    <div class="chdr"><div class="ctitle"><div class="dot p"></div>Active Ghost Tracker — Live Milestones</div></div>
+    <div style="overflow-x:auto;max-width:100%"><table style="width:100%;table-layout:auto">
       <thead><tr>
-        <th>Status</th><th>Symbol</th><th>Type</th><th>Dir</th><th>VWAP</th><th>Sess</th><th>#Key</th>
-        <th style="color:var(--b)">RR Now</th><th style="color:var(--g)">Peak+RR</th><th style="color:var(--r)">Peak−%</th>
-        <th>→TP</th><th>Band%</th><th>TV Entry</th><th>SL%×buf</th><th>SL Dist</th>
+        <th>Status</th><th>Symbol</th><th style="font-size:8px">MT5 Comment</th><th>Type</th><th>Dir</th><th>VWAP</th><th>Session</th><th>#Key</th>
+        <th style="color:var(--b)">RR Now</th><th style="color:var(--g)">Peak+RR</th><th style="color:var(--r)">Peak−</th>
+        <th>TP Set</th>
         <th class="adv-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">-1.0</th><th class="adv-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">-0.9</th><th class="adv-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">-0.8</th><th class="adv-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">-0.7</th><th class="adv-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">-0.6</th><th class="adv-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">-0.5</th><th class="adv-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">-0.4</th><th class="adv-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">-0.3</th><th class="adv-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">-0.2</th><th class="adv-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">-0.1</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+0.1</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+0.2</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+0.3</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+0.4</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+0.5</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+0.6</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+0.7</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+0.8</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+0.9</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+1.0</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+1.1</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+1.2</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+1.3</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+1.4</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+1.5</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+1.6</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+1.7</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+1.8</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+1.9</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+2.0</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+2.1</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+2.2</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+2.3</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+2.4</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+2.5</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+2.6</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+2.7</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+2.8</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+2.9</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+3.0</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+3.1</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+3.2</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+3.3</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+3.4</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+3.5</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+3.6</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+3.7</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+3.8</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+3.9</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+4.0</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+4.1</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+4.2</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+4.3</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+4.4</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+4.5</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+4.6</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+4.7</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+4.8</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+4.9</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+5.0</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+5.1</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+5.2</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+5.3</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+5.4</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+5.5</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+5.6</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+5.7</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+5.8</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+5.9</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+6.0</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+6.1</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+6.2</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+6.3</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+6.4</th><th class="fav-th" style="min-width:22px;font-size:6.5px;text-align:center;padding:2px">+6.5</th>
         <th>Entry</th><th>SL</th><th>TP</th><th>P&amp;L €</th><th>Lots</th><th>Opened</th>
       </tr></thead>
@@ -2310,13 +2331,50 @@ const nw  = (cols,msg='Geen data') => \`<tr><td colspan="\${cols}" class="nd wai
 
 function bdDir(d){return d==='BUY'?'<span class="bd bd-buy">BUY</span>':'<span class="bd bd-sell">SELL</span>';}
 function bdVwap(v){return v==='ABOVE'?'<span class="bd bd-ab">ABOVE</span>':'<span class="bd bd-bw">BELOW</span>';}
-function bdSess(s){const cls={LON:'bd-lon',LONDON:'bd-lon',NY:'bd-ny','NEW YORK':'bd-ny',ASIA:'bd-asia'}; return \`<span class="bd \${cls[s]||'bd-lon'}">\${s||'—'}</span>\`;}
-function bdType(t){const cls={forex:'bd-fx',index:'bd-ix',stock:'bd-sk',commodity:'bd-cm'}; const k=(t||'').toLowerCase(); return \`<span class="bd \${cls[k]||'bd-fx'}">\${(t||'?').slice(0,3).toUpperCase()}</span>\`;}
-function keyBdg(k){const n=parseInt(k)||1; return \`<span class="key-badge key-\${Math.min(n,3)}">\${n}</span>\`;}
-function stopBdg(r){
-  const m={phantom_sl:'dg-stop',sl:'dg-stop',sl_gap:'dg-slgap',gap_stop:'dg-slgap',tp_hit:'dg-tp',tp:'dg-tp',manual:'dg-man'};
-  return r?\`<span class="\${m[r]||'dg-man'}">\${r}</span>\`:'—';
+function bdSess(s){
+  const _s=(s||'').toLowerCase();
+  const m={
+    ny:'NEW YORK',london:'LONDON',asia:'ASIA',
+    ny_dead_zone:'NY DEAD',ny_night:'NY NIGHT',asia_morning:'ASIA'
+  };
+  const lbl=m[_s]||(_s?_s.toUpperCase():'—');
+  const st=_s==='ny'||_s==='ny_dead_zone'||_s==='ny_night'
+    ?'color:#f0883e'
+    :_s==='london'
+    ?'color:#3fb950'
+    :'color:#8b949e';
+  return '<span style="'+st+';font-size:10px;font-weight:500">'+lbl+'</span>';
 }
+function bdType(t){
+  const _t=(t||'').toLowerCase();
+  const m={forex:'FX',stock:'STK',index:'IDX',commodity:'COM'};
+  const lbl=m[_t]||(_t?_t.toUpperCase().slice(0,3):'?');
+  const styles={
+    FX:'background:rgba(56,139,253,.15);color:#388bfd;border:1px solid rgba(56,139,253,.3)',
+    STK:'background:rgba(240,136,62,.15);color:#f0883e;border:1px solid rgba(240,136,62,.3)',
+    IDX:'background:rgba(57,211,242,.15);color:#39d3f2;border:1px solid rgba(57,211,242,.3)',
+    COM:'background:rgba(188,140,255,.15);color:#bc8cff;border:1px solid rgba(188,140,255,.3)',
+  };
+  const st=styles[lbl]||'background:rgba(139,148,158,.1);color:#8b949e;border:1px solid rgba(139,148,158,.25)';
+  return '<span style="'+st+';padding:1px 5px;border-radius:3px;font-size:9px;font-weight:700">'+lbl+'</span>';
+}
+function stopBdg(r){
+  const m={sl:'SL',tp:'TP',sl_gap:'GAP',gap_stop:'GAP',phantom_sl:'SL',tp_hit:'TP',manual:'SL'};
+  const lbl=m[(r||'').toLowerCase()]||((r||'').toUpperCase().slice(0,4));
+  const st=lbl==='TP'?'background:rgba(63,185,80,.2);color:#3fb950;border:1px solid rgba(63,185,80,.4)'
+    :lbl==='SL'?'background:rgba(248,81,73,.2);color:#f85149;border:1px solid rgba(248,81,73,.4)'
+    :lbl==='GAP'?'background:rgba(210,153,34,.2);color:#d29922;border:1px solid rgba(210,153,34,.4)'
+    :'background:rgba(139,148,158,.1);color:#8b949e';
+  return '<span style="'+st+';padding:1px 6px;border-radius:3px;font-size:9px;font-weight:700">'+lbl+'</span>';
+}
+function keyBdg(n){
+  const k=parseInt(n)||1;
+  const st=k>=4?'background:rgba(188,140,255,.2);color:#bc8cff;border:1px solid rgba(188,140,255,.4)'
+    :k>=2?'background:rgba(56,139,253,.15);color:#388bfd;border:1px solid rgba(56,139,253,.3)'
+    :'background:rgba(139,148,158,.1);color:#8b949e;border:1px solid rgba(139,148,158,.25)';
+  return '<span style="'+st+';padding:1px 6px;border-radius:3px;font-size:9px;font-weight:700">'+k+'</span>';
+}
+
 function blockBdg(bt){
   if(!bt) return '—';
   if(bt.includes('NY_DEAD'))  return '<span class="bt-ny">⏰ NY Dead</span>';
@@ -2536,7 +2594,7 @@ async function loadOverview(){
         <td class="cd" style="font-size:8px">\${d.peakNegTime||'—'}</td>
         <td class="\${(d.maxDD||0)>0.4?'cr fw':'cr'}">\${d.maxDD!=null?'-'+fmtP(d.maxDD):'—'}</td>
         <td class="cd">\${fmt(d.lots||0,2)}</td>
-        <td class="\${cE(pnl)} fw">\${fmtE(pnl)}</td>
+        <td class="\${pnl!=null?cE(pnl):'cd'} fw">\${pnl!=null?fmtE(pnl):'—'}</td>
       </tr>\`;
     }).join('');
   }
@@ -2550,7 +2608,7 @@ async function loadOverview(){
     tEl.innerHTML=trList.slice(0,100).map(t=>{
       const cr=t.closeReason||t.close_reason;
       const gr=t.ghostStopReason||t.ghost_stop_reason;
-      const pnl=t.realizedPnl||t.realized_pnl;
+      const pnl=t.realizedPnl||t.realized_pnl||t.realizedPnlEur||t.realized_pnl_eur||null;
       return \`<tr>
         <td>\${stopBdg(cr)}</td>
         <td class="cb fw">\${t.symbol||'—'}</td>
@@ -2565,10 +2623,15 @@ async function loadOverview(){
         <td class="\${cE(pnl)} fw">\${fmtE(pnl)}</td>
         <td class="cd">\${fmt(t.lots,2)}</td>
         <td style="font-size:8px;white-space:nowrap">\${
-          gr==='phantom_sl'||gr==='sl'||gr==='gap_stop'?stopBdg(gr):
-          gr==='tp_hit'||gr==='tp'?stopBdg(gr):
-          !gr||gr===''?'<span style="color:var(--g);font-size:8px">● Still Live</span>':
-          stopBdg(gr)
+          gr==='phantom_sl'||gr==='sl'||gr==='gap_stop'?stopBdg('sl'):
+          gr==='tp_hit'||gr==='tp'?stopBdg('tp'):
+          gr==='manual'&&cr==='sl'?stopBdg('sl'):
+          gr==='manual'&&cr==='tp'?stopBdg('tp'):
+          !gr||gr===''||gr==='manual'?
+            (openPositions&&[...openPositions.keys()].some(k=>k===t.positionId||k===t.position_id)
+              ?'<span style="color:var(--g);font-size:9px;font-weight:600">● Still Live</span>'
+              :'<span style="color:var(--o);font-size:9px">⚠ '+((cr||'sl').toUpperCase())+'</span>')
+          :stopBdg(gr)
         }</td>
         <td class="cd" style="font-size:7.5px">\${t.mt5Comment||t.mt5_comment||'—'}</td>
         <td class="cd" style="font-size:8px">\${fmtTs(t.openedAt||t.opened_at)}</td>
@@ -2715,17 +2778,17 @@ async function loadGhost(){
       const allMs={..._slA,..._rrA};
       return \`<tr class="\${slHit?'sl-row':''}">
         <td>\${stateBdg}</td>
-        <td class="cb fw">\${p.symbol||'—'}</td>
-        <td style="font-size:7.5px;color:var(--ink3);max-width:90px;overflow:hidden">\${p.mt5Comment||p.orderComment||p.comment||'—'}</td>
+        <td class="cb fw" style="white-space:nowrap">\${p.symbol||'—'}</td>
+        <td style="font-size:8px;color:var(--ink3);max-width:110px;overflow:hidden;white-space:nowrap" title="\${p.mt5Comment||p.orderComment||p.comment||''}">\${p.mt5Comment||p.orderComment||p.comment||'—'}</td>
         <td>\${bdType(p.assetType||p.type)}</td>
         <td>\${bdDir(p.direction)}</td>
         <td>\${bdVwap(p.vwapPosition||p.vwap_position)}</td>
-        <td>\${bdSess(p.session)}</td>
+        <td style="white-space:nowrap">\${bdSess(p.session)}</td>
         <td>\${keyBdg(p.keyCount||g.keyCount||1)}</td>
-        <td class="\${cRR(rrNow)}">\${rrNow!=null?fmtR(rrNow):'—'}</td>
-        <td class="\${cRR(g.peakRRPos)}">\${fmtR(g.peakRRPos)}</td>
-        <td class="\${(g.peakRRNeg||0)>=80?'cr fw':(g.peakRRNeg||0)>=50?'cr':'cd'}">\${g.peakRRNeg!=null?'-'+fmtP(g.peakRRNeg):'—'}</td>
-        <td class="cy">\${g.tpRRUsed!=null?fmtR(g.tpRRUsed):'—'}</td>
+        <td class="\${cRR(rrNow)}" style="font-weight:700">\${rrNow!=null?fmtR(rrNow):'—'}</td>
+        <td class="\${(g.peakRRPos||0)>0?'cg fw':'cd'}" style="font-weight:700">\${(g.peakRRPos||0)>0?'+'+g.peakRRPos.toFixed(2)+'R':'—'}</td>
+        <td class="\${(g.peakRRNeg||0)>=80?'cr fw':(g.peakRRNeg||0)>=50?'cr':'cd'}" style="font-weight:700">\${g.peakRRNeg!=null&&g.peakRRNeg>0?'-'+fmtP(g.peakRRNeg):'—'}</td>
+        <td class="cg" style="font-weight:700">+\${(g.tpRRUsed||1.5).toFixed(2)}R</td>
         <td class="\${(p.vwapBandPct||0)>150?'co fw':'cd'}">\${p.vwapBandPct!=null?fmtP(p.vwapBandPct):'—'}</td>
         <td class="cd" style="font-size:8px">\${p.tvEntry!=null?fmt(p.tvEntry,5):'—'}</td>
         <td class="cd" style="font-size:8px">\${p.slPctFinal!=null?p.slPctFinal.toFixed(3)+'%':'—'}<span style="font-size:7px;color:var(--ink3)">×\${p.slMultiplier||'—'}</span></td>
