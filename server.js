@@ -47,7 +47,7 @@ const {
 } = require("./session");
 
 // ── Version ──────────────────────────────────────────────────────
-const VERSION = "14.7.6"; // v14.7.6: auto currency detection EUR/USD, correct conversion, currency symbol in dashboard USD→EUR conversion, verbose logs removed, complete API fields, mt5Comment shadowRow bdSess fix, milestone format fix, ghost active count fix, signal stats fix, data from 20/05 10:00 ghost restore assetType+vwapBandPct, all display fixes complete ghost restore assetType, ghost peakRRNeg display, signal log session cols, fin ghost realizedPnl fix startBalance fix, peakRRNeg display fix, exitPrice in trades, force adoption on startup, session fallback assetType everywhere, unrealizedPnl, signal outcomes, signal stats fixed correct signal outcomes, unrealizedPnl, assetType in API, signal stats per outcome /api/performance returns balance/equity/startBalance from latestEquity fix isTrackableBlock (no STOCK_OOH in shadow), bdSess fix fix bdSess template literal, add assetType/keyCount to shadow API MetaAPI auto-deploy on startup, stock timing 15:30-18:00, symInfoB crash fix fix symInfoB undefined crash, META_BASE global URL fix DB connection timeout 5s→15s, retry backoff 3s→5s, META_BASE london TP default 1.5R, session_high/low/day_high/low from webhook, vwapBandPct in all ghost saves MetaAPI 429 fix (60s cache), SL TV vs MT5 log, vwapBandPct everywhere, circuit open skip (1 aandeel=1lot, P&L=lots×move) // v14.3: bugs fixed (const→let adoptPosition, dupNumber, blockTypes, duplicate fetchHistoryDeals, NY_NIGHT/ASIA_MORNING shadow tracking) all milestone gaps fixed, outside night 21-02h, daily open log, ghost finalized fix, slHitAt EOD keep
+const VERSION = "14.7.7"; // v14.7.7: fmtMs global helper, no inline functions in templates, browser syntax error fixed auto currency detection EUR/USD, correct conversion, currency symbol in dashboard USD→EUR conversion, verbose logs removed, complete API fields, mt5Comment shadowRow bdSess fix, milestone format fix, ghost active count fix, signal stats fix, data from 20/05 10:00 ghost restore assetType+vwapBandPct, all display fixes complete ghost restore assetType, ghost peakRRNeg display, signal log session cols, fin ghost realizedPnl fix startBalance fix, peakRRNeg display fix, exitPrice in trades, force adoption on startup, session fallback assetType everywhere, unrealizedPnl, signal outcomes, signal stats fixed correct signal outcomes, unrealizedPnl, assetType in API, signal stats per outcome /api/performance returns balance/equity/startBalance from latestEquity fix isTrackableBlock (no STOCK_OOH in shadow), bdSess fix fix bdSess template literal, add assetType/keyCount to shadow API MetaAPI auto-deploy on startup, stock timing 15:30-18:00, symInfoB crash fix fix symInfoB undefined crash, META_BASE global URL fix DB connection timeout 5s→15s, retry backoff 3s→5s, META_BASE london TP default 1.5R, session_high/low/day_high/low from webhook, vwapBandPct in all ghost saves MetaAPI 429 fix (60s cache), SL TV vs MT5 log, vwapBandPct everywhere, circuit open skip (1 aandeel=1lot, P&L=lots×move) // v14.3: bugs fixed (const→let adoptPosition, dupNumber, blockTypes, duplicate fetchHistoryDeals, NY_NIGHT/ASIA_MORNING shadow tracking) all milestone gaps fixed, outside night 21-02h, daily open log, ghost finalized fix, slHitAt EOD keep
 
 // ── Config ───────────────────────────────────────────────────────
 const PORT           = process.env.PORT           || 3000;
@@ -2295,6 +2295,22 @@ const fmtEl = (s,e) => {
   const h=Math.floor(ms/3600000),m=Math.floor((ms%3600000)/60000);
   return h>0?h+'h'+m+'m':m+'m';
 };
+// Convert milestone value (Unix ms timestamp or ISO string) to elapsed time string
+// openTs = Date.getTime() of trade open
+const fmtMs = (v, openTs) => {
+  if(v==null) return null;
+  let n = null;
+  if(typeof v==='number' && v>1000000000000) n=v;
+  else if(typeof v==='string' && v.length>10) n=new Date(v).getTime();
+  if(n && openTs) {
+    const el = Math.round((n - openTs) / 60000);
+    if(el < 0) return '0m';
+    if(el < 60) return el+'m';
+    const h=Math.floor(el/60), m=el%60;
+    return h+'h'+(m?String(m).padStart(2,'0')+'m':'');
+  }
+  return typeof v==='number' && v<100000 ? v+'m' : String(v);
+};
 const cRR = v => v==null?'cd':v>0?'cg':v<0?'cr':'cd';
 const cE  = v => v==null?'cd':v>0?'cg':v<0?'cr':'cd';
 const nd  = (cols,msg='Geen data') => \`<tr><td colspan="\${cols}" class="nd">\${msg}</td></tr>\`;
@@ -2666,8 +2682,9 @@ async function loadGhost(){
       const slMs=g.slMilestones||g.sl_milestones||{};
       const rrMs=g.rrMilestones||g.rr_milestones||{};
       const _otsA=p.openedAt||g.openedAt?new Date(p.openedAt||g.openedAt).getTime():null;
-      function _mA(v){if(v==null)return null;const n=typeof v==='number'&&v>1000000000000?v:typeof v==='string'&&v.length>10?new Date(v).getTime():null;if(n&&_otsA){const el=Math.round((n-_otsA)/60000);return el<0?'0m':el<60?el+'m':(Math.floor(el/60)+'h'+(el%60?String(el%60).padStart(2,'0')+'m':''));}return typeof v==='number'&&v<100000?v+'m':String(v);}
-      const _slA={},_rrA={};for(const k in slMs)_slA[k]=_mA(slMs[k]);for(const k in rrMs)_rrA[k]=_mA(rrMs[k]);
+      const _slA={},_rrA={};
+      for(const k in slMs)_slA[k]=fmtMs(slMs[k],_otsA);
+      for(const k in rrMs)_rrA[k]=fmtMs(rrMs[k],_otsA);
       const allMs={..._slA,..._rrA};
       return \`<tr class="\${slHit?'sl-row':''}">
         <td>\${stateBdg}</td>
@@ -2704,8 +2721,9 @@ async function loadGhost(){
       const slMs=g.slMilestones||g.sl_milestones||{};
       const rrMs=g.rrMilestones||g.rr_milestones||{};
       const _otsF=g.openedAt||g.opened_at?new Date(g.openedAt||g.opened_at).getTime():null;
-      function _mFmtFin(v){if(v==null)return null;const n=typeof v==='number'&&v>1000000000000?v:typeof v==='string'&&v.length>10?new Date(v).getTime():null;if(n&&_otsF){const el=Math.round((n-_otsF)/60000);return el<0?'0m':el<60?el+'m':(Math.floor(el/60)+'h'+(el%60?String(el%60).padStart(2,'0')+'m':''));}return typeof v==='number'&&v<10000?v+'m':v;}
-      const _slFF={},_rrFF={};for(const k in slMs)_slFF[k]=_mFmtFin(slMs[k]);for(const k in rrMs)_rrFF[k]=_mFmtFin(rrMs[k]);
+      const _slFF={},_rrFF={};
+      for(const k in slMs)_slFF[k]=fmtMs(slMs[k],_otsF);
+      for(const k in rrMs)_rrFF[k]=fmtMs(rrMs[k],_otsF);
       return \`<tr>
         <td class="cd">\${i+1}</td>
         <td class="cb fw">\${g.symbol||'—'}</td>
