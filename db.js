@@ -761,6 +761,10 @@ async function initDB() {
   await safeAlter(`ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS sl_hit_at        TIMESTAMPTZ`);
   await safeAlter(`ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS key_count         INTEGER DEFAULT 1`);
   await safeAlter(`ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS vwap_band_pct    NUMERIC`);
+  // v14.7: exit_price, asset_type, trade_number on closed_trades
+  await safeAlter(`ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS exit_price    NUMERIC`);
+  await safeAlter(`ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS asset_type    TEXT`);
+  await safeAlter(`ALTER TABLE closed_trades ADD COLUMN IF NOT EXISTS trade_number  INTEGER`);
   // v14.6: session/day context columns in webhook_history + signal_log
   await safeAlter(`ALTER TABLE webhook_history ADD COLUMN IF NOT EXISTS session_high  NUMERIC`);
   await safeAlter(`ALTER TABLE webhook_history ADD COLUMN IF NOT EXISTS session_low   NUMERIC`);
@@ -824,8 +828,8 @@ async function saveTrade(t) {
          ghost_stop_reason, ghost_finalized_at, session, vwap_at_entry,
          opened_at, closed_at, sl_multiplier, realized_pnl_eur, hit_tp, close_reason,
          spread_at_entry, vwap_band_pct, execution_price, tv_entry, slippage,
-         exclude_from_ev)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31)
+         exclude_from_ev, exit_price, asset_type, trade_number)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34)
       ON CONFLICT (position_id) DO UPDATE SET
         true_max_rr        = EXCLUDED.true_max_rr,
         true_max_price     = EXCLUDED.true_max_price,
@@ -842,7 +846,10 @@ async function saveTrade(t) {
         execution_price    = EXCLUDED.execution_price,
         tv_entry           = EXCLUDED.tv_entry,
         slippage           = EXCLUDED.slippage,
-        exclude_from_ev    = EXCLUDED.exclude_from_ev
+        exclude_from_ev    = EXCLUDED.exclude_from_ev,
+        exit_price         = COALESCE(EXCLUDED.exit_price, closed_trades.exit_price),
+        asset_type         = COALESCE(EXCLUDED.asset_type, closed_trades.asset_type),
+        trade_number       = COALESCE(EXCLUDED.trade_number, closed_trades.trade_number)
     `, [
       t.positionId   ?? null,
       t.symbol       ?? "",
@@ -875,6 +882,9 @@ async function saveTrade(t) {
       t.tvEntry        ?? null,
       t.slippage       ?? null,
       t.excludeFromEV  ?? false,  // Fix E: RR_VERIFY_FAILED trades
+      t.exitPrice      ?? null,   // actual fill price at close
+      t.assetType      ?? null,   // forex/stock/index/commodity
+      t.tradeNumber    ?? null,   // trade sequence number
     ]);
   } catch (e) { console.warn("[!] saveTrade:", e.message); }
 }
@@ -920,7 +930,11 @@ async function loadAllTrades({ since = null, until = null, openFrom = null, open
         CAST(vwap_band_pct  AS FLOAT) AS "vwapBandPct",
         CAST(execution_price AS FLOAT) AS "executionPrice",
         CAST(tv_entry       AS FLOAT) AS "tvEntry",
-        CAST(slippage       AS FLOAT) AS slippage
+        CAST(slippage       AS FLOAT) AS slippage,
+        CAST(exit_price     AS FLOAT) AS "exitPrice",
+        CAST(realized_pnl_eur AS FLOAT) AS "realizedPnl",
+        asset_type          AS "assetType",
+        trade_number        AS "tradeNumber"
       FROM closed_trades
       ${whereClause}
       ORDER BY closed_at DESC
@@ -1397,15 +1411,32 @@ async function loadSignalStats({ since = null, until = null } = {}) {
       symsByReason[r].push({ symbol: row.symbol, direction: row.direction, count: parseInt(row.cnt, 10) });
     }
 
+    // Count per outcome type
+    const byOutcomeMap = {};
+    for (const r of byOutcomeR.rows) byOutcomeMap[r.outcome] = parseInt(r.cnt, 10);
+    const shadowN = (byOutcomeMap['NY_DEAD_ZONE']||0) + (byOutcomeMap['NY_NIGHT']||0) +
+      (byOutcomeMap['ASIA_MORNING']||0) + (byOutcomeMap['VWAP_EXHAUSTION']||0) +
+      (byOutcomeMap['DUPLICATE']||0);
+
     return {
       total:            totalN,
       placed:           placedN,
+      shadow:           shadowN,
       conversionPct:    totalN > 0 ? parseFloat((placedN / totalN * 100).toFixed(2)) : 0,
+      nyDead:           byOutcomeMap['NY_DEAD_ZONE']   ?? 0,
+      nyNight:          byOutcomeMap['NY_NIGHT']       ?? 0,
+      asiaMorning:      byOutcomeMap['ASIA_MORNING']   ?? 0,
+      vwapExhaustion:   byOutcomeMap['VWAP_EXHAUSTION']?? 0,
+      duplicate:        byOutcomeMap['DUPLICATE']      ?? 0,
+      weekend:          byOutcomeMap['WEEKEND']        ?? 0,
+      stockOOH:         byOutcomeMap['STOCK_OOH']      ?? 0,
+      unknownSymbol:    byOutcomeMap['UNKNOWN_SYMBOL'] ?? 0,
+      maxPositions:     byOutcomeMap['MAX_POSITIONS']  ?? 0,
+      errors:           byOutcomeMap['ERROR']          ?? 0,
       byOutcome:        byOutcomeR.rows.map(r => ({ outcome: r.outcome, count: parseInt(r.cnt, 10) })),
       topRejectReasons: rejectR.rows.map(r => ({
         reason: r.reject_reason,
         count:  parseInt(r.cnt, 10),
-        // Top 5 pairs voor deze reason, gesorteerd op count
         pairs:  (symsByReason[r.reject_reason] ?? []).slice(0, 5),
       })),
     };
@@ -1988,7 +2019,8 @@ async function loadAllGhostStates() {
         CAST(peak_rr_pos      AS FLOAT) AS "peakRRPos",
         CAST(peak_rr_neg      AS FLOAT) AS "peakRRNeg",
         COALESCE(phantom_sl_hit, FALSE) AS "phantomSLHit",
-        stop_reason           AS "stopReason"
+        stop_reason           AS "stopReason",
+        CAST(vwap_band_pct    AS FLOAT) AS "vwapBandPct"
       FROM ghost_state
     `);
     return r.rows;
