@@ -47,7 +47,7 @@ const {
 } = require("./session");
 
 // ── Version ──────────────────────────────────────────────────────
-const VERSION = "14.7.9"; // v14.7.9: FX/STK/IDX/COM labels, ghost stopReason never manual, realPnl EUR, mt5Comment at placement FX/STK labels, ghost col cleanup, close reason SL/TP only mt5Comment in trades, ghost stop labels, outcome badges, what-if comment, SYNC_RAW removed asset_type in signal_log, daily log from open pos, mt5 comment in ghost, slDist/tvEntry in adopt fmtMs global helper, no inline functions in templates, browser syntax error fixed auto currency detection EUR/USD, correct conversion, currency symbol in dashboard USD→EUR conversion, verbose logs removed, complete API fields, mt5Comment shadowRow bdSess fix, milestone format fix, ghost active count fix, signal stats fix, data from 20/05 10:00 ghost restore assetType+vwapBandPct, all display fixes complete ghost restore assetType, ghost peakRRNeg display, signal log session cols, fin ghost realizedPnl fix startBalance fix, peakRRNeg display fix, exitPrice in trades, force adoption on startup, session fallback assetType everywhere, unrealizedPnl, signal outcomes, signal stats fixed correct signal outcomes, unrealizedPnl, assetType in API, signal stats per outcome /api/performance returns balance/equity/startBalance from latestEquity fix isTrackableBlock (no STOCK_OOH in shadow), bdSess fix fix bdSess template literal, add assetType/keyCount to shadow API MetaAPI auto-deploy on startup, stock timing 15:30-18:00, symInfoB crash fix fix symInfoB undefined crash, META_BASE global URL fix DB connection timeout 5s→15s, retry backoff 3s→5s, META_BASE london TP default 1.5R, session_high/low/day_high/low from webhook, vwapBandPct in all ghost saves MetaAPI 429 fix (60s cache), SL TV vs MT5 log, vwapBandPct everywhere, circuit open skip (1 aandeel=1lot, P&L=lots×move) // v14.3: bugs fixed (const→let adoptPosition, dupNumber, blockTypes, duplicate fetchHistoryDeals, NY_NIGHT/ASIA_MORNING shadow tracking) all milestone gaps fixed, outside night 21-02h, daily open log, ghost finalized fix, slHitAt EOD keep
+const VERSION = "14.7.9e"; // v14.7.9e: fix rrNow/buyCnt direction case, ghost KPI peakRR from ghost subobj, remove date filter bdDir/bdVwap case-insensitive, shows BUY/ABOVE correctly fix 500 on open-positions (symInfo undefined), fix openPositions in browser, fix loadHeader ghost block FX/STK/IDX/COM labels, ghost stopReason never manual, realPnl EUR, mt5Comment at placement FX/STK labels, ghost col cleanup, close reason SL/TP only mt5Comment in trades, ghost stop labels, outcome badges, what-if comment, SYNC_RAW removed asset_type in signal_log, daily log from open pos, mt5 comment in ghost, slDist/tvEntry in adopt fmtMs global helper, no inline functions in templates, browser syntax error fixed auto currency detection EUR/USD, correct conversion, currency symbol in dashboard USD→EUR conversion, verbose logs removed, complete API fields, mt5Comment shadowRow bdSess fix, milestone format fix, ghost active count fix, signal stats fix, data from 20/05 10:00 ghost restore assetType+vwapBandPct, all display fixes complete ghost restore assetType, ghost peakRRNeg display, signal log session cols, fin ghost realizedPnl fix startBalance fix, peakRRNeg display fix, exitPrice in trades, force adoption on startup, session fallback assetType everywhere, unrealizedPnl, signal outcomes, signal stats fixed correct signal outcomes, unrealizedPnl, assetType in API, signal stats per outcome /api/performance returns balance/equity/startBalance from latestEquity fix isTrackableBlock (no STOCK_OOH in shadow), bdSess fix fix bdSess template literal, add assetType/keyCount to shadow API MetaAPI auto-deploy on startup, stock timing 15:30-18:00, symInfoB crash fix fix symInfoB undefined crash, META_BASE global URL fix DB connection timeout 5s→15s, retry backoff 3s→5s, META_BASE london TP default 1.5R, session_high/low/day_high/low from webhook, vwapBandPct in all ghost saves MetaAPI 429 fix (60s cache), SL TV vs MT5 log, vwapBandPct everywhere, circuit open skip (1 aandeel=1lot, P&L=lots×move) // v14.3: bugs fixed (const→let adoptPosition, dupNumber, blockTypes, duplicate fetchHistoryDeals, NY_NIGHT/ASIA_MORNING shadow tracking) all milestone gaps fixed, outside night 21-02h, daily open log, ghost finalized fix, slHitAt EOD keep
 
 // ── Config ───────────────────────────────────────────────────────
 const PORT           = process.env.PORT           || 3000;
@@ -1727,8 +1727,8 @@ app.get("/api/open-positions", (req, res) => {
       unrealizedPnl: pos.liveProfitMT5 ?? null,
       profitUSD:     pos.profitUSD ?? null,
       exchangeRate:  pos.exchangeRate ?? 1.0,
-      assetType:     pos.assetType ?? symInfo?.type ?? null,
-      type:          pos.assetType ?? symInfo?.type ?? null,
+      assetType:     pos.assetType ?? getSymbolInfo(pos.symbol)?.type ?? null,
+      type:          pos.assetType ?? getSymbolInfo(pos.symbol)?.type ?? null,
       exitPrice:     pos.exitPrice ?? null,
       lots:          pos.lots ?? null,
       ghost: pos.ghost ? {
@@ -2329,8 +2329,8 @@ const cE  = v => v==null?'cd':v>0?'cg':v<0?'cr':'cd';
 const nd  = (cols,msg='Geen data') => \`<tr><td colspan="\${cols}" class="nd">\${msg}</td></tr>\`;
 const nw  = (cols,msg='Geen data') => \`<tr><td colspan="\${cols}" class="nd waiting">⏳ \${msg}</td></tr>\`;
 
-function bdDir(d){return d==='BUY'?'<span class="bd bd-buy">BUY</span>':'<span class="bd bd-sell">SELL</span>';}
-function bdVwap(v){return v==='ABOVE'?'<span class="bd bd-ab">ABOVE</span>':'<span class="bd bd-bw">BELOW</span>';}
+function bdDir(d){const _d=(d||'').toUpperCase();return _d==='BUY'?'<span class="bd bd-buy">BUY</span>':'<span class="bd bd-sell">SELL</span>';}
+function bdVwap(v){const _v=(v||'').toUpperCase();return _v==='ABOVE'?'<span class="bd bd-ab">ABOVE</span>':'<span class="bd bd-bw">BELOW</span>';}
 function bdSess(s){
   const _s=(s||'').toLowerCase();
   const m={
@@ -2488,13 +2488,13 @@ async function loadHeader(){
     api('/api/ghost-grouped'),
     api('/api/blocked-ghosts/active'),
   ]);
-  const ghosts=ghostG||[];
-  // Active = from open-positions (live data), finalized = from ghost-grouped
-  const active=pos; // open-positions IS the active ghost list
-  const fin=ghosts.filter(g=>g.stopReason||g.stop_reason||g.finalizedAt||g.finalized_at);
-  if(el('h-ghost')){el('h-ghost').textContent=active.length;}
-  if(el('h-fin')){el('h-fin').textContent=fin.length;}
-  if(el('nb-gh')) el('nb-gh').textContent=active.length;
+  // Ghost/Shadow KPI counts for header
+  const _ghosts=ghostG||[];
+  const _activeCount=positions.length; // open positions = active ghosts
+  const _finCount=_ghosts.filter(g=>g.stopReason||g.stop_reason).length;
+  if(el('h-ghost')){el('h-ghost').textContent=_activeCount;}
+  if(el('h-fin')){el('h-fin').textContent=_finCount;}
+  if(el('nb-gh')) el('nb-gh').textContent=_activeCount;
   if(el('nb-sh')) el('nb-sh').textContent=(blockedA||[]).length;
   if(el('h-shadow')) el('h-shadow').textContent=(blockedA||[]).length;
 
@@ -2553,7 +2553,7 @@ async function loadOverview(){
     if(s('ov-tradecount'))s('ov-tradecount').textContent=(trades||[]).length+' gesloten trades';
     if(s('ov-cashbal'))s('ov-cashbal').textContent='\\u20ac'+Math.round(cashBal);
     if(s('ov-equity'))s('ov-equity').textContent='\\u20ac'+Math.round(eq);
-    if(s('ov-equitycheck'))s('ov-equitycheck').textContent='\\u20ac'+Math.round(startBal)+' + \\u20ac'+Math.round(rp)+' + \\u20ac'+Math.round(upnl)+' = \\u20ac'+Math.round(eq)+' \\u2713';
+    if(s('ov-equitycheck'))s('ov-equitycheck').textContent='\\u20ac'+Math.round(startBal).toLocaleString('nl-BE')+' + \\u20ac'+Math.round(rp)+' + '+fmtE(upnl)+' = \\u20ac'+Math.round(eq).toLocaleString('nl-BE')+' \\u2713';
   }
 
   // Daily log
@@ -2628,9 +2628,9 @@ async function loadOverview(){
           gr==='manual'&&cr==='sl'?stopBdg('sl'):
           gr==='manual'&&cr==='tp'?stopBdg('tp'):
           !gr||gr===''||gr==='manual'?
-            (openPositions&&[...openPositions.keys()].some(k=>k===t.positionId||k===t.position_id)
+            (pos&&(pos.some?pos:Object.values(pos)).some(p=>p.positionId===t.positionId||p.positionId===t.position_id)
               ?'<span style="color:var(--g);font-size:9px;font-weight:600">● Still Live</span>'
-              :'<span style="color:var(--o);font-size:9px">⚠ '+((cr||'sl').toUpperCase())+'</span>')
+              :stopBdg(cr==='tp'?'tp':'sl'))
           :stopBdg(gr)
         }</td>
         <td class="cd" style="font-size:7.5px">\${t.mt5Comment||t.mt5_comment||'—'}</td>
@@ -2644,8 +2644,8 @@ async function loadOverview(){
 // ── SIGNALS ──
 async function loadSignals(){
   const [stats,log,rejects] = await Promise.all([
-    api('/api/signal-stats?since=2026-05-20T10:00:00Z'),
-    api('/api/signal-log?since=2026-05-20T10:00:00Z'),
+    api('/api/signal-stats'),
+    api('/api/signal-log'),
     api('/api/signal-rejects'),
   ]);
 
@@ -2736,17 +2736,21 @@ async function loadGhost(){
 
   const pos=openPos||[];
   const ghosts=ghostG||[];
-  const active=ghosts.filter(g=>!g.stopReason&&!g.stop_reason);
-  const fin=ghosts.filter(g=>g.stopReason||g.stop_reason);
+  // Active ghosts = open positions (live data from MT5)
+  // Finalized ghosts = from ghost-grouped DB (have stopReason)
+  const active=pos;
+  const fin=ghosts.filter(g=>g.stopReason||g.stop_reason||g.finalizedAt||g.finalized_at);
 
   // KPI strip
-  const slToday=active.filter(g=>g.phantomSLHit||g.phantom_sl_hit).length;
+  const slToday=active.filter(g=>g.ghost?.phantomSLHit||g.ghost?.phantom_sl_hit||g.phantomSLHit||g.phantom_sl_hit).length;
   let bestP=null,sumP=0,buyCnt=0,sellCnt=0,tpCnt=0;
   for(const g of active){
-    if(bestP===null||(g.peakRRPos||0)>bestP)bestP=g.peakRRPos;
-    sumP+=g.peakRRPos||0;
-    if(g.direction==='BUY')buyCnt++;else sellCnt++;
-    if(g.tpRRUsed&&(g.peakRRPos||0)>=g.tpRRUsed)tpCnt++;
+    const _gpRPos=g.ghost?.peakRRPos??g.peakRRPos??0;
+    if(bestP===null||_gpRPos>bestP)bestP=_gpRPos;
+    sumP+=_gpRPos;
+    if((g.direction||'').toUpperCase()==='BUY')buyCnt++;else sellCnt++;
+    const _gtpRR=g.ghost?.tpRRUsed??g.tpRRUsed;
+    if(_gtpRR&&_gpRPos>=_gtpRR)tpCnt++;
   }
   const f=(id,v,cls)=>{const e=$(id);if(!e)return;e.textContent=v;if(cls)e.className=cls;};
   f('gh-active-cnt', pos.length, 'ksv cp');  // use open-positions count
@@ -2766,7 +2770,7 @@ async function loadGhost(){
       const g=p.ghost||{};
       const slD=Math.abs((p.entry||0)-(p.sl||0));
       const cur=p.currentPrice||p.entry||0;
-      const rrNow=slD>0?((p.direction==='BUY'?(cur-p.entry):(p.entry-cur))/slD):null;
+      const rrNow=slD>0?(((p.direction||'').toUpperCase()==='BUY'?(cur-p.entry):(p.entry-cur))/slD):null;
       const slHit=g.phantomSLHit||g.phantom_sl_hit;
       const stateBdg=slHit?'<span class="dg-stop">SL HIT</span>':'<span class="dg-live">● LIVE</span>';
       const slMs=g.slMilestones||g.sl_milestones||{};
