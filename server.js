@@ -2801,7 +2801,6 @@ async function loadSignals(){
           :outcomeBdg(outcome);
         // Raw webhook expandable
         const rawId='raw-'+Math.random().toString(36).slice(2,8);
-        const rawData=JSON.stringify({sym:s.symbol,dir:s.direction,entry:s.entry,band:s.band_pct,sH:s.session_high,sL:s.session_low,bulls:s.bull_breaks,key:s.optimizer_key,outcome:s.outcome,reason:s.reason,lat:s.latency_ms},null,1);
         return '<tr class="'+rowCls+'">'+
           '<td class="cd" style="font-size:9px;white-space:nowrap">'+fmtT(s.ts||s.receivedAt||s.received_at)+'</td>'+
           '<td class="cw fw">'+( s.symbol||'—')+'</td>'+
@@ -2818,7 +2817,7 @@ async function loadSignals(){
           '<td>'+outcomeBdg(outcome)+'</td>'+
           '<td>'+destCell+'</td>'+
           '<td class="cd" style="font-size:9px">'+( s.latency_ms!=null?s.latency_ms+'ms':'—')+'</td>'+
-          '<td class="cd" style="font-size:8px" title="'+rawData.replace(/"/g,"&#34;")+'">&#128221;</td>'+'
+          '<td></td>'+
         '</tr>';
       }).join('');
     }
@@ -3014,7 +3013,7 @@ async function loadShadow(){
     const el2=$(bodyId);
     if(!el2)return;
     if(!list.length){el2.innerHTML=nd(cols,emptyMsg);}
-    else el2.innerHTML=list.map(b=>'<tr>'+shadowRow(b,bodyId==='sh-fin-body')+'</tr>').join('').replace(/<tr><\/tr>/g,'').replace(/<tr><tr>/g,'<tr>');
+    else el2.innerHTML=list.map(b=>shadowRow(b,bodyId==='sh-fin-body')).filter(Boolean).join('');
   }
 
   // Filter by type
