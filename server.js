@@ -21,7 +21,7 @@
 //     loadAll() filtert trades niet meer op cutoff datum.
 //
 //  4. SELECTIEVE DATUMFILTER GHOST HISTORY:
-//     Datumfilter bovenaan Ghost History tab (van/tot datum).
+//     Datefilter bovenaan Ghost History tab (van/tot datum).
 //     loadGhostHistory() stuurt from/to params naar API.
 //     /api/ghost-history-by-pair?from=YYYY-MM-DD&to=YYYY-MM-DD
 //     loadGhostHistoryByPair(from, to) in db.js.
@@ -47,7 +47,7 @@ const {
 } = require("./session");
 
 // ── Version ──────────────────────────────────────────────────────
-const VERSION = "14.7.9e"; // v14.7.9e: fix rrNow/buyCnt direction case, ghost KPI peakRR from ghost subobj, remove date filter bdDir/bdVwap case-insensitive, shows BUY/ABOVE correctly fix 500 on open-positions (symInfo undefined), fix openPositions in browser, fix loadHeader ghost block FX/STK/IDX/COM labels, ghost stopReason never manual, realPnl EUR, mt5Comment at placement FX/STK labels, ghost col cleanup, close reason SL/TP only mt5Comment in trades, ghost stop labels, outcome badges, what-if comment, SYNC_RAW removed asset_type in signal_log, daily log from open pos, mt5 comment in ghost, slDist/tvEntry in adopt fmtMs global helper, no inline functions in templates, browser syntax error fixed auto currency detection EUR/USD, correct conversion, currency symbol in dashboard USD→EUR conversion, verbose logs removed, complete API fields, mt5Comment shadowRow bdSess fix, milestone format fix, ghost active count fix, signal stats fix, data from 20/05 10:00 ghost restore assetType+vwapBandPct, all display fixes complete ghost restore assetType, ghost peakRRNeg display, signal log session cols, fin ghost realizedPnl fix startBalance fix, peakRRNeg display fix, exitPrice in trades, force adoption on startup, session fallback assetType everywhere, unrealizedPnl, signal outcomes, signal stats fixed correct signal outcomes, unrealizedPnl, assetType in API, signal stats per outcome /api/performance returns balance/equity/startBalance from latestEquity fix isTrackableBlock (no STOCK_OOH in shadow), bdSess fix fix bdSess template literal, add assetType/keyCount to shadow API MetaAPI auto-deploy on startup, stock timing 15:30-18:00, symInfoB crash fix fix symInfoB undefined crash, META_BASE global URL fix DB connection timeout 5s→15s, retry backoff 3s→5s, META_BASE london TP default 1.5R, session_high/low/day_high/low from webhook, vwapBandPct in all ghost saves MetaAPI 429 fix (60s cache), SL TV vs MT5 log, vwapBandPct everywhere, circuit open skip (1 aandeel=1lot, P&L=lots×move) // v14.3: bugs fixed (const→let adoptPosition, dupNumber, blockTypes, duplicate fetchHistoryDeals, NY_NIGHT/ASIA_MORNING shadow tracking) all milestone gaps fixed, outside night 21-02h, daily open log, ghost finalized fix, slHitAt EOD keep
+const VERSION = "14.8.5"; // v14.8.5: final fixes - Time/ALL OUTCOMES/no dup Lots ghost_trades has peak_rr/realized/lots, ghost finalized from individual trades ghost finalized uses individual ghost_trades, fin header fixed, mt5comment in fin no scroll tables, dup lots fixed, all scroll removed fixed trades header, signal highlights, 500 row limit, Dutch→English Peak- in RR, no scroll tables, English labels, signal cols fixed, realPnl chain fix rrNow/buyCnt direction case, ghost KPI peakRR from ghost subobj, remove date filter bdDir/bdVwap case-insensitive, shows BUY/ABOVE correctly fix 500 on open-positions (symInfo undefined), fix openPositions in browser, fix loadHeader ghost block FX/STK/IDX/COM labels, ghost stopReason never manual, realPnl EUR, mt5Comment at placement FX/STK labels, ghost col cleanup, close reason SL/TP only mt5Comment in trades, ghost stop labels, outcome badges, what-if comment, SYNC_RAW removed asset_type in signal_log, daily log from open pos, mt5 comment in ghost, slDist/tvEntry in adopt fmtMs global helper, no inline functions in templates, browser syntax error fixed auto currency detection EUR/USD, correct conversion, currency symbol in dashboard USD→EUR conversion, verbose logs removed, complete API fields, mt5Comment shadowRow bdSess fix, milestone format fix, ghost active count fix, signal stats fix, data from 20/05 10:00 ghost restore assetType+vwapBandPct, all display fixes complete ghost restore assetType, ghost peakRRNeg display, signal log session cols, fin ghost realizedPnl fix startBalance fix, peakRRNeg display fix, exitPrice in trades, force adoption on startup, session fallback assetType everywhere, unrealizedPnl, signal outcomes, signal stats fixed correct signal outcomes, unrealizedPnl, assetType in API, signal stats per outcome /api/performance returns balance/equity/startBalance from latestEquity fix isTrackableBlock (no STOCK_OOH in shadow), bdSess fix fix bdSess template literal, add assetType/keyCount to shadow API MetaAPI auto-deploy on startup, stock timing 15:30-18:00, symInfoB crash fix fix symInfoB undefined crash, META_BASE global URL fix DB connection timeout 5s→15s, retry backoff 3s→5s, META_BASE london TP default 1.5R, session_high/low/day_high/low from webhook, vwapBandPct in all ghost saves MetaAPI 429 fix (60s cache), SL TV vs MT5 log, vwapBandPct everywhere, circuit open skip (1 aandeel=1lot, P&L=lots×move) // v14.3: bugs fixed (const→let adoptPosition, dupNumber, blockTypes, duplicate fetchHistoryDeals, NY_NIGHT/ASIA_MORNING shadow tracking) all milestone gaps fixed, outside night 21-02h, daily open log, ghost finalized fix, slHitAt EOD keep
 
 // ── Config ───────────────────────────────────────────────────────
 const PORT           = process.env.PORT           || 3000;
@@ -354,10 +354,14 @@ async function closePosition(positionId, reason = "manual", pnl = null) {
           type: d.type, profit: d.profit ?? 0, commission: d.commission ?? 0,
           swap: d.swap ?? 0, volume: d.volume, price: d.price, time: d.time });
       }
-      const _rawPnl = await db.fetchRealizedPnl(positionId) ?? pnl;
-      // Convert to EUR if USD account
+      // Try DB deals first, then MetaAPI deals, then closingDeal profit
+      let _rawPnl = await db.fetchRealizedPnl(positionId).catch(()=>null);
+      if (_rawPnl == null && closingDeal?.profit != null) {
+        _rawPnl = parseFloat(closingDeal.profit);
+      }
+      if (_rawPnl == null && pnl != null) _rawPnl = pnl;
       const _posExRate = pos?.exchangeRate ?? (latestAccountCurrency === 'EUR' ? 1.0 : 1.0);
-      realPnl = _rawPnl != null ? parseFloat((_rawPnl * _posExRate).toFixed(2)) : pnl;
+      realPnl = _rawPnl != null ? parseFloat((_rawPnl * _posExRate).toFixed(2)) : null;
     } catch (e) { recordError(`closePos deals: ${e.message}`); }
   }
   // v14.2 FIX: Gap detection — uses deals already fetched above (no second call)
@@ -1926,7 +1930,7 @@ header{background:var(--bg2);border-bottom:1px solid var(--bdr2);padding:0 10px;
 .ldot{width:6px;height:6px;border-radius:50%;background:var(--g);box-shadow:0 0 5px var(--g);animation:pulse 2s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
 .sbdg{padding:2px 6px;border-radius:3px;font-size:8px;font-weight:700;background:var(--b2);color:var(--b)}
-nav{display:flex;border-bottom:1px solid var(--bdr2);background:var(--bg2);overflow-x:auto;position:sticky;top:40px;z-index:99}
+nav{display:flex;border-bottom:1px solid var(--bdr2);background:var(--bg2);overflow-x:visible;position:sticky;top:40px;z-index:99}
 .ntab{padding:7px 12px;cursor:pointer;color:var(--ink3);white-space:nowrap;border-bottom:2px solid transparent;font-size:10px;user-select:none}
 .ntab:hover{color:var(--ink)}.ntab.on{color:var(--b);border-bottom-color:var(--b)}
 .nbdg{display:inline-flex;align-items:center;justify-content:center;min-width:14px;height:12px;border-radius:6px;font-size:7px;font-weight:700;padding:0 3px;margin-left:2px;background:var(--r2);color:var(--r)}
@@ -1938,7 +1942,7 @@ nav{display:flex;border-bottom:1px solid var(--bdr2);background:var(--bg2);overf
 .dot{width:5px;height:5px;border-radius:50%;background:var(--g);display:inline-block;flex-shrink:0}
 .dot.r{background:var(--r)}.dot.p{background:var(--p)}.dot.y{background:var(--y)}.dot.b{background:var(--b)}
 .cm{font-size:7.5px;color:var(--ink3);white-space:nowrap}
-.tw{overflow-x:auto;-webkit-overflow-scrolling:touch}
+.tw{width:100%;overflow-x:visible}
 table{width:100%;border-collapse:collapse}
 th{color:var(--ink3);font-size:6.5px;text-transform:uppercase;letter-spacing:.3px;padding:3px 4px;border-bottom:1px solid var(--bdr);text-align:left;white-space:nowrap;background:var(--bg3)}
 td{padding:3px 4px;border-bottom:1px solid var(--bdr);white-space:nowrap;font-size:9px;vertical-align:middle}
@@ -2045,11 +2049,11 @@ tr:last-child td{border-bottom:none}tr:hover td{background:var(--bg4)}
     <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:1px;background:var(--bdr)">
       <div style="background:var(--bg2);padding:9px 12px">
         <div class="ovl">Start Balance</div><div class="ovv cd" id="ov-startbal">—</div>
-        <div class="ovs">bij start van trading</div>
+        <div class="ovs">at trading start</div>
       </div>
       <div style="background:var(--bg2);padding:9px 12px">
         <div class="ovl">+ Realized P&L</div><div class="ovv cg" id="ov-realbal">—</div>
-        <div class="ovs" id="ov-tradecount">— gesloten trades</div>
+        <div class="ovs" id="ov-tradecount">— closed trades</div>
       </div>
       <div style="background:var(--bg2);padding:9px 12px">
         <div class="ovl">= Cash Balance</div><div class="ovv cb" id="ov-cashbal">—</div>
@@ -2057,7 +2061,7 @@ tr:last-child td{border-bottom:none}tr:hover td{background:var(--bg4)}
       </div>
       <div style="background:var(--bg2);padding:9px 12px">
         <div class="ovl">+ Unrealized P&L</div><div class="ovv" id="ov-upnl">—</div>
-        <div class="ovs" id="ov-opencount">— open posities</div>
+        <div class="ovs" id="ov-opencount">— open positions</div>
       </div>
       <div style="background:var(--bg2);padding:9px 12px;border-left:2px solid var(--b)">
         <div class="ovl" style="color:var(--b)">= Equity (Balance MT5)</div>
@@ -2088,13 +2092,13 @@ tr:last-child td{border-bottom:none}tr:hover td{background:var(--bg4)}
   <div class="card">
     <div class="chdr">
       <div class="ctitle"><div class="dot b"></div>Open Trades — Daily Log</div>
-      <div class="cm">per dag · peak+/− · DD%</div>
+      <div class="cm">per day · peak+/− · DD%</div>
     </div>
     <div class="tw"><table>
       <thead><tr>
-        <th>Datum</th><th>Open</th><th>Win</th><th>Loss</th><th>WR</th>
-        <th style="color:var(--g)">Peak+RR</th><th style="color:var(--g)">Tijd</th>
-        <th style="color:var(--r)">Peak−RR</th><th style="color:var(--r)">Tijd</th>
+        <th>Date</th><th>Open</th><th>Win</th><th>Loss</th><th>WR</th>
+        <th style="color:var(--g)">Peak+RR</th><th style="color:var(--g)">Time</th>
+        <th style="color:var(--r)">Peak−RR</th><th style="color:var(--r)">Time</th>
         <th style="color:var(--r)">Max DD%</th><th>Lots</th><th>P&L</th>
       </tr></thead>
       <tbody id="ov-daily"><tr><td colspan="12" class="nd waiting">⏳ Laden…</td></tr></tbody>
@@ -2103,14 +2107,14 @@ tr:last-child td{border-bottom:none}tr:hover td{background:var(--bg4)}
 
   <div class="card">
     <div class="chdr">
-      <div class="ctitle"><div class="dot r"></div>Gesloten Trades</div>
+      <div class="ctitle"><div class="dot r"></div>Closed Trades</div>
       <div class="cm" id="ov-trades-cm">—</div>
     </div>
-    <div class="tw" style="max-height:300px;overflow-y:auto"><table>
+    <div class="tw" style=""><table>
       <thead><tr>
-        <th>Close</th><th>Symbol</th><th>Type</th><th>Dir</th><th>VWAP</th><th>Sess</th>
+        <th>SL/TP</th><th>Symbol</th><th>Type</th><th>Dir</th><th>VWAP</th><th>Session</th>
         <th>Entry</th><th>SL</th><th>TP</th><th>Exit</th>
-        <th>Realized €</th><th>Lots</th><th>Ghost Stop</th><th style="font-size:7px">MT5 Comment</th><th>Geopend</th><th>Gesloten</th>
+        <th>Realized €</th><th>Lots</th><th>Ghost</th><th>MT5 Comment</th><th>Opened</th><th>Closed</th>
       </tr></thead>
       <tbody id="ov-trades"><tr><td colspan="15" class="nd waiting">⏳ Laden…</td></tr></tbody>
     </table></div>
@@ -2120,7 +2124,7 @@ tr:last-child td{border-bottom:none}tr:hover td{background:var(--bg4)}
 <div class="page" id="p-sig"><div class="pg">
 
   <div class="card">
-    <div class="chdr"><div class="ctitle"><div class="dot r"></div>Signal Intelligence</div><div class="cm" id="sig-period">laatste 7 dagen</div></div>
+    <div class="chdr"><div class="ctitle"><div class="dot r"></div>Signal Intelligence</div><div class="cm" id="sig-period">last 7 days</div></div>
     <div class="sig-grid">
       <div class="sig-cell"><div class="sig-lbl">Total Signals</div><div class="sig-val cb" id="sg-total">—</div></div>
       <div class="sig-cell"><div class="sig-lbl">→ Placed (Ghost)</div><div class="sig-val cg" id="sg-placed">—</div></div>
@@ -2139,21 +2143,21 @@ tr:last-child td{border-bottom:none}tr:hover td{background:var(--bg4)}
   </div>
 
   <div class="card">
-    <div class="chdr"><div class="ctitle"><div class="dot g"></div>Signal Log — Alle Outcomes</div><div class="cm">meest recent eerst</div></div>
-    <div class="tw" style="max-height:340px;overflow-y:auto"><table>
+    <div class="chdr"><div class="ctitle"><div class="dot g"></div>Signal Log — All Outcomes</div><div class="cm">most recent first</div></div>
+    <div class="tw" style=""><table>
       <thead><tr>
-        <th>Tijd</th><th>Symbol</th><th>Type</th><th>Dir</th><th>Sess</th><th>VWAP</th>
-        <th>Entry</th><th>Band%</th><th>#Key</th><th>Outcome</th><th>Bestemming</th><th>Latency</th>
+        <th>Time</th><th>Symbol</th><th>Type</th><th>Dir</th><th>Session</th><th>VWAP</th>
+        <th>Entry</th><th>Band%</th><th>S.High</th><th>S.Low</th><th>Bulls</th><th>#Key</th><th>Outcome</th><th>Destination</th><th>Latency</th>
       </tr></thead>
       <tbody id="sig-log"><tr><td colspan="12" class="nd waiting">⏳ Laden…</td></tr></tbody>
     </table></div>
   </div>
 
-  <div style="padding:2px 9px;background:rgba(248,81,73,.06);border:1px solid var(--bdr);border-radius:0;font-size:7px;color:var(--r);font-weight:600">⚠ ERRORS — DID NOT REACH GHOST OR SHADOW</div>
+  <div style="padding:2px 9px;background:rgba(248,81,73,.06);border:1px solid var(--bdr);border-radius:0;font-size:7px;color:var(--r);font-weight:600">⚠ ERRORS — Signal did not reach Ghost or Shadow</div>
   <div class="card">
-    <div class="tw" style="max-height:200px;overflow-y:auto"><table>
+    <div class="tw" style=""><table>
       <thead><tr>
-        <th>Tijd</th><th>Symbol</th><th>Dir</th><th>Error Type</th><th>Detail</th><th>Retried</th>
+        <th>Time</th><th>Symbol</th><th>Dir</th><th>Error Type</th><th>Detail</th><th>Retried</th>
       </tr></thead>
       <tbody id="sig-errors"><tr><td colspan="6" class="nd">Geen errors</td></tr></tbody>
     </table></div>
@@ -2177,7 +2181,7 @@ tr:last-child td{border-bottom:none}tr:hover td{background:var(--bg4)}
 
   <div class="card">
     <div class="chdr"><div class="ctitle"><div class="dot p"></div>Active Ghost Tracker — Live Milestones</div></div>
-    <div style="overflow-x:auto;max-width:100%"><table style="width:100%;table-layout:auto">
+    <div style="width:100%"><table style="width:100%;min-width:100%;border-collapse:collapse">
       <thead><tr>
         <th>Status</th><th>Symbol</th><th style="font-size:8px">MT5 Comment</th><th>Type</th><th>Dir</th><th>VWAP</th><th>Session</th><th>#Key</th>
         <th style="color:var(--b)">RR Now</th><th style="color:var(--g)">Peak+RR</th><th style="color:var(--r)">Peak−</th>
@@ -2191,7 +2195,7 @@ tr:last-child td{border-bottom:none}tr:hover td{background:var(--bg4)}
 
   <div class="sechdr"><div class="dot r"></div>Ghost Finalized — Stop Reasons: phantom_sl · gap_stop · tp_hit · manual</div>
   <div class="card">
-    <div class="tw" style="max-height:340px;overflow-y:auto"><table>
+    <div class="tw" style=""><table>
       <thead><tr>
         <th>#</th><th>Symbol</th><th>Type</th><th>Sess</th><th>Dir</th><th>VWAP</th>
         <th style="color:var(--r)">Stop Reason</th><th>TP used</th>
@@ -2208,7 +2212,7 @@ tr:last-child td{border-bottom:none}tr:hover td{background:var(--bg4)}
 
   <div class="sechdr" style="margin-top:0"><div class="dot o"></div>⏰ Timezone Blocks — NY Dead · NY Night · Asia Morning</div>
   <div class="card">
-    <div class="tw" style="max-height:280px;overflow-y:auto"><table>
+    <div class="tw" style=""><table>
       <thead><tr>
         <th>Block</th><th>Symbol</th><th>Type</th><th>#Key</th><th>Dir</th><th>VWAP</th><th>Sess</th>
         <th style="color:var(--g)">Peak+</th><th style="color:var(--r)">Peak−%</th><th>Band%</th>
@@ -2221,7 +2225,7 @@ tr:last-child td{border-bottom:none}tr:hover td{background:var(--bg4)}
 
   <div class="sechdr"><div class="dot p"></div>📊 VWAP Exhaustion Blocks</div>
   <div class="card">
-    <div class="tw" style="max-height:220px;overflow-y:auto"><table>
+    <div class="tw" style=""><table>
       <thead><tr>
         <th>Block</th><th>Symbol</th><th>Type</th><th>#Key</th><th>Dir</th><th>VWAP</th>
         <th style="color:var(--g)">Peak+</th><th style="color:var(--r)">Peak−%</th><th>Band%</th>
@@ -2234,7 +2238,7 @@ tr:last-child td{border-bottom:none}tr:hover td{background:var(--bg4)}
 
   <div class="sechdr"><div class="dot y"></div>📌 Duplicate Position Blocks (#Key ≥ 2)</div>
   <div class="card">
-    <div class="tw" style="max-height:220px;overflow-y:auto"><table>
+    <div class="tw" style=""><table>
       <thead><tr>
         <th>Block</th><th>Symbol</th><th>Type</th><th>#Key</th><th>Dir</th><th>VWAP</th>
         <th style="color:var(--g)">Peak+</th><th style="color:var(--r)">Peak−%</th><th>Band%</th>
@@ -2247,7 +2251,7 @@ tr:last-child td{border-bottom:none}tr:hover td{background:var(--bg4)}
 
   <div class="sechdr"><div class="dot r"></div>Shadow Finalized — History</div>
   <div class="card">
-    <div class="tw" style="max-height:280px;overflow-y:auto"><table>
+    <div class="tw" style=""><table>
       <thead><tr>
         <th>Block</th><th>Symbol</th><th>Type</th><th>#Key</th><th>Dir</th><th>VWAP</th>
         <th style="color:var(--r)">Stop</th>
@@ -2264,7 +2268,7 @@ tr:last-child td{border-bottom:none}tr:hover td{background:var(--bg4)}
 
   <div class="card">
     <div class="chdr"><div class="ctitle"><div class="dot b"></div>EV TP Optimizer — per symbol+sess+dir+vwap combo · ≥20 ghosts voor TP lock</div></div>
-    <div class="tw" style="max-height:340px;overflow-y:auto"><table>
+    <div class="tw" style=""><table>
       <thead><tr>
         <th>Symbol</th><th>Type</th><th>Sess</th><th>Dir</th><th>VWAP</th>
         <th>#Key Max</th><th>#Ghosts</th>
@@ -2407,15 +2411,15 @@ function outcomeBdg(o){
 
 // Milestone cells — exact match to original table structure
 const ADV = ['-1.0','-0.9','-0.8','-0.7','-0.6','-0.5','-0.4','-0.3','-0.2','-0.1'];
-const FAV = Array.from({length:65},(_,i)=>'+'+(((i+1)/10).toFixed(1)));
+const FAV = Array.from({length:30},(_,i)=>'+'+(((i+1)/10).toFixed(1))); // +0.1 to +3.0R
 function msCells(ms){
   ms = ms||{};
   let h='';
   for(const k of ADV){
     const v=ms[k];
     h += v!=null
-      ? \`<td class="adv-hit" style="min-width:22px;text-align:center;padding:2px 3px"><b style="color:#f85149;font-size:8px">\${typeof v==='number'?Math.round(v)+'m':v}</b></td>\`
-      : \`<td class="adv-th" style="min-width:22px;text-align:center;padding:2px 3px;opacity:.3;font-size:9px">·</td>\`;
+      ? \`<td class="adv-hit" style="min-width:30px;max-width:50px;text-align:center;padding:2px 4px;white-space:nowrap"><span style="color:#f85149;font-size:8px;font-weight:600">\${typeof v==='string'?v:v}</span></td>\`
+      : \`<td class="adv-th" style="min-width:30px;max-width:50px;text-align:center;padding:2px 4px;opacity:.2;font-size:8px">·</td>\`;
   }
   for(const k of FAV){
     const v=ms[k];
@@ -2525,7 +2529,7 @@ async function loadOverview(){
   if(s('ov-wr')){s('ov-wr').textContent=wr;s('ov-wr').className='ksv '+((wins/Math.max(pos.length,1))>=0.6?'cg fw':'cy');}
   if(s('ov-upnl')){s('ov-upnl').textContent=fmtE(upnl);s('ov-upnl').className='ovv '+(upnl>0?'cg':upnl<0?'cr':'cd');}
   if(s('ov-upnl2')){s('ov-upnl2').textContent=fmtE(upnl);s('ov-upnl2').className='ksv '+(upnl>0?'cg':upnl<0?'cr':'cd');}
-  if(s('ov-opencount'))s('ov-opencount').textContent=pos.length+' open posities';
+  if(s('ov-opencount'))s('ov-opencount').textContent=pos.length+' open positions';
 
   // Peak stats from ghosts
   let bestP=null,worstP=null,maxRR=null,totLots=0;
@@ -2550,7 +2554,7 @@ async function loadOverview(){
     const cashBal=startBal+rp;
     if(s('ov-startbal'))s('ov-startbal').textContent='\\u20ac'+Math.round(startBal).toLocaleString();
     if(s('ov-realbal')){s('ov-realbal').textContent=fmtE(rp);s('ov-realbal').className='ovv '+(rp>=0?'cg':'cr');}
-    if(s('ov-tradecount'))s('ov-tradecount').textContent=(trades||[]).length+' gesloten trades';
+    if(s('ov-tradecount'))s('ov-tradecount').textContent=(trades||[]).length+' closed trades';
     if(s('ov-cashbal'))s('ov-cashbal').textContent='\\u20ac'+Math.round(cashBal);
     if(s('ov-equity'))s('ov-equity').textContent='\\u20ac'+Math.round(eq);
     if(s('ov-equitycheck'))s('ov-equitycheck').textContent='\\u20ac'+Math.round(startBal).toLocaleString('nl-BE')+' + \\u20ac'+Math.round(rp)+' + '+fmtE(upnl)+' = \\u20ac'+Math.round(eq).toLocaleString('nl-BE')+' \\u2713';
@@ -2574,7 +2578,7 @@ async function loadOverview(){
       peakRRPos:_bestPeak,peakRRNeg:_worstPeak*100,peakPosTime:'open',peakNegTime:'open',
       maxDD:_worstPeak>0?_worstPeak:null,lots:_totalLots,pnl:_totalPnl}];
   }
-  if(!_dailyRows.length){dEl.innerHTML=nd(12,'Geen data — wacht op eerste trades');}
+  if(!_dailyRows.length){dEl.innerHTML=nd(12,'No data yet — waiting for first trades');}
   else {
     dEl.innerHTML=_dailyRows.slice(0,14).map(d=>{
       const total=d.total||0,wins2=d.wins||0,loss2=d.losses||0;
@@ -2603,9 +2607,9 @@ async function loadOverview(){
   const tEl=$('ov-trades');
   const trList=trades||[];
   if(s('ov-trades-cm'))s('ov-trades-cm').textContent=trList.length+' trades';
-  if(!trList.length){tEl.innerHTML=nd(15,'Geen gesloten trades');}
+  if(!trList.length){tEl.innerHTML=nd(15,'No closed trades');}
   else {
-    tEl.innerHTML=trList.slice(0,100).map(t=>{
+    tEl.innerHTML=trList.slice(0,500).map(t=>{
       const cr=t.closeReason||t.close_reason;
       const gr=t.ghostStopReason||t.ghost_stop_reason;
       const pnl=t.realizedPnl||t.realized_pnl||t.realizedPnlEur||t.realized_pnl_eur||null;
@@ -2620,8 +2624,8 @@ async function loadOverview(){
         <td class="cr" style="font-size:8.5px">\${fmt(t.sl,5)}</td>
         <td class="cg" style="font-size:8.5px">\${t.tp?fmt(t.tp,5):'—'}</td>
         <td class="cy" style="font-size:8.5px">\${fmt(t.exitPrice||t.exit_price,5)}</td>
-        <td class="\${cE(pnl)} fw">\${fmtE(pnl)}</td>
-        <td class="cd">\${fmt(t.lots,2)}</td>
+        <td class="\${pnl!=null?cE(pnl):'cd'} fw" style="font-weight:700">\${pnl!=null?fmtE(pnl):'—'}</td>
+        <td class="cd" style="font-size:9px">\${t.lots!=null?Number(t.lots).toFixed(2):'—'}</td>
         <td style="font-size:8px;white-space:nowrap">\${
           gr==='phantom_sl'||gr==='sl'||gr==='gap_stop'?stopBdg('sl'):
           gr==='tp_hit'||gr==='tp'?stopBdg('tp'):
@@ -2693,15 +2697,16 @@ async function loadSignals(){
       const lat=s.latencyMs||s.latency_ms;
       const band=s.vwapBandPct||s.vwap_band_pct;
       return \`<tr>
-        <td class="cd">\${fmtT(s.receivedAt||s.received_at||s.createdAt||s.created_at)}</td>
+        <td class="cd" style="font-size:9px;white-space:nowrap">\${fmtT(s.receivedAt||s.received_at||s.createdAt||s.created_at)}</td>
         <td class="cb fw">\${s.symbol||'—'}</td>
         <td>\${bdType(s.assetType||s.asset_type||s.type)}</td>
         <td>\${bdDir(s.direction)}</td>
-        <td>\${bdSess(s.session)}</td>
+        <td style="white-space:nowrap">\${bdSess(s.session)}</td>
         <td>\${bdVwap(s.vwapPosition||s.vwap_position)}</td>
-        <td class="cd" style="font-size:8px">\${fmt(s.tvEntry||s.tv_entry||s.entry,5)}</td>
-        <td class="cd" style="font-size:8px">\${(s.sessionHigh||s.session_high)?fmt(s.sessionHigh||s.session_high,5):'—'}</td>
-        <td class="cd" style="font-size:8px">\${(s.sessionLow||s.session_low)?fmt(s.sessionLow||s.session_low,5):'—'}</td>
+        <td class="cd" style="font-size:9px">\${fmt(s.tvEntry||s.tv_entry||s.entry,5)}</td>
+        <td class="\${(s.vwapBandPct||s.band_pct)>150?'cr fw':(s.vwapBandPct||s.band_pct)>100?'co':'cd'}" style="font-size:9px">\${s.vwapBandPct||s.band_pct?fmtP(s.vwapBandPct||s.band_pct):'—'}</td>
+        <td class="cd" style="font-size:8px">\${(s.sessionHigh||s.session_high)?fmt(s.sessionHigh||s.session_high,3):'—'}</td>
+        <td class="cd" style="font-size:8px">\${(s.sessionLow||s.session_low)?fmt(s.sessionLow||s.session_low,3):'—'}</td>
         <td class="\${(s.bullBreaks||s.bull_breaks||0)>=8?'cg fw':'cd'}">\${s.bullBreaks||s.bull_breaks||'—'}</td>
         <td class="\${(band||0)>150?'cr fw':'cd'}">\${band!=null?fmtP(band):'—'}</td>
         <td>\${keyBdg(s.keyCount||s.key_count||1)}</td>
@@ -2729,17 +2734,18 @@ async function loadSignals(){
 
 // ── GHOST ──
 async function loadGhost(){
-  const [openPos,ghostG] = await Promise.all([
+  const [openPos,ghostG,ghostFin] = await Promise.all([
     api('/api/open-positions'),
     api('/api/ghost-grouped'),
+    api('/api/ghost-trades'),
   ]);
 
   const pos=openPos||[];
   const ghosts=ghostG||[];
   // Active ghosts = open positions (live data from MT5)
-  // Finalized ghosts = from ghost-grouped DB (have stopReason)
+  // Finalized ghosts = individual ghost_trades from DB
   const active=pos;
-  const fin=ghosts.filter(g=>g.stopReason||g.stop_reason||g.finalizedAt||g.finalized_at);
+  const fin=(ghostFin||[]).filter(g=>g.stopReason||g.stop_reason||g.closedAt||g.closed_at);
 
   // KPI strip
   const slToday=active.filter(g=>g.ghost?.phantomSLHit||g.ghost?.phantom_sl_hit||g.phantomSLHit||g.phantom_sl_hit).length;
@@ -2761,10 +2767,11 @@ async function loadGhost(){
   f('gh-sell',       sellCnt,'ksv cr');
   f('gh-tp-est',     tpCnt,  'ksv cy');
   f('gh-fin-cnt',    fin.length,'ksv cc');
+  f('h-fin',         fin.length,'kv');
 
   // Active ghost table — from open positions (has live milestone data)
   const aBody=$('gh-active-body');
-  if(!pos.length){aBody.innerHTML=nd(90,'Geen open posities');}
+  if(!pos.length){aBody.innerHTML=nd(90,'Geen open positions');}
   else {
     aBody.innerHTML=pos.map(p=>{
       const g=p.ghost||{};
@@ -2791,7 +2798,7 @@ async function loadGhost(){
         <td>\${keyBdg(p.keyCount||g.keyCount||1)}</td>
         <td class="\${cRR(rrNow)}" style="font-weight:700">\${rrNow!=null?fmtR(rrNow):'—'}</td>
         <td class="\${(g.peakRRPos||0)>0?'cg fw':'cd'}" style="font-weight:700">\${(g.peakRRPos||0)>0?'+'+g.peakRRPos.toFixed(2)+'R':'—'}</td>
-        <td class="\${(g.peakRRNeg||0)>=80?'cr fw':(g.peakRRNeg||0)>=50?'cr':'cd'}" style="font-weight:700">\${g.peakRRNeg!=null&&g.peakRRNeg>0?'-'+fmtP(g.peakRRNeg):'—'}</td>
+        <td class="\${(g.peakRRNeg||0)>=80?'cr fw':(g.peakRRNeg||0)>=50?'cr':'cd'}" style="font-weight:700">\${g.peakRRNeg!=null&&g.peakRRNeg>0?fmtR(-(g.peakRRNeg/100)):'—'}</td>
         <td class="cg" style="font-weight:700">+\${(g.tpRRUsed||1.5).toFixed(2)}R</td>
         <td class="\${(p.vwapBandPct||0)>150?'co fw':'cd'}">\${p.vwapBandPct!=null?fmtP(p.vwapBandPct):'—'}</td>
         <td class="cd" style="font-size:8px">\${p.tvEntry!=null?fmt(p.tvEntry,5):'—'}</td>
@@ -2810,7 +2817,7 @@ async function loadGhost(){
 
   // Finalized ghost history
   const fBody=$('gh-fin-body');
-  if(!fin.length){fBody.innerHTML=nd(90,'Geen gefinaliseerde ghosts');}
+  if(!fin.length){fBody.innerHTML=nd(90,'No finalized ghosts');}
   else {
     fBody.innerHTML=fin.slice(0,300).map((g,i)=>{
       const slMs=g.slMilestones||g.sl_milestones||{};
@@ -2829,11 +2836,12 @@ async function loadGhost(){
         <td>\${stopBdg(g.stopReason||g.stop_reason)}</td>
         <td class="cd">\${g.tpRRUsed!=null?fmtR(g.tpRRUsed):'—'}</td>
         <td class="\${cRR(g.peakRRPos)}">\${fmtR(g.peakRRPos)}</td>
-        <td class="\${(g.peakRRNeg||0)>=80?'cr fw':(g.peakRRNeg||0)>=50?'cr':'cd'}">\${g.peakRRNeg!=null?'-'+fmtP(g.peakRRNeg):'—'}</td>
+        <td class="\${(g.peakRRNeg||0)>=80?'cr fw':(g.peakRRNeg||0)>=50?'cr':'cd'}">\${g.peakRRNeg!=null?fmtR(-(g.peakRRNeg/100)):'—'}</td>
         <td class="\${(g.vwapBandPct||0)>150?'co fw':'cd'}">\${g.vwapBandPct!=null?fmtP(g.vwapBandPct):'—'}</td>
         <td>\${keyBdg(g.keyCount||1)}</td>
         <td class="\${cE(g.realizedPnlEUR||g.realized_pnl_eur||g.realizedPnl||g.realized_pnl)} fw">\${fmtE(g.realizedPnlEUR||g.realized_pnl_eur||g.realizedPnl||g.realized_pnl)}</td>
-        <td class="cd">\${fmt(g.lots,2)}</td>
+        <td class="cd">\${g.lots!=null?Number(g.lots).toFixed(2):'—'}</td>
+        <td class="cd" style="font-size:8px">\${g.mt5Comment||g.mt5_comment||g.orderComment||'—'}</td>
         <td class="cd" style="font-size:8px">\${fmtTs(g.openedAt||g.opened_at)}</td>
         <td class="cd">\${fmtEl(g.openedAt||g.opened_at,g.finalizedAt||g.finalized_at)}</td>
         \${msCells({..._slF,..._rrF})}
@@ -2866,7 +2874,7 @@ async function loadShadow(){
       <td>\${bdVwap(b.vwapPosition||b.vwap_position)}</td>
       \${_sessOrStop}
       <td class="\${cRR(b.peakRRPos)}">\${fmtR(b.peakRRPos)}</td>
-      <td class="\${(b.peakRRNeg||0)>=80?'cr fw':(b.peakRRNeg||0)>=50?'cr':'cd'}">\${b.peakRRNeg!=null?'-'+fmtP(b.peakRRNeg):'—'}</td>
+      <td class="\${(b.peakRRNeg||0)>=80?'cr fw':(b.peakRRNeg||0)>=50?'cr':'cd'}">\${b.peakRRNeg!=null?fmtR(-(b.peakRRNeg/100)):'—'}</td>
       <td class="\${(b.vwapBandPct||0)>150?'co fw':'cd'}">\${b.vwapBandPct!=null?fmtP(b.vwapBandPct):'—'}</td>
       \${msCells({..._slFF,..._rrFF})}
       <td class="cd" style="font-size:8.5px">\${fmt(b.entry,5)}</td>
@@ -2888,7 +2896,7 @@ async function loadShadow(){
   render('sh-tz-body',  tz, 90, 'Geen timezone blocks actief');
   render('sh-vwap-body',vw, 90, 'Geen VWAP blocks actief');
   render('sh-dup-body', dp, 90, 'Geen duplicate blocks actief');
-  render('sh-fin-body', history||[], 90, 'Geen shadow history', true);
+  render('sh-fin-body', history||[], 90, 'No shadow history', true);
 }
 
 // ── EV OPTIMIZER ──
@@ -2946,7 +2954,7 @@ async function loadEV(){
 
   const slEl=$('ev-sl-body');
   const san=shadowAn||[];
-  if(!san.length){slEl.innerHTML=nd(10,'Geen shadow data');}
+  if(!san.length){slEl.innerHTML=nd(10,'No shadow data');}
   else {
     slEl.innerHTML=san.slice(0,20).map(s=>{
       const cnt=s.count||s.total||0;
