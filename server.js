@@ -2006,7 +2006,7 @@ tr:last-child td{border-bottom:none}
 /* Expandable raw webhook */
 .raw-json{display:none;background:#0d1117;border-radius:4px;padding:8px;font-family:monospace;font-size:9px;color:#8b949e;max-height:200px;overflow-y:auto;margin-top:4px;border:1px solid rgba(139,148,158,.15);white-space:pre-wrap;word-break:break-all}
 .raw-json.open{display:block}
-.expand-btn{cursor:pointer;font-size:8px;color:#388bfd;padding:0 4px}
+          '<td></td>'+
 /* Scroll */
 .sl-row{background:rgba(248,81,73,.05)!important}
 `;
@@ -2818,7 +2818,7 @@ async function loadSignals(){
           '<td>'+outcomeBdg(outcome)+'</td>'+
           '<td>'+destCell+'</td>'+
           '<td class="cd" style="font-size:9px">'+( s.latency_ms!=null?s.latency_ms+'ms':'—')+'</td>'+
-          '<td><span class="expand-btn" onclick="var d=this.nextSibling;d.classList.toggle('open')">JSON</span><div class="raw-json">'+rawData.replace(/</g,'&lt;')+'</div></td>'+
+          '<td class="cd" style="font-size:8px" title="'+rawData.replace(/"/g,"&#34;")+'">&#128221;</td>'+'
         '</tr>';
       }).join('');
     }
