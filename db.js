@@ -1040,6 +1040,9 @@ async function loadGhostTrades(optimizerKey = null, limitRows = 200) {
         trade_number         AS "tradeNumber",
         CAST(peak_rr_pos     AS FLOAT) AS "peakRRPos",
         CAST(peak_rr_neg     AS FLOAT) AS "peakRRNeg",
+        CAST(realized_pnl_eur AS FLOAT) AS "realizedPnlEUR",
+        CAST(lots            AS FLOAT) AS lots,
+        vwap_band_pct        AS "vwapBandPct",
         opened_at            AS "openedAt",
         closed_at            AS "closedAt"
       FROM ghost_trades
