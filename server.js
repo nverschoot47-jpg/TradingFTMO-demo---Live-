@@ -47,7 +47,7 @@ const {
 } = require("./session");
 
 // ── Version ──────────────────────────────────────────────────────
-const VERSION = "14.8.5"; // v14.8.5: final fixes - Time/ALL OUTCOMES/no dup Lots ghost_trades has peak_rr/realized/lots, ghost finalized from individual trades ghost finalized uses individual ghost_trades, fin header fixed, mt5comment in fin no scroll tables, dup lots fixed, all scroll removed fixed trades header, signal highlights, 500 row limit, Dutch→English Peak- in RR, no scroll tables, English labels, signal cols fixed, realPnl chain fix rrNow/buyCnt direction case, ghost KPI peakRR from ghost subobj, remove date filter bdDir/bdVwap case-insensitive, shows BUY/ABOVE correctly fix 500 on open-positions (symInfo undefined), fix openPositions in browser, fix loadHeader ghost block FX/STK/IDX/COM labels, ghost stopReason never manual, realPnl EUR, mt5Comment at placement FX/STK labels, ghost col cleanup, close reason SL/TP only mt5Comment in trades, ghost stop labels, outcome badges, what-if comment, SYNC_RAW removed asset_type in signal_log, daily log from open pos, mt5 comment in ghost, slDist/tvEntry in adopt fmtMs global helper, no inline functions in templates, browser syntax error fixed auto currency detection EUR/USD, correct conversion, currency symbol in dashboard USD→EUR conversion, verbose logs removed, complete API fields, mt5Comment shadowRow bdSess fix, milestone format fix, ghost active count fix, signal stats fix, data from 20/05 10:00 ghost restore assetType+vwapBandPct, all display fixes complete ghost restore assetType, ghost peakRRNeg display, signal log session cols, fin ghost realizedPnl fix startBalance fix, peakRRNeg display fix, exitPrice in trades, force adoption on startup, session fallback assetType everywhere, unrealizedPnl, signal outcomes, signal stats fixed correct signal outcomes, unrealizedPnl, assetType in API, signal stats per outcome /api/performance returns balance/equity/startBalance from latestEquity fix isTrackableBlock (no STOCK_OOH in shadow), bdSess fix fix bdSess template literal, add assetType/keyCount to shadow API MetaAPI auto-deploy on startup, stock timing 15:30-18:00, symInfoB crash fix fix symInfoB undefined crash, META_BASE global URL fix DB connection timeout 5s→15s, retry backoff 3s→5s, META_BASE london TP default 1.5R, session_high/low/day_high/low from webhook, vwapBandPct in all ghost saves MetaAPI 429 fix (60s cache), SL TV vs MT5 log, vwapBandPct everywhere, circuit open skip (1 aandeel=1lot, P&L=lots×move) // v14.3: bugs fixed (const→let adoptPosition, dupNumber, blockTypes, duplicate fetchHistoryDeals, NY_NIGHT/ASIA_MORNING shadow tracking) all milestone gaps fixed, outside night 21-02h, daily open log, ghost finalized fix, slHitAt EOD keep
+const VERSION = "14.8.6"; // v14.8.6: shadow fix (_slFF/_rrFF), type resolution client-side, ghost scroll, FAV 20 cols final fixes - Time/ALL OUTCOMES/no dup Lots ghost_trades has peak_rr/realized/lots, ghost finalized from individual trades ghost finalized uses individual ghost_trades, fin header fixed, mt5comment in fin no scroll tables, dup lots fixed, all scroll removed fixed trades header, signal highlights, 500 row limit, Dutch→English Peak- in RR, no scroll tables, English labels, signal cols fixed, realPnl chain fix rrNow/buyCnt direction case, ghost KPI peakRR from ghost subobj, remove date filter bdDir/bdVwap case-insensitive, shows BUY/ABOVE correctly fix 500 on open-positions (symInfo undefined), fix openPositions in browser, fix loadHeader ghost block FX/STK/IDX/COM labels, ghost stopReason never manual, realPnl EUR, mt5Comment at placement FX/STK labels, ghost col cleanup, close reason SL/TP only mt5Comment in trades, ghost stop labels, outcome badges, what-if comment, SYNC_RAW removed asset_type in signal_log, daily log from open pos, mt5 comment in ghost, slDist/tvEntry in adopt fmtMs global helper, no inline functions in templates, browser syntax error fixed auto currency detection EUR/USD, correct conversion, currency symbol in dashboard USD→EUR conversion, verbose logs removed, complete API fields, mt5Comment shadowRow bdSess fix, milestone format fix, ghost active count fix, signal stats fix, data from 20/05 10:00 ghost restore assetType+vwapBandPct, all display fixes complete ghost restore assetType, ghost peakRRNeg display, signal log session cols, fin ghost realizedPnl fix startBalance fix, peakRRNeg display fix, exitPrice in trades, force adoption on startup, session fallback assetType everywhere, unrealizedPnl, signal outcomes, signal stats fixed correct signal outcomes, unrealizedPnl, assetType in API, signal stats per outcome /api/performance returns balance/equity/startBalance from latestEquity fix isTrackableBlock (no STOCK_OOH in shadow), bdSess fix fix bdSess template literal, add assetType/keyCount to shadow API MetaAPI auto-deploy on startup, stock timing 15:30-18:00, symInfoB crash fix fix symInfoB undefined crash, META_BASE global URL fix DB connection timeout 5s→15s, retry backoff 3s→5s, META_BASE london TP default 1.5R, session_high/low/day_high/low from webhook, vwapBandPct in all ghost saves MetaAPI 429 fix (60s cache), SL TV vs MT5 log, vwapBandPct everywhere, circuit open skip (1 aandeel=1lot, P&L=lots×move) // v14.3: bugs fixed (const→let adoptPosition, dupNumber, blockTypes, duplicate fetchHistoryDeals, NY_NIGHT/ASIA_MORNING shadow tracking) all milestone gaps fixed, outside night 21-02h, daily open log, ghost finalized fix, slHitAt EOD keep
 
 // ── Config ───────────────────────────────────────────────────────
 const PORT           = process.env.PORT           || 3000;
@@ -2091,7 +2091,7 @@ tr:last-child td{border-bottom:none}tr:hover td{background:var(--bg4)}
 
   <div class="card">
     <div class="chdr">
-      <div class="ctitle"><div class="dot b"></div>Open Trades — Daily Log</div>
+      <div class="ctitle"><div class="dot b"></div>Closed Trades — Daily Log</div>
       <div class="cm">per day · peak+/− · DD%</div>
     </div>
     <div class="tw"><table>
@@ -2181,7 +2181,7 @@ tr:last-child td{border-bottom:none}tr:hover td{background:var(--bg4)}
 
   <div class="card">
     <div class="chdr"><div class="ctitle"><div class="dot p"></div>Active Ghost Tracker — Live Milestones</div></div>
-    <div style="width:100%"><table style="width:100%;min-width:100%;border-collapse:collapse">
+    <div style="width:100%;overflow-x:auto"><table style="min-width:1400px;border-collapse:collapse">
       <thead><tr>
         <th>Status</th><th>Symbol</th><th style="font-size:8px">MT5 Comment</th><th>Type</th><th>Dir</th><th>VWAP</th><th>Session</th><th>#Key</th>
         <th style="color:var(--b)">RR Now</th><th style="color:var(--g)">Peak+RR</th><th style="color:var(--r)">Peak−</th>
@@ -2349,10 +2349,50 @@ function bdSess(s){
     :'color:#8b949e';
   return '<span style="'+st+';font-size:10px;font-weight:500">'+lbl+'</span>';
 }
-function bdType(t){
-  const _t=(t||'').toLowerCase();
+// Client-side symbol catalog for type resolution
+const STYPE={
+  forex:['EURUSD','GBPUSD','AUDUSD','USDCAD','USDCHF','USDJPY','NZDUSD','EURGBP','EURJPY',
+    'GBPJPY','AUDJPY','CADJPY','CHFJPY','EURAUD','EURCAD','EURCHF','EURNZD','GBPAUD',
+    'GBPCAD','GBPCHF','GBPNZD','AUDCAD','AUDCHF','AUDNZD','CADCHF','NZDCAD','NZDCHF',
+    'NZDJPY','EURCZK','EURDKK','EURHUF','EURMXN','EURNOK','EURPLN','EURSEK','EURZAR',
+    'GBPDKK','GBPHUF','GBPNOK','GBPPLN','GBPSEK','USDCZK','USDDKK','USDHUF','USDMXN',
+    'USDNOK','USDPLN','USDSEK','USDZAR','XAUUSD','XAGUSD','XPTUSD','XPDUSD'],
+  stock:['AAPL','MSFT','GOOGL','GOOG','AMZN','META','TSLA','NVDA','AMD','INTC','CSCO',
+    'ORCL','IBM','QCOM','TXN','AVGO','MU','AMAT','KLAC','LRCX','ADI','MCHP','NXPI',
+    'SWKS','QRVO','XLNX','MRVL','LITE','CRUS','SLAB','MPWR','AAOI',
+    'JPM','BAC','WFC','GS','MS','C','USB','PNC','TFC','COF','AXP','BLK','SCHW','ICE',
+    'CME','CBOE','NDAQ','SPGI','MCO','V','MA','PYPL','SQ','FISV','FIS','GPN','WU',
+    'UNH','JNJ','PFE','ABBV','MRK','BMY','LLY','AMGN','GILD','BIIB','REGN','VRTX',
+    'MDT','ABT','SYK','BSX','EW','IDXX','ISRG','ZBH','DHR','TMO','A','PKI','IQV',
+    'CVX','XOM','COP','EOG','PXD','DVN','MPC','VLO','PSX','OXY','SLB','HAL','BKR',
+    'KO','PEP','MCD','SBUX','YUM','QSR','CMG','DPZ','WEN','JACK','CAKE','DIN',
+    'WMT','TGT','COST','HD','LOW','BBY','M','KSS','JWN','RL','PVH','TPR','CPRI',
+    'AMZN','EBAY','ETSY','W','CHWY','CHEWY','WISH','OSTK','PRTS','FLXS',
+    'DIS','NFLX','PARA','WBD','FOXA','FOX','LYV','IMAX','CNK','AMC','MSGS',
+    'BA','LMT','RTX','NOC','GD','L3H','HII','TDG','SPR','HEI','TDY','LDOS','CACI',
+    'GE','HON','MMM','EMR','ROK','PH','ITW','ETN','IR','CARR','OTIS','XYL','RWX',
+    'AZN','MSTR','KO','INTC','V','MA','NFLX','AMD','BA','CSCO','SBUX','WMT',
+    'LMT','QCOM','IBM','MSTR','MCD','GOOGL','DIS','META','TSLA','AAPL','AMZN'],
+  index:['SPX500','US500','US30','NAS100','US100','DE30','GER40','UK100','JP225',
+    'AUS200','NAS100USD','US30USD','UK100GBP','DE30EUR','GER40EUR','USTEC',
+    'SPX','DAX','FTSE','CAC40','STOXX50','US30USD','NAS100USD','UK100GBP','DE30EUR'],
+  commodity:['XAUUSD','XAGUSD','XPTUSD','XPDUSD','WTIUSD','BCOUSD','XTIUSD',
+    'NGAS','WHEAT','CORN','SOYBEAN','COPPER','USOIL','UKOIL'],
+};
+function resolveType(sym){
+  if(!sym)return null;
+  const s=sym.toUpperCase().replace(/\..*$/,'').replace(/USD$|EUR$|GBP$/,'');
+  for(const [type,arr] of Object.entries(STYPE)){
+    if(arr.includes(sym.toUpperCase())||arr.includes(s))return type;
+  }
+  return null;
+}
+function bdType(t,sym){
+  // Try stored type first, then client-side catalog
+  const _resolved = t || (sym?resolveType(sym):null);
+  const _t=(_resolved||'').toLowerCase();
   const m={forex:'FX',stock:'STK',index:'IDX',commodity:'COM'};
-  const lbl=m[_t]||(_t?_t.toUpperCase().slice(0,3):'?');
+  const lbl=m[_t]||(_t&&_t!=='?'&&_t.length>0?_t.toUpperCase().slice(0,3):'?');
   const styles={
     FX:'background:rgba(56,139,253,.15);color:#388bfd;border:1px solid rgba(56,139,253,.3)',
     STK:'background:rgba(240,136,62,.15);color:#f0883e;border:1px solid rgba(240,136,62,.3)',
@@ -2411,7 +2451,7 @@ function outcomeBdg(o){
 
 // Milestone cells — exact match to original table structure
 const ADV = ['-1.0','-0.9','-0.8','-0.7','-0.6','-0.5','-0.4','-0.3','-0.2','-0.1'];
-const FAV = Array.from({length:30},(_,i)=>'+'+(((i+1)/10).toFixed(1))); // +0.1 to +3.0R
+const FAV = Array.from({length:20},(_,i)=>'+'+(((i+1)/10).toFixed(1))); // +0.1 to +2.0R
 function msCells(ms){
   ms = ms||{};
   let h='';
@@ -2616,7 +2656,7 @@ async function loadOverview(){
       return \`<tr>
         <td>\${stopBdg(cr)}</td>
         <td class="cb fw">\${t.symbol||'—'}</td>
-        <td>\${bdType(t.assetType||t.asset_type)}</td>
+        <td>\${bdType(t.assetType||t.asset_type,t.symbol)}</td>
         <td>\${bdDir(t.direction)}</td>
         <td>\${bdVwap(t.vwapPosition||t.vwap_position)}</td>
         <td>\${bdSess(t.session)}</td>
@@ -2672,7 +2712,7 @@ async function loadSignals(){
     const _realErrors = (stats.byOutcome||[])
       .filter(o=>o.outcome&&(o.outcome.includes('ERROR')||o.outcome.includes('NO_POS')||o.outcome.includes('TIMEOUT')||o.outcome.includes('CIRCUIT')))
       .reduce((s,o)=>s+(o.count||0),0);
-    f('sg-err', _realErrors||stats.errors||0);
+    f('sg-err', _realErrors||0); // Only count real system errors
     if($('nb-sig'))$('nb-sig').textContent=stats.total||0;
   }
 
@@ -2699,7 +2739,7 @@ async function loadSignals(){
       return \`<tr>
         <td class="cd" style="font-size:9px;white-space:nowrap">\${fmtT(s.receivedAt||s.received_at||s.createdAt||s.created_at)}</td>
         <td class="cb fw">\${s.symbol||'—'}</td>
-        <td>\${bdType(s.assetType||s.asset_type||s.type)}</td>
+        <td>\${bdType(s.assetType||s.asset_type||s.type,s.symbol)}</td>
         <td>\${bdDir(s.direction)}</td>
         <td style="white-space:nowrap">\${bdSess(s.session)}</td>
         <td>\${bdVwap(s.vwapPosition||s.vwap_position)}</td>
@@ -2735,9 +2775,9 @@ async function loadSignals(){
 // ── GHOST ──
 async function loadGhost(){
   const [openPos,ghostG,ghostFin] = await Promise.all([
-    api('/api/open-positions'),
-    api('/api/ghost-grouped'),
-    api('/api/ghost-trades'),
+    api('/api/open-positions').catch(()=>[]),
+    api('/api/ghost-grouped').catch(()=>[]),
+    api('/api/ghost-trades').catch(()=>[]),
   ]);
 
   const pos=openPos||[];
@@ -2745,7 +2785,8 @@ async function loadGhost(){
   // Active ghosts = open positions (live data from MT5)
   // Finalized ghosts = individual ghost_trades from DB
   const active=pos;
-  const fin=(ghostFin||[]).filter(g=>g.stopReason||g.stop_reason||g.closedAt||g.closed_at);
+  const fin=Array.isArray(ghostFin)?ghostFin.filter(g=>g.stopReason||g.stop_reason||g.closedAt||g.closed_at):[];
+  console.log('[Ghost] Finalized:', fin.length, 'of', (ghostFin||[]).length, 'ghost trades');
 
   // KPI strip
   const slToday=active.filter(g=>g.ghost?.phantomSLHit||g.ghost?.phantom_sl_hit||g.phantomSLHit||g.phantom_sl_hit).length;
@@ -2791,7 +2832,7 @@ async function loadGhost(){
         <td>\${stateBdg}</td>
         <td class="cb fw" style="white-space:nowrap">\${p.symbol||'—'}</td>
         <td style="font-size:8px;color:var(--ink3);max-width:110px;overflow:hidden;white-space:nowrap" title="\${p.mt5Comment||p.orderComment||p.comment||''}">\${p.mt5Comment||p.orderComment||p.comment||'—'}</td>
-        <td>\${bdType(p.assetType||p.type)}</td>
+        <td>\${bdType(p.assetType||p.type,p.symbol)}</td>
         <td>\${bdDir(p.direction)}</td>
         <td>\${bdVwap(p.vwapPosition||p.vwap_position)}</td>
         <td style="white-space:nowrap">\${bdSess(p.session)}</td>
@@ -2829,7 +2870,7 @@ async function loadGhost(){
       return \`<tr>
         <td class="cd">\${i+1}</td>
         <td class="cb fw">\${g.symbol||'—'}</td>
-        <td>\${bdType(g.assetType||g.type)}</td>
+        <td>\${bdType(g.assetType||g.type,g.symbol)}</td>
         <td>\${bdSess(g.session)}</td>
         <td>\${bdDir(g.direction)}</td>
         <td>\${bdVwap(g.vwapPosition||g.vwap_position)}</td>
@@ -2853,14 +2894,19 @@ async function loadGhost(){
 // ── SHADOW ──
 async function loadShadow(){
   const [active,history] = await Promise.all([
-    api('/api/blocked-ghosts/active'),
-    api('/api/blocked-ghosts/history'),
+    api('/api/blocked-ghosts/active').catch(()=>[]),
+    api('/api/blocked-ghosts/history').catch(()=>[]),
   ]);
 
   function shadowRow(b, showStop=false){
     const bt=b.blockType||b.block_type||'';
     const slMs=b.slMilestones||b.sl_milestones||{};
     const rrMs=b.rrMilestones||b.rr_milestones||{};
+    // Convert milestone timestamps to elapsed time using fmtMs
+    const _otsS=b.openedAt||b.opened_at?new Date(b.openedAt||b.opened_at).getTime():null;
+    const _slFF={},_rrFF={};
+    for(const k in slMs)_slFF[k]=fmtMs(slMs[k],_otsS);
+    for(const k in rrMs)_rrFF[k]=fmtMs(rrMs[k],_otsS);
     // Pre-compute conditional cell to avoid nested template literal issues
     const _sessOrStop = showStop
       ? '<td>'+stopBdg(b.stopReason||b.stop_reason)+'</td>'
@@ -2868,7 +2914,7 @@ async function loadShadow(){
     const base = \`
       <td>\${blockBdg(bt)}</td>
       <td class="cb fw">\${b.symbol||'—'}</td>
-      <td>\${bdType(b.assetType||b.type)}</td>
+      <td>\${bdType(b.assetType||b.type,b.symbol)}</td>
       <td>\${keyBdg(b.keyCount||b.key_count||1)}</td>
       <td>\${bdDir(b.direction)}</td>
       <td>\${bdVwap(b.vwapPosition||b.vwap_position)}</td>
@@ -2933,7 +2979,7 @@ async function loadEV(){
       const evC=ev>0?'cg fw':ev<0?'cr fw':'cd';
       return \`<tr>
         <td class="cb fw">\${c.symbol||'—'}</td>
-        <td>\${bdType(c.assetType||c.type)}</td>
+        <td>\${bdType(c.assetType||c.type,c.symbol)}</td>
         <td>\${bdSess(c.session)}</td>
         <td>\${bdDir(c.direction)}</td>
         <td>\${bdVwap(c.vwapPosition||c.vwap_position)}</td>
@@ -2984,7 +3030,14 @@ async function loadEV(){
 
 // ── BOOT ──
 async function loadAll(){
-  await Promise.all([loadHeader(), loadOverview()]);
+  await Promise.all([
+    loadHeader().catch(e=>console.error('[loadHeader]',e.message)),
+    loadOverview().catch(e=>console.error('[loadOverview]',e.message)),
+    loadSignals().catch(e=>console.error('[loadSignals]',e.message)),
+    loadGhost().catch(e=>console.error('[loadGhost]',e.message)),
+    loadShadow().catch(e=>console.error('[loadShadow]',e.message)),
+    loadEV().catch(e=>console.error('[loadEV]',e.message)),
+  ]);
 }
 
 async function waitForDBAndLoad(){
@@ -3001,7 +3054,12 @@ async function waitForDBAndLoad(){
 
 waitForDBAndLoad();
 setInterval(loadHeader,   10000);  // header every 10s
-setInterval(loadOverview, 30000);  // overview every 30s
+setInterval(loadOverview, 30000);   // overview every 30s
+setInterval(loadHeader, 15000);     // header every 15s
+setInterval(()=>{if(document.querySelector('.tab-btn.active')?.dataset?.tab==='signals')loadSignals();}, 20000);
+setInterval(()=>{if(document.querySelector('.tab-btn.active')?.dataset?.tab==='ghost')loadGhost();}, 10000);
+setInterval(()=>{if(document.querySelector('.tab-btn.active')?.dataset?.tab==='shadow')loadShadow();}, 10000);
+setInterval(()=>{if(document.querySelector('.tab-btn.active')?.dataset?.tab==='ev')loadEV();}, 30000);
 
 </script>
 </body>
