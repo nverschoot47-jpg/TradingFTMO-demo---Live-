@@ -172,6 +172,7 @@ const SYMBOL_CATALOG = {
   UK100GBP:  { type: "index",     mt5: "UK100.cash"   },
   // ── Stocks (US30 = Dow Jones, treated as stock for NY-hours / 15-18u dead zone) ──
   US30USD:   { type: "index",     mt5: "US30.cash"    },
+  'NAS100.cash':  { type: 'index', mt5: 'NAS100.cash' },
   // ── Commodities ───────────────────────────────────────────────
   XAUUSD:    { type: "commodity", mt5: "XAUUSD"    },
 };
