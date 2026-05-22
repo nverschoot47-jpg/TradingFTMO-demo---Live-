@@ -906,40 +906,46 @@ async function loadAllTrades({ since = null, until = null, openFrom = null, open
     const whereClause = where.length ? 'WHERE ' + where.join(' AND ') : '';
     const r = await pool.query(`
       SELECT
-        position_id         AS "positionId",
-        symbol, mt5_symbol  AS "mt5Symbol", direction,
-        vwap_position       AS "vwapPosition",
-        CAST(entry          AS FLOAT) AS entry,
-        CAST(sl             AS FLOAT) AS sl,
-        CAST(tp             AS FLOAT) AS tp,
-        CAST(lots           AS FLOAT) AS lots,
-        CAST(risk_pct       AS FLOAT) AS "riskPct",
-        CAST(risk_eur       AS FLOAT) AS "riskEUR",
-        CAST(max_price      AS FLOAT) AS "maxPrice",
-        CAST(max_rr         AS FLOAT) AS "maxRR",
-        CAST(true_max_rr    AS FLOAT) AS "trueMaxRR",
-        CAST(true_max_price AS FLOAT) AS "trueMaxPrice",
-        ghost_stop_reason   AS "ghostStopReason",
-        ghost_finalized_at  AS "ghostFinalizedAt",
-        session,
-        CAST(vwap_at_entry  AS FLOAT) AS "vwapAtEntry",
-        opened_at           AS "openedAt",
-        closed_at           AS "closedAt",
-        CAST(sl_multiplier  AS FLOAT) AS "slMultiplier",
-        CAST(realized_pnl_eur AS FLOAT) AS "realizedPnlEUR",
-        hit_tp              AS "hitTP",
-        close_reason        AS "closeReason",
-        CAST(spread_at_entry AS FLOAT) AS "spreadAtEntry",
-        CAST(vwap_band_pct  AS FLOAT) AS "vwapBandPct",
-        CAST(execution_price AS FLOAT) AS "executionPrice",
-        CAST(tv_entry       AS FLOAT) AS "tvEntry",
-        CAST(slippage       AS FLOAT) AS slippage,
-        CAST(exit_price     AS FLOAT) AS "exitPrice",
-        CAST(realized_pnl_eur AS FLOAT) AS "realizedPnl",
-        asset_type          AS "assetType",
-        trade_number        AS "tradeNumber",
-        mt5_comment         AS "mt5Comment"
-      FROM closed_trades
+        ct.position_id      AS "positionId",
+        ct.symbol, ct.mt5_symbol AS "mt5Symbol", ct.direction,
+        ct.vwap_position  AS "vwapPosition",
+        CAST(ct.entry        AS FLOAT) AS entry,
+        CAST(ct.sl           AS FLOAT) AS sl,
+        CAST(ct.tp           AS FLOAT) AS tp,
+        CAST(ct.lots         AS FLOAT) AS lots,
+        CAST(ct.risk_pct     AS FLOAT) AS "riskPct",
+        CAST(ct.risk_eur     AS FLOAT) AS "riskEUR",
+        CAST(ct.max_price    AS FLOAT) AS "maxPrice",
+        CAST(ct.max_rr       AS FLOAT) AS "maxRR",
+        CAST(ct.true_max_rr  AS FLOAT) AS "trueMaxRR",
+        CAST(ct.true_max_price AS FLOAT) AS "trueMaxPrice",
+        ct.ghost_stop_reason AS "ghostStopReason",
+        ct.ghost_finalized_at AS "ghostFinalizedAt",
+        ct.session,
+        CAST(ct.vwap_at_entry AS FLOAT) AS "vwapAtEntry",
+        ct.opened_at     AS "openedAt",
+        ct.closed_at     AS "closedAt",
+        CAST(ct.sl_multiplier AS FLOAT) AS "slMultiplier",
+        CAST(ct.realized_pnl_eur AS FLOAT) AS "realizedPnlEUR",
+        ct.hit_tp            AS "hitTP",
+        ct.close_reason      AS "closeReason",
+        CAST(ct.spread_at_entry AS FLOAT) AS "spreadAtEntry",
+        CAST(ct.vwap_band_pct AS FLOAT) AS "vwapBandPct",
+        CAST(ct.execution_price AS FLOAT) AS "executionPrice",
+        CAST(ct.tv_entry     AS FLOAT) AS "tvEntry",
+        CAST(ct.slippage     AS FLOAT) AS slippage,
+        CAST(ct.exit_price   AS FLOAT) AS "exitPrice",
+        CAST(ct.realized_pnl_eur AS FLOAT) AS "realizedPnl",
+        ct.asset_type    AS "assetType",
+        ct.trade_number  AS "tradeNumber",
+        ct.mt5_comment         AS "mt5Comment",
+        CAST(gt.peak_rr_pos    AS FLOAT) AS "peakRRPos",
+        CAST(gt.peak_rr_neg    AS FLOAT) AS "peakRRNeg",
+        gt.rr_milestones       AS "rrMilestones",
+        gt.sl_milestones       AS "slMilestones",
+        gt.optimizer_key       AS "optimizerKey"
+      FROM closed_trades ct
+      LEFT JOIN ghost_trades gt ON ct.position_id = gt.position_id
       ${whereClause}
       ORDER BY closed_at DESC
       LIMIT 10000
@@ -962,8 +968,8 @@ async function saveGhostTrade(g) {
          time_to_sl_min, max_sl_pct_used, sl_milestones, rr_milestones,
          trade_number, peak_rr_pos, peak_rr_neg,
          realized_pnl_eur, lots, vwap_band_pct,
-         opened_at, closed_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)
+         opened_at, closed_at, mt5_comment)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28)
       ON CONFLICT (position_id) WHERE position_id IS NOT NULL
       DO UPDATE SET
         max_price        = EXCLUDED.max_price,
@@ -980,7 +986,8 @@ async function saveGhostTrade(g) {
         lots             = COALESCE(EXCLUDED.lots, ghost_trades.lots),
         trade_number     = COALESCE(EXCLUDED.trade_number, ghost_trades.trade_number),
         vwap_band_pct    = COALESCE(EXCLUDED.vwap_band_pct, ghost_trades.vwap_band_pct),
-        closed_at        = EXCLUDED.closed_at
+        closed_at        = EXCLUDED.closed_at,
+        mt5_comment      = COALESCE(EXCLUDED.mt5_comment, ghost_trades.mt5_comment)
     `, [
       g.positionId      ?? null,
       g.symbol, g.session, g.direction,
@@ -1006,6 +1013,7 @@ async function saveGhostTrade(g) {
       g.vwapBandPct     ?? null,
       g.openedAt        ?? null,
       g.closedAt        ?? null,
+      g.mt5Comment      ?? g.mt5_comment ?? null,   // $28
     ]);
   } catch (e) { console.warn('[!] saveGhostTrade:', e.message); }
 }
@@ -1044,7 +1052,8 @@ async function loadGhostTrades(optimizerKey = null, limitRows = 200) {
         CAST(lots            AS FLOAT) AS lots,
         vwap_band_pct        AS "vwapBandPct",
         opened_at            AS "openedAt",
-        closed_at            AS "closedAt"
+        closed_at            AS "closedAt",
+        mt5_comment          AS "mt5Comment"
       FROM ghost_trades
       ${where}
       ORDER BY closed_at DESC
@@ -1398,7 +1407,7 @@ async function loadSignalStats({ since = null, until = null } = {}) {
       pool.query(`
         SELECT reject_reason,
                symbol,
-               direction,
+               ct.direction,
                COUNT(*) AS cnt
         FROM signal_log
         WHERE reject_reason IS NOT NULL AND reject_reason != ''
@@ -2340,6 +2349,96 @@ async function computeAndSaveGhostComboAnalysis(optimizerKey) {
   }
 }
 
+// ── Session-level Win Rate stats (Fix 7) ─────────────────────
+async function loadSessionStats() {
+  try {
+    const r = await pool.query(`
+      SELECT
+        session,
+        COUNT(*)                                              AS total,
+        COUNT(*) FILTER (WHERE stop_reason = 'max_rr_15'
+                            OR phantom_sl_hit = FALSE
+                            AND peak_rr_pos >= tp_rr_used)   AS wins,
+        CAST(AVG(CAST(peak_rr_pos AS FLOAT)) AS FLOAT)       AS avg_peak_pos,
+        CAST(AVG(CAST(peak_rr_neg AS FLOAT)) AS FLOAT)       AS avg_peak_neg,
+        CAST(AVG(time_to_sl_min) AS FLOAT)                   AS avg_time_to_sl,
+        CAST(MIN(CAST(peak_rr_neg AS FLOAT)) AS FLOAT)       AS worst_peak_neg,
+        CAST(MAX(CAST(peak_rr_pos AS FLOAT)) AS FLOAT)       AS best_peak_pos
+      FROM ghost_trades
+      WHERE closed_at IS NOT NULL
+      GROUP BY session
+      ORDER BY total DESC
+    `);
+    return r.rows.map(row => ({
+      session:     row.session,
+      total:       parseInt(row.total),
+      wins:        parseInt(row.wins),
+      winRate:     row.total > 0 ? parseFloat(((row.wins / row.total) * 100).toFixed(1)) : 0,
+      avgPeakPos:  row.avg_peak_pos != null ? parseFloat(parseFloat(row.avg_peak_pos).toFixed(3)) : null,
+      avgPeakNeg:  row.avg_peak_neg != null ? parseFloat(parseFloat(row.avg_peak_neg).toFixed(1)) : null,
+      avgTimeToSL: row.avg_time_to_sl != null ? Math.round(row.avg_time_to_sl) : null,
+      worstPeakNeg:row.worst_peak_neg != null ? parseFloat(parseFloat(row.worst_peak_neg).toFixed(1)) : null,
+      bestPeakPos: row.best_peak_pos != null ? parseFloat(parseFloat(row.best_peak_pos).toFixed(3)) : null,
+    }));
+  } catch (e) { return []; }
+}
+
+// ── Milestone Probability analysis (Fix 8 extension) ─────────
+async function loadMilestoneProbability(optimizerKey = null) {
+  try {
+    const vals = [];
+    const where = optimizerKey ? (vals.push(optimizerKey), `WHERE optimizer_key = $1 AND closed_at IS NOT NULL`) : `WHERE closed_at IS NOT NULL`;
+    const r = await pool.query(`
+      SELECT
+        optimizer_key, symbol, session, direction, vwap_position,
+        COUNT(*) AS total,
+        -- How many reached each negative RR milestone
+        COUNT(*) FILTER (WHERE (rr_milestones->>'-0.1') IS NOT NULL) AS hit_neg01,
+        COUNT(*) FILTER (WHERE (rr_milestones->>'-0.3') IS NOT NULL) AS hit_neg03,
+        COUNT(*) FILTER (WHERE (rr_milestones->>'-0.5') IS NOT NULL) AS hit_neg05,
+        COUNT(*) FILTER (WHERE (rr_milestones->>'-0.8') IS NOT NULL) AS hit_neg08,
+        COUNT(*) FILTER (WHERE (rr_milestones->>'-1.0') IS NOT NULL) AS hit_neg10,
+        -- How many reached each positive RR milestone
+        COUNT(*) FILTER (WHERE (rr_milestones->>'+0.3') IS NOT NULL) AS hit_pos03,
+        COUNT(*) FILTER (WHERE (rr_milestones->>'+0.5') IS NOT NULL) AS hit_pos05,
+        COUNT(*) FILTER (WHERE (rr_milestones->>'+0.8') IS NOT NULL) AS hit_pos08,
+        COUNT(*) FILTER (WHERE (rr_milestones->>'+1.0') IS NOT NULL) AS hit_pos10,
+        COUNT(*) FILTER (WHERE (rr_milestones->>'+1.5') IS NOT NULL) AS hit_pos15,
+        -- After hitting -0.3R, how many recovered to +0.5R?
+        COUNT(*) FILTER (WHERE (rr_milestones->>'-0.3') IS NOT NULL
+                           AND (rr_milestones->>'+0.5') IS NOT NULL) AS recovered_03_to_05,
+        CAST(AVG(time_to_sl_min) AS FLOAT) AS avg_time_to_sl_min
+      FROM ghost_trades
+      ${where}
+      GROUP BY optimizer_key, symbol, session, direction, vwap_position
+      HAVING COUNT(*) >= 3
+      ORDER BY total DESC
+    `, vals);
+    return r.rows.map(row => ({
+      optimizerKey: row.optimizer_key,
+      symbol: row.symbol,
+      session: row.session,
+      direction: row.direction,
+      vwapPosition: row.vwap_position,
+      total: parseInt(row.total),
+      // Probability of reaching each milestone
+      pNeg01: row.total > 0 ? parseFloat(((row.hit_neg01/row.total)*100).toFixed(0)) : 0,
+      pNeg03: row.total > 0 ? parseFloat(((row.hit_neg03/row.total)*100).toFixed(0)) : 0,
+      pNeg05: row.total > 0 ? parseFloat(((row.hit_neg05/row.total)*100).toFixed(0)) : 0,
+      pNeg08: row.total > 0 ? parseFloat(((row.hit_neg08/row.total)*100).toFixed(0)) : 0,
+      pNeg10: row.total > 0 ? parseFloat(((row.hit_neg10/row.total)*100).toFixed(0)) : 0,
+      pPos03: row.total > 0 ? parseFloat(((row.hit_pos03/row.total)*100).toFixed(0)) : 0,
+      pPos05: row.total > 0 ? parseFloat(((row.hit_pos05/row.total)*100).toFixed(0)) : 0,
+      pPos08: row.total > 0 ? parseFloat(((row.hit_pos08/row.total)*100).toFixed(0)) : 0,
+      pPos10: row.total > 0 ? parseFloat(((row.hit_pos10/row.total)*100).toFixed(0)) : 0,
+      pPos15: row.total > 0 ? parseFloat(((row.hit_pos15/row.total)*100).toFixed(0)) : 0,
+      // Recovery probability: after -0.3R, chance of +0.5R
+      pRecovery: row.hit_neg03 > 0 ? parseFloat(((row.recovered_03_to_05/row.hit_neg03)*100).toFixed(0)) : null,
+      avgTimeToSL: row.avg_time_to_sl_min != null ? Math.round(row.avg_time_to_sl_min) : null,
+    }));
+  } catch (e) { return []; }
+}
+
 async function loadGhostComboAnalysis(optimizerKey = null) {
   try {
     const vals = [];
@@ -3072,7 +3171,62 @@ async function loadPerformanceStats(since = null) {
   } catch (e) { console.warn('[!] loadPerformanceStats:', e.message); return null; }
 }
 
+// ── Shadow What-If Analysis (Fix 9) ─────────────────────────
+// Analyzes blocked positions AS IF they had been placed as real ghosts
+async function loadShadowWhatIfStats() {
+  try {
+    const r = await pool.query(`
+      SELECT
+        block_type,
+        optimizer_key,
+        symbol,
+        session,
+        direction,
+        vwap_position,
+        COUNT(*)                                                        AS total,
+        COUNT(*) FILTER (WHERE CAST(peak_rr_pos AS FLOAT) >= 1.5)      AS would_tp,
+        COUNT(*) FILTER (WHERE CAST(peak_rr_neg AS FLOAT) >= 100)       AS would_sl,
+        CAST(AVG(CAST(peak_rr_pos AS FLOAT)) AS FLOAT)                  AS avg_peak_pos,
+        CAST(AVG(CAST(peak_rr_neg AS FLOAT)) AS FLOAT)                  AS avg_peak_neg,
+        CAST(MAX(CAST(peak_rr_pos AS FLOAT)) AS FLOAT)                  AS best_peak_pos,
+        CAST(MAX(CAST(peak_rr_neg AS FLOAT)) AS FLOAT)                  AS worst_peak_neg
+      FROM blocked_ghost_state
+      WHERE peak_rr_pos IS NOT NULL
+        OR peak_rr_neg IS NOT NULL
+      GROUP BY block_type, optimizer_key, symbol, session, direction, vwap_position
+      ORDER BY total DESC
+      LIMIT 200
+    `);
+    const rows = r.rows;
+    // Summary by block type
+    const byBlock = {};
+    for (const row of rows) {
+      const bt = row.block_type || 'UNKNOWN';
+      if (!byBlock[bt]) byBlock[bt] = { total: 0, wouldTP: 0, wouldSL: 0, avgPeakPos: [], avgPeakNeg: [] };
+      byBlock[bt].total    += parseInt(row.total);
+      byBlock[bt].wouldTP  += parseInt(row.would_tp || 0);
+      byBlock[bt].wouldSL  += parseInt(row.would_sl || 0);
+      if (row.avg_peak_pos != null) byBlock[bt].avgPeakPos.push(parseFloat(row.avg_peak_pos) * parseInt(row.total));
+      if (row.avg_peak_neg != null) byBlock[bt].avgPeakNeg.push(parseFloat(row.avg_peak_neg) * parseInt(row.total));
+    }
+    const summary = Object.entries(byBlock).map(([bt, d]) => ({
+      blockType:   bt,
+      total:       d.total,
+      wouldTP:     d.wouldTP,
+      wouldSL:     d.wouldSL,
+      tpRate:      d.total > 0 ? parseFloat(((d.wouldTP / d.total) * 100).toFixed(1)) : 0,
+      slRate:      d.total > 0 ? parseFloat(((d.wouldSL / d.total) * 100).toFixed(1)) : 0,
+      avgPeakPos:  d.avgPeakPos.length ? parseFloat((d.avgPeakPos.reduce((s,v)=>s+v,0)/d.total).toFixed(3)) : null,
+      avgPeakNeg:  d.avgPeakNeg.length ? parseFloat((d.avgPeakNeg.reduce((s,v)=>s+v,0)/d.total).toFixed(1)) : null,
+    }));
+    return { summary, details: rows.slice(0, 100) };
+  } catch (e) { return { summary: [], details: [] }; }
+}
+
 module.exports = {
+  loadSessionStats,
+  loadMilestoneProbability,
+  loadShadowWhatIfStats,
   pool,
   initDB,
   // Trades
