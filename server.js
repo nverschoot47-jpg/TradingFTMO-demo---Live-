@@ -16,7 +16,7 @@
 //     rrMilestones worden doorgegeven via /api/ghost-history-by-pair.
 //
 //  3. COMPLIANCE DATE VERWIJDERD:
-//     COMPLIANCE_DATE \-> '2000-01-01' (geen filtering meer).
+//     COMPLIANCE_DATE -> '2000-01-01' (geen filtering meer).
 //     Compliance bar verborgen in dashboard.
 //     loadAll() filtert trades niet meer op cutoff datum.
 //
@@ -27,8 +27,8 @@
 //     loadGhostHistoryByPair(from, to) in db.js.
 //
 //  INHERITED (v13.2.0):
-//  FIX 1a \\-- VWAP EXHAUSTION BLOCK
-//  FIX 1b \\-- DUPLICATE POSITION BLOCK
+//  FIX 1a \-- VWAP EXHAUSTION BLOCK
+//  FIX 1b \-- DUPLICATE POSITION BLOCK
 //  KEY FIX: app.listen() fires BEFORE any DB/MetaAPI call.
 // ═══════════════════════════════════════════════════════════════
 
@@ -47,7 +47,7 @@ const {
 } = require("./session");
 
 // ── Version ──────────────────────────────────────────────────────
-const VERSION = "14.9.10"; // v14.8.7: hotfix - bg used before initialization (ReferenceError crash) shadow fix (_slFF/_rrFF), type resolution client-side, ghost scroll, FAV 20 cols final fixes - Time/ALL OUTCOMES/no dup Lots ghost_trades has peak_rr/realized/lots, ghost finalized from individual trades ghost finalized uses individual ghost_trades, fin header fixed, mt5comment in fin no scroll tables, dup lots fixed, all scroll removed fixed trades header, signal highlights, 500 row limit, Dutch\->English Peak- in RR, no scroll tables, English labels, signal cols fixed, realPnl chain fix rrNow/buyCnt direction case, ghost KPI peakRR from ghost subobj, remove date filter bdDir/bdVwap case-insensitive, shows BUY/ABOVE correctly fix 500 on open-positions (symInfo undefined), fix openPositions in browser, fix loadHeader ghost block FX/STK/IDX/COM labels, ghost stopReason never manual, realPnl EUR, mt5Comment at placement FX/STK labels, ghost col cleanup, close reason SL/TP only mt5Comment in trades, ghost stop labels, outcome badges, what-if comment, SYNC_RAW removed asset_type in signal_log, daily log from open pos, mt5 comment in ghost, slDist/tvEntry in adopt fmtMs global helper, no inline functions in templates, browser syntax error fixed auto currency detection EUR/USD, correct conversion, currency symbol in dashboard USD\->EUR conversion, verbose logs removed, complete API fields, mt5Comment shadowRow bdSess fix, milestone format fix, ghost active count fix, signal stats fix, data from 20/05 10:00 ghost restore assetType+vwapBandPct, all display fixes complete ghost restore assetType, ghost peakRRNeg display, signal log session cols, fin ghost realizedPnl fix startBalance fix, peakRRNeg display fix, exitPrice in trades, force adoption on startup, session fallback assetType everywhere, unrealizedPnl, signal outcomes, signal stats fixed correct signal outcomes, unrealizedPnl, assetType in API, signal stats per outcome /api/performance returns balance/equity/startBalance from latestEquity fix isTrackableBlock (no STOCK_OOH in shadow), bdSess fix fix bdSess template literal, add assetType/keyCount to shadow API MetaAPI auto-deploy on startup, stock timing 15:30-18:00, symInfoB crash fix fix symInfoB undefined crash, META_BASE global URL fix DB connection timeout 5s\->15s, retry backoff 3s\->5s, META_BASE london TP default 1.5R, session_high/low/day_high/low from webhook, vwapBandPct in all ghost saves MetaAPI 429 fix (60s cache), SL TV vs MT5 log, vwapBandPct everywhere, circuit open skip (1 aandeel=1lot, P&L=lots\xmove) // v14.3: bugs fixed (const\->let adoptPosition, dupNumber, blockTypes, duplicate fetchHistoryDeals, NY_NIGHT/ASIA_MORNING shadow tracking) all milestone gaps fixed, outside night 21-02h, daily open log, ghost finalized fix, slHitAt EOD keep
+const VERSION = "14.9.11"; // v14.8.7: hotfix - bg used before initialization (ReferenceError crash) shadow fix (_slFF/_rrFF), type resolution client-side, ghost scroll, FAV 20 cols final fixes - Time/ALL OUTCOMES/no dup Lots ghost_trades has peak_rr/realized/lots, ghost finalized from individual trades ghost finalized uses individual ghost_trades, fin header fixed, mt5comment in fin no scroll tables, dup lots fixed, all scroll removed fixed trades header, signal highlights, 500 row limit, Dutch->English Peak- in RR, no scroll tables, English labels, signal cols fixed, realPnl chain fix rrNow/buyCnt direction case, ghost KPI peakRR from ghost subobj, remove date filter bdDir/bdVwap case-insensitive, shows BUY/ABOVE correctly fix 500 on open-positions (symInfo undefined), fix openPositions in browser, fix loadHeader ghost block FX/STK/IDX/COM labels, ghost stopReason never manual, realPnl EUR, mt5Comment at placement FX/STK labels, ghost col cleanup, close reason SL/TP only mt5Comment in trades, ghost stop labels, outcome badges, what-if comment, SYNC_RAW removed asset_type in signal_log, daily log from open pos, mt5 comment in ghost, slDist/tvEntry in adopt fmtMs global helper, no inline functions in templates, browser syntax error fixed auto currency detection EUR/USD, correct conversion, currency symbol in dashboard USD->EUR conversion, verbose logs removed, complete API fields, mt5Comment shadowRow bdSess fix, milestone format fix, ghost active count fix, signal stats fix, data from 20/05 10:00 ghost restore assetType+vwapBandPct, all display fixes complete ghost restore assetType, ghost peakRRNeg display, signal log session cols, fin ghost realizedPnl fix startBalance fix, peakRRNeg display fix, exitPrice in trades, force adoption on startup, session fallback assetType everywhere, unrealizedPnl, signal outcomes, signal stats fixed correct signal outcomes, unrealizedPnl, assetType in API, signal stats per outcome /api/performance returns balance/equity/startBalance from latestEquity fix isTrackableBlock (no STOCK_OOH in shadow), bdSess fix fix bdSess template literal, add assetType/keyCount to shadow API MetaAPI auto-deploy on startup, stock timing 15:30-18:00, symInfoB crash fix fix symInfoB undefined crash, META_BASE global URL fix DB connection timeout 5s->15s, retry backoff 3s->5s, META_BASE london TP default 1.5R, session_high/low/day_high/low from webhook, vwapBandPct in all ghost saves MetaAPI 429 fix (60s cache), SL TV vs MT5 log, vwapBandPct everywhere, circuit open skip (1 aandeel=1lot, P&L=lots\xmove) // v14.3: bugs fixed (const->let adoptPosition, dupNumber, blockTypes, duplicate fetchHistoryDeals, NY_NIGHT/ASIA_MORNING shadow tracking) all milestone gaps fixed, outside night 21-02h, daily open log, ghost finalized fix, slHitAt EOD keep
 
 // ── Config ───────────────────────────────────────────────────────
 const PORT           = process.env.PORT           || 3000;
@@ -82,7 +82,7 @@ function getErrorCount() {
   return errorLog.filter(e => now - e.ts < 3_600_000).length;
 }
 
-// ── Express \\-- start listening IMMEDIATELY ────────────────────────
+// ── Express \-- start listening IMMEDIATELY ────────────────────────
 const app = express();
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(express.json({ limit: "1mb" }));
@@ -90,25 +90,25 @@ app.use(express.json({ limit: "1mb" }));
 const server = app.listen(PORT, () => {
   console.log(`[PRONTO-AI v${VERSION}] Server running on port ${PORT}`);
   console.log('[FIXES] weekend-sync | ghost-combined | stock-session | peak-rr-neg');
-  console.log(`[PRONTO-AI] Listening on port ${PORT} \\-- DB init starting...`);
+  console.log(`[PRONTO-AI] Listening on port ${PORT} \-- DB init starting...`);
 });
 
 // ── Webhook secret check ──────────────────────────────────────────
 function checkSecret(req, res) {
   if (!WEBHOOK_SECRET) {
-    res.status(401).json({ error: 'Unauthorized \\-- WEBHOOK_SECRET not configured' });
+    res.status(401).json({ error: 'Unauthorized \-- WEBHOOK_SECRET not configured' });
     return false;
   }
-  // v14.1: Header-only auth. Query params are logged by proxies/Railway \\-- security risk.
+  // v14.1: Header-only auth. Query params are logged by proxies/Railway \-- security risk.
   // TradingView supports custom headers: add "x-webhook-secret: YOUR_SECRET" in alert config.
   // Body/query fallback kept ONLY for backward compat with existing TV alerts (deprecated).
   const provided = req.headers['x-webhook-secret']
     || req.headers['x-secret']
     || req.body?.secret   // deprecated: body secret logged in Railway access logs
-    || req.query?.secret; // deprecated: URL params logged everywhere \\-- migrate to header
+    || req.query?.secret; // deprecated: URL params logged everywhere \-- migrate to header
   if (provided !== WEBHOOK_SECRET) {
     const ip = req.ip || '?';
-    recordError(`Bad webhook secret from ${ip} \\-- migrate TradingView alerts to x-webhook-secret header`);
+    recordError(`Bad webhook secret from ${ip} \-- migrate TradingView alerts to x-webhook-secret header`);
     res.status(401).json({ error: 'Unauthorized' });
     return false;
   }
@@ -116,12 +116,12 @@ function checkSecret(req, res) {
 }
 
 // ── MetaAPI helpers ───────────────────────────────────────────────
-// Circuit breaker for MetaAPI \\-- tracks consecutive failures
+// Circuit breaker for MetaAPI \-- tracks consecutive failures
 let _metaFailCount = 0;
 let _metaCircuitOpen = false;
 let _metaCircuitOpenAt = 0;
 const META_CIRCUIT_THRESHOLD = 5;     // open after 5 consecutive failures
-const META_CIRCUIT_RESET_MS  = 120000; // wait 120s \\-- MetaAPI 429 needs time to clear rate limit
+const META_CIRCUIT_RESET_MS  = 120000; // wait 120s \-- MetaAPI 429 needs time to clear rate limit
 // Helper: readable circuit state for other functions
 const circuitOpen = () => _metaCircuitOpen && (Date.now() - _metaCircuitOpenAt < META_CIRCUIT_RESET_MS);
 
@@ -130,16 +130,16 @@ async function metaFetch(path, method = "GET", body = null, retries = 2) {
   if (_metaCircuitOpen) {
     if (Date.now() - _metaCircuitOpenAt > META_CIRCUIT_RESET_MS) {
       _metaCircuitOpen = false; _metaFailCount = 0;
-      console.log('[MetaAPI] Circuit breaker reset \\-- retrying');
+      console.log('[MetaAPI] Circuit breaker reset \-- retrying');
     } else {
-      throw new Error('MetaAPI circuit open \\-- skipping call');
+      throw new Error('MetaAPI circuit open \-- skipping call');
     }
   }
   const url = `${META_BASE}${path}`;
   const opts = {
     method,
     headers: { "auth-token": META_API_TOKEN, "Content-Type": "application/json" },
-    signal: AbortSignal.timeout(12000), // 12s \\-- leaves buffer for 30s cron
+    signal: AbortSignal.timeout(12000), // 12s \-- leaves buffer for 30s cron
   };
   if (body) opts.body = JSON.stringify(body);
   for (let attempt = 0; attempt <= retries; attempt++) {
@@ -148,9 +148,9 @@ async function metaFetch(path, method = "GET", body = null, retries = 2) {
       if (!res.ok) {
         let errBody = "";
         try { errBody = await res.text(); } catch {}
-        throw new Error(`MetaAPI ${method} ${path} \-> ${res.status} ${errBody.slice(0, 200)}`);
+        throw new Error(`MetaAPI ${method} ${path} -> ${res.status} ${errBody.slice(0, 200)}`);
       }
-      // Success \\-- reset failure counter
+      // Success \-- reset failure counter
       _metaFailCount = 0;
       return res.json().catch(() => null);
     } catch (e) {
@@ -170,7 +170,7 @@ async function metaFetch(path, method = "GET", body = null, retries = 2) {
   }
 }
 
-// ── getAccountInfo: 60s cache \\-- prevents TooManyRequests 429 on MetaAPI ──
+// ── getAccountInfo: 60s cache \-- prevents TooManyRequests 429 on MetaAPI ──
 // MetaAPI has strict rate limits. Calling this every 10s sync causes 429 storms.
 // Cache ensures max 1 real call per 60s across ALL callers (sync, /status, webhook).
 let _acctCache   = null;
@@ -180,7 +180,7 @@ const ACCT_CACHE_TTL = 60000; // 60 seconds
 async function getAccountInfo() {
   const now = Date.now();
   if (_acctCache && (now - _acctCacheTs) < ACCT_CACHE_TTL) {
-    return _acctCache; // return cached \\-- no MetaAPI call
+    return _acctCache; // return cached \-- no MetaAPI call
   }
   if (!META_API_TOKEN || !META_ACCOUNT) {
     console.warn("[MetaAPI] getAccountInfo: TOKEN or ACCOUNT not set");
@@ -271,7 +271,7 @@ function initGhost(pos) {
 }
 
 function updateGhost(ghost, price) {
-  // Don't update after phantom SL hit \\-- that is the ONLY way a ghost closes now
+  // Don't update after phantom SL hit \-- that is the ONLY way a ghost closes now
   if (ghost.phantomSLHit) return;
   price = parseFloat(price);
   const entry   = ghost.entry;
@@ -330,7 +330,7 @@ function updateGhost(ghost, price) {
       }
     }
   }
-  // NOTE: ghost no longer auto-closes at 15R \\-- runs until phantom SL hit (-1R)
+  // NOTE: ghost no longer auto-closes at 15R \-- runs until phantom SL hit (-1R)
   // 15R milestone is still tracked but does NOT finalize the ghost
   if (rr >= 15 && !ghost.rrMilestones['+15.0']) {
     // Just a milestone record, not a stop
@@ -364,7 +364,7 @@ async function closePosition(positionId, reason = "manual", pnl = null) {
       realPnl = _rawPnl != null ? parseFloat((_rawPnl * _posExRate).toFixed(2)) : null;
     } catch (e) { recordError(`closePos deals: ${e.message}`); }
   }
-  // v14.2 FIX: Gap detection \\-- uses deals already fetched above (no second call)
+  // v14.2 FIX: Gap detection \-- uses deals already fetched above (no second call)
   let gapStop = false;
   if (reason === 'sl' && pos) {
     try {
@@ -380,10 +380,10 @@ async function closePosition(positionId, reason = "manual", pnl = null) {
           const overrun = pos.direction === 'buy'
             ? pos.sl - fillPrice    // buy: SL is below entry, fill should be AT SL, gap = fill below SL
             : fillPrice - pos.sl;   // sell: SL is above entry, gap = fill above SL
-          // If fill is more than 0.5\x slDist past the SL \-> gap
+          // If fill is more than 0.5\x slDist past the SL -> gap
           if (overrun > slDist * 0.5) {
             gapStop = true;
-            console.warn(`[Gap] ${positionId} ${pos.symbol} stopped via GAP \\-- fill=${fillPrice} SL=${pos.sl} overrun=${overrun.toFixed(5)}`);
+            console.warn(`[Gap] ${positionId} ${pos.symbol} stopped via GAP \-- fill=${fillPrice} SL=${pos.sl} overrun=${overrun.toFixed(5)}`);
           }
         }
       }
@@ -393,7 +393,7 @@ async function closePosition(positionId, reason = "manual", pnl = null) {
 
   if (ghost && dbReady) {
     ghost.closedAt       = now;
-    // stopReason: never "manual" \\-- use the close reason (sl/tp) as fallback
+    // stopReason: never "manual" \-- use the close reason (sl/tp) as fallback
     const _finalGhostStop = gapStop ? 'gap_stop' 
       : ghost.stopReason && ghost.stopReason !== 'manual' ? ghost.stopReason
       : reason === 'manual' ? 'sl'  // fallback: manual close treated as SL
@@ -414,7 +414,7 @@ async function closePosition(positionId, reason = "manual", pnl = null) {
     await db.saveGhostTrade({ ...ghost, maxRRBeforeSL: ghost.maxRR }).catch(e => recordError(e.message));
     db.computeAndSaveGhostComboAnalysis(ghost.optimizerKey).catch(() => {});
     // v14.2: Check if this ghost pushed us over the TP lock threshold
-    // Don't wait for the hourly cron \\-- recompute TP immediately
+    // Don't wait for the hourly cron \-- recompute TP immediately
     const gcCount = await db.countGhostsByKey(ghost.optimizerKey).catch(() => 0);
     if (gcCount >= 10) {
       setTimeout(() => runTPOptimizer().catch(() => {}), 2000); // async, 2s delay
@@ -496,13 +496,13 @@ async function closeBlockedGhost(id, reason = 'timeout') {
 
 // ── Adopt an MT5 position that is not in openPositions ───────────
 // Wordt aangeroepen bij syncPositions wanneer een live MT5 positie
-// niet in memory zit \\-- bv. na een deploy/restart terwijl er een trade open stond.
+// niet in memory zit \-- bv. na een deploy/restart terwijl er een trade open stond.
 // Reconstrueert de positie vanuit MT5 data + comment parsing.
 function parseMT5Comment(comment = '') {
   // Two comment formats:
-  // OLD: "S-NY-UNK #10"           \-> DIR-SESS-VWAP #N
-  // NEW: "EURCHF S-LD-ABV #1"     \-> SYMBOL DIR-SESS-VWAP #N
-  // NEW: "NZDCHF B-LD-ABV #1"     \-> SYMBOL DIR-SESS-VWAP #N
+  // OLD: "S-NY-UNK #10"           -> DIR-SESS-VWAP #N
+  // NEW: "EURCHF S-LD-ABV #1"     -> SYMBOL DIR-SESS-VWAP #N
+  // NEW: "NZDCHF B-LD-ABV #1"     -> SYMBOL DIR-SESS-VWAP #N
   const dirMap  = { B: 'buy',  S: 'sell' };
   const sessMap = { NY: 'ny',  LD: 'london', AS: 'asia', LOND: 'london' };
   const vwapMap = { ABV: 'above', BLW: 'below', UNK: 'unknown' };
@@ -515,7 +515,7 @@ function parseMT5Comment(comment = '') {
     const sess = sessMap[segs[1]];
     const vwap = vwapMap[segs[2]] ?? 'unknown';
     if (dir && sess) {
-      // Found a valid DIR-SESS segment \\-- get trade number from next hash part
+      // Found a valid DIR-SESS segment \-- get trade number from next hash part
       const numPart = parts.find((p, j) => j > i && /^\d+$/.test(p));
       return {
         direction:    dir,
@@ -541,7 +541,7 @@ async function adoptPosition(lp) {
 
   // Parse comment for direction/session/vwap
   const parsed = parseMT5Comment(lp.comment ?? '');
-  // Determine direction: comment parse \-> MT5 type field \-> current position type
+  // Determine direction: comment parse -> MT5 type field -> current position type
   const lpType = (lp.type ?? lp.positionType ?? '').toString().toUpperCase();
   const isBuyType = lpType.includes('BUY') || lpType === 'BUY' || lpType === 'POSITION_TYPE_BUY';
   const direction = parsed.direction ?? (isBuyType ? 'buy' : 'sell');
@@ -554,16 +554,16 @@ async function adoptPosition(lp) {
   const openedAt  = (lp.time ?? lp.openTime) ? new Date(lp.time ?? lp.openTime).toISOString() : new Date().toISOString();
   const optKey    = buildOptimizerKey(symbol, session, direction, vwapPos);
 
-  // Guard: don't adopt if we can't determine direction reliably \\-- log and skip
+  // Guard: don't adopt if we can't determine direction reliably \-- log and skip
   if (!direction) {
-    console.error(`[Adopt] SKIP ${id} ${symbol} \\-- cannot determine direction. lp.type="${lp.type}", comment="${lp.comment ?? ''}"`);
+    console.error(`[Adopt] SKIP ${id} ${symbol} \-- cannot determine direction. lp.type="${lp.type}", comment="${lp.comment ?? ''}"`);
     return;
   }
 
   // Estimate SL pct from entry/sl distance
   const slPct = entry > 0 && sl > 0 ? Math.abs(entry - sl) / entry : 0.003;
 
-  // Use ALL available MT5 data for adopted positions \\-- handle all field variants
+  // Use ALL available MT5 data for adopted positions \-- handle all field variants
   const lpVol2    = lp.volume ?? lp.currentVolume ?? lp.size;
   const lpSL2     = lp.stopLoss ?? lp.currentStopLoss;
   const lpTP2     = lp.takeProfit ?? lp.currentTakeProfit;
@@ -629,7 +629,7 @@ async function adoptPosition(lp) {
   openPositions.set(id, pos);
 
   if (dbReady) db.saveGhostState(pos.ghost).catch(() => {});
-  console.log(`[Adopt] Hersteld MT5 positie ${id} ${symbol} ${direction} entry=${entry} \\-- comment="${lp.comment ?? ''}"`);
+  console.log(`[Adopt] Hersteld MT5 positie ${id} ${symbol} ${direction} entry=${entry} \-- comment="${lp.comment ?? ''}"`);
 }
 
 // ── Position sync (cron) ─────────────────────────────────────────
@@ -639,10 +639,10 @@ let latestEquity  = 50000;   // updated by pollStatus / placeOrder
 let latestAccountCurrency = process.env.ACCOUNT_CURRENCY || 'USD'; // auto-detected from MetaAPI
 let _lastEquityRecord = 0;   // timestamp of last equity_curve insert
 async function syncPositions() {
-  // Always sync \\-- weekends included. Market may be closed but positions exist.
+  // Always sync \-- weekends included. Market may be closed but positions exist.
   if (!dbReady) return;
   if (_syncRunning) {
-    console.warn('[Sync] Skipping \\-- previous sync still running');
+    console.warn('[Sync] Skipping \-- previous sync still running');
     return;
   }
   _syncRunning = true;
@@ -653,12 +653,12 @@ async function syncPositions() {
   }
 }
 async function _doSyncPositions() {
-  // Run sync ALWAYS \\-- even weekends. Positions stay open over weekend.
+  // Run sync ALWAYS \-- even weekends. Positions stay open over weekend.
   // isMonitoringActive() only affects NEW trade signals, not position tracking.
   if (!dbReady) return;
   // Update equity from account info every 5 syncs (~2.5 min)
   _syncCount = (_syncCount || 0) + 1;
-  // Update equity from account info every 10 syncs (~100s) \\-- avoid 429 TooManyRequests
+  // Update equity from account info every 10 syncs (~100s) \-- avoid 429 TooManyRequests
   if (_syncCount % 10 === 1 && !circuitOpen()) {
     try {
       const acct = await getAccountInfo(); // has 60s internal cache
@@ -668,7 +668,7 @@ async function _doSyncPositions() {
   const live = await getPositions();
   const liveIds = new Set(live.map(p => String(p.id)));
 
-  // Sluit posities die niet meer in MT5 zitten \\-- detecteer SL/TP via deals
+  // Sluit posities die niet meer in MT5 zitten \-- detecteer SL/TP via deals
   for (const [id] of openPositions) {
     if (!liveIds.has(id)) {
       // v13.5.1: probeer close reason te detecteren via history deals
@@ -713,10 +713,10 @@ async function _doSyncPositions() {
     const id  = String(lp.id);
     const pos = openPositions.get(id);
     if (!pos) {
-      // ── v13.5: positie bestaat in MT5 maar niet in memory \-> adopteer ──
+      // ── v13.5: positie bestaat in MT5 maar niet in memory -> adopteer ──
       await adoptPosition(lp);
     } else {
-      // ALWAYS sync MT5 position data \\-- handle multiple MetaAPI field name variants
+      // ALWAYS sync MT5 position data \-- handle multiple MetaAPI field name variants
       // Lots: volume / currentVolume / size
       const lpVol = lp.volume ?? lp.currentVolume ?? lp.size;
       if (lpVol != null) pos.lots = Math.max(0, parseFloat(lpVol));
@@ -763,7 +763,7 @@ async function _doSyncPositions() {
       pos._synced = true; // position data received}
       if (pos.ghost) {
         if (!pos.ghost.direction || !pos.ghost.entry || !pos.ghost.sl) {
-          console.warn(`[Sync] Skipping ghost ${id} ${pos.symbol} \\-- missing direction/entry/sl`);
+          console.warn(`[Sync] Skipping ghost ${id} ${pos.symbol} \-- missing direction/entry/sl`);
           continue;
         }
         // Use best available price for ghost tracking
@@ -772,7 +772,7 @@ async function _doSyncPositions() {
           const wasHit = pos.ghost.phantomSLHit;
           updateGhost(pos.ghost, priceForGhost);
           pos.ghost.lastPriceTs = Date.now();
-          // v14.2: When phantom SL is just hit \-> record slHitAt + save finalized ghost trade
+          // v14.2: When phantom SL is just hit -> record slHitAt + save finalized ghost trade
           if (!wasHit && pos.ghost.phantomSLHit && dbReady) {
             pos.ghost.slHitAt  = new Date().toISOString();
             pos.ghost.closedAt = pos.ghost.slHitAt;
@@ -780,7 +780,7 @@ async function _doSyncPositions() {
             pos.ghost.lots = pos.lots ?? null;
             db.saveGhostTrade({ ...pos.ghost, maxRRBeforeSL: pos.ghost.maxRR }).catch(e => recordError(e.message));
             db.computeAndSaveGhostComboAnalysis(pos.ghost.optimizerKey).catch(() => {});
-            console.log(`[Ghost] Finalized ${id} ${pos.symbol} \\-- phantom SL hit at peak ${pos.ghost.peakRRPos?.toFixed(2)}R`);
+            console.log(`[Ghost] Finalized ${id} ${pos.symbol} \-- phantom SL hit at peak ${pos.ghost.peakRRPos?.toFixed(2)}R`);
             pos.ghost.closedAt = null; // reset so ghost stays "active" in memory till EOD
           }
         }
@@ -789,7 +789,7 @@ async function _doSyncPositions() {
     }
   }
   // ── Blocked ghost trackers: update via live MT5 prices ──
-  // Gebruik de liveIds priceMap \\-- blocked ghosts volgen hetzelfde symbool
+  // Gebruik de liveIds priceMap \-- blocked ghosts volgen hetzelfde symbool
   const priceMap = new Map(live.map(p => [p.symbol, p.currentPrice]));
   const now = Date.now();
   for (const [id, bg] of blockedPositions) {
@@ -810,7 +810,7 @@ async function _doSyncPositions() {
           }
         }
       }
-      // Keep shadow till end of Brussels day \\-- remove after Brussels midnight
+      // Keep shadow till end of Brussels day \-- remove after Brussels midnight
       const now = new Date();
       const bru  = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/Brussels' }));
       const slHitDate = new Date(new Date(bg.slHitAt).toLocaleString('en-US', { timeZone: 'Europe/Brussels' }));
@@ -819,7 +819,7 @@ async function _doSyncPositions() {
         slHitDate.getMonth()    === bru.getMonth() &&
         slHitDate.getDate()     === bru.getDate();
       if (!sameBruDay) {
-        // Past Brussels midnight since SL hit \\-- save to DB first, then remove
+        // Past Brussels midnight since SL hit \-- save to DB first, then remove
         if (dbReady) await db.saveBlockedGhostTrade(bg).catch(()=>{});
         await closeBlockedGhost(id, bg.stopReason ?? 'phantom_sl');
       } else if (dbReady) {
@@ -839,7 +839,7 @@ async function runShadowSnapshots() {
   for (const [id, pos] of openPositions) {
     const price   = priceMap.get(id);
     if (!price) continue;
-    // v14.0: skip if direction missing \\-- would cause NOT NULL constraint error
+    // v14.0: skip if direction missing \-- would cause NOT NULL constraint error
     if (!pos.direction || !pos.symbol || !pos.session) continue;
     const slDist  = Math.abs(pos.entry - pos.sl);
     if (slDist <= 0) continue;
@@ -880,7 +880,7 @@ async function runTPOptimizer() {
         await db.saveTPConfig(g.optimizerKey, g.symbol, g.session, g.direction,
           g.vwapPosition, ev.bestRR, g.n, ev.bestEV, existing?.lockedRR ?? null).catch(() => {});
         tpConfigs[g.optimizerKey] = { ...existing, lockedRR: ev.bestRR, lockedGhosts: g.n };
-        if (rrChanged) console.log(`[TP] ${g.optimizerKey}: TP updated ${existing?.lockedRR}R \-> ${ev.bestRR}R (${g.n} ghosts, EV=${ev.bestEV?.toFixed(3)})`);
+        if (rrChanged) console.log(`[TP] ${g.optimizerKey}: TP updated ${existing?.lockedRR}R -> ${ev.bestRR}R (${g.n} ghosts, EV=${ev.bestEV?.toFixed(3)})`);
       }
     }
   } catch (e) { recordError(`TPOptimizer: ${e.message}`); }
@@ -896,7 +896,7 @@ app.get("/", (req, res) => {
   res.send(dashboardHTML());
 });
 
-// /dashboard \-> alias for root (fixes broken /dashboard link)
+// /dashboard -> alias for root (fixes broken /dashboard link)
 app.get("/dashboard", (req, res) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(dashboardHTML());
@@ -946,7 +946,7 @@ app.post("/api/debug/force-sync", async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// DB ANALYSIS \\-- analyse comment formats + backfill missing data
+// DB ANALYSIS \-- analyse comment formats + backfill missing data
 // ═══════════════════════════════════════════════════════════════
 
 // Analyse comment formats in closed_trades
@@ -1144,7 +1144,7 @@ app.get("/status", async (req, res) => {
     errorCount:     getErrorCount(),
     ts:             new Date().toISOString(),
   };
-  // Account info: use cached value (60s TTL) \\-- never hammer MetaAPI on /status polls
+  // Account info: use cached value (60s TTL) \-- never hammer MetaAPI on /status polls
   const acct = circuitOpen() ? _acctCache : await Promise.race([
     getAccountInfo(),
     new Promise(r => setTimeout(() => r(null), 8000)),
@@ -1192,7 +1192,7 @@ app.post("/webhook", async (req, res) => {
           day_high: wh_day_high, day_low: wh_day_low,
           bull_breaks: wh_bull_breaks, bear_breaks: wh_bear_breaks,
           sl_points: wh_sl_points } = req.body ?? {};
-  // Informatieve velden vanuit webhook \\-- geen filters, alleen opslaan
+  // Informatieve velden vanuit webhook \-- geen filters, alleen opslaan
   const sessionHigh  = wh_session_high  ? parseFloat(wh_session_high)  : null;
   const sessionLow   = wh_session_low   ? parseFloat(wh_session_low)   : null;
   const dayHigh      = wh_day_high      ? parseFloat(wh_day_high)      : null;
@@ -1200,7 +1200,7 @@ app.post("/webhook", async (req, res) => {
   const bullBreaks   = wh_bull_breaks   ? parseInt(wh_bull_breaks)     : null;
   const bearBreaks   = wh_bear_breaks   ? parseInt(wh_bear_breaks)     : null;
   const slPoints     = wh_sl_points     ? parseFloat(wh_sl_points)     : null;
-  // Pine Script sends "action":"buy"/"sell" \\-- normalize to direction
+  // Pine Script sends "action":"buy"/"sell" \-- normalize to direction
   const direction = (_dir ?? _action ?? '').toLowerCase().trim() || null;
   if (!direction || (direction !== 'buy' && direction !== 'sell')) {
     recordError(`Webhook missing valid direction/action. body=${JSON.stringify(req.body).slice(0,200)}`);
@@ -1246,10 +1246,10 @@ app.post("/webhook", async (req, res) => {
     // NY_DEAD_ZONE: outside 15:30-18:00 Brussels (forex/stocks blocked at NYSE open)
     // OUTSIDE_WINDOW: outside 21:00-02:00 Brussels (market closed overnight)
     // STOCK_OUTSIDE_MARKET: stocks outside 16:00-21:00 Brussels
-    // These are trades that WOULD have been valid setups \\-- we track them for EV analysis
+    // These are trades that WOULD have been valid setups \-- we track them for EV analysis
     // Shadow tracker: ONLY block reasons where market IS open but we chose not to trade
-    // STOCK_OUTSIDE_MARKET = market closed \-> NOT tracked in shadow
-    // WEEKEND = market closed \-> NOT tracked in shadow
+    // STOCK_OUTSIDE_MARKET = market closed -> NOT tracked in shadow
+    // WEEKEND = market closed -> NOT tracked in shadow
     const isTrackableBlock = mktReason && (
       mktReason.includes('NY_DEAD_ZONE') ||
       mktReason.includes('NY_NIGHT') ||
@@ -1314,7 +1314,7 @@ app.post("/webhook", async (req, res) => {
     return res.json({ ok: false, reason: mktReason });
   }
 
-  // Pine Script sends both "entry" and "close" \\-- accept either
+  // Pine Script sends both "entry" and "close" \-- accept either
   const tvEntry  = tvClose ? parseFloat(tvClose) : (req.body?.entry ? parseFloat(req.body.entry) : null);
   const vwapMid  = vwap    ? parseFloat(vwap)    : null;
   const session  = getSession();
@@ -1322,10 +1322,10 @@ app.post("/webhook", async (req, res) => {
   const optKey   = buildOptimizerKey(symbol, session, direction, vwapPos);
   const slPct    = sl_pct ? parseFloat(sl_pct) : 0.003;
 
-  // ── FIX 1a: VWAP band% block \\-- blokkeer signalen ≥150% van de VWAP band ──
+  // ── FIX 1a: VWAP band% block \-- blokkeer signalen ≥150% van de VWAP band ──
   // bandPct = afstand van prijs tot VWAP mid, uitgedrukt als % van de halve band breedte.
   // 100% = prijs zit op de eerste band (vwap_upper / vwap_lower).
-  // 150% = prijs zit 1.5\x de halve band buiten de VWAP mid \-> te ver uitgerokken.
+  // 150% = prijs zit 1.5\x de halve band buiten de VWAP mid -> te ver uitgerokken.
   // Geldt voor ALLE asset types: forex, stock, index, commodity.
   let vwapBandPct = null;
   if (tvEntry !== null && vwapMid !== null && vwap_upper) {
@@ -1335,16 +1335,16 @@ app.post("/webhook", async (req, res) => {
       vwapBandPct = parseFloat(((dist / halfBand) * 100).toFixed(2));
     }
   }
-  // VWAP exhaustion threshold \\-- configurable per asset type
-  // Stocks: wider bands (higher volatility) \-> higher threshold
-  // Forex/Index: tighter bands \-> lower threshold  
-  const vwapThreshold = assetType === 'stock' ? 250 : assetType === 'index' ? 130 : 150; // stocks: open+ghost allowed up to 250%, above\->shadow
+  // VWAP exhaustion threshold \-- configurable per asset type
+  // Stocks: wider bands (higher volatility) -> higher threshold
+  // Forex/Index: tighter bands -> lower threshold  
+  const vwapThreshold = assetType === 'stock' ? 250 : assetType === 'index' ? 130 : 150; // stocks: open+ghost allowed up to 250%, above->shadow
   if (vwapBandPct !== null && vwapBandPct >= vwapThreshold) {
     const rejectReason = `VWAP_EXHAUSTION: band_pct=${vwapBandPct.toFixed(1)}% (max ${vwapThreshold}% for ${assetType})`;
     db.logSignal({ symbol, direction, session, vwapPosition: vwapPos, optimizerKey: optKey,
       tvEntry, slPct, vwapBandPct, outcome: "REJECTED", rejectReason,
       latencyMs: Date.now() - t0 }).catch(() => {});
-    // ── v13.4: VWAP_EXHAUSTION \-> maak invisible blocked ghost tracker ──
+    // ── v13.4: VWAP_EXHAUSTION -> maak invisible blocked ghost tracker ──
     if (dbReady && tvEntry && slPct) {
       const slBufVE  = assetType === 'stock' ? STOCK_SL_BUFFER_MULT : SL_BUFFER_MULT;
       const slDistVE = slPct * slBufVE * tvEntry;
@@ -1375,14 +1375,14 @@ app.post("/webhook", async (req, res) => {
     return res.json({ ok: false, reason: rejectReason });
   }
 
-  // ── FIX 1b: Duplicate check \\-- max 1 open positie per optimizerKey ──
+  // ── FIX 1b: Duplicate check \-- max 1 open positie per optimizerKey ──
   for (const [, existingPos] of openPositions) {
     if (existingPos.optimizerKey === optKey) {
       const rejectReason = `DUPLICATE_POSITION: ${optKey} already open (positionId=${existingPos.positionId})`;
       db.logSignal({ symbol, direction, session, vwapPosition: vwapPos, optimizerKey: optKey,
         tvEntry, slPct, vwapBandPct, outcome: "REJECTED", rejectReason,
         latencyMs: Date.now() - t0 }).catch(() => {});
-      // ── v13.4: DUPLICATE \-> maak invisible blocked ghost tracker ──
+      // ── v13.4: DUPLICATE -> maak invisible blocked ghost tracker ──
       if (dbReady && tvEntry && slPct) {
         const slBufD  = assetType === 'stock' ? STOCK_SL_BUFFER_MULT : SL_BUFFER_MULT;
         const slDistD = slPct * slBufD * tvEntry;
@@ -1416,7 +1416,7 @@ app.post("/webhook", async (req, res) => {
     }
   }
 
-  // Use cached equity \\-- if circuit is open or cache fresh, avoid extra MetaAPI call
+  // Use cached equity \-- if circuit is open or cache fresh, avoid extra MetaAPI call
   let equity = latestEquity || 10000;
   if (!circuitOpen()) {
     const acct = await Promise.race([getAccountInfo(), new Promise(r => setTimeout(() => r(null), 5000))]);
@@ -1447,7 +1447,7 @@ app.post("/webhook", async (req, res) => {
   //         This ensures the SL is always correctly placed relative to where we filled
   // Verification:
   //   slDistTV  = sl_pct \x slBuf \x tvEntry   (what TV would place)
-  //   slDistMT5 = sl_pct \x slBuf \x execPrice (what we actually place \\-- CORRECT)
+  //   slDistMT5 = sl_pct \x slBuf \x execPrice (what we actually place \-- CORRECT)
   //   Difference = slippage \x slBuf (small, expected)
   const slDistTV    = tvEntry ? parseFloat((slPct * slBuf * tvEntry).toFixed(6)) : null;
   const slDist      = parseFloat((slPct * slBuf * execPrice).toFixed(6));
@@ -1476,8 +1476,8 @@ app.post("/webhook", async (req, res) => {
     // Stocks (FTMO CFD): 1 lot = 1 share
     // P&L = lots \x price_move (dollar \~ euro on FTMO)
     // Example: JNJ entry=221.25 SL=222.59 slDist=1.34 riskEUR=38
-    //   \-> lots = 38 / 1.34 = 28 aandelen \OK
-    // No multiplier \\-- 1 share moves dollar-for-dollar
+    //   -> lots = 38 / 1.34 = 28 aandelen \OK
+    // No multiplier \-- 1 share moves dollar-for-dollar
     const rawLots = slDist > 0 ? riskEUR / slDist : 1;
     lots = Math.max(1, Math.round(rawLots)); // whole shares only (FTMO)
   }
@@ -1488,12 +1488,12 @@ app.post("/webhook", async (req, res) => {
 
   // Place order
   let positionId;
-  // v14.0: MT5 comment \\-- readable format shown in MetaTrader position list
+  // v14.0: MT5 comment \-- readable format shown in MetaTrader position list
   // Format: "SYMBOL D-SESS-VWAP #N"  e.g. "GBPUSD S-NY-BLW #42"
   const orderComment = (()=>{
     const d = direction === 'buy' ? 'B' : 'S';
-    // getSession() returns 'ny'|'london'|'asia'|'outside' \\-- NOT 'new_york'
-    const sessMap = { ny: 'NY', london: 'LD', asia: 'AS', outside: 'NY' }; // outside\->ny
+    // getSession() returns 'ny'|'london'|'asia'|'outside' \-- NOT 'new_york'
+    const sessMap = { ny: 'NY', london: 'LD', asia: 'AS', outside: 'NY' }; // outside->ny
     const s = sessMap[session] ?? (session||'??').slice(0,2).toUpperCase();
     const v = vwapPos === 'above' ? 'ABV' : vwapPos === 'below' ? 'BLW' : 'UNK';
     const n = tradeNumber ?? '?';
@@ -1510,11 +1510,11 @@ app.post("/webhook", async (req, res) => {
     });
     positionId = r?.positionId ?? r?.orderId ?? null;
 
-    // ── v13.5.1: ORDER_NOT_CONFIRMED \\-- poll MT5 voor positionId ──
+    // ── v13.5.1: ORDER_NOT_CONFIRMED \-- poll MT5 voor positionId ──
     // Stocks (GOOG, AAPL, JNJ etc.) geven soms geen positionId terug
     // bij market open. Poll tot 10s om de nieuwe positie te vinden.
     if (!positionId) {
-      console.warn(`[Order] Geen positionId ontvangen voor ${mt5Sym} ${direction} \\-- polling MT5...`);
+      console.warn(`[Order] Geen positionId ontvangen voor ${mt5Sym} ${direction} \-- polling MT5...`);
       const placeTime = Date.now();
       for (let attempt = 0; attempt < 5; attempt++) {
         await new Promise(resolve => setTimeout(resolve, 2000));
@@ -1532,8 +1532,8 @@ app.post("/webhook", async (req, res) => {
         } catch {}
       }
       if (!positionId) {
-        // ORDER_NOT_CONFIRMED: positie niet gevonden \\-- log en geef error terug.
-        // Maak GEEN fallback ghost met Date.now() ID \\-- dit leidt tot orphan ghosts.
+        // ORDER_NOT_CONFIRMED: positie niet gevonden \-- log en geef error terug.
+        // Maak GEEN fallback ghost met Date.now() ID \-- dit leidt tot orphan ghosts.
         const _errMsg = `geen positionId van MetaApi en positie niet gevonden op MT5 (${symbol} ${direction})`;
         console.error(`[Order] ORDER_NOT_CONFIRMED: geen positie gevonden voor ${mt5Sym} ${direction}`);
         db.logSignal({ symbol, direction, session, vwapPosition: vwapPos, optimizerKey: optKey,
@@ -1555,9 +1555,9 @@ app.post("/webhook", async (req, res) => {
     tpRRUsed: tpRR, slMultiplier: slBuf, vwapAtEntry: vwapMid, tvEntry, executionPrice: execPrice,
     slippage, spreadAtEntry, vwapBandPct, tradeNumber,
     slDistTV, slDist, slPctFinal, assetType,  // SL verification fields
-    // Informatieve velden vanuit webhook (geen filters \\-- enkel opslaan voor analyse)
+    // Informatieve velden vanuit webhook (geen filters \-- enkel opslaan voor analyse)
     sessionHigh, sessionLow, dayHigh, dayLow, bullBreaks, bearBreaks, slPoints,
-    mt5Comment: orderComment,  // "EURUSD S-NY-BLW #5" \\-- saved for display
+    mt5Comment: orderComment,  // "EURUSD S-NY-BLW #5" \-- saved for display
     orderComment: orderComment,
     ghost: null };
   pos.ghost = initGhost({ ...pos, slPct, evMult: km.evMult, dayMult: km.dayMult });
@@ -1611,7 +1611,7 @@ app.post("/history-deals", async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── API endpoints (all safe \\-- return empty on error/not ready) ───
+// ── API endpoints (all safe \-- return empty on error/not ready) ───
 
 function apiGet(path, fn, empty = []) {
   app.get(path, async (req, res) => {
@@ -1732,7 +1732,7 @@ apiGet("/api/band-ghosts",         r  => db.loadBandGhosts(r.query),           [
 apiGet("/api/symbol-risk",         () => db.loadSymbolRiskConfig(),            {});
 
 app.get("/api/open-positions", (req, res) => {
-  // No secret required \\-- served to the dashboard which runs on same origin
+  // No secret required \-- served to the dashboard which runs on same origin
   // Data is position metadata only; full security would need session auth
   const out = [];
   for (const [id, pos] of openPositions) {
@@ -1788,7 +1788,7 @@ app.get("/api/open-positions", (req, res) => {
 
 app.get("/api/tp-config", (req, res) => res.json(tpConfigs));
 
-// /api/performance \\-- served by apiGet above (loadPerformanceStats)
+// /api/performance \-- served by apiGet above (loadPerformanceStats)
 // Old loadPerformanceSummary route removed to avoid duplicate registration
 
 app.get("/api/daily-breakdown", async (req, res) => {
@@ -1821,7 +1821,7 @@ app.post("/api/symbol-risk", async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════════
-//  /api/snapshot  \\-- full system state in one call (for Claude / monitoring)
+//  /api/snapshot  \-- full system state in one call (for Claude / monitoring)
 //  Secret required. Returns everything needed to diagnose any issue.
 // ══════════════════════════════════════════════════════════════════
 app.get("/api/snapshot", async (req, res) => {
@@ -1933,7 +1933,7 @@ app.get("/api/snapshot", async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════════
-//  DASHBOARD HTML  (self-contained \\-- all JS inline)
+//  DASHBOARD HTML  (self-contained \-- all JS inline)
 // ══════════════════════════════════════════════════════════════════
 
 function dashboardHTML() {
@@ -2047,20 +2047,20 @@ return `<!DOCTYPE html>
 <!-- HEADER -->
 <div class="hdr">
   <div class="brand">PRONTO\.AI <span id="ver" style="font-size:10px;color:#6e7681;font-weight:400">v14.8</span></div>
-  <div class="hkv">Balance <b id="h-bal">\\--</b></div>
-  <div class="hkv cg">Unrealized <b id="h-upnl">\\--</b></div>
-  <div class="hkv cg">Realized <b id="h-rpnl">\\--</b></div>
-  <div class="hkv">Open MT5 <b id="h-open">\\--</b></div>
-  <div class="hkv cp">Active Ghost <b id="h-ghost">\\--</b></div>
-  <div class="hkv cc">Finalized <b id="h-fin">\\--</b></div>
-  <div class="hkv cp">Shadow <b id="h-shadow">\\--</b></div>
-  <div class="hkv">TP Locked <b id="h-tp">\\--</b></div>
+  <div class="hkv">Balance <b id="h-bal">\--</b></div>
+  <div class="hkv cg">Unrealized <b id="h-upnl">\--</b></div>
+  <div class="hkv cg">Realized <b id="h-rpnl">\--</b></div>
+  <div class="hkv">Open MT5 <b id="h-open">\--</b></div>
+  <div class="hkv cp">Active Ghost <b id="h-ghost">\--</b></div>
+  <div class="hkv cc">Finalized <b id="h-fin">\--</b></div>
+  <div class="hkv cp">Shadow <b id="h-shadow">\--</b></div>
+  <div class="hkv">TP Locked <b id="h-tp">\--</b></div>
   <div class="hkv cr">Errors <b id="h-err">0</b></div>
   <div class="hkv cb" id="h-db">DB init...</div>
   <div class="hstat">
     <span id="h-sess-dot" class="dot-g"></span>
-    <span id="h-sess" style="font-size:10px;color:#8b949e">\\--</span>
-    <span id="h-time" style="font-size:10px;color:#6e7681">\\--</span>
+    <span id="h-sess" style="font-size:10px;color:#8b949e">\--</span>
+    <span id="h-time" style="font-size:10px;color:#6e7681">\--</span>
   </div>
 </div>
 
@@ -2082,28 +2082,28 @@ return `<!DOCTYPE html>
     <div class="balgrid">
       <div class="balcard">
         <div class="bll">Start Balance</div>
-        <div class="blv" id="ov-startbal">\EUR50.000</div>
+        <div class="blv" id="ov-startbal">EUR50.000</div>
         <div class="bls">at trading start</div>
       </div>
       <div class="balcard">
         <div class="bll">+ Realized P&amp;L</div>
-        <div class="blv cg" id="ov-realbal">\\--</div>
-        <div class="bls"><span id="ov-tradecount">\\--</span> closed trades</div>
+        <div class="blv cg" id="ov-realbal">\--</div>
+        <div class="bls"><span id="ov-tradecount">\--</span> closed trades</div>
       </div>
       <div class="balcard">
         <div class="bll">= Cash Balance</div>
-        <div class="blv" id="ov-cashbal">\\--</div>
+        <div class="blv" id="ov-cashbal">\--</div>
         <div class="bls">start + closed P&amp;L</div>
       </div>
       <div class="balcard">
         <div class="bll">+ Unrealized P&amp;L</div>
-        <div class="blv cg" id="ov-upnl">\\--</div>
-        <div class="bls"><span id="ov-opencount">\\--</span> open positions</div>
+        <div class="blv cg" id="ov-upnl">\--</div>
+        <div class="bls"><span id="ov-opencount">\--</span> open positions</div>
       </div>
       <div class="balcard eq">
         <div class="bll">= Equity (MT5)</div>
-        <div class="blv cb" id="ov-equity">\\--</div>
-        <div class="bleq" id="ov-equitycheck">\\--</div>
+        <div class="blv cb" id="ov-equity">\--</div>
+        <div class="bleq" id="ov-equitycheck">\--</div>
       </div>
     </div>
   </div>
@@ -2124,28 +2124,28 @@ return `<!DOCTYPE html>
       <div class="cm">WR = P&amp;L &gt; 0</div>
     </div>
     <div class="kst" style="grid-template-columns:repeat(8,1fr)">
-      <div class="ks"><div class="ksl">Open MT5</div><div class="ksv" id="ov-open">\\--</div></div>
-      <div class="ks"><div class="ksl">Wins (P&amp;L&gt;0)</div><div class="ksv cg" id="ov-wins">\\--</div></div>
-      <div class="ks"><div class="ksl">Losses</div><div class="ksv cr" id="ov-loss">\\--</div></div>
-      <div class="ks"><div class="ksl">Win Rate</div><div class="ksv cy" id="ov-wr">\\--</div></div>
-      <div class="ks"><div class="ksl">Best Peak+RR</div><div class="ksv cg fw" id="ov-bestpeak">\\--</div></div>
-      <div class="ks"><div class="ksl">Worst Peak−RR</div><div class="ksv cr fw" id="ov-worstpeak">\\--</div></div>
-      <div class="ks"><div class="ksl">Max Possible +RR</div><div class="ksv cy" id="ov-maxrr">\\--</div></div>
-      <div class="ks"><div class="ksl">Unrealized P&amp;L</div><div class="ksv cg" id="ov-upnl2">\\--</div></div>
+      <div class="ks"><div class="ksl">Open MT5</div><div class="ksv" id="ov-open">\--</div></div>
+      <div class="ks"><div class="ksl">Wins (P&amp;L&gt;0)</div><div class="ksv cg" id="ov-wins">\--</div></div>
+      <div class="ks"><div class="ksl">Losses</div><div class="ksv cr" id="ov-loss">\--</div></div>
+      <div class="ks"><div class="ksl">Win Rate</div><div class="ksv cy" id="ov-wr">\--</div></div>
+      <div class="ks"><div class="ksl">Best Peak+RR</div><div class="ksv cg fw" id="ov-bestpeak">\--</div></div>
+      <div class="ks"><div class="ksl">Worst Peak−RR</div><div class="ksv cr fw" id="ov-worstpeak">\--</div></div>
+      <div class="ks"><div class="ksl">Max Possible +RR</div><div class="ksv cy" id="ov-maxrr">\--</div></div>
+      <div class="ks"><div class="ksl">Unrealized P&amp;L</div><div class="ksv cg" id="ov-upnl2">\--</div></div>
     </div>
   </div>
 
   <!-- Open Trades Table (live MT5) -->
   <div class="card">
     <div class="chdr">
-      <div class="ctitle"><div class="dot g"></div>Open Trades \\-- Live MT5</div>
-      <div class="cm" id="ov-open-cm">\\--</div>
+      <div class="ctitle"><div class="dot g"></div>Open Trades \-- Live MT5</div>
+      <div class="cm" id="ov-open-cm">\--</div>
     </div>
     <div class="tw">
       <table>
         <thead><tr>
           <th>Status</th><th>Symbol</th><th>Type</th><th>Dir</th><th>VWAP</th><th>Session</th>
-          <th>Risk%</th><th>Risk\EUR</th>
+          <th>Risk%</th><th>RiskEUR</th>
           <th>Entry</th><th>SL</th><th>TP</th>
           <th style="color:#388bfd">RR Now</th>
           <th style="color:#3fb950">Peak+</th>
@@ -2166,15 +2166,15 @@ return `<!DOCTYPE html>
   <div class="card">
     <div class="chdr">
       <div class="ctitle"><div class="dot r"></div>Closed Trades</div>
-      <div class="cm" id="ov-trades-cm">\\--</div>
+      <div class="cm" id="ov-trades-cm">\--</div>
     </div>
     <div class="tw">
       <table>
         <thead><tr>
           <th>SL/TP</th><th>Symbol</th><th>Type</th><th>Dir</th><th>VWAP</th><th>Session</th>
           <th>Entry</th><th>SL</th><th>TP</th><th>Exit</th>
-          <th>Risk%</th><th>Risk\EUR</th>
-          <th>Realized \EUR</th><th>Lots</th>
+          <th>Risk%</th><th>RiskEUR</th>
+          <th>Realized EUR</th><th>Lots</th>
           <th style="color:#3fb950">Peak+RR</th><th style="color:#f85149">Peak−RR</th><th>Ghost</th><th>MT5 Comment</th>
           <th>Opened</th><th>Closed</th>
         </tr></thead>
@@ -2191,24 +2191,24 @@ return `<!DOCTYPE html>
   <div class="card">
     <div class="chdr"><div class="ctitle"><div class="dot b"></div>Signal Intelligence</div><div class="cm">last 7 days</div></div>
     <div class="kst" style="grid-template-columns:repeat(11,1fr)">
-      <div class="ks"><div class="ksl">Total</div><div class="ksv" id="sg-total">\\--</div></div>
-      <div class="ks"><div class="ksl">\-> Placed</div><div class="ksv cg" id="sg-placed">\\--</div></div>
-      <div class="ks"><div class="ksl">Conv%</div><div class="ksv cy" id="sg-conv">\\--</div></div>
-      <div class="ks"><div class="ksl">\-> Shadow</div><div class="ksv cp" id="sg-shadow">\\--</div></div>
-      <div class="ks"><div class="ksl" style="font-size:8px"> NY Dead 15:30</div><div class="ksv co" id="sg-ny-dead">\\--</div></div>
-      <div class="ks"><div class="ksl" style="font-size:8px"> NY Night 21h</div><div class="ksv co" id="sg-ny-night">\\--</div></div>
-      <div class="ks"><div class="ksl" style="font-size:8px"> Asia 0-2h</div><div class="ksv co" id="sg-asia">\\--</div></div>
-      <div class="ks"><div class="ksl">⚡ VWAP Exh</div><div class="ksv cp" id="sg-vwap">\\--</div></div>
-      <div class="ks"><div class="ksl"> Duplicate</div><div class="ksv cy" id="sg-dup">\\--</div></div>
-      <div class="ks"><div class="ksl"> Stk OOH</div><div class="ksv cd" id="sg-ooh">\\--</div></div>
-      <div class="ks" style="background:rgba(248,81,73,.06)"><div class="ksl" style="color:#f85149">⚠ Errors</div><div class="ksv cr fw" id="sg-err">\\--</div></div>
+      <div class="ks"><div class="ksl">Total</div><div class="ksv" id="sg-total">\--</div></div>
+      <div class="ks"><div class="ksl">-> Placed</div><div class="ksv cg" id="sg-placed">\--</div></div>
+      <div class="ks"><div class="ksl">Conv%</div><div class="ksv cy" id="sg-conv">\--</div></div>
+      <div class="ks"><div class="ksl">-> Shadow</div><div class="ksv cp" id="sg-shadow">\--</div></div>
+      <div class="ks"><div class="ksl" style="font-size:8px"> NY Dead 15:30</div><div class="ksv co" id="sg-ny-dead">\--</div></div>
+      <div class="ks"><div class="ksl" style="font-size:8px"> NY Night 21h</div><div class="ksv co" id="sg-ny-night">\--</div></div>
+      <div class="ks"><div class="ksl" style="font-size:8px"> Asia 0-2h</div><div class="ksv co" id="sg-asia">\--</div></div>
+      <div class="ks"><div class="ksl">⚡ VWAP Exh</div><div class="ksv cp" id="sg-vwap">\--</div></div>
+      <div class="ks"><div class="ksl"> Duplicate</div><div class="ksv cy" id="sg-dup">\--</div></div>
+      <div class="ks"><div class="ksl"> Stk OOH</div><div class="ksv cd" id="sg-ooh">\--</div></div>
+      <div class="ks" style="background:rgba(248,81,73,.06)"><div class="ksl" style="color:#f85149">⚠ Errors</div><div class="ksv cr fw" id="sg-err">\--</div></div>
     </div>
   </div>
 
   <!-- Signal Log -->
   <div class="card">
     <div class="chdr">
-      <div class="ctitle"><div class="dot g"></div>Signal Log \\-- All Outcomes</div>
+      <div class="ctitle"><div class="dot g"></div>Signal Log \-- All Outcomes</div>
       <div class="cm">most recent first</div>
     </div>
     <div class="tw">
@@ -2238,7 +2238,7 @@ return `<!DOCTYPE html>
 
   <!-- Errors section -->
   <div class="card">
-    <div class="chdr"><div class="ctitle"><div class="dot r"></div>Errors \\-- Did Not Reach Ghost or Shadow</div></div>
+    <div class="chdr"><div class="ctitle"><div class="dot r"></div>Errors \-- Did Not Reach Ghost or Shadow</div></div>
     <div class="tw">
       <table>
         <thead><tr>
@@ -2255,19 +2255,19 @@ return `<!DOCTYPE html>
 
   <!-- KPIs -->
   <div class="kst" style="grid-template-columns:repeat(8,1fr);margin-bottom:12px">
-    <div class="ks card"><div class="ksl">Active</div><div class="ksv" id="gh-active-cnt">\\--</div></div>
-    <div class="ks card"><div class="ksl">SL Today</div><div class="ksv cr" id="gh-sl-today">\\--</div></div>
-    <div class="ks card"><div class="ksl">Best Peak+</div><div class="ksv cg fw" id="gh-best-peak">\\--</div></div>
-    <div class="ks card"><div class="ksl">Avg Peak+</div><div class="ksv cy" id="gh-avg-peak">\\--</div></div>
-    <div class="ks card"><div class="ksl">Buy</div><div class="ksv cg" id="gh-buy">\\--</div></div>
-    <div class="ks card"><div class="ksl">Sell</div><div class="ksv cr" id="gh-sell">\\--</div></div>
-    <div class="ks card"><div class="ksl">TP Estimated</div><div class="ksv cy" id="gh-tp-est">\\--</div></div>
-    <div class="ks card"><div class="ksl">Finalized Total</div><div class="ksv cc" id="gh-fin-cnt">\\--</div></div>
+    <div class="ks card"><div class="ksl">Active</div><div class="ksv" id="gh-active-cnt">\--</div></div>
+    <div class="ks card"><div class="ksl">SL Today</div><div class="ksv cr" id="gh-sl-today">\--</div></div>
+    <div class="ks card"><div class="ksl">Best Peak+</div><div class="ksv cg fw" id="gh-best-peak">\--</div></div>
+    <div class="ks card"><div class="ksl">Avg Peak+</div><div class="ksv cy" id="gh-avg-peak">\--</div></div>
+    <div class="ks card"><div class="ksl">Buy</div><div class="ksv cg" id="gh-buy">\--</div></div>
+    <div class="ks card"><div class="ksl">Sell</div><div class="ksv cr" id="gh-sell">\--</div></div>
+    <div class="ks card"><div class="ksl">TP Estimated</div><div class="ksv cy" id="gh-tp-est">\--</div></div>
+    <div class="ks card"><div class="ksl">Finalized Total</div><div class="ksv cc" id="gh-fin-cnt">\--</div></div>
   </div>
 
   <!-- Active Ghost Table -->
   <div class="card">
-    <div class="chdr"><div class="ctitle"><div class="dot g"></div>Active Ghost Tracker \\-- Live Milestones</div></div>
+    <div class="chdr"><div class="ctitle"><div class="dot g"></div>Active Ghost Tracker \-- Live Milestones</div></div>
     <div class="tw">
       <table style="min-width:2000px">
         <thead><tr>
@@ -2299,7 +2299,7 @@ return `<!DOCTYPE html>
 
   <!-- Ghost Finalized -->
   <div class="card">
-    <div class="chdr"><div class="ctitle"><div class="dot r"></div>Ghost Finalized \\-- Stop Reasons: PHANTOM_SL \. GAP_STOP \. TP_HIT</div></div>
+    <div class="chdr"><div class="ctitle"><div class="dot r"></div>Ghost Finalized \-- Stop Reasons: PHANTOM_SL \. GAP_STOP \. TP_HIT</div></div>
     <div class="tw">
       <table style="min-width:2000px">
         <thead><tr>
@@ -2315,7 +2315,7 @@ return `<!DOCTYPE html>
           <th style="color:#f85149">Peak−RR</th>
           <th>Band%</th>
           <th>#Key</th>
-          <th>Realized \EUR</th>
+          <th>Realized EUR</th>
           <th>Lots</th>
           <th>MT5 Comment</th>
           <th>Optimizer Key</th>
@@ -2333,7 +2333,7 @@ return `<!DOCTYPE html>
 <div class="pg" id="p-sh">
 
   <!-- Timezone Blocks -->
-  <div class="sechdr"><div class="dot o"></div> Timezone Blocks \\-- NY Dead \. NY Night \. Asia Morning</div>
+  <div class="sechdr"><div class="dot o"></div> Timezone Blocks \-- NY Dead \. NY Night \. Asia Morning</div>
   <div class="card">
     <div class="tw">
       <table style="min-width:1800px">
@@ -2388,7 +2388,7 @@ return `<!DOCTYPE html>
   </div>
 
   <!-- Shadow Finalized -->
-  <div class="sechdr"><div class="dot cd"></div> Shadow Finalized \\-- History</div>
+  <div class="sechdr"><div class="dot cd"></div> Shadow Finalized \-- History</div>
   <div class="card">
     <div class="tw">
       <table style="min-width:1800px">
@@ -2415,7 +2415,7 @@ return `<!DOCTYPE html>
     <div class="tw"><table>
       <thead><tr>
         <th>Session</th><th>Ghosts</th><th>Would TP</th><th>Win%</th>
-        <th style="color:#3fb950">Avg Peak+</th><th style="color:#f85149">Avg Peak−%</th><th>Avg T\->SL</th>
+        <th style="color:#3fb950">Avg Peak+</th><th style="color:#f85149">Avg Peak−%</th><th>Avg T->SL</th>
       </tr></thead>
       <tbody id="sess-stats-body"><tr><td colspan="7" class="nd">⏳ Loading...</td></tr></tbody>
     </table></div>
@@ -2433,7 +2433,7 @@ return `<!DOCTYPE html>
         <th style="color:#3fb950">+0.3R</th><th style="color:#3fb950">+0.5R</th>
         <th style="color:#3fb950">+0.8R</th><th style="color:#3fb950">+1.0R</th>
         <th style="color:#3fb950">+1.5R</th>
-        <th style="color:#d29922">Recovery</th><th>Avg T\->SL</th>
+        <th style="color:#d29922">Recovery</th><th>Avg T->SL</th>
       </tr></thead>
       <tbody id="ms-prob-body"><tr><td colspan="14" class="nd">⏳ Loading...</td></tr></tbody>
     </table></div>
@@ -2441,14 +2441,14 @@ return `<!DOCTYPE html>
 
   <!-- Shadow What-If -->
   <div class="card">
-    <div class="chdr"><div class="ctitle"><div class="dot o"></div>Shadow \-> Ghost "What If"</div><div class="cm">if blocked signals were placed \\-- peak tracking from shadow</div></div>
+    <div class="chdr"><div class="ctitle"><div class="dot o"></div>Shadow -> Ghost "What If"</div><div class="cm">if blocked signals were placed \-- peak tracking from shadow</div></div>
     <div class="tw"><table>
       <thead><tr>
         <th>Block Type</th><th>Total</th>
         <th style="color:#3fb950">Would TP (≥1.5R)</th><th>TP%</th>
         <th style="color:#f85149">Would SL (≥100%)</th><th>SL%</th>
         <th style="color:#3fb950">Avg Peak+</th><th style="color:#f85149">Avg Peak−%</th>
-        <th style="color:#388bfd">Est. Missed \EUR</th>
+        <th style="color:#388bfd">Est. Missed EUR</th>
       </tr></thead>
       <tbody id="shadow-whatif-body"><tr><td colspan="9" class="nd">⏳ Loading...</td></tr></tbody>
     </table></div>
@@ -2456,7 +2456,7 @@ return `<!DOCTYPE html>
 
   <!-- EV Optimizer -->
   <div class="card">
-    <div class="chdr"><div class="ctitle"><div class="dot p"></div>EV TP Optimizer \\-- per Optimizer Key</div><div class="cm">min 5 ghosts for reliable stats</div></div>
+    <div class="chdr"><div class="ctitle"><div class="dot p"></div>EV TP Optimizer \-- per Optimizer Key</div><div class="cm">min 5 ghosts for reliable stats</div></div>
     <div class="tw"><table>
       <thead><tr>
         <th>Symbol</th><th>Type</th><th>Session</th><th>Dir</th><th>VWAP</th>
@@ -2475,17 +2475,17 @@ return `<!DOCTYPE html>
 // ==============================================
 const $  = id => document.getElementById(id);
 const el = id => document.getElementById(id);
-const fmt   = (v,d=2) => v==null?'\\--':Number(v).toFixed(d);
-const fmtE  = v => v==null?'\\--':(v>=0?'+':'')+'\EUR'+Math.abs(Number(v)).toFixed(0);
-const fmtR  = v => v==null?'\\--':(v>=0?'+':'')+Number(v).toFixed(2)+'R';
-const fmtP  = v => v==null?'\\--':Number(v).toFixed(1)+'%';
-const fmtPct= v => v==null?'\\--':(v*100).toFixed(2)+'%';
+const fmt   = (v,d=2) => v==null?'\--':Number(v).toFixed(d);
+const fmtE  = v => v==null?'\--':(v>=0?'+':'')+'EUR'+Math.abs(Number(v)).toFixed(0);
+const fmtR  = v => v==null?'\--':(v>=0?'+':'')+Number(v).toFixed(2)+'R';
+const fmtP  = v => v==null?'\--':Number(v).toFixed(1)+'%';
+const fmtPct= v => v==null?'\--':(v*100).toFixed(2)+'%';
 const cRR   = v => v==null?'cd':v>0.5?'cg fw':v>0?'cg':v<-0.5?'cr fw':v<0?'cr':'cd';
 const cE    = v => v==null?'cd':v>0?'cg':v<0?'cr':'cd';
-const fmtT  = s => !s?'\\--':new Date(s).toLocaleTimeString('nl-BE',{timeZone:'Europe/Brussels',hour:'2-digit',minute:'2-digit',second:'2-digit'});
-const fmtTs = s => !s?'\\--':new Date(s).toLocaleString('nl-BE',{timeZone:'Europe/Brussels',day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'});
+const fmtT  = s => !s?'\--':new Date(s).toLocaleTimeString('nl-BE',{timeZone:'Europe/Brussels',hour:'2-digit',minute:'2-digit',second:'2-digit'});
+const fmtTs = s => !s?'\--':new Date(s).toLocaleString('nl-BE',{timeZone:'Europe/Brussels',day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'});
 const fmtEl = (s,e) => {
-  if(!s) return '\\--';
+  if(!s) return '\--';
   const ms=(e?new Date(e):new Date())-new Date(s);
   const h=Math.floor(ms/3600000),m=Math.floor((ms%3600000)/60000);
   return h>0?h+'h'+String(m).padStart(2,'0')+'m':m+'m';
@@ -2645,19 +2645,19 @@ async function loadOverview(){
 
   // --- Balance ---
   if(perf){
-    const _cs=perf.currency==='EUR'?'\EUR':perf.currency==='USD'?'$':'\EUR';
+    const _cs=perf.currency==='EUR'?'EUR':perf.currency==='USD'?'$':'EUR';
     const s=perf.startBalance||50000;
     const rp=perf.realizedPnl||perf.totalPnl||0;
     const up=perf.unrealizedPnl||0;
     const cash=s+rp;
     const eq=cash+up;
     const f=v=>Math.round(v).toLocaleString('nl-BE');
-    if($('ov-startbal'))$('ov-startbal').textContent='\EUR'+f(s);
-    if($('ov-realbal')){$('ov-realbal').textContent=(rp>=0?'+':'')+'\EUR'+f(Math.abs(rp));$('ov-realbal').className='blv '+(rp>=0?'cg':'cr');}
-    if($('ov-cashbal'))$('ov-cashbal').textContent='\EUR'+f(cash);
-    if($('ov-upnl')){$('ov-upnl').textContent=(up>=0?'+':'')+'\EUR'+f(Math.abs(up));$('ov-upnl').className='blv '+(up>=0?'cg':'cr');}
-    if($('ov-equity'))$('ov-equity').textContent='\EUR'+f(eq);
-    if($('ov-equitycheck'))$('ov-equitycheck').textContent='\EUR'+f(s)+' + \EUR'+f(rp)+' + '+(up>=0?'+':'')+f(up)+' = \EUR'+f(eq)+' \OK';
+    if($('ov-startbal'))$('ov-startbal').textContent='EUR'+f(s);
+    if($('ov-realbal')){$('ov-realbal').textContent=(rp>=0?'+':'')+'EUR'+f(Math.abs(rp));$('ov-realbal').className='blv '+(rp>=0?'cg':'cr');}
+    if($('ov-cashbal'))$('ov-cashbal').textContent='EUR'+f(cash);
+    if($('ov-upnl')){$('ov-upnl').textContent=(up>=0?'+':'')+'EUR'+f(Math.abs(up));$('ov-upnl').className='blv '+(up>=0?'cg':'cr');}
+    if($('ov-equity'))$('ov-equity').textContent='EUR'+f(eq);
+    if($('ov-equitycheck'))$('ov-equitycheck').textContent='EUR'+f(s)+' + EUR'+f(rp)+' + '+(up>=0?'+':'')+f(up)+' = EUR'+f(eq)+' \OK';
     if($('ov-tradecount'))$('ov-tradecount').textContent=(perf.tradeCount||0)+' closed';
     if($('ov-opencount'))$('ov-opencount').textContent=(pos||[]).length+' open';
   }
@@ -2677,15 +2677,15 @@ async function loadOverview(){
     if(g.tpRRUsed!=null&&(maxRR===null||g.tpRRUsed>maxRR))maxRR=g.tpRRUsed;
     totLots+=p.lots||0;
   });
-  const wr=_pos.length?((wins/_pos.length)*100).toFixed(1)+'%':'\\--';
+  const wr=_pos.length?((wins/_pos.length)*100).toFixed(1)+'%':'\--';
   if($('ov-open'))$('ov-open').textContent=_pos.length;
   if($('ov-wins'))$('ov-wins').textContent=wins;
   if($('ov-loss'))$('ov-loss').textContent=loss;
   if($('ov-wr')){$('ov-wr').textContent=wr;$('ov-wr').className='ksv '+(_pos.length&&wins/_pos.length>=0.6?'cg':'cy');}
-  if($('ov-bestpeak'))$('ov-bestpeak').textContent=bestP!=null?fmtR(bestP):'\\--';
-  if($('ov-worstpeak'))$('ov-worstpeak').textContent=worstP!=null?fmtR(worstP):'\\--';
-  if($('ov-maxrr'))$('ov-maxrr').textContent=maxRR!=null?'+'+maxRR.toFixed(2)+'R':'\\--';
-  if($('ov-upnl2')){const u=perf?.unrealizedPnl||0;$('ov-upnl2').textContent=(u>=0?'+':'')+Math.round(u)+'\EUR';$('ov-upnl2').className='ksv '+(u>=0?'cg':'cr');}
+  if($('ov-bestpeak'))$('ov-bestpeak').textContent=bestP!=null?fmtR(bestP):'\--';
+  if($('ov-worstpeak'))$('ov-worstpeak').textContent=worstP!=null?fmtR(worstP):'\--';
+  if($('ov-maxrr'))$('ov-maxrr').textContent=maxRR!=null?'+'+maxRR.toFixed(2)+'R':'\--';
+  if($('ov-upnl2')){const u=perf?.unrealizedPnl||0;$('ov-upnl2').textContent=(u>=0?'+':'')+Math.round(u)+'EUR';$('ov-upnl2').className='ksv '+(u>=0?'cg':'cr');}
   if($('ov-open-cm'))$('ov-open-cm').textContent=_pos.length+' positions';
 
   // --- Open positions table ---
@@ -2708,28 +2708,28 @@ async function loadOverview(){
         const re=parseFloat(p.riskEUR||0);
         return '<tr>'+
           '<td>'+isLive+'</td>'+
-          '<td class="cw fw">'+( p.symbol||'\\--')+'</td>'+
+          '<td class="cw fw">'+( p.symbol||'\--')+'</td>'+
           '<td>'+bdType(p.assetType||p.type,p.symbol)+'</td>'+
           '<td>'+bdDir(p.direction)+'</td>'+
           '<td>'+bdVwap(p.vwapPosition||p.vwap_position)+'</td>'+
           '<td>'+bdSess(p.session)+'</td>'+
-          '<td class="cd">'+( (()=>{ if(rp>0&&rp<0.1)return fmtPct(rp); if(re>0)return ((re/50000)*100).toFixed(4)+'%'; return '\\--'; })())+'</td>'+
-          '<td class="cr">'+( re>0?'\EUR'+re.toFixed(0):'\\--')+'</td>'+
+          '<td class="cd">'+( (()=>{ if(rp>0&&rp<0.1)return fmtPct(rp); if(re>0)return ((re/50000)*100).toFixed(4)+'%'; return '\--'; })())+'</td>'+
+          '<td class="cr">'+( re>0?'EUR'+re.toFixed(0):'\--')+'</td>'+
           '<td class="cd">'+fmt(en,5)+'</td>'+
           '<td class="cr">'+fmt(sl,5)+'</td>'+
           '<td class="cg">'+fmt(p.tp,5)+'</td>'+
           '<td class="'+cRR(rrNow)+' fw">'+fmtR(rrNow)+'</td>'+
-          '<td class="'+(peakP>0?'cg fw':'cd')+' fw">'+( peakP>0?'+'+peakP.toFixed(2)+'R':'\\--')+'</td>'+
-          '<td class="'+(pr!=null&&pr<-0.5?'cr fw':pr!=null&&pr<0?'cr':'cd')+' fw">'+( pr!=null?fmtR(pr):'\\--')+'</td>'+
+          '<td class="'+(peakP>0?'cg fw':'cd')+' fw">'+( peakP>0?'+'+peakP.toFixed(2)+'R':'\--')+'</td>'+
+          '<td class="'+(pr!=null&&pr<-0.5?'cr fw':pr!=null&&pr<0?'cr':'cd')+' fw">'+( pr!=null?fmtR(pr):'\--')+'</td>'+
           '<td class="cg">+'+( g.tpRRUsed||1.5).toFixed(2)+'R</td>'+
-          '<td class="'+(p.vwapBandPct>150?'co fw':p.vwapBandPct>100?'co':'cd')+'">'+(p.vwapBandPct!=null?fmtP(p.vwapBandPct):(g.vwapBandPct!=null?fmtP(g.vwapBandPct):'\\--'))+'</td>'+
-          '<td class="cd" style="font-size:8px">'+( p.sessionHigh!=null?fmt(p.sessionHigh,3):'\\--')+'</td>'+
-          '<td class="cd" style="font-size:8px">'+( p.sessionLow!=null?fmt(p.sessionLow,3):'\\--')+'</td>'+
+          '<td class="'+(p.vwapBandPct>150?'co fw':p.vwapBandPct>100?'co':'cd')+'">'+(p.vwapBandPct!=null?fmtP(p.vwapBandPct):(g.vwapBandPct!=null?fmtP(g.vwapBandPct):'\--'))+'</td>'+
+          '<td class="cd" style="font-size:8px">'+( p.sessionHigh!=null?fmt(p.sessionHigh,3):'\--')+'</td>'+
+          '<td class="cd" style="font-size:8px">'+( p.sessionLow!=null?fmt(p.sessionLow,3):'\--')+'</td>'+
           '<td>'+bdKey(p.tradeNumber)+'</td>'+
           '<td class="cb2">'+fmt(cur,5)+'</td>'+
           '<td class="'+(p.unrealizedPnl>=0?'cg':'cr')+' fw">'+fmtE(p.unrealizedPnl)+'</td>'+
-          '<td class="cd">'+( p.lots!=null?p.lots.toFixed(2):'\\--')+'</td>'+
-          '<td class="cd" style="font-size:8px;max-width:120px">'+( p.mt5Comment||p.orderComment||'\\--')+'</td>'+
+          '<td class="cd">'+( p.lots!=null?p.lots.toFixed(2):'\--')+'</td>'+
+          '<td class="cd" style="font-size:8px;max-width:120px">'+( p.mt5Comment||p.orderComment||'\--')+'</td>'+
           '<td class="cd" style="font-size:9px">'+fmtTs(p.openedAt)+'</td>'+
         '</tr>';
       }).join('');
@@ -2752,20 +2752,20 @@ async function loadOverview(){
     if(!_rows.length){dEl.innerHTML=nd(12,'No closed trades yet');}
     else{
       dEl.innerHTML=_rows.slice(0,30).map(d=>{
-        const wr2=d.total?((d.wins/d.total)*100).toFixed(0)+'%':'\\--';
+        const wr2=d.total?((d.wins/d.total)*100).toFixed(0)+'%':'\--';
         const wN=d.peakRRNeg!=null?-(d.peakRRNeg/100):null;
         return '<tr>'+
-          '<td class="cw fw">'+(d.date||'\\--')+'</td>'+
+          '<td class="cw fw">'+(d.date||'\--')+'</td>'+
           '<td class="cb">'+( d.total||0)+'</td>'+
           '<td class="cg">'+( d.wins||0)+'</td>'+
           '<td class="cr">'+( d.losses||0)+'</td>'+
           '<td class="'+(d.total&&d.wins/d.total>=0.6?'cg fw':'cy')+'">'+wr2+'</td>'+
-          '<td class="'+(d.peakRRPos>1?'cg fw':'cg')+'">'+( d.peakRRPos!=null?fmtR(d.peakRRPos):'\\--')+'</td>'+
-          '<td class="cd" style="font-size:9px">'+( d.peakPosTime||'\\--')+'</td>'+
-          '<td class="'+(wN!=null&&wN<-0.5?'cr fw':'cr')+'">'+( wN!=null?fmtR(wN):'\\--')+'</td>'+
-          '<td class="cd" style="font-size:9px">'+( d.peakNegTime||'\\--')+'</td>'+
-          '<td class="'+(d.maxDD!=null&&d.maxDD>-50?'cr fw':'cr')+'">'+( d.maxDD!=null?fmtP(d.maxDD):'\\--')+'</td>'+
-          '<td class="cd">'+( d.lots!=null?d.lots.toFixed(2):'\\--')+'</td>'+
+          '<td class="'+(d.peakRRPos>1?'cg fw':'cg')+'">'+( d.peakRRPos!=null?fmtR(d.peakRRPos):'\--')+'</td>'+
+          '<td class="cd" style="font-size:9px">'+( d.peakPosTime||'\--')+'</td>'+
+          '<td class="'+(wN!=null&&wN<-0.5?'cr fw':'cr')+'">'+( wN!=null?fmtR(wN):'\--')+'</td>'+
+          '<td class="cd" style="font-size:9px">'+( d.peakNegTime||'\--')+'</td>'+
+          '<td class="'+(d.maxDD!=null&&d.maxDD>-50?'cr fw':'cr')+'">'+( d.maxDD!=null?fmtP(d.maxDD):'\--')+'</td>'+
+          '<td class="cd">'+( d.lots!=null?d.lots.toFixed(2):'\--')+'</td>'+
           '<td class="'+cE(d.pnl)+' fw">'+fmtE(d.pnl)+'</td>'+
         '</tr>';
       }).join('');
@@ -2817,7 +2817,7 @@ async function loadOverview(){
       // Start/end markers
       const start = vals[0], end = vals[vals.length-1];
       const diff = end - start;
-      if ($('eq-stats')) $('eq-stats').textContent = '\EUR'+Math.round(start).toLocaleString('nl-BE')+' \-> \EUR'+Math.round(end).toLocaleString('nl-BE')+' ('+(diff>=0?'+':'')+Math.round(diff)+'\EUR)';
+      if ($('eq-stats')) $('eq-stats').textContent = 'EUR'+Math.round(start).toLocaleString('nl-BE')+' -> EUR'+Math.round(end).toLocaleString('nl-BE')+' ('+(diff>=0?'+':'')+Math.round(diff)+'EUR)';
     } catch(e) {}
   })();
 
@@ -2835,7 +2835,7 @@ async function loadOverview(){
                         !t.closedAt?'<span class="bd bd-live">\* Live</span>':bdStop('sl');
         return '<tr>'+
           '<td>'+stopCell+'</td>'+
-          '<td class="cw fw">'+( t.symbol||'\\--')+'</td>'+
+          '<td class="cw fw">'+( t.symbol||'\--')+'</td>'+
           '<td>'+bdType(t.assetType||t.asset_type,t.symbol)+'</td>'+
           '<td>'+bdDir(t.direction)+'</td>'+
           '<td>'+bdVwap(t.vwapPosition||t.vwap_position)+'</td>'+
@@ -2844,14 +2844,14 @@ async function loadOverview(){
           '<td class="cr">'+fmt(t.sl,5)+'</td>'+
           '<td class="cg">'+fmt(t.tp,5)+'</td>'+
           '<td class="cy">'+fmt(t.exitPrice||t.exit_price,5)+'</td>'+
-          '<td class="cd">'+( (()=>{ const rp=t.riskPct||t.risk_pct||null; const re=t.riskEUR||t.risk_eur||null; if(rp!=null&&rp<0.1) return fmtPct(rp); if(re!=null) return ((re/50000)*100).toFixed(4)+'%'; return '\\--'; })())+'</td>'+
-          '<td class="cr">'+( t.riskEUR!=null?'\EUR'+t.riskEUR.toFixed(0):'\\--')+'</td>'+
-          '<td class="'+( (()=>{ if(pnl!=null&&pnl!==0)return cE(pnl); const re=t.riskEUR||t.risk_eur||null; return re?'cr':'cd'; })())+' fw">'+( (()=>{ if(pnl!=null&&pnl!==0)return fmtE(pnl); const stop=gr||cr||''; const re=t.riskEUR||t.risk_eur||null; if(re!=null&&(stop.includes('sl')||stop.includes('SL')||stop==='gap_stop'))return '\~'+fmtE(-re); return pnl!=null?fmtE(pnl):'\\--'; })())+'</td>'+
-          '<td class="cd">'+( t.lots!=null?Number(t.lots).toFixed(2):'\\--')+'</td>'+
-          '<td class="'+(( t.peakRRPos||t.peak_rr_pos||0)>0?'cg fw':'cd')+'">'+((t.peakRRPos||t.peak_rr_pos||0)>0?'+'+Number(t.peakRRPos||t.peak_rr_pos).toFixed(2)+'R':'\\--')+'</td>'+
-          '<td class="'+(( t.peakRRNeg||t.peak_rr_neg||0)>0?'cr fw':'cd')+'">'+((t.peakRRNeg||t.peak_rr_neg||0)>0?fmtR(-(t.peakRRNeg||t.peak_rr_neg)/100):'\\--')+'</td>'+
+          '<td class="cd">'+( (()=>{ const rp=t.riskPct||t.risk_pct||null; const re=t.riskEUR||t.risk_eur||null; if(rp!=null&&rp<0.1) return fmtPct(rp); if(re!=null) return ((re/50000)*100).toFixed(4)+'%'; return '\--'; })())+'</td>'+
+          '<td class="cr">'+( t.riskEUR!=null?'EUR'+t.riskEUR.toFixed(0):'\--')+'</td>'+
+          '<td class="'+( (()=>{ if(pnl!=null&&pnl!==0)return cE(pnl); const re=t.riskEUR||t.risk_eur||null; return re?'cr':'cd'; })())+' fw">'+( (()=>{ if(pnl!=null&&pnl!==0)return fmtE(pnl); const stop=gr||cr||''; const re=t.riskEUR||t.risk_eur||null; if(re!=null&&(stop.includes('sl')||stop.includes('SL')||stop==='gap_stop'))return '\~'+fmtE(-re); return pnl!=null?fmtE(pnl):'\--'; })())+'</td>'+
+          '<td class="cd">'+( t.lots!=null?Number(t.lots).toFixed(2):'\--')+'</td>'+
+          '<td class="'+(( t.peakRRPos||t.peak_rr_pos||0)>0?'cg fw':'cd')+'">'+((t.peakRRPos||t.peak_rr_pos||0)>0?'+'+Number(t.peakRRPos||t.peak_rr_pos).toFixed(2)+'R':'\--')+'</td>'+
+          '<td class="'+(( t.peakRRNeg||t.peak_rr_neg||0)>0?'cr fw':'cd')+'">'+((t.peakRRNeg||t.peak_rr_neg||0)>0?fmtR(-(t.peakRRNeg||t.peak_rr_neg)/100):'\--')+'</td>'+
           '<td>'+bdStop(gr||cr)+'</td>'+
-          '<td class="cd" style="font-size:8px;max-width:120px">'+( t.mt5Comment||t.mt5_comment||'\\--')+'</td>'+
+          '<td class="cd" style="font-size:8px;max-width:120px">'+( t.mt5Comment||t.mt5_comment||'\--')+'</td>'+
           '<td class="cd" style="font-size:9px">'+fmtTs(t.openedAt||t.opened_at)+'</td>'+
           '<td class="cd" style="font-size:9px">'+fmtTs(t.closedAt||t.closed_at)+'</td>'+
         '</tr>';
@@ -2874,7 +2874,7 @@ async function loadSignals(){
   const by=(stats?.byOutcome||[]).reduce((a,o)=>{a[o.outcome]=(o.count||0);return a;},{});
   const total=(stats?.total||0);
   const placed=by['PLACED']||0;
-  const conv=total>0?((placed/total)*100).toFixed(1)+'%':'\\--';
+  const conv=total>0?((placed/total)*100).toFixed(1)+'%':'\--';
   const shadow=(by['NY_DEAD_ZONE']||0)+(by['NY_NIGHT']||0)+(by['ASIA_MORNING']||0)+(by['VWAP_EXHAUSTION']||0)+(by['DUPLICATE_POSITION']||0);
   const realErrors=(stats?.byOutcome||[]).filter(o=>['ERROR','ORDER_NOT_CONFIRMED','TIMEOUT'].includes(o.outcome)).reduce((s,o)=>s+(o.count||0),0);
 
@@ -2905,19 +2905,19 @@ async function loadSignals(){
         const _vm={ny:'NY',london:'LD',asia:'AS'};
         const _ss=_vm[(s.session||'ny').toLowerCase()]||'NY';
         const _vp=(s.vwapPosition||s.vwap_position||'').toUpperCase()==='ABOVE'?'ABV':'BLW';
-        const _whatif=s.symbol?s.symbol.slice(0,7)+' '+_dir2+'-'+_ss+'-'+_vp:'\\--';
+        const _whatif=s.symbol?s.symbol.slice(0,7)+' '+_dir2+'-'+_ss+'-'+_vp:'\--';
         const pid=s.positionId||s.position_id;
         // Determine destination label
         let destCell;
         if(pid){
           const _mt5c=s.orderComment||s.mt5_comment||_whatif;
-          destCell='<span style="background:rgba(63,185,80,.15);color:#3fb950;padding:1px 6px;border-radius:3px;font-size:9px;border:1px solid rgba(63,185,80,.3);font-weight:700">\-> Ghost #'+(s.tradeNumber||pid.slice(-4))+'</span> <span style="color:#6e7681;font-size:8px">'+_mt5c+'</span>';
+          destCell='<span style="background:rgba(63,185,80,.15);color:#3fb950;padding:1px 6px;border-radius:3px;font-size:9px;border:1px solid rgba(63,185,80,.3);font-weight:700">-> Ghost #'+(s.tradeNumber||pid.slice(-4))+'</span> <span style="color:#6e7681;font-size:8px">'+_mt5c+'</span>';
         } else if(outcome==='NY_DEAD_ZONE'||outcome==='NY_NIGHT'||outcome==='ASIA_MORNING'){
-          destCell='<span style="background:rgba(240,136,62,.15);color:#f0883e;padding:1px 6px;border-radius:3px;font-size:9px;border:1px solid rgba(240,136,62,.3);font-weight:700">\-> Shadow TZ</span>';
+          destCell='<span style="background:rgba(240,136,62,.15);color:#f0883e;padding:1px 6px;border-radius:3px;font-size:9px;border:1px solid rgba(240,136,62,.3);font-weight:700">-> Shadow TZ</span>';
         } else if(outcome==='VWAP_EXHAUSTION'){
-          destCell='<span style="background:rgba(188,140,255,.15);color:#bc8cff;padding:1px 6px;border-radius:3px;font-size:9px;border:1px solid rgba(188,140,255,.3);font-weight:700">\-> Shadow VWAP</span>';
+          destCell='<span style="background:rgba(188,140,255,.15);color:#bc8cff;padding:1px 6px;border-radius:3px;font-size:9px;border:1px solid rgba(188,140,255,.3);font-weight:700">-> Shadow VWAP</span>';
         } else if(outcome==='DUPLICATE_POSITION'){
-          destCell='<span style="background:rgba(210,153,34,.15);color:#d29922;padding:1px 6px;border-radius:3px;font-size:9px;border:1px solid rgba(210,153,34,.3);font-weight:700">\-> Shadow DUP</span>';
+          destCell='<span style="background:rgba(210,153,34,.15);color:#d29922;padding:1px 6px;border-radius:3px;font-size:9px;border:1px solid rgba(210,153,34,.3);font-weight:700">-> Shadow DUP</span>';
         } else if(isOoh){
           destCell='<span class="cd" style="font-size:9px">'+_whatif+' (OOH)</span>';
         } else {
@@ -2927,20 +2927,20 @@ async function loadSignals(){
         const rawId='raw-'+Math.random().toString(36).slice(2,8);
         return '<tr class="'+rowCls+'">'+
           '<td class="cd" style="font-size:9px;white-space:nowrap">'+fmtT(s.ts||s.receivedAt||s.received_at)+'</td>'+
-          '<td class="cw fw">'+( s.symbol||'\\--')+'</td>'+
+          '<td class="cw fw">'+( s.symbol||'\--')+'</td>'+
           '<td>'+bdType(s.assetType||s.asset_type,s.symbol)+'</td>'+
           '<td>'+bdDir(s.direction)+'</td>'+
           '<td style="white-space:nowrap">'+bdSess(s.session)+'</td>'+
           '<td>'+bdVwap(s.vwapPosition||s.vwap_position)+'</td>'+
           '<td class="cd" style="font-size:9px">'+fmt(s.entry||s.tvEntry||s.tv_entry,5)+'</td>'+
-          '<td class="'+(s.band_pct>150?'co fw':s.band_pct>100?'co':'cd')+'">'+( s.band_pct!=null?fmtP(s.band_pct):'\\--')+'</td>'+
-          '<td class="cd" style="font-size:8px">'+( s.session_high!=null?fmt(s.session_high,3):'\\--')+'</td>'+
-          '<td class="cd" style="font-size:8px">'+( s.session_low!=null?fmt(s.session_low,3):'\\--')+'</td>'+
-          '<td class="'+(s.bull_breaks>=8?'cg fw':'cd')+'">'+( s.bull_breaks!=null?s.bull_breaks:'\\--')+'</td>'+
+          '<td class="'+(s.band_pct>150?'co fw':s.band_pct>100?'co':'cd')+'">'+( s.band_pct!=null?fmtP(s.band_pct):'\--')+'</td>'+
+          '<td class="cd" style="font-size:8px">'+( s.session_high!=null?fmt(s.session_high,3):'\--')+'</td>'+
+          '<td class="cd" style="font-size:8px">'+( s.session_low!=null?fmt(s.session_low,3):'\--')+'</td>'+
+          '<td class="'+(s.bull_breaks>=8?'cg fw':'cd')+'">'+( s.bull_breaks!=null?s.bull_breaks:'\--')+'</td>'+
           '<td>'+bdKey(s.optimizer_key?.split('_').pop()||1)+'</td>'+
           '<td>'+outcomeBdg(outcome)+'</td>'+
           '<td>'+destCell+'</td>'+
-          '<td class="cd" style="font-size:9px">'+( s.latency_ms!=null?s.latency_ms+'ms':'\\--')+'</td>'+
+          '<td class="cd" style="font-size:9px">'+( s.latency_ms!=null?s.latency_ms+'ms':'\--')+'</td>'+
           '<td></td>'+
         '</tr>';
       }).join('');
@@ -2956,11 +2956,11 @@ async function loadSignals(){
       errBody.innerHTML=errList.slice(0,50).map(e=>{
         return '<tr>'+
           '<td class="cd" style="font-size:9px">'+fmtTs(e.ts||e.receivedAt)+'</td>'+
-          '<td class="cw fw">'+( e.symbol||'\\--')+'</td>'+
+          '<td class="cw fw">'+( e.symbol||'\--')+'</td>'+
           '<td>'+bdDir(e.direction)+'</td>'+
           '<td class="cr">'+( e.outcome||e.error_type||'ERROR')+'</td>'+
-          '<td class="cd" style="font-size:9px">'+( e.reason||e.rejectReason||e.detail||'\\--')+'</td>'+
-          '<td class="cd">'+( e.retried!=null?e.retried:'\\--')+'</td>'+
+          '<td class="cd" style="font-size:9px">'+( e.reason||e.rejectReason||e.detail||'\--')+'</td>'+
+          '<td class="cd">'+( e.retried!=null?e.retried:'\--')+'</td>'+
         '</tr>';
       }).join('');
     }
@@ -2994,8 +2994,8 @@ async function loadGhost(){
   const f2=(id,v,cls)=>{const e=$(id);if(!e)return;e.textContent=v;if(cls)e.className='ksv '+cls;};
   f2('gh-active-cnt',_pos.length,'');
   f2('gh-sl-today',slToday,'cr'+(slToday>0?' fw':''));
-  f2('gh-best-peak',bestP!=null?fmtR(bestP):'\\--','cg fw');
-  f2('gh-avg-peak',_pos.length?fmtR(avgP):'\\--','cy');
+  f2('gh-best-peak',bestP!=null?fmtR(bestP):'\--','cg fw');
+  f2('gh-avg-peak',_pos.length?fmtR(avgP):'\--','cy');
   f2('gh-buy',buyCnt,'cg');f2('gh-sell',sellCnt,'cr');
   f2('gh-tp-est',tpCnt,'cy');f2('gh-fin-cnt',fin.length,'cb2');
   if($('nb-gh'))$('nb-gh').textContent=_pos.length;
@@ -3026,27 +3026,27 @@ async function loadGhost(){
         for(const k in rrMs)allMs[k]=fmtMs(rrMs[k],openTs);
         return '<tr class="'+(g.phantomSLHit?'sl-row':'')+'">'+
           '<td>'+isLive+'</td>'+
-          '<td class="cw fw" style="white-space:nowrap">'+( p.symbol||'\\--')+'</td>'+
-          '<td style="font-size:8px;color:#8b949e;max-width:110px;overflow:hidden;white-space:nowrap" title="'+( p.mt5Comment||p.orderComment||'')+'">'+( p.mt5Comment||p.orderComment||'\\--')+'</td>'+
+          '<td class="cw fw" style="white-space:nowrap">'+( p.symbol||'\--')+'</td>'+
+          '<td style="font-size:8px;color:#8b949e;max-width:110px;overflow:hidden;white-space:nowrap" title="'+( p.mt5Comment||p.orderComment||'')+'">'+( p.mt5Comment||p.orderComment||'\--')+'</td>'+
           '<td>'+bdType(p.assetType||p.type,p.symbol)+'</td>'+
           '<td>'+bdDir(p.direction)+'</td>'+
           '<td>'+bdVwap(p.vwapPosition||p.vwap_position)+'</td>'+
           '<td style="white-space:nowrap">'+bdSess(p.session)+'</td>'+
           '<td>'+bdKey(p.keyCount||g.keyCount||p.tradeNumber||1)+'</td>'+
           '<td class="'+cRR(rrNow)+' fw">'+fmtR(rrNow)+'</td>'+
-          '<td class="'+(peakP>0?'cg fw':'cd')+'">'+( peakP>0?'+'+peakP.toFixed(2)+'R':'\\--')+'</td>'+
-          '<td class="'+(prR!=null&&prR<-0.5?'cr fw':prR!=null?'cr':'cd')+'">'+( prR!=null?fmtR(prR):'\\--')+'</td>'+
+          '<td class="'+(peakP>0?'cg fw':'cd')+'">'+( peakP>0?'+'+peakP.toFixed(2)+'R':'\--')+'</td>'+
+          '<td class="'+(prR!=null&&prR<-0.5?'cr fw':prR!=null?'cr':'cd')+'">'+( prR!=null?fmtR(prR):'\--')+'</td>'+
           '<td class="cg fw">+'+( g.tpRRUsed||1.5).toFixed(2)+'R</td>'+
-          '<td class="'+(( g.vwapBandPct||p.vwapBandPct||0)>150?'co fw':(g.vwapBandPct||p.vwapBandPct||0)>100?'co':'cd')+'">'+((g.vwapBandPct||p.vwapBandPct)!=null?fmtP(g.vwapBandPct||p.vwapBandPct):'\\--')+'</td>'+
-          '<td class="cd" style="font-size:8px">'+( p.sessionHigh!=null?fmt(p.sessionHigh,3):'\\--')+'</td>'+
-          '<td class="cd" style="font-size:8px">'+( p.sessionLow!=null?fmt(p.sessionLow,3):'\\--')+'</td>'+
+          '<td class="'+(( g.vwapBandPct||p.vwapBandPct||0)>150?'co fw':(g.vwapBandPct||p.vwapBandPct||0)>100?'co':'cd')+'">'+((g.vwapBandPct||p.vwapBandPct)!=null?fmtP(g.vwapBandPct||p.vwapBandPct):'\--')+'</td>'+
+          '<td class="cd" style="font-size:8px">'+( p.sessionHigh!=null?fmt(p.sessionHigh,3):'\--')+'</td>'+
+          '<td class="cd" style="font-size:8px">'+( p.sessionLow!=null?fmt(p.sessionLow,3):'\--')+'</td>'+
           msCells(allMs)+
           '<td class="cd" style="font-size:8px">'+fmt(p.tvEntry||g.tvEntry,5)+'</td>'+
           '<td class="cd" style="font-size:8px">'+fmt(en,5)+'</td>'+
           '<td class="cr" style="font-size:8px">'+fmt(sl,5)+'</td>'+
           '<td class="cg" style="font-size:8px">'+fmt(p.tp,5)+'</td>'+
           '<td class="'+(p.unrealizedPnl>=0?'cg':'cr')+' fw">'+fmtE(p.unrealizedPnl)+'</td>'+
-          '<td class="cd">'+( p.lots!=null?p.lots.toFixed(2):'\\--')+'</td>'+
+          '<td class="cd">'+( p.lots!=null?p.lots.toFixed(2):'\--')+'</td>'+
           '<td class="cd" style="font-size:9px">'+fmtTs(p.openedAt||g.openedAt)+'</td>'+
         '</tr>';
       }).join('');
@@ -3056,7 +3056,7 @@ async function loadGhost(){
   // Finalized ghost table
   const fb=$('gh-fin-body');
   if(fb){
-    if(!fin.length){fb.innerHTML=nd(17+MS_COLS,'No finalized ghosts yet \\-- waiting for positions to close');}
+    if(!fin.length){fb.innerHTML=nd(17+MS_COLS,'No finalized ghosts yet \-- waiting for positions to close');}
     else{
       fb.innerHTML=fin.slice(0,500).map((g,i)=>{
         const openTs=g.openedAt||g.opened_at?new Date(g.openedAt||g.opened_at).getTime():null;
@@ -3071,21 +3071,21 @@ async function loadGhost(){
         const prR=peakN>0?-(peakN/100):null;
         return '<tr>'+
           '<td class="cd">'+( i+1)+'</td>'+
-          '<td class="cw fw">'+( g.symbol||'\\--')+'</td>'+
+          '<td class="cw fw">'+( g.symbol||'\--')+'</td>'+
           '<td>'+bdType(g.assetType||g.type,g.symbol)+'</td>'+
           '<td>'+bdSess(g.session)+'</td>'+
           '<td>'+bdDir(g.direction)+'</td>'+
           '<td>'+bdVwap(g.vwapPosition||g.vwap_position)+'</td>'+
           '<td>'+bdStop(g.stopReason||g.stop_reason)+'</td>'+
           '<td class="cg">+'+( g.tpRRUsed||g.tp_rr_used||1.5).toFixed(2)+'R</td>'+
-          '<td class="'+(peakP>0?'cg fw':'cd')+'">'+( peakP>0?'+'+peakP.toFixed(2)+'R':'\\--')+'</td>'+
-          '<td class="'+(prR!=null&&prR<-0.5?'cr fw':'cr')+'">'+( prR!=null?fmtR(prR):'\\--')+'</td>'+
-          '<td class="'+(g.vwapBandPct>150?'co fw':'cd')+'">'+( g.vwapBandPct!=null?fmtP(g.vwapBandPct):'\\--')+'</td>'+
+          '<td class="'+(peakP>0?'cg fw':'cd')+'">'+( peakP>0?'+'+peakP.toFixed(2)+'R':'\--')+'</td>'+
+          '<td class="'+(prR!=null&&prR<-0.5?'cr fw':'cr')+'">'+( prR!=null?fmtR(prR):'\--')+'</td>'+
+          '<td class="'+(g.vwapBandPct>150?'co fw':'cd')+'">'+( g.vwapBandPct!=null?fmtP(g.vwapBandPct):'\--')+'</td>'+
           '<td>'+bdKey(g.keyCount||1)+'</td>'+
-          '<td class="'+cE(pnl)+' fw">'+( pnl!=null?fmtE(pnl):'\\--')+'</td>'+
-          '<td class="cd">'+( g.lots!=null?Number(g.lots).toFixed(2):'\\--')+'</td>'+
-          '<td class="cd" style="font-size:8px;max-width:110px">'+( g.mt5Comment||g.mt5_comment||'\\--')+'</td>'+
-          '<td class="cd" style="font-size:9px">'+( g.optimizerKey||g.optimizer_key||'\\--')+'</td>'+
+          '<td class="'+cE(pnl)+' fw">'+( pnl!=null?fmtE(pnl):'\--')+'</td>'+
+          '<td class="cd">'+( g.lots!=null?Number(g.lots).toFixed(2):'\--')+'</td>'+
+          '<td class="cd" style="font-size:8px;max-width:110px">'+( g.mt5Comment||g.mt5_comment||'\--')+'</td>'+
+          '<td class="cd" style="font-size:9px">'+( g.optimizerKey||g.optimizer_key||'\--')+'</td>'+
           msCells(allMs)+
           '<td class="cd" style="font-size:9px">'+fmtTs(g.openedAt||g.opened_at)+'</td>'+
           '<td class="cd">'+fmtEl(g.openedAt||g.opened_at,g.closedAt||g.closed_at)+'</td>'+
@@ -3120,15 +3120,15 @@ async function loadShadow(){
     const sessOrStop=showStop?bdStop(b.stopReason||b.stop_reason||'sl'):bdSess(b.session||b.sub_session||'ny');
     return '<tr>'+
       '<td>'+bdBlock(b.blockType||b.block_type)+'</td>'+
-      '<td class="cw fw">'+( b.symbol||'\\--')+'</td>'+
+      '<td class="cw fw">'+( b.symbol||'\--')+'</td>'+
       '<td>'+bdType(b.assetType||b.type,b.symbol)+'</td>'+
       '<td>'+bdKey(b.keyCount||b.key_count||1)+'</td>'+
       '<td>'+bdDir(b.direction)+'</td>'+
       '<td>'+bdVwap(b.vwapPosition||b.vwap_position)+'</td>'+
       '<td>'+sessOrStop+'</td>'+
-      '<td class="'+(peakP>0?'cg fw':'cd')+'">'+( peakP>0?fmtR(peakP):'\\--')+'</td>'+
-      '<td class="'+(prR!=null&&prR<-0.5?'cr fw':prR!=null?'cr':'cd')+'">'+( prR!=null?fmtR(prR):'\\--')+'</td>'+
-      '<td class="'+(b.vwapBandPct>150?'co fw':b.vwapBandPct>100?'co':'cd')+'">'+( b.vwapBandPct!=null?fmtP(b.vwapBandPct):'\\--')+'</td>'+
+      '<td class="'+(peakP>0?'cg fw':'cd')+'">'+( peakP>0?fmtR(peakP):'\--')+'</td>'+
+      '<td class="'+(prR!=null&&prR<-0.5?'cr fw':prR!=null?'cr':'cd')+'">'+( prR!=null?fmtR(prR):'\--')+'</td>'+
+      '<td class="'+(b.vwapBandPct>150?'co fw':b.vwapBandPct>100?'co':'cd')+'">'+( b.vwapBandPct!=null?fmtP(b.vwapBandPct):'\--')+'</td>'+
       msCells(allMs)+
       '<td class="cd" style="font-size:8px">'+fmt(b.entry,5)+'</td>'+
       '<td class="cd" style="font-size:9px">'+fmtTs(b.openedAt||b.opened_at)+'</td>'+
@@ -3159,7 +3159,7 @@ async function loadShadow(){
   render('sh-dup-body', du,   9+MS_COLS+2,  'No duplicate blocks');
   // Shadow finalized: DB history only (truly finalized positions)
   // Active timezone blocks still showing as active in other sections
-  render('sh-fin-body', hist, 10+MS_COLS+3, 'No shadow history yet \\-- finalized positions appear here after SL/TP/gap');
+  render('sh-fin-body', hist, 10+MS_COLS+3, 'No shadow history yet \-- finalized positions appear here after SL/TP/gap');
 }
 
 // ==============================================
@@ -3178,19 +3178,19 @@ async function loadEV(){
   const ssb=$('sess-stats-body');
   const sessList=Array.isArray(sessData)?sessData:[];
   if(ssb){
-    if(!sessList.length){ssb.innerHTML=nd(7,'No session data \\-- need finalized ghosts');}
+    if(!sessList.length){ssb.innerHTML=nd(7,'No session data \-- need finalized ghosts');}
     else{
       ssb.innerHTML=sessList.map(s=>{
-        const sessLabel={'ny':'NEW YORK','london':'LONDON','asia':'ASIA'}[s.session]||s.session?.toUpperCase()||'\\--';
+        const sessLabel={'ny':'NEW YORK','london':'LONDON','asia':'ASIA'}[s.session]||s.session?.toUpperCase()||'\--';
         const wrCls=s.winRate>=60?'cg fw':s.winRate>=50?'cy':'cr';
-        const avgTsl=s.avgTimeToSL!=null?(s.avgTimeToSL>=60?Math.floor(s.avgTimeToSL/60)+'h'+(s.avgTimeToSL%60)+'m':s.avgTimeToSL+'m'):'\\--';
+        const avgTsl=s.avgTimeToSL!=null?(s.avgTimeToSL>=60?Math.floor(s.avgTimeToSL/60)+'h'+(s.avgTimeToSL%60)+'m':s.avgTimeToSL+'m'):'\--';
         return '<tr>'+
           '<td class="cw fw" style="white-space:nowrap">'+sessLabel+'</td>'+
           '<td class="cd">'+s.total+'</td>'+
           '<td class="cg">'+s.wins+'</td>'+
           '<td class="'+wrCls+' fw">'+s.winRate+'%</td>'+
-          '<td class="cg">'+( s.avgPeakPos!=null?'+'+s.avgPeakPos.toFixed(3)+'R':'\\--')+'</td>'+
-          '<td class="cr">'+( s.avgPeakNeg!=null?'-'+s.avgPeakNeg.toFixed(1)+'%':'\\--')+'</td>'+
+          '<td class="cg">'+( s.avgPeakPos!=null?'+'+s.avgPeakPos.toFixed(3)+'R':'\--')+'</td>'+
+          '<td class="cr">'+( s.avgPeakNeg!=null?'-'+s.avgPeakNeg.toFixed(1)+'%':'\--')+'</td>'+
           '<td class="cd">'+avgTsl+'</td>'+
         '</tr>';
       }).join('');
@@ -3201,15 +3201,15 @@ async function loadEV(){
   const mpb=$('ms-prob-body');
   const msList=Array.isArray(msData)?msData:[];
   if(mpb){
-    if(!msList.length){mpb.innerHTML=nd(14,'No milestone data \\-- need min 3 finalized ghosts per key');}
+    if(!msList.length){mpb.innerHTML=nd(14,'No milestone data \-- need min 3 finalized ghosts per key');}
     else{
       mpb.innerHTML=msList.slice(0,100).map(m=>{
-        const avgTsl=m.avgTimeToSL!=null?(m.avgTimeToSL>=60?Math.floor(m.avgTimeToSL/60)+'h'+(m.avgTimeToSL%60)+'m':m.avgTimeToSL+'m'):'\\--';
+        const avgTsl=m.avgTimeToSL!=null?(m.avgTimeToSL>=60?Math.floor(m.avgTimeToSL/60)+'h'+(m.avgTimeToSL%60)+'m':m.avgTimeToSL+'m'):'\--';
         const pct=v=>'<td class="'+(v>=70?'cr fw':v>=40?'co':'cd')+'" style="font-size:10px">'+v+'%</td>';
         const pctG=v=>'<td class="'+(v>=70?'cg fw':v>=40?'cy':'cd')+'" style="font-size:10px">'+v+'%</td>';
-        const rec=m.pRecovery!=null?'<td class="'+(m.pRecovery>=50?'cy fw':'cd')+'" style="font-size:10px">'+m.pRecovery+'%</td>':'<td class="cd">\\--</td>';
+        const rec=m.pRecovery!=null?'<td class="'+(m.pRecovery>=50?'cy fw':'cd')+'" style="font-size:10px">'+m.pRecovery+'%</td>':'<td class="cd">\--</td>';
         return '<tr>'+
-          '<td class="cw" style="font-size:9px">'+( m.optimizerKey||'\\--')+'</td>'+
+          '<td class="cw" style="font-size:9px">'+( m.optimizerKey||'\--')+'</td>'+
           '<td class="cd">'+m.total+'</td>'+
           pct(m.pNeg01)+pct(m.pNeg03)+pct(m.pNeg05)+pct(m.pNeg08)+
           '<td class="'+(m.pNeg10>=70?'cr fw':m.pNeg10>=40?'co':'cd')+'" style="font-size:10px;border-right:1px solid rgba(139,148,158,.2)">'+m.pNeg10+'%</td>'+
@@ -3231,14 +3231,14 @@ async function loadEV(){
         const missedEst=Math.round((w.wouldTP*(1.5*riskPerTrade))-(w.wouldSL*riskPerTrade));
         return '<tr>'+
           '<td><span class="bd bd-block" style="background:rgba(240,136,62,.15);color:#f0883e;padding:1px 6px;border-radius:3px;font-size:9px">'+
-            (w.blockType?.replace('_',' ')||'\\--')+'</span></td>'+
+            (w.blockType?.replace('_',' ')||'\--')+'</span></td>'+
           '<td class="cd">'+w.total+'</td>'+
           '<td class="cg fw">'+w.wouldTP+'</td>'+
           '<td class="'+(w.tpRate>=50?'cg fw':'cy')+'" >'+w.tpRate+'%</td>'+
           '<td class="cr">'+w.wouldSL+'</td>'+
           '<td class="'+(w.slRate>=50?'cr fw':'co')+'">'+w.slRate+'%</td>'+
-          '<td class="cg">'+( w.avgPeakPos!=null?'+'+w.avgPeakPos.toFixed(3)+'R':'\\--')+'</td>'+
-          '<td class="cr">'+( w.avgPeakNeg!=null?'-'+w.avgPeakNeg.toFixed(1)+'%':'\\--')+'</td>'+
+          '<td class="cg">'+( w.avgPeakPos!=null?'+'+w.avgPeakPos.toFixed(3)+'R':'\--')+'</td>'+
+          '<td class="cr">'+( w.avgPeakNeg!=null?'-'+w.avgPeakNeg.toFixed(1)+'%':'\--')+'</td>'+
           '<td class="'+(missedEst>=0?'cg':'cr')+' fw">'+( missedEst>=0?'+':'')+fmtE(missedEst)+'</td>'+
         '</tr>';
       }).join('');
@@ -3247,13 +3247,13 @@ async function loadEV(){
   const evBody=$('ev-body');
   const evList=Array.isArray(evData)?evData:[];
   if(evBody){
-    if(!evList.length){evBody.innerHTML=nd(16,'No EV data yet \\-- need min 5 finalized ghosts per combo');}
+    if(!evList.length){evBody.innerHTML=nd(16,'No EV data yet \-- need min 5 finalized ghosts per combo');}
     else{
       evBody.innerHTML=evList.map(c=>{
         const cfg=tpCfg?.[c.optimizerKey||c.optimizer_key];
         const ev=c.evScore||c.ev_score||0;
         return '<tr>'+
-          '<td class="cw fw">'+( c.symbol||'\\--')+'</td>'+
+          '<td class="cw fw">'+( c.symbol||'\--')+'</td>'+
           '<td>'+bdType(c.assetType||c.type,c.symbol)+'</td>'+
           '<td>'+bdSess(c.session)+'</td>'+
           '<td>'+bdDir(c.direction)+'</td>'+
@@ -3261,14 +3261,14 @@ async function loadEV(){
           '<td>'+bdKey(c.keyMax||1)+'</td>'+
           '<td class="cd">'+( c.n||c.total||0)+'</td>'+
           '<td class="cd">'+( c.wins||0)+'/'+( c.n||0)+'</td>'+
-          '<td class="'+(c.winPct>=60?'cg fw':'cy')+'">'+( c.winPct!=null?c.winPct.toFixed(1)+'%':'\\--')+'</td>'+
-          '<td class="'+(ev>=0.5?'cg fw':ev>=0?'cg':'cr')+' fw">'+( c.evScore!=null?c.evScore.toFixed(3):'\\--')+'</td>'+
-          '<td class="cg">'+( c.bestTP!=null?'+'+c.bestTP.toFixed(2)+'R':'\\--')+'</td>'+
+          '<td class="'+(c.winPct>=60?'cg fw':'cy')+'">'+( c.winPct!=null?c.winPct.toFixed(1)+'%':'\--')+'</td>'+
+          '<td class="'+(ev>=0.5?'cg fw':ev>=0?'cg':'cr')+' fw">'+( c.evScore!=null?c.evScore.toFixed(3):'\--')+'</td>'+
+          '<td class="cg">'+( c.bestTP!=null?'+'+c.bestTP.toFixed(2)+'R':'\--')+'</td>'+
           '<td class="cd" style="font-size:9px">'+( cfg?.status||'Need data 0/5')+'</td>'+
-          '<td class="'+(cfg?.lockedRR?'cg fw':'cd')+'">'+( cfg?.lockedRR?'+'+cfg.lockedRR.toFixed(2)+'R':'\\--')+'</td>'+
-          '<td class="cd">'+( c.avgTimeToSL!=null?c.avgTimeToSL+'m':'\\--')+'</td>'+
+          '<td class="'+(cfg?.lockedRR?'cg fw':'cd')+'">'+( cfg?.lockedRR?'+'+cfg.lockedRR.toFixed(2)+'R':'\--')+'</td>'+
+          '<td class="cd">'+( c.avgTimeToSL!=null?c.avgTimeToSL+'m':'\--')+'</td>'+
           '<td class="cd">x'+( c.riskMult||1).toFixed(2)+'</td>'+
-          '<td class="'+cE(c.totalPnl||c.total_pnl)+' fw">'+( c.totalPnl!=null?fmtE(c.totalPnl):'\\--')+'</td>'+
+          '<td class="'+cE(c.totalPnl||c.total_pnl)+' fw">'+( c.totalPnl!=null?fmtE(c.totalPnl):'\--')+'</td>'+
         '</tr>';
       }).join('');
     }
@@ -3297,8 +3297,8 @@ async function loadHeader(){
   const _ba=Array.isArray(blockedA)?blockedA:[];
   const _finCount=_gh.filter(g=>g.stopReason||g.stop_reason||g.closedAt||g.closed_at).length;
   if(perf){
-    const _cs='\EUR';
-    if($('h-bal'))$('h-bal').textContent=perf.mt5Balance?'$'+Math.round(perf.mt5Balance).toLocaleString():'\EUR'+(Math.round(perf.balance||50000)).toLocaleString();
+    const _cs='EUR';
+    if($('h-bal'))$('h-bal').textContent=perf.mt5Balance?'$'+Math.round(perf.mt5Balance).toLocaleString():'EUR'+(Math.round(perf.balance||50000)).toLocaleString();
     const rp=perf.realizedPnl||0;const up=perf.unrealizedPnl||0;
     if($('h-rpnl')){$('h-rpnl').textContent=(rp>=0?'+':'')+_cs+Math.round(Math.abs(rp));$('h-rpnl').className='hkv cg';}
     if($('h-upnl')){$('h-upnl').textContent=(up>=0?'+':'')+_cs+Math.round(Math.abs(up));$('h-upnl').className='hkv '+(up>=0?'cg':'cr');}
@@ -3404,7 +3404,7 @@ async function initBackground() {
     for (const gs of states) {
       if (openPositions.has(gs.positionId)) continue;
       if (!gs.direction || !gs.entry || !gs.sl) {
-        console.warn(`[DB] Skipping incomplete ghost state ${gs.positionId} \\-- missing direction/entry/sl`);
+        console.warn(`[DB] Skipping incomplete ghost state ${gs.positionId} \-- missing direction/entry/sl`);
         continue;
       }
       // v14.0: Preserve phantomSLHit/stopReason from ghost_state (don't reset on restart)
@@ -3436,7 +3436,7 @@ async function initBackground() {
     }
     console.log(`[DB] Restored ${openPositions.size} positions from ghost_state`);
     // Also immediately sync with MT5 to adopt any positions not in ghost_state
-    // Don't wait \\-- this runs in background
+    // Don't wait \-- this runs in background
     setTimeout(async () => {
       try {
         const live = await getPositions();
@@ -3452,7 +3452,7 @@ async function initBackground() {
         console.log(`[Startup] Total open positions: ${openPositions.size}`);
       } catch(e) { console.error('[Startup] MT5 adopt error:', e.message); }
     }, 8000); // wait 8s for MetaAPI to fully connect + deploy account
-    // Second adoption attempt after 20s \\-- catches positions missed in first attempt
+    // Second adoption attempt after 20s \-- catches positions missed in first attempt
     setTimeout(async () => {
       try {
         const live2 = await getPositions();
@@ -3502,7 +3502,7 @@ async function initBackground() {
         }
       }
       if (adopted > 0) console.log(`[DB] Adopted ${adopted} MT5 positions not found in ghost_state`);
-      else console.log(`[DB] All MT5 positions already in ghost_state \\-- no adoption needed`);
+      else console.log(`[DB] All MT5 positions already in ghost_state \-- no adoption needed`);
     } catch (e) { console.warn(`[DB] MT5 adoption check failed: ${e.message}`); }
   }
 
@@ -3511,19 +3511,19 @@ async function initBackground() {
 
   // Mark DB as ready
   dbReady = true;
-  console.log("[PRONTO-AI] ✅ DB ready \\-- all systems operational");
+  console.log("[PRONTO-AI] ✅ DB ready \-- all systems operational");
 
   // MetaAPI connectivity check + auto-deploy
   if (META_API_TOKEN && META_ACCOUNT) {
-    console.log(`[MetaAPI] Checking connectivity \\-- account ${META_ACCOUNT.slice(0,8)}...`);
+    console.log(`[MetaAPI] Checking connectivity \-- account ${META_ACCOUNT.slice(0,8)}...`);
     try {
-      // Step 1: Try to deploy the account (idempotent \\-- safe to call even if already deployed)
+      // Step 1: Try to deploy the account (idempotent \-- safe to call even if already deployed)
       try {
         await metaFetch(`/users/current/accounts/${META_ACCOUNT}/deploy`, "POST");
-        console.log("[MetaAPI] Deploy request sent \\-- waiting 5s for account to come online...");
+        console.log("[MetaAPI] Deploy request sent \-- waiting 5s for account to come online...");
         await new Promise(r => setTimeout(r, 5000));
       } catch (deployErr) {
-        // Deploy may fail if already deployed \\-- that's fine
+        // Deploy may fail if already deployed \-- that's fine
         console.log(`[MetaAPI] Deploy note: ${deployErr.message.slice(0, 80)}`);
       }
 
@@ -3536,13 +3536,13 @@ async function initBackground() {
         latestEquity = parseFloat(acct.equity ?? acct.balance ?? 50000);
         _acctCache = acct; _acctCacheTs = Date.now();
         latestAccountCurrency = acct.currency ?? 'USD';
-        console.log(`[MetaAPI] ✅ Connected \\-- balance: ${acct.balance} ${acct.currency} (display currency: ${latestAccountCurrency})`);
+        console.log(`[MetaAPI] ✅ Connected \-- balance: ${acct.balance} ${acct.currency} (display currency: ${latestAccountCurrency})`);
       } else {
-        console.warn("[MetaAPI] ⚠️ Response empty \\-- account may still be deploying");
+        console.warn("[MetaAPI] ⚠️ Response empty \-- account may still be deploying");
       }
     } catch (e) {
       console.error(`[MetaAPI] ❌ Connection failed: ${e.message}`);
-      // If 404: wrong region URL \\-- log helpful message
+      // If 404: wrong region URL \-- log helpful message
       if (e.message.includes("404")) {
         console.error("[MetaAPI] ❌ 404 = wrong region URL. Check META_BASE in Railway Variables.");
         console.error("[MetaAPI] Possible URLs: london / new-york / singapore / us-east");
@@ -3550,13 +3550,13 @@ async function initBackground() {
       recordError(`MetaAPI startup check: ${e.message}`);
     }
   } else {
-    console.warn("[MetaAPI] ⚠️ META_API_TOKEN or META_ACCOUNT not set \\-- MetaAPI disabled");
+    console.warn("[MetaAPI] ⚠️ META_API_TOKEN or META_ACCOUNT not set \-- MetaAPI disabled");
   }
 
   // Start cron jobs
   cron.schedule("*/10 * * * * *", syncPositions); // 10s for responsive P&L + milestones
 
-  // ── Auto-backfill realized P&L for closed trades with NULL/\EUR0 ────
+  // ── Auto-backfill realized P&L for closed trades with NULL/EUR0 ────
   // Runs once after startup, non-blocking
   setTimeout(async () => {
     try {
@@ -3605,7 +3605,7 @@ async function initBackground() {
           await new Promise(r => setTimeout(r, 200)); // rate limit
         } catch (e) { /* skip this trade */ }
       }
-      console.log(`[Backfill] Done \\-- updated ${updated}/${nullTrades.rows.length} trades`);
+      console.log(`[Backfill] Done \-- updated ${updated}/${nullTrades.rows.length} trades`);
     } catch (e) {
       console.warn('[Backfill] Error:', e.message);
     }
