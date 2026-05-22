@@ -788,6 +788,7 @@ async function initDB() {
   await safeAlter(`ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS mt5_symbol       TEXT`);
   await safeAlter(`ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS type             TEXT`);
   await safeAlter(`ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS sub_session      TEXT`);
+  await safeAlter(`ALTER TABLE ghost_trades ADD COLUMN IF NOT EXISTS mt5_comment     TEXT`);
   // ghost_state: same new fields
   await safeAlter(`ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS sl_hit_at       TIMESTAMPTZ`);
   await safeAlter(`ALTER TABLE ghost_state ADD COLUMN IF NOT EXISTS key_count        INTEGER DEFAULT 1`);
@@ -1052,8 +1053,7 @@ async function loadGhostTrades(optimizerKey = null, limitRows = 200) {
         CAST(lots            AS FLOAT) AS lots,
         vwap_band_pct        AS "vwapBandPct",
         opened_at            AS "openedAt",
-        closed_at            AS "closedAt",
-        mt5_comment          AS "mt5Comment"
+        closed_at            AS "closedAt"
       FROM ghost_trades
       ${where}
       ORDER BY closed_at DESC
@@ -1407,7 +1407,7 @@ async function loadSignalStats({ since = null, until = null } = {}) {
       pool.query(`
         SELECT reject_reason,
                symbol,
-               ct.direction,
+               direction,
                COUNT(*) AS cnt
         FROM signal_log
         WHERE reject_reason IS NOT NULL AND reject_reason != ''
