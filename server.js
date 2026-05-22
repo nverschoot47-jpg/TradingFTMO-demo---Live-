@@ -399,8 +399,18 @@ async function closePosition(positionId, reason = "manual", pnl = null) {
       : reason === 'manual' ? 'sl'  // fallback: manual close treated as SL
       : reason;
     ghost.stopReason = _finalGhostStop;
+    // For gap stops: price jumped past SL - record all ADV milestones as triggered
+    if (_finalGhostStop === 'gap_stop' && ghost.rrMilestones) {
+      const _now = Date.now();
+      for (const _rv of [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]) {
+        const _k = '-' + _rv.toFixed(1);
+        if (!ghost.rrMilestones[_k]) ghost.rrMilestones[_k] = _now;
+      }
+    }
     ghost.realizedPnlEUR = realPnl ?? null;
     ghost.lots           = pos.lots ?? null;
+    ghost.mt5Comment     = pos.orderComment ?? pos.mt5Comment ?? pos.comment ?? null;
+    ghost.vwapBandPct    = pos.vwapBandPct ?? ghost.vwapBandPct ?? null;
     await db.saveGhostTrade({ ...ghost, maxRRBeforeSL: ghost.maxRR }).catch(e => recordError(e.message));
     db.computeAndSaveGhostComboAnalysis(ghost.optimizerKey).catch(() => {});
     // v14.2: Check if this ghost pushed us over the TP lock threshold
@@ -572,14 +582,21 @@ async function adoptPosition(lp) {
   if (liveTP)    tp    = liveTP;
   if (liveEntry) entry = liveEntry;
 
-  const assetTypeA = symInfo?.type ?? 'forex';
+  // Always resolve assetType for adopted positions - critical for risk calculation
+  const _resolvedType = symInfo?.type ?? (
+    // Fallback: detect by symbol name pattern
+    /USD$|EUR$|GBP$|JPY$|CHF$|CAD$|AUD$|NZD$/.test(symbol) ? 'forex' :
+    /US30|NAS100|DE30|UK100|GER40|SPX|DAX|FTSE|cash$/.test(symbol) ? 'index' :
+    /XAUUSD|XAGUSD|OIL|GAS|WHEAT|CORN/.test(symbol) ? 'commodity' : 'forex'
+  );
+  const assetTypeA = _resolvedType;
   const slDistA = Math.abs(entry - sl);
   let riskEURAdopted = null;
   if (lots > 0 && slDistA > 0) {
-    if (assetTypeA === 'forex')     riskEURAdopted = lots * 100000 * slDistA;
-    else if (assetTypeA === 'index')riskEURAdopted = lots * slDistA;
-    else if (assetTypeA === 'stock')riskEURAdopted = lots * slDistA; // 1 share × price_move = EUR
-    else                            riskEURAdopted = lots * 100 * slDistA;
+    if (assetTypeA === 'index')     riskEURAdopted = lots * slDistA;  // index: 1 lot = 1 unit, P&L = lots × points
+    else if (assetTypeA === 'stock')riskEURAdopted = lots * slDistA;  // stock CFD: 1 lot = 1 share
+    else if (assetTypeA === 'commodity') riskEURAdopted = lots * slDistA * 100;
+    else                            riskEURAdopted = lots * 100000 * slDistA; // forex default
     riskEURAdopted = parseFloat(riskEURAdopted.toFixed(2));
   }
   const equityA  = latestEquity || 50000;
@@ -1434,7 +1451,8 @@ app.post("/webhook", async (req, res) => {
   //   Difference = slippage × slBuf (small, expected)
   const slDistTV    = tvEntry ? parseFloat((slPct * slBuf * tvEntry).toFixed(6)) : null;
   const slDist      = parseFloat((slPct * slBuf * execPrice).toFixed(6));
-  const slPctFinal  = parseFloat((slDist / execPrice * 100).toFixed(4)); // actual % on MT5
+  // slPctFinal: cap at 50% to prevent absurd values for indices (US30 at 50000 has tiny %)  
+  const slPctFinal  = parseFloat(Math.min(50, (slDist / execPrice * 100)).toFixed(4)); // actual % on MT5
 
   console.log(`[SL-CALC] ${symbol} ${direction.toUpperCase()}`
     + ` | TV entry=${tvEntry} sl_pct=${(slPct*100).toFixed(3)}% buf=${slBuf}x`
@@ -1696,6 +1714,9 @@ app.get("/api/blocked-ghosts/active", (req, res) => {
 apiGet("/api/blocked-ghosts/history", r  => db.loadBlockedGhostHistory(
   r.query.blockType ?? 'NY_DEAD_ZONE', r.query.from ?? null, r.query.to ?? null), []);
 apiGet("/api/ghost-combo-analysis",r  => db.loadGhostComboAnalysis(r.query.key??null), []);
+apiGet("/api/session-stats",       () => db.loadSessionStats(),                               []);
+apiGet("/api/milestone-probability",r => db.loadMilestoneProbability(r.query.key??null),      []);
+apiGet("/api/shadow-whatif",       () => db.loadShadowWhatIfStats(),                          {summary:[],details:[]});
 apiGet("/api/shadow-analysis",     () => db.loadAllShadowAnalysis(),           []);
 apiGet("/api/shadow-winners",      () => db.loadShadowWinners(),               {});
 apiGet("/api/mae-stats",           r  => db.loadMAEStats(r.query.since??null), []);
@@ -1722,6 +1743,9 @@ app.get("/api/open-positions", (req, res) => {
       session: pos.session, vwapPosition: pos.vwapPosition, optimizerKey: pos.optimizerKey,
       entry: pos.entry, sl: pos.sl, tp: pos.tp, lots: lotsOut,
       riskPct: pos.riskPct, riskEUR: pos.riskEUR, vwapBandPct: pos.vwapBandPct ?? null,
+      sessionHigh: pos.sessionHigh ?? pos.session_high ?? null,
+      sessionLow:  pos.sessionLow  ?? pos.session_low  ?? null,
+      mt5Comment:  pos.orderComment ?? pos.mt5Comment ?? pos.comment ?? null,
       slDistTV: pos.slDistTV ?? null, slDist: pos.slDist ?? null, slPctFinal: pos.slPctFinal ?? null,
       slMultiplier: pos.slMultiplier ?? null, tvEntry: pos.tvEntry ?? null,
       openedAt: pos.openedAt,
@@ -2085,6 +2109,15 @@ return `<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- Equity Curve Chart (Fix 10) -->
+  <div class="card" style="padding:12px 12px 8px">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+      <span style="font-size:11px;font-weight:600;color:#e6edf3">📈 Equity Curve</span>
+      <span id="eq-stats" style="font-size:9px;color:#8b949e">loading…</span>
+    </div>
+    <canvas id="equity-chart" style="width:100%;height:80px;display:block"></canvas>
+  </div>
+
   <!-- Open Positions Performance -->
   <div class="card">
     <div class="chdr">
@@ -2119,33 +2152,16 @@ return `<!DOCTYPE html>
           <th style="color:#3fb950">Peak+</th>
           <th style="color:#f85149">Peak−</th>
           <th>TP Set</th>
-          <th>Band%</th><th>#</th>
+          <th>Band%</th><th>S.High</th><th>S.Low</th><th>#</th>
           <th>Curr.Price</th><th>Unrealized</th><th>Lots</th>
           <th>MT5 Comment</th><th>Opened</th>
         </tr></thead>
-        <tbody id="ov-open-body"><tr><td colspan="22" class="nd">⏳ Loading…</td></tr></tbody>
+        <tbody id="ov-open-body"><tr><td colspan="24" class="nd">⏳ Loading…</td></tr></tbody>
       </table>
     </div>
   </div>
 
-  <!-- Closed Trades Daily Log -->
-  <div class="card">
-    <div class="chdr">
-      <div class="ctitle"><div class="dot y"></div>Closed Trades — Daily Log</div>
-      <div class="cm">per day · peak+/− · DD%</div>
-    </div>
-    <div class="tw">
-      <table>
-        <thead><tr>
-          <th>Date</th><th>Open</th><th>Win</th><th>Loss</th><th>WR</th>
-          <th style="color:#3fb950">Peak+RR</th><th>Time</th>
-          <th style="color:#f85149">Peak−RR</th><th>Time</th>
-          <th style="color:#f85149">Max DD%</th><th>Lots</th><th>P&amp;L</th>
-        </tr></thead>
-        <tbody id="ov-daily"><tr><td colspan="12" class="nd">⏳ Loading…</td></tr></tbody>
-      </table>
-    </div>
-  </div>
+  <!-- Daily Log removed by user request -->
 
   <!-- Closed Trades Full Table -->
   <div class="card">
@@ -2160,10 +2176,10 @@ return `<!DOCTYPE html>
           <th>Entry</th><th>SL</th><th>TP</th><th>Exit</th>
           <th>Risk%</th><th>Risk€</th>
           <th>Realized €</th><th>Lots</th>
-          <th>Ghost</th><th>MT5 Comment</th>
+          <th style="color:#3fb950">Peak+RR</th><th style="color:#f85149">Peak−RR</th><th>Ghost</th><th>MT5 Comment</th>
           <th>Opened</th><th>Closed</th>
         </tr></thead>
-        <tbody id="ov-trades"><tr><td colspan="18" class="nd">⏳ Loading…</td></tr></tbody>
+        <tbody id="ov-trades"><tr><td colspan="20" class="nd">⏳ Loading…</td></tr></tbody>
       </table>
     </div>
   </div>
@@ -2394,21 +2410,64 @@ return `<!DOCTYPE html>
 
 <!-- ══════════ EV + OPTIMIZER ══════════ -->
 <div class="pg" id="p-ev">
+  <!-- Session Win Rate -->
   <div class="card">
-    <div class="chdr"><div class="ctitle"><div class="dot p"></div>EV TP Optimizer — min 5 ghosts per combo</div></div>
-    <div class="tw">
-      <table>
-        <thead><tr>
-          <th>Symbol</th><th>Type</th><th>Session</th><th>Dir</th><th>VWAP</th>
-          <th>#Key Max</th><th>#Ghosts</th><th>Win/In</th><th>Win%</th>
-          <th>EV Score</th><th>Best TP</th><th>TP Status</th><th>TP Lock</th>
-          <th>Avg T-SL</th><th>Risk Mult</th><th>P&amp;L €</th>
-        </tr></thead>
-        <tbody id="ev-body"><tr><td colspan="16" class="nd">⏳ Loading…</td></tr></tbody>
-      </table>
-    </div>
+    <div class="chdr"><div class="ctitle"><div class="dot g"></div>Win Rate per Session</div><div class="cm">based on finalized ghosts</div></div>
+    <div class="tw"><table>
+      <thead><tr>
+        <th>Session</th><th>Ghosts</th><th>Would TP</th><th>Win%</th>
+        <th style="color:#3fb950">Avg Peak+</th><th style="color:#f85149">Avg Peak−%</th><th>Avg T→SL</th>
+      </tr></thead>
+      <tbody id="sess-stats-body"><tr><td colspan="7" class="nd">⏳ Loading…</td></tr></tbody>
+    </table></div>
   </div>
-</div>
+
+  <!-- Milestone Probability -->
+  <div class="card">
+    <div class="chdr"><div class="ctitle"><div class="dot y"></div>Milestone Probability per Key</div><div class="cm">% chance of reaching each RR level · min 3 ghosts</div></div>
+    <div class="tw"><table style="min-width:900px">
+      <thead><tr>
+        <th>Key</th><th>#</th>
+        <th style="color:#f85149">-0.1R</th><th style="color:#f85149">-0.3R</th>
+        <th style="color:#f85149">-0.5R</th><th style="color:#f85149">-0.8R</th>
+        <th style="color:#f85149;border-right:1px solid rgba(139,148,158,.2)">-1.0R</th>
+        <th style="color:#3fb950">+0.3R</th><th style="color:#3fb950">+0.5R</th>
+        <th style="color:#3fb950">+0.8R</th><th style="color:#3fb950">+1.0R</th>
+        <th style="color:#3fb950">+1.5R</th>
+        <th style="color:#d29922">Recovery</th><th>Avg T→SL</th>
+      </tr></thead>
+      <tbody id="ms-prob-body"><tr><td colspan="14" class="nd">⏳ Loading…</td></tr></tbody>
+    </table></div>
+  </div>
+
+  <!-- Shadow What-If -->
+  <div class="card">
+    <div class="chdr"><div class="ctitle"><div class="dot o"></div>Shadow → Ghost "What If"</div><div class="cm">if blocked signals were placed — peak tracking from shadow</div></div>
+    <div class="tw"><table>
+      <thead><tr>
+        <th>Block Type</th><th>Total</th>
+        <th style="color:#3fb950">Would TP (≥1.5R)</th><th>TP%</th>
+        <th style="color:#f85149">Would SL (≥100%)</th><th>SL%</th>
+        <th style="color:#3fb950">Avg Peak+</th><th style="color:#f85149">Avg Peak−%</th>
+        <th style="color:#388bfd">Est. Missed €</th>
+      </tr></thead>
+      <tbody id="shadow-whatif-body"><tr><td colspan="9" class="nd">⏳ Loading…</td></tr></tbody>
+    </table></div>
+  </div>
+
+  <!-- EV Optimizer -->
+  <div class="card">
+    <div class="chdr"><div class="ctitle"><div class="dot p"></div>EV TP Optimizer — per Optimizer Key</div><div class="cm">min 5 ghosts for reliable stats</div></div>
+    <div class="tw"><table>
+      <thead><tr>
+        <th>Symbol</th><th>Type</th><th>Session</th><th>Dir</th><th>VWAP</th>
+        <th>#Ghosts</th><th>Win%</th><th>EV Score</th>
+        <th style="color:#3fb950">Avg Peak+</th><th style="color:#f85149">Avg Peak−</th>
+        <th>Avg T-SL</th><th>Best TP</th><th>TP Lock</th><th>Risk×</th><th>P&amp;L €</th>
+      </tr></thead>
+      <tbody id="ev-body"><tr><td colspan="15" class="nd">⏳ Loading…</td></tr></tbody>
+    </table></div>
+  </div
 
 <script>
 'use strict';
@@ -2451,8 +2510,8 @@ const nd = (cols,msg='No data') => '<tr><td colspan="'+cols+'" class="nd">'+msg+
 // Client-side symbol type catalog
 const STYPE={
   forex:['EURUSD','GBPUSD','AUDUSD','USDCAD','USDCHF','USDJPY','NZDUSD','EURGBP','EURJPY','GBPJPY','AUDJPY','CADJPY','CHFJPY','EURAUD','EURCAD','EURCHF','EURNZD','GBPAUD','GBPCAD','GBPCHF','GBPNZD','AUDCAD','AUDCHF','AUDNZD','CADCHF','NZDCAD','NZDCHF','NZDJPY','XAUUSD','XAGUSD'],
-  stock:['AAPL','MSFT','GOOGL','GOOG','AMZN','META','TSLA','NVDA','AMD','INTC','CSCO','ORCL','IBM','QCOM','TXN','AVGO','MU','JPM','BAC','WFC','GS','MS','C','UNH','JNJ','PFE','ABBV','MRK','BMY','LLY','AMGN','GILD','CVX','XOM','COP','EOG','KO','PEP','MCD','SBUX','YUM','WMT','TGT','COST','HD','DIS','NFLX','PARA','BA','LMT','RTX','NOC','GD','GE','HON','MMM','AZN','MSTR','KO','INTC','V','MA','NFLX','AMD','BA','CSCO','SBUX','WMT','LMT','QCOM','IBM','MSTR','MCD','GOOGL','DIS','META','TSLA','AAPL','AMZN','AZN','JNJ','MSTR','AVGO','LMT','INTC','QCOM','AZN','V','MA','MSTR','JNJ','NVDA','AMD','BA','IBM','KO','WMT','LMT','MCD','NFLX','AZN','CSCO','INTC','QCOM','SBUX','AMZN','DIS','META','MSFT','TSLA','AAPL','GOOGL','AVGO','JNJ','KO','WMT','AZN','GME','AMC','PLTR','RIVN','LCID','SOFI','BB','NOK','SPCE','NIO','XPEV','LI','BIDU','PDD','BABA','JD','SE','GRAB','COIN','HOOD','RBLX','U','PATH','AI','SNOW','DDOG','NET','CRWD','ZS','OKTA','MDB','CFLT','GTLB','BILL','PCTY','PAYC','HUBS','TEAM','ZI','RNG','FROG','ESTC','SUMO','BIGC','BRZE','TOST','DLO','MGNI','TTD','PUBM','APPS','IRBT','SQ','PYPL','AFRM','UPST','SOFI','OPEN','OPENDOOR','LMND','ROOT','METROMILE','HIPPO','DOMA','PAYO','GH','ILMN','EDIT','NTLA','BEAM','CRSP','FATE','SANA','AGEN','RCKT','ARVN','ARWR','IDYA','IMVT','NKTR','ALNY','BMRN','JAZZ','RARE','ACAD','SGEN','EXAS','NTRA','IOVA','MRSN','FATE','VERV','TALS','DNLI','KYMR'],
-  index:['SPX500','US500','US30','NAS100','US100','DE30','GER40','UK100','JP225','AUS200','NAS100USD','US30USD','UK100GBP','DE30EUR','GER40EUR','USTEC','SPX','DAX','FTSE','CAC40','STOXX50'],
+  stock:['AAPL','MSFT','GOOGL','GOOG','AMZN','META','TSLA','ZM','BRKB','ARM','NKE','ASML','JPM','GE','SNOW','PLTR','GS','MS','C','WFC','BAC','NVDA','AMD','INTC','CSCO','ORCL','IBM','QCOM','TXN','AVGO','MU','JPM','BAC','WFC','GS','MS','C','UNH','JNJ','PFE','ABBV','MRK','BMY','LLY','AMGN','GILD','CVX','XOM','COP','EOG','KO','PEP','MCD','SBUX','YUM','WMT','TGT','COST','HD','DIS','NFLX','PARA','BA','LMT','RTX','NOC','GD','GE','HON','MMM','AZN','MSTR','KO','INTC','V','MA','NFLX','AMD','BA','CSCO','SBUX','WMT','LMT','QCOM','IBM','MSTR','MCD','GOOGL','DIS','META','TSLA','AAPL','AMZN','AZN','JNJ','MSTR','AVGO','LMT','INTC','QCOM','AZN','V','MA','MSTR','JNJ','NVDA','AMD','BA','IBM','KO','WMT','LMT','MCD','NFLX','AZN','CSCO','INTC','QCOM','SBUX','AMZN','DIS','META','MSFT','TSLA','AAPL','GOOGL','AVGO','JNJ','KO','WMT','AZN','GME','AMC','PLTR','RIVN','LCID','SOFI','BB','NOK','SPCE','NIO','XPEV','LI','BIDU','PDD','BABA','JD','SE','GRAB','COIN','HOOD','RBLX','U','PATH','AI','SNOW','DDOG','NET','CRWD','ZS','OKTA','MDB','CFLT','GTLB','BILL','PCTY','PAYC','HUBS','TEAM','ZI','RNG','FROG','ESTC','SUMO','BIGC','BRZE','TOST','DLO','MGNI','TTD','PUBM','APPS','IRBT','SQ','PYPL','AFRM','UPST','SOFI','OPEN','OPENDOOR','LMND','ROOT','METROMILE','HIPPO','DOMA','PAYO','GH','ILMN','EDIT','NTLA','BEAM','CRSP','FATE','SANA','AGEN','RCKT','ARVN','ARWR','IDYA','IMVT','NKTR','ALNY','BMRN','JAZZ','RARE','ACAD','SGEN','EXAS','NTRA','IOVA','MRSN','FATE','VERV','TALS','DNLI','KYMR'],
+  index:['SPX500','US500','US30','NAS100','US100','DE30','GER40','UK100','JP225','AUS200','NAS100USD','US30USD','UK100GBP','DE30EUR','GER40EUR','USTEC','SPX','DAX','FTSE','CAC40','STOXX50','US30.cash','US100.cash','NAS100.cash','NAS100USD','US30USD'],
   commodity:['XAUUSD','XAGUSD','XPTUSD','XPDUSD','WTIUSD','BCOUSD','XTIUSD','NGAS','WHEAT','CORN','COPPER','USOIL','UKOIL'],
 };
 function resolveType(sym){
@@ -2655,7 +2714,7 @@ async function loadOverview(){
           '<td>'+bdDir(p.direction)+'</td>'+
           '<td>'+bdVwap(p.vwapPosition||p.vwap_position)+'</td>'+
           '<td>'+bdSess(p.session)+'</td>'+
-          '<td class="cd">'+( rp>0?fmtPct(rp):'—')+'</td>'+
+          '<td class="cd">'+( (()=>{ if(rp>0&&rp<0.1)return fmtPct(rp); if(re>0)return ((re/50000)*100).toFixed(4)+'%'; return '—'; })())+'</td>'+
           '<td class="cr">'+( re>0?'\u20ac'+re.toFixed(0):'—')+'</td>'+
           '<td class="cd">'+fmt(en,5)+'</td>'+
           '<td class="cr">'+fmt(sl,5)+'</td>'+
@@ -2664,7 +2723,9 @@ async function loadOverview(){
           '<td class="'+(peakP>0?'cg fw':'cd')+' fw">'+( peakP>0?'+'+peakP.toFixed(2)+'R':'—')+'</td>'+
           '<td class="'+(pr!=null&&pr<-0.5?'cr fw':pr!=null&&pr<0?'cr':'cd')+' fw">'+( pr!=null?fmtR(pr):'—')+'</td>'+
           '<td class="cg">+'+( g.tpRRUsed||1.5).toFixed(2)+'R</td>'+
-          '<td class="'+(p.vwapBandPct>150?'co fw':p.vwapBandPct>100?'co':'cd')+'">'+(p.vwapBandPct!=null?fmtP(p.vwapBandPct):'—')+'</td>'+
+          '<td class="'+(p.vwapBandPct>150?'co fw':p.vwapBandPct>100?'co':'cd')+'">'+(p.vwapBandPct!=null?fmtP(p.vwapBandPct):(g.vwapBandPct!=null?fmtP(g.vwapBandPct):'—'))+'</td>'+
+          '<td class="cd" style="font-size:8px">'+( p.sessionHigh!=null?fmt(p.sessionHigh,3):'—')+'</td>'+
+          '<td class="cd" style="font-size:8px">'+( p.sessionLow!=null?fmt(p.sessionLow,3):'—')+'</td>'+
           '<td>'+bdKey(p.tradeNumber)+'</td>'+
           '<td class="cb2">'+fmt(cur,5)+'</td>'+
           '<td class="'+(p.unrealizedPnl>=0?'cg':'cr')+' fw">'+fmtE(p.unrealizedPnl)+'</td>'+
@@ -2714,6 +2775,53 @@ async function loadOverview(){
 
   // --- Closed trades ---
   const tb=$('ov-trades');
+  // Fix 10: Draw equity curve chart
+  (async () => {
+    try {
+      const eq = await api('/api/equity-curve').catch(()=>[]);
+      const canvas = $('equity-chart');
+      if (!canvas || !eq || !eq.length) return;
+      const ctx = canvas.getContext('2d');
+      const W = canvas.offsetWidth || canvas.parentElement.offsetWidth || 400;
+      canvas.width = W * window.devicePixelRatio;
+      canvas.height = 80 * window.devicePixelRatio;
+      canvas.style.width = W + 'px';
+      canvas.style.height = '80px';
+      const s = window.devicePixelRatio;
+      ctx.scale(s, s);
+      const h = 80, pad = 6;
+      // Filter to last 100 points sorted by time
+      const pts = [...eq].sort((a,b)=>new Date(a.ts||a.recorded_at||a.created_at)-new Date(b.ts||b.recorded_at||b.created_at)).slice(-100);
+      if (pts.length < 2) return;
+      const vals = pts.map(p => parseFloat(p.equity ?? p.balance ?? 0));
+      const minV = Math.min(...vals), maxV = Math.max(...vals);
+      const range = maxV - minV || 1;
+      const xs = i => pad + (i / (pts.length-1)) * (W - pad*2);
+      const ys = v => h - pad - ((v - minV) / range) * (h - pad*2);
+      // Fill gradient
+      const grad = ctx.createLinearGradient(0, 0, 0, h);
+      const isUp = vals[vals.length-1] >= vals[0];
+      grad.addColorStop(0, isUp ? 'rgba(63,185,80,.25)' : 'rgba(248,81,73,.15)');
+      grad.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.beginPath();
+      ctx.moveTo(xs(0), ys(vals[0]));
+      for (let i=1; i<vals.length; i++) ctx.lineTo(xs(i), ys(vals[i]));
+      ctx.lineTo(xs(vals.length-1), h); ctx.lineTo(xs(0), h);
+      ctx.closePath();
+      ctx.fillStyle = grad; ctx.fill();
+      // Line
+      ctx.beginPath();
+      ctx.moveTo(xs(0), ys(vals[0]));
+      for (let i=1; i<vals.length; i++) ctx.lineTo(xs(i), ys(vals[i]));
+      ctx.strokeStyle = isUp ? '#3fb950' : '#f85149';
+      ctx.lineWidth = 1.5; ctx.stroke();
+      // Start/end markers
+      const start = vals[0], end = vals[vals.length-1];
+      const diff = end - start;
+      if ($('eq-stats')) $('eq-stats').textContent = '\u20ac'+Math.round(start).toLocaleString('nl-BE')+' → \u20ac'+Math.round(end).toLocaleString('nl-BE')+' ('+(diff>=0?'+':'')+Math.round(diff)+'\u20ac)';
+    } catch(e) {}
+  })();
+
   const trList=Array.isArray(trades)?trades:[];
   if($('ov-trades-cm'))$('ov-trades-cm').textContent=trList.length+' trades';
   if(tb){
@@ -2737,10 +2845,12 @@ async function loadOverview(){
           '<td class="cr">'+fmt(t.sl,5)+'</td>'+
           '<td class="cg">'+fmt(t.tp,5)+'</td>'+
           '<td class="cy">'+fmt(t.exitPrice||t.exit_price,5)+'</td>'+
-          '<td class="cd">'+( t.riskPct!=null?fmtPct(t.riskPct):'—')+'</td>'+
+          '<td class="cd">'+( (()=>{ const rp=t.riskPct||t.risk_pct||null; const re=t.riskEUR||t.risk_eur||null; if(rp!=null&&rp<0.1) return fmtPct(rp); if(re!=null) return ((re/50000)*100).toFixed(4)+'%'; return '—'; })())+'</td>'+
           '<td class="cr">'+( t.riskEUR!=null?'\u20ac'+t.riskEUR.toFixed(0):'—')+'</td>'+
-          '<td class="'+cE(pnl)+' fw">'+( pnl!=null?fmtE(pnl):'—')+'</td>'+
+          '<td class="'+( (()=>{ if(pnl!=null&&pnl!==0)return cE(pnl); const re=t.riskEUR||t.risk_eur||null; return re?'cr':'cd'; })())+' fw">'+( (()=>{ if(pnl!=null&&pnl!==0)return fmtE(pnl); const stop=gr||cr||''; const re=t.riskEUR||t.risk_eur||null; if(re!=null&&(stop.includes('sl')||stop.includes('SL')||stop==='gap_stop'))return '≈'+fmtE(-re); return pnl!=null?fmtE(pnl):'—'; })())+'</td>'+
           '<td class="cd">'+( t.lots!=null?Number(t.lots).toFixed(2):'—')+'</td>'+
+          '<td class="'+(( t.peakRRPos||t.peak_rr_pos||0)>0?'cg fw':'cd')+'">'+((t.peakRRPos||t.peak_rr_pos||0)>0?'+'+Number(t.peakRRPos||t.peak_rr_pos).toFixed(2)+'R':'—')+'</td>'+
+          '<td class="'+(( t.peakRRNeg||t.peak_rr_neg||0)>0?'cr fw':'cd')+'">'+((t.peakRRNeg||t.peak_rr_neg||0)>0?fmtR(-(t.peakRRNeg||t.peak_rr_neg)/100):'—')+'</td>'+
           '<td>'+bdStop(gr||cr)+'</td>'+
           '<td class="cd" style="font-size:8px;max-width:120px">'+( t.mt5Comment||t.mt5_comment||'—')+'</td>'+
           '<td class="cd" style="font-size:9px">'+fmtTs(t.openedAt||t.opened_at)+'</td>'+
@@ -2783,7 +2893,9 @@ async function loadSignals(){
   if(sl){
     if(!signals.length){sl.innerHTML=nd(16,'No signals yet');}
     else{
-      sl.innerHTML=signals.slice(0,500).map(s=>{
+      // Filter: exclude STK_OOH from signal log (market closed, not tradeable)
+    const filteredSigs=signals.filter(s=>s.outcome!=='STOCK_OOH'&&s.outcome!=='WEEKEND');
+    sl.innerHTML=filteredSigs.slice(0,500).map(s=>{
         const outcome=s.outcome||'?';
         const isPlaced=outcome==='PLACED';
         const isRej=outcome==='REJECTED'||outcome==='ERROR';
@@ -2796,9 +2908,22 @@ async function loadSignals(){
         const _vp=(s.vwapPosition||s.vwap_position||'').toUpperCase()==='ABOVE'?'ABV':'BLW';
         const _whatif=s.symbol?s.symbol.slice(0,7)+' '+_dir2+'-'+_ss+'-'+_vp:'—';
         const pid=s.positionId||s.position_id;
-        const destCell=pid?'<span style="background:rgba(63,185,80,.15);color:#3fb950;padding:1px 6px;border-radius:3px;font-size:9px;border:1px solid rgba(63,185,80,.3);font-weight:700">\u2192 Ghost #'+(s.tradeNumber||pid.slice(-4))+'</span>'
-          :isOoh?'<span class="cd" style="font-size:9px">\ud83d\udccb '+_whatif+' (OOH)</span>'
-          :outcomeBdg(outcome);
+        // Determine destination label
+        let destCell;
+        if(pid){
+          const _mt5c=s.orderComment||s.mt5_comment||_whatif;
+          destCell='<span style="background:rgba(63,185,80,.15);color:#3fb950;padding:1px 6px;border-radius:3px;font-size:9px;border:1px solid rgba(63,185,80,.3);font-weight:700">\u2192 Ghost #'+(s.tradeNumber||pid.slice(-4))+'</span> <span style="color:#6e7681;font-size:8px">'+_mt5c+'</span>';
+        } else if(outcome==='NY_DEAD_ZONE'||outcome==='NY_NIGHT'||outcome==='ASIA_MORNING'){
+          destCell='<span style="background:rgba(240,136,62,.15);color:#f0883e;padding:1px 6px;border-radius:3px;font-size:9px;border:1px solid rgba(240,136,62,.3);font-weight:700">\u2192 Shadow TZ</span>';
+        } else if(outcome==='VWAP_EXHAUSTION'){
+          destCell='<span style="background:rgba(188,140,255,.15);color:#bc8cff;padding:1px 6px;border-radius:3px;font-size:9px;border:1px solid rgba(188,140,255,.3);font-weight:700">\u2192 Shadow VWAP</span>';
+        } else if(outcome==='DUPLICATE_POSITION'){
+          destCell='<span style="background:rgba(210,153,34,.15);color:#d29922;padding:1px 6px;border-radius:3px;font-size:9px;border:1px solid rgba(210,153,34,.3);font-weight:700">\u2192 Shadow DUP</span>';
+        } else if(isOoh){
+          destCell='<span class="cd" style="font-size:9px">\ud83d\udccb '+_whatif+' (OOH)</span>';
+        } else {
+          destCell=outcomeBdg(outcome);
+        }
         // Raw webhook expandable
         const rawId='raw-'+Math.random().toString(36).slice(2,8);
         return '<tr class="'+rowCls+'">'+
@@ -2913,6 +3038,9 @@ async function loadGhost(){
           '<td class="'+(peakP>0?'cg fw':'cd')+'">'+( peakP>0?'+'+peakP.toFixed(2)+'R':'—')+'</td>'+
           '<td class="'+(prR!=null&&prR<-0.5?'cr fw':prR!=null?'cr':'cd')+'">'+( prR!=null?fmtR(prR):'—')+'</td>'+
           '<td class="cg fw">+'+( g.tpRRUsed||1.5).toFixed(2)+'R</td>'+
+          '<td class="'+(( g.vwapBandPct||p.vwapBandPct||0)>150?'co fw':(g.vwapBandPct||p.vwapBandPct||0)>100?'co':'cd')+'">'+((g.vwapBandPct||p.vwapBandPct)!=null?fmtP(g.vwapBandPct||p.vwapBandPct):'—')+'</td>'+
+          '<td class="cd" style="font-size:8px">'+( p.sessionHigh!=null?fmt(p.sessionHigh,3):'—')+'</td>'+
+          '<td class="cd" style="font-size:8px">'+( p.sessionLow!=null?fmt(p.sessionLow,3):'—')+'</td>'+
           msCells(allMs)+
           '<td class="cd" style="font-size:8px">'+fmt(p.tvEntry||g.tvEntry,5)+'</td>'+
           '<td class="cd" style="font-size:8px">'+fmt(en,5)+'</td>'+
@@ -3030,17 +3158,93 @@ async function loadShadow(){
   render('sh-tz-body',  tz,   10+MS_COLS+3, 'No timezone blocks active');
   render('sh-vwap-body',vw,   9+MS_COLS+2,  'No VWAP exhaustion blocks');
   render('sh-dup-body', du,   9+MS_COLS+2,  'No duplicate blocks');
-  render('sh-fin-body', hist, 10+MS_COLS+3, 'No shadow history yet');
+  // Shadow finalized: DB history only (truly finalized positions)
+  // Active timezone blocks still showing as active in other sections
+  render('sh-fin-body', hist, 10+MS_COLS+3, 'No shadow history yet — finalized positions appear here after SL/TP/gap');
 }
 
 // ══════════════════════════════════════════════
 // EV OPTIMIZER
 // ══════════════════════════════════════════════
 async function loadEV(){
-  const [evData,tpCfg] = await Promise.all([
+  const [evData,tpCfg,sessData,msData,wiData] = await Promise.all([
     api('/api/ghost-combo-analysis').catch(()=>[]),
     api('/api/tp-config').catch(()=>({})),
+    api('/api/session-stats').catch(()=>[]),
+    api('/api/milestone-probability').catch(()=>[]),
+    api('/api/shadow-whatif').catch(()=>({summary:[],details:[]})),
   ]);
+
+  // Session Win Rate table (Fix 7)
+  const ssb=$('sess-stats-body');
+  const sessList=Array.isArray(sessData)?sessData:[];
+  if(ssb){
+    if(!sessList.length){ssb.innerHTML=nd(7,'No session data — need finalized ghosts');}
+    else{
+      ssb.innerHTML=sessList.map(s=>{
+        const sessLabel={'ny':'NEW YORK','london':'LONDON','asia':'ASIA'}[s.session]||s.session?.toUpperCase()||'—';
+        const wrCls=s.winRate>=60?'cg fw':s.winRate>=50?'cy':'cr';
+        const avgTsl=s.avgTimeToSL!=null?(s.avgTimeToSL>=60?Math.floor(s.avgTimeToSL/60)+'h'+(s.avgTimeToSL%60)+'m':s.avgTimeToSL+'m'):'—';
+        return '<tr>'+
+          '<td class="cw fw" style="white-space:nowrap">'+sessLabel+'</td>'+
+          '<td class="cd">'+s.total+'</td>'+
+          '<td class="cg">'+s.wins+'</td>'+
+          '<td class="'+wrCls+' fw">'+s.winRate+'%</td>'+
+          '<td class="cg">'+( s.avgPeakPos!=null?'+'+s.avgPeakPos.toFixed(3)+'R':'—')+'</td>'+
+          '<td class="cr">'+( s.avgPeakNeg!=null?'-'+s.avgPeakNeg.toFixed(1)+'%':'—')+'</td>'+
+          '<td class="cd">'+avgTsl+'</td>'+
+        '</tr>';
+      }).join('');
+    }
+  }
+
+  // Milestone Probability table (Fix 8)
+  const mpb=$('ms-prob-body');
+  const msList=Array.isArray(msData)?msData:[];
+  if(mpb){
+    if(!msList.length){mpb.innerHTML=nd(14,'No milestone data — need min 3 finalized ghosts per key');}
+    else{
+      mpb.innerHTML=msList.slice(0,100).map(m=>{
+        const avgTsl=m.avgTimeToSL!=null?(m.avgTimeToSL>=60?Math.floor(m.avgTimeToSL/60)+'h'+(m.avgTimeToSL%60)+'m':m.avgTimeToSL+'m'):'—';
+        const pct=v=>'<td class="'+(v>=70?'cr fw':v>=40?'co':'cd')+'" style="font-size:10px">'+v+'%</td>';
+        const pctG=v=>'<td class="'+(v>=70?'cg fw':v>=40?'cy':'cd')+'" style="font-size:10px">'+v+'%</td>';
+        const rec=m.pRecovery!=null?'<td class="'+(m.pRecovery>=50?'cy fw':'cd')+'" style="font-size:10px">'+m.pRecovery+'%</td>':'<td class="cd">—</td>';
+        return '<tr>'+
+          '<td class="cw" style="font-size:9px">'+( m.optimizerKey||'—')+'</td>'+
+          '<td class="cd">'+m.total+'</td>'+
+          pct(m.pNeg01)+pct(m.pNeg03)+pct(m.pNeg05)+pct(m.pNeg08)+
+          '<td class="'+(m.pNeg10>=70?'cr fw':m.pNeg10>=40?'co':'cd')+'" style="font-size:10px;border-right:1px solid rgba(139,148,158,.2)">'+m.pNeg10+'%</td>'+
+          pctG(m.pPos03)+pctG(m.pPos05)+pctG(m.pPos08)+pctG(m.pPos10)+pctG(m.pPos15)+
+          rec+'<td class="cd" style="font-size:9px">'+avgTsl+'</td>'+
+        '</tr>';
+      }).join('');
+    }
+  }
+
+  // Shadow What-If table (Fix 9)
+  const swb=$('shadow-whatif-body');
+  const wiSummary=Array.isArray(wiData?.summary)?wiData.summary:[];
+  if(swb){
+    if(!wiSummary.length){swb.innerHTML=nd(9,'No shadow data with peak tracking yet');}
+    else{
+      swb.innerHTML=wiSummary.map(w=>{
+        const riskPerTrade=19; // approx
+        const missedEst=Math.round((w.wouldTP*(1.5*riskPerTrade))-(w.wouldSL*riskPerTrade));
+        return '<tr>'+
+          '<td><span class="bd bd-block" style="background:rgba(240,136,62,.15);color:#f0883e;padding:1px 6px;border-radius:3px;font-size:9px">'+
+            (w.blockType?.replace('_',' ')||'—')+'</span></td>'+
+          '<td class="cd">'+w.total+'</td>'+
+          '<td class="cg fw">'+w.wouldTP+'</td>'+
+          '<td class="'+(w.tpRate>=50?'cg fw':'cy')+'" >'+w.tpRate+'%</td>'+
+          '<td class="cr">'+w.wouldSL+'</td>'+
+          '<td class="'+(w.slRate>=50?'cr fw':'co')+'">'+w.slRate+'%</td>'+
+          '<td class="cg">'+( w.avgPeakPos!=null?'+'+w.avgPeakPos.toFixed(3)+'R':'—')+'</td>'+
+          '<td class="cr">'+( w.avgPeakNeg!=null?'-'+w.avgPeakNeg.toFixed(1)+'%':'—')+'</td>'+
+          '<td class="'+(missedEst>=0?'cg':'cr')+' fw">'+( missedEst>=0?'+':'')+fmtE(missedEst)+'</td>'+
+        '</tr>';
+      }).join('');
+    }
+  }
   const evBody=$('ev-body');
   const evList=Array.isArray(evData)?evData:[];
   if(evBody){
@@ -3352,6 +3556,61 @@ async function initBackground() {
 
   // Start cron jobs
   cron.schedule("*/10 * * * * *", syncPositions); // 10s for responsive P&L + milestones
+
+  // ── Auto-backfill realized P&L for closed trades with NULL/€0 ────
+  // Runs once after startup, non-blocking
+  setTimeout(async () => {
+    try {
+      const nullTrades = await db.pool.query(`
+        SELECT position_id, risk_eur FROM closed_trades
+        WHERE (realized_pnl_eur IS NULL OR realized_pnl_eur = 0)
+          AND closed_at IS NOT NULL
+          AND position_id IS NOT NULL
+        LIMIT 200
+      `);
+      if (!nullTrades.rows.length) {
+        console.log('[Backfill] No trades need realized P&L backfill');
+        return;
+      }
+      console.log(`[Backfill] Backfilling realized P&L for ${nullTrades.rows.length} trades…`);
+      let updated = 0;
+      for (const row of nullTrades.rows) {
+        try {
+          const deals = await fetchHistoryDeals(row.position_id);
+          const closing = deals.filter(d => d.entryType === 'DEAL_ENTRY_OUT' || d.type === 'DEAL_TYPE_SELL' || d.type === 'DEAL_TYPE_BUY');
+          const profit = closing.reduce((s, d) => s + parseFloat(d.profit || 0), 0);
+          if (profit !== 0) {
+            const exRate = latestExchangeRate ?? 1.0;
+            const pnlEur = parseFloat((profit * exRate).toFixed(2));
+            await db.pool.query(
+              'UPDATE closed_trades SET realized_pnl_eur = $1 WHERE position_id = $2',
+              [pnlEur, row.position_id]
+            );
+            updated++;
+          } else if (row.risk_eur && profit === 0) {
+            // Fallback: SL hit = -riskEUR approximately
+            const stopTrade = await db.pool.query(
+              'SELECT ghost_stop_reason, close_reason FROM closed_trades WHERE position_id = $1', 
+              [row.position_id]
+            );
+            const st = stopTrade.rows[0];
+            if (st && (st.ghost_stop_reason?.includes('sl') || st.close_reason === 'sl')) {
+              const fallback = -Math.abs(parseFloat(row.risk_eur));
+              await db.pool.query(
+                'UPDATE closed_trades SET realized_pnl_eur = $1 WHERE position_id = $2',
+                [fallback, row.position_id]
+              );
+              updated++;
+            }
+          }
+          await new Promise(r => setTimeout(r, 200)); // rate limit
+        } catch (e) { /* skip this trade */ }
+      }
+      console.log(`[Backfill] Done — updated ${updated}/${nullTrades.rows.length} trades`);
+    } catch (e) {
+      console.warn('[Backfill] Error:', e.message);
+    }
+  }, 30000); // 30s after startup
   cron.schedule("*/5 * * * *",    runShadowSnapshots);
   cron.schedule("0 * * * *",      runTPOptimizer);
   console.log("[PRONTO-AI] Cron jobs active");
