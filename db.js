@@ -908,7 +908,7 @@ async function loadAllTrades({ since = null, until = null, openFrom = null, open
     const r = await pool.query(`
       SELECT
         ct.position_id      AS "positionId",
-        ct.symbol, ct.mt5_symbol AS "mt5Symbol", ct.direction,
+        ct.symbol, ct.mt5_symbol AS "mt5Symbol", direction,
         ct.vwap_position  AS "vwapPosition",
         CAST(ct.entry        AS FLOAT) AS entry,
         CAST(ct.sl           AS FLOAT) AS sl,
