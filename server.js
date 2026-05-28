@@ -47,7 +47,7 @@ const {
 } = require("./session");
 
 // ── Version ──────────────────────────────────────────────────────
-const VERSION = "14.9.13"; // v14.8.7: hotfix - bg used before initialization (ReferenceError crash) shadow fix (_slFF/_rrFF), type resolution client-side, ghost scroll, FAV 20 cols final fixes - Time/ALL OUTCOMES/no dup Lots ghost_trades has peak_rr/realized/lots, ghost finalized from individual trades ghost finalized uses individual ghost_trades, fin header fixed, mt5comment in fin no scroll tables, dup lots fixed, all scroll removed fixed trades header, signal highlights, 500 row limit, Dutch->English Peak- in RR, no scroll tables, English labels, signal cols fixed, realPnl chain fix rrNow/buyCnt direction case, ghost KPI peakRR from ghost subobj, remove date filter bdDir/bdVwap case-insensitive, shows BUY/ABOVE correctly fix 500 on open-positions (symInfo undefined), fix openPositions in browser, fix loadHeader ghost block FX/STK/IDX/COM labels, ghost stopReason never manual, realPnl EUR, mt5Comment at placement FX/STK labels, ghost col cleanup, close reason SL/TP only mt5Comment in trades, ghost stop labels, outcome badges, what-if comment, SYNC_RAW removed asset_type in signal_log, daily log from open pos, mt5 comment in ghost, slDist/tvEntry in adopt fmtMs global helper, no inline functions in templates, browser syntax error fixed auto currency detection EUR/USD, correct conversion, currency symbol in dashboard USD->EUR conversion, verbose logs removed, complete API fields, mt5Comment shadowRow bdSess fix, milestone format fix, ghost active count fix, signal stats fix, data from 20/05 10:00 ghost restore assetType+vwapBandPct, all display fixes complete ghost restore assetType, ghost peakRRNeg display, signal log session cols, fin ghost realizedPnl fix startBalance fix, peakRRNeg display fix, exitPrice in trades, force adoption on startup, session fallback assetType everywhere, unrealizedPnl, signal outcomes, signal stats fixed correct signal outcomes, unrealizedPnl, assetType in API, signal stats per outcome /api/performance returns balance/equity/startBalance from latestEquity fix isTrackableBlock (no STOCK_OOH in shadow), bdSess fix fix bdSess template literal, add assetType/keyCount to shadow API MetaAPI auto-deploy on startup, stock timing 15:30-18:00, symInfoB crash fix fix symInfoB undefined crash, META_BASE global URL fix DB connection timeout 5s->15s, retry backoff 3s->5s, META_BASE london TP default 1.5R, session_high/low/day_high/low from webhook, vwapBandPct in all ghost saves MetaAPI 429 fix (60s cache), SL TV vs MT5 log, vwapBandPct everywhere, circuit open skip (1 aandeel=1lot, P&L=lots\xmove) // v14.3: bugs fixed (const->let adoptPosition, dupNumber, blockTypes, duplicate fetchHistoryDeals, NY_NIGHT/ASIA_MORNING shadow tracking) all milestone gaps fixed, outside night 21-02h, daily open log, ghost finalized fix, slHitAt EOD keep
+const VERSION = "14.9.14"; // v14.8.7: hotfix - bg used before initialization (ReferenceError crash) shadow fix (_slFF/_rrFF), type resolution client-side, ghost scroll, FAV 20 cols final fixes - Time/ALL OUTCOMES/no dup Lots ghost_trades has peak_rr/realized/lots, ghost finalized from individual trades ghost finalized uses individual ghost_trades, fin header fixed, mt5comment in fin no scroll tables, dup lots fixed, all scroll removed fixed trades header, signal highlights, 500 row limit, Dutch->English Peak- in RR, no scroll tables, English labels, signal cols fixed, realPnl chain fix rrNow/buyCnt direction case, ghost KPI peakRR from ghost subobj, remove date filter bdDir/bdVwap case-insensitive, shows BUY/ABOVE correctly fix 500 on open-positions (symInfo undefined), fix openPositions in browser, fix loadHeader ghost block FX/STK/IDX/COM labels, ghost stopReason never manual, realPnl EUR, mt5Comment at placement FX/STK labels, ghost col cleanup, close reason SL/TP only mt5Comment in trades, ghost stop labels, outcome badges, what-if comment, SYNC_RAW removed asset_type in signal_log, daily log from open pos, mt5 comment in ghost, slDist/tvEntry in adopt fmtMs global helper, no inline functions in templates, browser syntax error fixed auto currency detection EUR/USD, correct conversion, currency symbol in dashboard USD->EUR conversion, verbose logs removed, complete API fields, mt5Comment shadowRow bdSess fix, milestone format fix, ghost active count fix, signal stats fix, data from 20/05 10:00 ghost restore assetType+vwapBandPct, all display fixes complete ghost restore assetType, ghost peakRRNeg display, signal log session cols, fin ghost realizedPnl fix startBalance fix, peakRRNeg display fix, exitPrice in trades, force adoption on startup, session fallback assetType everywhere, unrealizedPnl, signal outcomes, signal stats fixed correct signal outcomes, unrealizedPnl, assetType in API, signal stats per outcome /api/performance returns balance/equity/startBalance from latestEquity fix isTrackableBlock (no STOCK_OOH in shadow), bdSess fix fix bdSess template literal, add assetType/keyCount to shadow API MetaAPI auto-deploy on startup, stock timing 15:30-18:00, symInfoB crash fix fix symInfoB undefined crash, META_BASE global URL fix DB connection timeout 5s->15s, retry backoff 3s->5s, META_BASE london TP default 1.5R, session_high/low/day_high/low from webhook, vwapBandPct in all ghost saves MetaAPI 429 fix (60s cache), SL TV vs MT5 log, vwapBandPct everywhere, circuit open skip (1 aandeel=1lot, P&L=lots\xmove) // v14.3: bugs fixed (const->let adoptPosition, dupNumber, blockTypes, duplicate fetchHistoryDeals, NY_NIGHT/ASIA_MORNING shadow tracking) all milestone gaps fixed, outside night 21-02h, daily open log, ghost finalized fix, slHitAt EOD keep
 
 // ── Config ───────────────────────────────────────────────────────
 const PORT           = process.env.PORT           || 3000;
@@ -399,15 +399,31 @@ async function closePosition(positionId, reason = "manual", pnl = null) {
       : reason === 'manual' ? 'sl'  // fallback: manual close treated as SL
       : reason;
     ghost.stopReason = _finalGhostStop;
-    // For gap stops: price jumped past SL - record all ADV milestones as triggered
-    if (_finalGhostStop === 'gap_stop' && ghost.rrMilestones) {
+    // SL hit (any type): force all negative milestones AND peakRRNeg=100
+    const _isSLHit = ['phantom_sl','gap_stop','sl'].includes(_finalGhostStop);
+    if (_isSLHit && ghost.rrMilestones) {
       const _now = Date.now();
       for (const _rv of [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]) {
         const _k = '-' + _rv.toFixed(1);
         if (!ghost.rrMilestones[_k]) ghost.rrMilestones[_k] = _now;
       }
+      if (ghost.peakRRNeg < 100) ghost.peakRRNeg = 100;
     }
-    ghost.realizedPnlEUR = realPnl ?? null;
+    // TP hit: force the +tpRR milestone
+    if (['max_rr_15','tp'].includes(_finalGhostStop) && ghost.rrMilestones) {
+      const _tpKey = '+' + (ghost.tpRRUsed || 1.5).toFixed(1);
+      if (!ghost.rrMilestones[_tpKey]) ghost.rrMilestones[_tpKey] = Date.now();
+    }
+    // Realized P&L: use preset risk as baseline (simpler, no MT5 fetch needed)
+    const _riskE = pos.riskEUR ?? null;
+    const _tpRR  = ghost.tpRRUsed ?? 1.5;
+    if (_isSLHit && _riskE) {
+      ghost.realizedPnlEUR = -Math.abs(_riskE);  // SL = -1R = full risk
+    } else if ((_finalGhostStop === 'max_rr_15' || _finalGhostStop === 'tp') && _riskE) {
+      ghost.realizedPnlEUR = Math.abs(_riskE) * _tpRR;  // TP = +tpRR * risk
+    } else {
+      ghost.realizedPnlEUR = realPnl ?? (_riskE ? -Math.abs(_riskE) : null);  // fallback
+    }
     ghost.lots           = pos.lots ?? null;
     ghost.mt5Comment     = pos.orderComment ?? pos.mt5Comment ?? pos.comment ?? null;
     ghost.vwapBandPct    = pos.vwapBandPct ?? ghost.vwapBandPct ?? null;
@@ -796,7 +812,10 @@ async function _doSyncPositions() {
     const price = priceMap.get(bg.mt5Symbol) ?? priceMap.get(bg.symbol);
     if (price) updateGhost(bg, price);
     if (bg.phantomSLHit) {
-      // v14.2: record slHitAt when first hit + backfill ALL adverse milestones
+      // SL hit: set peakRRNeg=100 (full SL) and ensure stop reason
+      if (bg.peakRRNeg < 100) bg.peakRRNeg = 100;
+      if (!bg.stopReason) bg.stopReason = 'phantom_sl';
+      // record slHitAt when first hit + backfill ALL adverse milestones
       if (!bg.slHitAt) {
         bg.slHitAt = new Date().toISOString();
         const elapsed = bg.openedAt
@@ -810,18 +829,11 @@ async function _doSyncPositions() {
           }
         }
       }
-      // Keep shadow till end of Brussels day \-- remove after Brussels midnight
-      const now = new Date();
-      const bru  = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/Brussels' }));
-      const slHitDate = new Date(new Date(bg.slHitAt).toLocaleString('en-US', { timeZone: 'Europe/Brussels' }));
-      const sameBruDay =
-        slHitDate.getFullYear() === bru.getFullYear() &&
-        slHitDate.getMonth()    === bru.getMonth() &&
-        slHitDate.getDate()     === bru.getDate();
-      if (!sameBruDay) {
-        // Past Brussels midnight since SL hit \-- save to DB first, then remove
-        if (dbReady) await db.saveBlockedGhostTrade(bg).catch(()=>{});
-        await closeBlockedGhost(id, bg.stopReason ?? 'phantom_sl');
+      // When SL is hit, finalize immediately (show in shadow finalized tab)
+      // Save to DB and move to history right away
+      if (dbReady) await db.saveBlockedGhostTrade(bg).catch(()=>{});
+      await closeBlockedGhost(id, bg.stopReason ?? 'phantom_sl');
+      if (false) { // old code kept for reference
       } else if (dbReady) {
         db.saveBlockedGhostState(bg).catch(() => {});
       }
@@ -1218,7 +1230,7 @@ app.post("/webhook", async (req, res) => {
   if (!allowed) {
     const sesForLog = getSession();
     const _sigOutcome = mktReason?.includes('NY_NIGHT') ? 'NY_NIGHT' :
-      mktReason?.includes('ASIA_MORNING') ? 'ASIA_MORNING' :
+      mktReason?.includes('NY_NIGHT') ? 'NY_NIGHT' :
       mktReason?.includes('NY_DEAD_ZONE') ? 'NY_DEAD_ZONE' :
       mktReason?.includes('STOCK_OUTSIDE_MARKET') ? 'STOCK_OOH' :
       mktReason?.includes('WEEKEND') ? 'WEEKEND' :
@@ -1253,7 +1265,7 @@ app.post("/webhook", async (req, res) => {
     const isTrackableBlock = mktReason && (
       mktReason.includes('NY_DEAD_ZONE') ||
       mktReason.includes('NY_NIGHT') ||
-      mktReason.includes('ASIA_MORNING') ||
+      mktReason.includes('NY_NIGHT') ||
       mktReason.includes('OUTSIDE_WINDOW')        // legacy compat only
     );
 
@@ -1274,7 +1286,7 @@ app.post("/webhook", async (req, res) => {
         // NY_DEAD_ZONE, NY_NIGHT, ASIA_MORNING all route to shadow timezone tab
         let blockType = 'NY_DEAD_ZONE'; // default
         if (mktReason.includes('NY_NIGHT'))            blockType = 'NY_NIGHT';
-        else if (mktReason.includes('ASIA_MORNING'))   blockType = 'ASIA_MORNING';
+        else if (mktReason.includes('NY_NIGHT'))   blockType = 'NY_NIGHT';
         else if (mktReason.includes('NY_DEAD_ZONE'))   blockType = 'NY_DEAD_ZONE';
         else if (mktReason.includes('OUTSIDE_WINDOW')) blockType = 'NY_DEAD_ZONE';
         else if (mktReason.includes('STOCK_OUTSIDE_MARKET')) blockType = 'NY_DEAD_ZONE';
@@ -2510,7 +2522,7 @@ const nd = (cols,msg='No data') => '<tr><td colspan="'+cols+'" class="nd">'+msg+
 const STYPE={
   forex:['EURUSD','GBPUSD','AUDUSD','USDCAD','USDCHF','USDJPY','NZDUSD','EURGBP','EURJPY','GBPJPY','AUDJPY','CADJPY','CHFJPY','EURAUD','EURCAD','EURCHF','EURNZD','GBPAUD','GBPCAD','GBPCHF','GBPNZD','AUDCAD','AUDCHF','AUDNZD','CADCHF','NZDCAD','NZDCHF','NZDJPY','XAUUSD','XAGUSD'],
   stock:['AAPL','MSFT','GOOGL','GOOG','AMZN','META','TSLA','ZM','BRKB','ARM','NKE','ASML','JPM','GE','SNOW','PLTR','GS','MS','C','WFC','BAC','NVDA','AMD','INTC','CSCO','ORCL','IBM','QCOM','TXN','AVGO','MU','JPM','BAC','WFC','GS','MS','C','UNH','JNJ','PFE','ABBV','MRK','BMY','LLY','AMGN','GILD','CVX','XOM','COP','EOG','KO','PEP','MCD','SBUX','YUM','WMT','TGT','COST','HD','DIS','NFLX','PARA','BA','LMT','RTX','NOC','GD','GE','HON','MMM','AZN','MSTR','KO','INTC','V','MA','NFLX','AMD','BA','CSCO','SBUX','WMT','LMT','QCOM','IBM','MSTR','MCD','GOOGL','DIS','META','TSLA','AAPL','AMZN','AZN','JNJ','MSTR','AVGO','LMT','INTC','QCOM','AZN','V','MA','MSTR','JNJ','NVDA','AMD','BA','IBM','KO','WMT','LMT','MCD','NFLX','AZN','CSCO','INTC','QCOM','SBUX','AMZN','DIS','META','MSFT','TSLA','AAPL','GOOGL','AVGO','JNJ','KO','WMT','AZN','GME','AMC','PLTR','RIVN','LCID','SOFI','BB','NOK','SPCE','NIO','XPEV','LI','BIDU','PDD','BABA','JD','SE','GRAB','COIN','HOOD','RBLX','U','PATH','AI','SNOW','DDOG','NET','CRWD','ZS','OKTA','MDB','CFLT','GTLB','BILL','PCTY','PAYC','HUBS','TEAM','ZI','RNG','FROG','ESTC','SUMO','BIGC','BRZE','TOST','DLO','MGNI','TTD','PUBM','APPS','IRBT','SQ','PYPL','AFRM','UPST','SOFI','OPEN','OPENDOOR','LMND','ROOT','METROMILE','HIPPO','DOMA','PAYO','GH','ILMN','EDIT','NTLA','BEAM','CRSP','FATE','SANA','AGEN','RCKT','ARVN','ARWR','IDYA','IMVT','NKTR','ALNY','BMRN','JAZZ','RARE','ACAD','SGEN','EXAS','NTRA','IOVA','MRSN','FATE','VERV','TALS','DNLI','KYMR'],
-  index:['SPX500','US500','US30','NAS100','US100','DE30','GER40','UK100','JP225','AUS200','NAS100USD','US30USD','UK100GBP','DE30EUR','GER40EUR','USTEC','SPX','DAX','FTSE','CAC40','STOXX50','US30.cash','US100.cash','NAS100.cash','NAS100USD','US30USD'],
+  index:['SPX500','US500','US30','NAS100','US100','DE30','GER40','UK100','JP225','AUS200','NAS100USD','US30USD','UK100GBP','UK100.cash','DE30EUR','GER40EUR','GER40.cash','USTEC','SPX','DAX','FTSE','CAC40','STOXX50','US30.cash','US100.cash','NAS100.cash'],
   commodity:['XAUUSD','XAGUSD','XPTUSD','XPDUSD','WTIUSD','BCOUSD','XTIUSD','NGAS','WHEAT','CORN','COPPER','USOIL','UKOIL'],
 };
 function resolveType(sym){
@@ -2736,41 +2748,8 @@ async function loadOverview(){
     }
   }
 
-  // --- Daily log ---
-  const dEl=$('ov-daily');
-  if(dEl){
-    const days=(daily?.days)||[];
-    let _rows=days;
-    if(!_rows.length&&_pos.length){
-      const _wCount=_pos.filter(p=>(p.unrealizedPnl||0)>0).length;
-      const _lCount=_pos.filter(p=>(p.unrealizedPnl||0)<0).length;
-      const _today=new Date().toLocaleDateString('nl-BE',{timeZone:'Europe/Brussels',day:'2-digit',month:'2-digit'});
-      _rows=[{date:_today,total:_pos.length,wins:_wCount,losses:_lCount,
-        peakRRPos:bestP,peakRRNeg:worstP!=null?Math.abs(worstP)*100:null,
-        lots:totLots,pnl:perf?.unrealizedPnl||0}];
-    }
-    if(!_rows.length){dEl.innerHTML=nd(12,'No closed trades yet');}
-    else{
-      dEl.innerHTML=_rows.slice(0,30).map(d=>{
-        const wr2=d.total?((d.wins/d.total)*100).toFixed(0)+'%':'\--';
-        const wN=d.peakRRNeg!=null?-(d.peakRRNeg/100):null;
-        return '<tr>'+
-          '<td class="cw fw">'+(d.date||'\--')+'</td>'+
-          '<td class="cb">'+( d.total||0)+'</td>'+
-          '<td class="cg">'+( d.wins||0)+'</td>'+
-          '<td class="cr">'+( d.losses||0)+'</td>'+
-          '<td class="'+(d.total&&d.wins/d.total>=0.6?'cg fw':'cy')+'">'+wr2+'</td>'+
-          '<td class="'+(d.peakRRPos>1?'cg fw':'cg')+'">'+( d.peakRRPos!=null?fmtR(d.peakRRPos):'\--')+'</td>'+
-          '<td class="cd" style="font-size:9px">'+( d.peakPosTime||'\--')+'</td>'+
-          '<td class="'+(wN!=null&&wN<-0.5?'cr fw':'cr')+'">'+( wN!=null?fmtR(wN):'\--')+'</td>'+
-          '<td class="cd" style="font-size:9px">'+( d.peakNegTime||'\--')+'</td>'+
-          '<td class="'+(d.maxDD!=null&&d.maxDD>-50?'cr fw':'cr')+'">'+( d.maxDD!=null?fmtP(d.maxDD):'\--')+'</td>'+
-          '<td class="cd">'+( d.lots!=null?d.lots.toFixed(2):'\--')+'</td>'+
-          '<td class="'+cE(d.pnl)+' fw">'+fmtE(d.pnl)+'</td>'+
-        '</tr>';
-      }).join('');
-    }
-  }
+  // Daily log removed by user request
+
 
   // --- Closed trades ---
   const tb=$('ov-trades');
@@ -2875,13 +2854,13 @@ async function loadSignals(){
   const total=(stats?.total||0);
   const placed=by['PLACED']||0;
   const conv=total>0?((placed/total)*100).toFixed(1)+'%':'\--';
-  const shadow=(by['NY_DEAD_ZONE']||0)+(by['NY_NIGHT']||0)+(by['ASIA_MORNING']||0)+(by['VWAP_EXHAUSTION']||0)+(by['DUPLICATE_POSITION']||0);
+  const shadow=(by['NY_DEAD_ZONE']||0)+(by['NY_NIGHT']||0)+(by['NY_NIGHT']||0)+(by['VWAP_EXHAUSTION']||0)+(by['DUPLICATE_POSITION']||0);
   const realErrors=(stats?.byOutcome||[]).filter(o=>['ERROR','ORDER_NOT_CONFIRMED','TIMEOUT'].includes(o.outcome)).reduce((s,o)=>s+(o.count||0),0);
 
   const f=(id,v)=>{const e=$(id);if(e)e.textContent=v;};
   f('sg-total',total);f('sg-placed',placed);f('sg-conv',conv);f('sg-shadow',shadow);
   f('sg-ny-dead',by['NY_DEAD_ZONE']||0);f('sg-ny-night',by['NY_NIGHT']||0);
-  f('sg-asia',by['ASIA_MORNING']||0);f('sg-vwap',by['VWAP_EXHAUSTION']||0);
+  f('sg-asia',by['NY_NIGHT']||0);f('sg-vwap',by['VWAP_EXHAUSTION']||0);
   f('sg-dup',by['DUPLICATE_POSITION']||0);f('sg-ooh',by['STOCK_OOH']||0);
   f('sg-err',realErrors);
   if($('nb-sig'))$('nb-sig').textContent=total;
@@ -2893,7 +2872,20 @@ async function loadSignals(){
     if(!signals.length){sl.innerHTML=nd(16,'No signals yet');}
     else{
       // Filter: exclude STK_OOH from signal log (market closed, not tradeable)
-    const filteredSigs=signals.filter(s=>s.outcome!=='STOCK_OOH'&&s.outcome!=='WEEKEND');
+    const _now = new Date();
+    const _hhmm = _now.getHours()*100 + _now.getMinutes(); // approx Brussels (server side renders UTC+1/+2)
+    const filteredSigs=signals.filter(s=>{
+      if(s.outcome==='WEEKEND') return false;
+      if(s.outcome==='STOCK_OOH'||s.outcome==='STOCK_OUTSIDE_MARKET') return false;
+      // For STK type: only show signals that arrived during market hours 15:30-21:00
+      const isStk=(s.assetType||s.asset_type||bdTypeRaw(s.symbol))==='stock';
+      if(isStk){
+        const sHhmm=s.receivedAt||s.received_at?( ()=>{ const d=new Date(s.receivedAt||s.received_at); return d.getUTCHours()*100+d.getUTCMinutes()+100; })():0;
+        // Show stock signal only if it was received 15:30-21:00 Brussels (approx UTC+1: 14:30-20:00 UTC)
+        if(sHhmm>0 && (sHhmm<1430||sHhmm>=2000)) return false;
+      }
+      return true;
+    });
     sl.innerHTML=filteredSigs.slice(0,500).map(s=>{
         const outcome=s.outcome||'?';
         const isPlaced=outcome==='PLACED';
@@ -2912,7 +2904,7 @@ async function loadSignals(){
         if(pid){
           const _mt5c=s.orderComment||s.mt5_comment||_whatif;
           destCell='<span style="background:rgba(63,185,80,.15);color:#3fb950;padding:1px 6px;border-radius:3px;font-size:9px;border:1px solid rgba(63,185,80,.3);font-weight:700">-> Ghost #'+(s.tradeNumber||pid.slice(-4))+'</span> <span style="color:#6e7681;font-size:8px">'+_mt5c+'</span>';
-        } else if(outcome==='NY_DEAD_ZONE'||outcome==='NY_NIGHT'||outcome==='ASIA_MORNING'){
+        } else if(outcome==='NY_DEAD_ZONE'||outcome==='NY_NIGHT'||outcome==='NY_NIGHT'){
           destCell='<span style="background:rgba(240,136,62,.15);color:#f0883e;padding:1px 6px;border-radius:3px;font-size:9px;border:1px solid rgba(240,136,62,.3);font-weight:700">-> Shadow TZ</span>';
         } else if(outcome==='VWAP_EXHAUSTION'){
           destCell='<span style="background:rgba(188,140,255,.15);color:#bc8cff;padding:1px 6px;border-radius:3px;font-size:9px;border:1px solid rgba(188,140,255,.3);font-weight:700">-> Shadow VWAP</span>';
@@ -3117,15 +3109,17 @@ async function loadShadow(){
     const peakP=b.peakRRPos||b.peak_rr_pos||0;
     const peakN=b.peakRRNeg||b.peak_rr_neg||0;
     const prR=peakN>0?-(peakN/100):null;
-    const sessOrStop=showStop?bdStop(b.stopReason||b.stop_reason||'sl'):bdSess(b.session||b.sub_session||'ny');
-    return '<tr>'+
-      '<td>'+bdBlock(b.blockType||b.block_type)+'</td>'+
+    const _stop=b.stopReason||b.stop_reason||null;
+    const _hasSLHit=allMs['-1.0']!=null||(b.peakRRNeg||b.peak_rr_neg||0)>=100;
+    const _stopBadge=showStop?bdStop(_stop||(_hasSLHit?'phantom_sl':'sl')):'';
+    return '<tr class="'+( showStop&&_hasSLHit?'sl-row':'')+'">'+
+      '<td>'+bdBlock(b.blockType||b.block_type)+(_stopBadge?' '+_stopBadge:'')+'</td>'+
       '<td class="cw fw">'+( b.symbol||'\--')+'</td>'+
       '<td>'+bdType(b.assetType||b.type,b.symbol)+'</td>'+
       '<td>'+bdKey(b.keyCount||b.key_count||1)+'</td>'+
       '<td>'+bdDir(b.direction)+'</td>'+
       '<td>'+bdVwap(b.vwapPosition||b.vwap_position)+'</td>'+
-      '<td>'+sessOrStop+'</td>'+
+      '<td>'+bdSess(b.session||b.sub_session||'ny')+'</td>'+
       '<td class="'+(peakP>0?'cg fw':'cd')+'">'+( peakP>0?fmtR(peakP):'\--')+'</td>'+
       '<td class="'+(prR!=null&&prR<-0.5?'cr fw':prR!=null?'cr':'cd')+'">'+( prR!=null?fmtR(prR):'\--')+'</td>'+
       '<td class="'+(b.vwapBandPct>150?'co fw':b.vwapBandPct>100?'co':'cd')+'">'+( b.vwapBandPct!=null?fmtP(b.vwapBandPct):'\--')+'</td>'+
