@@ -97,9 +97,8 @@ const STOCK_SL_BUFFER_MULT = 3.0;   // stocks: 2× de standaard buffer
 const NY_DEAD_ZONE_START  = 1530;  // 15:30 Brussels — NY dead zone start
 const NY_DEAD_ZONE_END    = 1800;  // 18:00 Brussels — NY dead zone end
 const NY_NIGHT_START      = 2100;  // 21:00 Brussels — NY night start
-const NY_NIGHT_END        = 2400;  // 00:00 Brussels — NY night end (midnight)
-const ASIA_MORNING_START  =    0;  // 00:00 Brussels — Asia morning start
-const ASIA_MORNING_END    =  200;  // 02:00 Brussels — Asia morning end / Asia proper start
+const NY_NIGHT_END        =  200;  // 02:00 Brussels — NY night end (merged Asia morning)
+// ASIA_MORNING removed — merged into NY_NIGHT (now 21:00-02:00)er start
 
 // ── Approved symbol catalog ─────────────────────────────────────
 // ONLY these symbols are accepted. type determines lot/risk calc.
@@ -253,8 +252,8 @@ function getSubSession(date = null) {
   if (hhmm >= 800  && hhmm < 1530) return "LONDON";
   if (hhmm >= 1530 && hhmm < 1800) return "NY_DEAD_ZONE";    // 15:30–18:00 blocked
   if (hhmm >= 1800 && hhmm < 2100) return "NY_ACTIVE";       // 18:00–21:00 trading
-  if (hhmm >= 2100 && hhmm < 2400) return "NY_NIGHT";        // 21:00–00:00 blocked
-  if (hhmm >= 0    && hhmm < 200)  return "ASIA_MORNING";    // 00:00–02:00 blocked
+  if (hhmm >= 2100)                 return "NY_NIGHT";        // 21:00–02:00 blocked (midnight crossing)
+  if (hhmm < 200)                   return "NY_NIGHT";        // 00:00–02:00 also NY_NIGHT
   if (hhmm >= 200  && hhmm < 800)  return "ASIA";             // 02:00–08:00 trading
   return "NY"; // fallback
 }
@@ -263,8 +262,8 @@ function getSubSession(date = null) {
 function isMarketOpen(date = null) {
   const { day, hhmm } = getBrusselsComponents(date);
   if (day === 0 || day === 6) return false;
-  if (hhmm < 200)             return false;
-  if (hhmm >= 2100)           return false;
+  if (hhmm < 200)             return false;   // 00:00-02:00 = NY_NIGHT
+  if (hhmm >= 2100)           return false;   // 21:00+ = NY_NIGHT
   return true;
 }
 
@@ -324,10 +323,7 @@ function canOpenNewTrade(rawSymbol, date = null) {
       return { allowed: false, reason: `NY_DEAD_ZONE: ${hhmm} (${type} geblokkeerd 1530–1800 Brussels)` };
     }
     if (sub === "NY_NIGHT") {
-      return { allowed: false, reason: `NY_NIGHT: ${hhmm} (${type} geblokkeerd 2100–0000 Brussels)` };
-    }
-    if (sub === "ASIA_MORNING") {
-      return { allowed: false, reason: `ASIA_MORNING: ${hhmm} (${type} geblokkeerd 0000–0200 Brussels)` };
+      return { allowed: false, reason: `NY_NIGHT: ${hhmm} (${type} geblokkeerd 2100-0200 Brussels)` };
     }
   } else {
     // Onbekend symbooltype — niet in catalog gevonden.
