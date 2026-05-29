@@ -397,8 +397,7 @@ const SUB_SESSION_LABELS = {
 // Which sub-sessions are blocked (no new trades allowed)
 const BLOCKED_SUB_SESSIONS = new Set([
   "NY_DEAD_ZONE",
-  "NY_NIGHT",
-  "ASIA_MORNING",
+  "NY_NIGHT",  // covers 21:00-02:00 (was: ASIA_MORNING merged into NY_NIGHT)
 ]);
 
 // ── Data quality compliance date (FIX 8: single source of truth) ────
@@ -423,8 +422,6 @@ module.exports = {
   NY_DEAD_ZONE_END,
   NY_NIGHT_START,
   NY_NIGHT_END,
-  ASIA_MORNING_START,
-  ASIA_MORNING_END,
   SUB_SESSION_LABELS,
   BLOCKED_SUB_SESSIONS,
   getSubSession,
