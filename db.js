@@ -624,8 +624,7 @@ async function loadPerformanceByKey() {
         AVG(peak_rr_pos) AS avg_peak,
         MAX(peak_rr_pos) AS max_peak,
         COUNT(*) FILTER (WHERE mt5_close_reason = 'tp') AS mt5_tp_count,
-        AVG(time_to_sl_min) AS avg_time_to_sl,
-        rr_milestones
+        CAST(AVG(time_to_sl_min) AS FLOAT) AS avg_time_to_sl
       FROM ghost_trades
       WHERE optimizer_key IS NOT NULL
       GROUP BY optimizer_key, symbol
