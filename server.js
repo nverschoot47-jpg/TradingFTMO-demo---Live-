@@ -835,7 +835,7 @@ app.get("/api/ghost-active", (req, res) => {
 
 app.get("/api/ghost-history", async (req, res) => {
   if (!dbReady) return res.json([]);
-  const data = await db.loadGhostTrades(req.query.from ?? null, req.query.to ?? null);
+  const data = await db.loadGhostTrades(req.query.from ?? null, req.query.to ?? null, parseInt(req.query.limit) || 300);
   res.json(data);
 });
 
