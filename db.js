@@ -268,6 +268,17 @@ async function initDB() {
       ALTER TABLE ghost_trades   ADD COLUMN IF NOT EXISTS time_to_sl_min  INTEGER;
       ALTER TABLE ghost_trades   ADD COLUMN IF NOT EXISTS mt5_close_reason TEXT;
     `);
+
+    // ── Fix: drop phantom_sl NOT NULL (blocks all ghost_trade INSERTs + milestone saving) ──
+    await client.query(`
+      ALTER TABLE ghost_trades ALTER COLUMN phantom_sl DROP NOT NULL
+    `).catch(() => {}); // safe to ignore if column doesn't exist on fresh install
+
+    // Also ensure tp is nullable in ghost_state (old schema had it NOT NULL)
+    await client.query(`
+      ALTER TABLE ghost_state ALTER COLUMN tp DROP NOT NULL
+    `).catch(() => {});
+
     console.log("[DB] Migrations applied");
 
     // ── Step 3: Indexes (now safe — columns exist) ─────────────────
