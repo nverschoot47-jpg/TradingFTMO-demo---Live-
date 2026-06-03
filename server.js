@@ -315,8 +315,9 @@ async function finalizeGhost(ghost) {
     closedAt:       ghost.slHitAt ?? new Date().toISOString(),
   });
   await db.deleteGhostState(ghost.positionId);
-  // Keep finalized ghost in memory so dashboard still shows it with SL badge + all milestones
-  // It will be removed from memory after 30 minutes (cleanup cron)
+  // Keep finalized ghost in memory permanently until server restart
+  // After restart: ghost_trades DB is loaded fresh in loadGhostHistory()
+  // So data is NEVER lost — it's always in DB
   const pos = openPositions.get(ghost.positionId);
   if (pos) {
     pos.finalizedAt = Date.now();
@@ -710,10 +711,10 @@ app.post("/webhook", async (req, res) => {
   }
 
   // Safety
-  if (openPositions.size >= 200) {
+  if (openPositions.size >= 20) {
     await db.logSignal({ symbol, direction, session, vwapPosition: vwapPos, optimizerKey: optKey,
       tvEntry, slPct, vwapMid, vwapBandPct, ...wh,
-      outcome: "MAX_POSITIONS", rejectReason: "Max 200 positions", latencyMs: Date.now() - t0 });
+      outcome: "MAX_POSITIONS", rejectReason: "Max 20 positions", latencyMs: Date.now() - t0 });
     return res.json({ ok: false, reason: "MAX_POSITIONS" });
   }
 
@@ -1466,7 +1467,7 @@ async function loadGhostTracker(){
   const hdrEl=$('gh-ms-header');if(hdrEl)hdrEl.innerHTML=hdrCells;
   const body=$('gh-active-body');if(!body)return;
 
-  // Split: active (not finalized) and finalized (stays 30min)
+  // Split: active (not finalized) and finalized (stays until page reload — always loaded from DB)
   const activePOS = _pos.filter(p=>!p.ghostFinalized);
   const finalPOS  = _pos.filter(p=>p.ghostFinalized);
 
@@ -1525,7 +1526,7 @@ async function loadGhostTracker(){
 
   const finRows = finalPOS.length
     ? '<tr><td colspan="50" class="divider-label" style="background:rgba(248,81,73,.08);border-top:1px solid rgba(248,81,73,.25);border-bottom:1px solid rgba(248,81,73,.25)">'
-      +'<span style="color:#f85149">SL</span> Ghost Finalized — phantom SL geraakt · data blijft 30min zichtbaar · alle ADV backfilled'
+      +'<span style="color:#f85149">SL</span> Ghost Finalized — phantom SL geraakt · alle ADV milestones backfilled'
       +'</td></tr>'
       + finalPOS.map(p=>ghostRowHtml(p,true)).join('')
     : '';
@@ -1635,7 +1636,7 @@ async function loadPerf(){
 }
 
 // Init
-loadHeader();loadOverview();loadGhostHistory();
+loadHeader();loadOverview();loadGhostHistory();  // loads all finalized from DB on startup
 setInterval(loadHeader,15000);
 setInterval(()=>{
   const a=document.querySelector('.pg.on');if(!a)return;
