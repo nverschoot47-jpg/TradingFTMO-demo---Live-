@@ -468,7 +468,7 @@ async function loadClosedTrades(limit = 200) {
         CAST(peak_rr_pos AS FLOAT) AS "peakRRPos",
         CAST(peak_rr_neg AS FLOAT) AS "peakRRNeg",
         mt5_comment AS "mt5Comment",
-        opened_at AS "openedAt", COALESCE(sl_hit_at, created_at) AS "closedAt"
+        opened_at AS "openedAt", closed_at AS "closedAt"
       FROM closed_trades
       ORDER BY opened_at DESC NULLS LAST
       LIMIT $1
