@@ -710,10 +710,10 @@ app.post("/webhook", async (req, res) => {
   }
 
   // Safety
-  if (openPositions.size >= 20) {
+  if (openPositions.size >= 200) {
     await db.logSignal({ symbol, direction, session, vwapPosition: vwapPos, optimizerKey: optKey,
       tvEntry, slPct, vwapMid, vwapBandPct, ...wh,
-      outcome: "MAX_POSITIONS", rejectReason: "Max 20 positions", latencyMs: Date.now() - t0 });
+      outcome: "MAX_POSITIONS", rejectReason: "Max 200 positions", latencyMs: Date.now() - t0 });
     return res.json({ ok: false, reason: "MAX_POSITIONS" });
   }
 
