@@ -1284,35 +1284,19 @@ tr:last-child td{border-bottom:none}
   </div>
   <div class="card">
     <div class="chdr">
-      <div class="ctitle"><div class="dot g"></div>Active Ghost — -1.0R to +20R per 0.1R · sync 5s</div>
-      <div class="cm">ghost never closes on MT5 TP — only phantom SL</div>
+      <div class="ctitle"><div class="dot g"></div>Ghost Tracker — -1.0R to +20R per 0.1R · sync 5s</div>
+      <div id="gh-badges" style="display:flex;gap:6px;margin-left:8px"></div>
+      <div class="cm">● LIVE = MT5 open · GHOST = MT5 TP ghost door · FINISHED = phantom SL</div>
+      <div style="display:flex;gap:6px;margin-left:4px">
+        <input type="date" id="gh-from" style="background:#0d1117;border:1px solid rgba(139,148,158,.2);color:#e6edf3;padding:2px 6px;border-radius:4px;font-size:10px">
+        <input type="date" id="gh-to"   style="background:#0d1117;border:1px solid rgba(139,148,158,.2);color:#e6edf3;padding:2px 6px;border-radius:4px;font-size:10px">
+        <button onclick="loadGhostHistory()" style="background:#21262d;border:1px solid rgba(139,148,158,.2);color:#8b949e;padding:2px 8px;border-radius:4px;font-size:10px;cursor:pointer">Filter finalized</button>
+      </div>
     </div>
-    <div class="tw" id="gh-active-wrap">
+    <div class="tw">
       <table id="gh-active-table" style="min-width:4000px">
         <thead><tr id="gh-ms-header"></tr></thead>
         <tbody id="gh-active-body"><tr><td colspan="50" class="nd">Loading...</td></tr></tbody>
-      </table>
-    </div>
-  </div>
-  <div class="section-sep">
-    <div class="section-sep-line"></div>
-    <span class="section-sep-lbl">Ghost Finalized — phantom SL only · all ADV milestones backfilled</span>
-    <div class="section-sep-line"></div>
-  </div>
-  <div class="card">
-    <div class="chdr">
-      <div class="ctitle"><div class="dot r"></div>Ghost Finalized</div>
-      <div style="display:flex;gap:6px;margin-left:8px">
-        <input type="date" id="gh-from" style="background:#0d1117;border:1px solid rgba(139,148,158,.2);color:#e6edf3;padding:3px 7px;border-radius:4px;font-size:10px">
-        <input type="date" id="gh-to"   style="background:#0d1117;border:1px solid rgba(139,148,158,.2);color:#e6edf3;padding:3px 7px;border-radius:4px;font-size:10px">
-        <button onclick="loadGhostHistory()" style="background:#21262d;border:1px solid rgba(139,148,158,.2);color:#8b949e;padding:3px 10px;border-radius:4px;font-size:10px;cursor:pointer">Filter</button>
-      </div>
-      <div class="cm" id="gh-fin-count">0 finalized</div>
-    </div>
-    <div class="tw">
-      <table id="gh-fin-table" style="min-width:4000px">
-        <thead><tr id="gh-fin-header"></tr></thead>
-        <tbody id="gh-fin-body"><tr><td colspan="50" class="nd">Loading...</td></tr></tbody>
       </table>
     </div>
   </div>
@@ -1546,27 +1530,68 @@ async function loadGhostTracker(){
       + finalPOS.map(p=>ghostRowHtml(p,true)).join('')
     : '';
 
-  body.innerHTML = activeRows + finRows;
+  // Load finalized from DB and append in same tbody
+  const from=$('gh-from')?.value||'', to=$('gh-to')?.value||'';
+  let histUrl='/api/ghost-history?limit=500';
+  if(from)histUrl+='&from='+from; if(to)histUrl+='&to='+to;
+  const histData = await api(histUrl)||[];
+  if($('gh-fin-count'))$('gh-fin-count').textContent=histData.length+' finalized';
+  if($('gh-fin'))$('gh-fin').textContent=histData.length;
+  if($('nb-gh'))$('nb-gh').textContent=(_pos.length+histData.length)||0;
+
+  // Update badges
+  const bdg=$('gh-badges');
+  if(bdg){
+    const liveCnt=_pos.filter(p=>!p.ghostFinalized&&!p.ghost?.mt5ClosedTP).length;
+    const ghostCnt=_pos.filter(p=>p.ghost?.mt5ClosedTP&&!p.ghostFinalized).length;
+    const finMem=_pos.filter(p=>p.ghostFinalized).length;
+    const s9='font-size:9px';
+    bdg.innerHTML=
+      (liveCnt?'<span style="'+s9+';background:rgba(63,185,80,.1);color:#3fb950;border:1px solid rgba(63,185,80,.25);padding:1px 6px;border-radius:3px">'+liveCnt+' LIVE</span>':'')
+      +(ghostCnt?'<span style="'+s9+';background:rgba(188,140,255,.1);color:#bc8cff;border:1px solid rgba(188,140,255,.25);padding:1px 6px;border-radius:3px">'+ghostCnt+' GHOST</span>':'')
+      +(finMem?'<span style="'+s9+';background:rgba(139,148,158,.1);color:#6e7681;border:1px solid rgba(139,148,158,.2);padding:1px 6px;border-radius:3px">'+finMem+' FINISHED</span>':'')
+      +(histData.length?'<span style="'+s9+';background:rgba(248,81,73,.08);color:#f85149;border:1px solid rgba(248,81,73,.2);padding:1px 6px;border-radius:3px">'+histData.length+' in DB</span>':'');
+  }
+
+  const maxFavH=histData.length?Math.min(20,Math.max(1.5,...histData.map(g=>g.peakRRPos||0))):MAX_FAV;
+  const finRows2=histData.length
+    ?'<tr><td colspan="200" class="divider-label"><div class="dot r" style="flex-shrink:0"></div>Ghost Finalized — phantom SL geraakt · alle ADV milestones backfilled · data altijd bewaard in DB</td></tr>'
+      +histData.map(g=>{
+        const ms=g.rrMilestones||{};
+        return '<tr>'
+          +'<td><span class="bd bd-sl" style="padding:2px 7px;font-size:9px;font-weight:700">SL</span></td>'
+          +'<td class="cw fw" style="font-size:9px">'+(g.dailyLabel||'--')+'</td>'
+          +'<td class="cw fw">'+g.symbol+'</td>'
+          +'<td class="cd" style="font-size:8px">'+(g.mt5Comment||'--')+'</td>'
+          +'<td>'+bdType(g.assetType)+'</td>'
+          +'<td>'+bdDir(g.direction)+'</td>'
+          +'<td>'+bdVwap(g.vwapPosition||'unknown')+'</td>'
+          +'<td>'+bdSess(g.session)+'</td>'
+          +'<td class="cg fw">+'+(g.peakRRPos||0).toFixed(2)+'R</td>'
+          +'<td class="cr fw">-1.00R</td>'
+          +'<td class="cg">+1.50R</td>'
+          +'<td class="cd">'+(g.timeToSLMin!=null?g.timeToSLMin+'m':'--')+'</td>'
+          +buildMsRow(ms,Math.min(maxFavH,20))
+          +'<td class="cd" style="font-size:9px">'+fmt(null,2)+'</td>'
+          +'<td class="cd">'+fmt(g.entry,g.assetType==="index"?2:5)+'</td>'
+          +'<td class="cr">'+fmt(g.sl,g.assetType==="index"?2:5)+'</td>'
+          +'<td class="cg">--</td>'
+          +'<td class="cd">'+fmt(g.lots,2)+'</td>'
+          +'<td class="cd" style="font-size:9px">'+fmtTs(g.openedAt)+'</td>'
+          +'<td class="cd">--</td><td class="cd">--</td><td class="cd">--</td>'
+          +'<td class="cd">--</td><td class="cd">--</td><td class="cd">--</td><td class="cd">--</td>'
+          +'<td class="cd">'+(g.vwapBandPct!=null?Number(g.vwapBandPct).toFixed(1)+'%':'--')+'</td>'
+          +'<td class="cd">--</td><td class="cd">--</td>'
+          +'</tr>';
+      }).join('')
+    :'';
+
+  body.innerHTML = activeRows + finRows + finRows2;
 }
 
 async function loadGhostHistory(){
-  const from=$('gh-from')?.value||'',to=$('gh-to')?.value||'';
-  let url='/api/ghost-history?limit=500';
-  if(from)url+='&from='+from;if(to)url+='&to='+to;
-  const data=await api(url)||[];
-  if($('gh-fin-count'))$('gh-fin-count').textContent=data.length+' finalized';
-  if($('nb-gh'))$('nb-gh').textContent=data.length;
-  // Build header
-  const maxFav=data.length?Math.max(1.5,...data.map(g=>g.peakRRPos||0)):5.0;
-  const finHdr='<th>Stop</th><th>#</th><th>Symbol</th><th>MT5 Comment</th><th>Type</th><th>Dir</th><th>VWAP</th><th>Session</th><th style="color:#3fb950">Peak+RR</th><th class="cr">Peak−RR</th><th>Time→SL</th>'+buildMsHeaders(Math.min(maxFav,20))+'<th>Optimizer Key</th><th>Lots</th><th>MT5 close</th><th>Opened</th><th>Closed</th>';
-  const hEl=$('gh-fin-header');if(hEl)hEl.innerHTML=finHdr;
-  const body=$('gh-fin-body');if(!body)return;
-  if(!data.length){body.innerHTML='<tr><td colspan="50" class="nd">No finalized ghost trades yet</td></tr>';return;}
-  body.innerHTML=data.map(g=>{
-    const ms=g.rrMilestones||{};
-    const isIdx=g.assetType==='index';
-    return '<tr><td><span class="bd bd-sl">SL</span></td><td class="cw fw" style="font-size:9px">'+(g.dailyLabel||'--')+'</td><td class="cw fw">'+g.symbol+'</td><td class="cd" style="font-size:8px">'+(g.mt5Comment||'--')+'</td><td>'+bdType(g.assetType)+'</td><td>'+bdDir(g.direction)+'</td><td>'+bdVwap(g.vwapPosition||'unknown')+'</td><td>'+bdSess(g.session)+'</td><td class="cg fw">+'+(g.peakRRPos||0).toFixed(2)+'R</td><td class="cr fw">-1.00R</td><td class="cd">'+(g.timeToSLMin!=null?g.timeToSLMin+'m':'--')+'</td>'+buildMsRow(ms,Math.min(maxFav,20))+'<td class="cd" style="font-size:8px">'+(g.optimizerKey||'--')+'</td><td class="cd">'+fmt(g.lots,2)+'</td><td><span class="bd '+(g.mt5CloseReason==='tp'?'bd-tp">TP':'bd-sl">SL')+' (MT5)</span></td><td class="cd" style="font-size:9px">'+fmtTs(g.openedAt)+'</td><td class="cd" style="font-size:9px">'+fmtTs(g.closedAt)+'</td></tr>';
-  }).join('');
+  // Alias — just reload the full ghost tracker
+  await loadGhostTracker();
 }
 
 // PERFORMANCE
