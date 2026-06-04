@@ -1506,6 +1506,9 @@ async function loadGhostTracker(){
     let statusBadge;
     if(isFinalized){
       statusBadge='<span class="bd" style="background:rgba(139,148,158,.15);color:#e6edf3;border:1px solid rgba(139,148,158,.4);padding:2px 7px;font-size:9px;font-weight:700">FINISHED</span>';
+    } else if(g.mt5ClosedTP && (ms['-1.0'] || (g.peakRRNeg||0) >= 100)){
+      // MT5 TP and phantom SL already hit — show FINISHED
+      statusBadge='<span class="bd" style="background:rgba(139,148,158,.15);color:#e6edf3;border:1px solid rgba(139,148,158,.4);padding:2px 7px;font-size:9px;font-weight:700">FINISHED</span>';
     } else if(g.mt5ClosedTP){
       statusBadge='<span class="bd" style="background:rgba(188,140,255,.15);color:#bc8cff;border:1px solid rgba(188,140,255,.3);padding:2px 7px;font-size:9px;font-weight:700">GHOST</span>';
     } else {
@@ -1577,7 +1580,7 @@ async function loadGhostTracker(){
 
   const maxFavH=histData.length?Math.min(20,Math.max(1.5,...histData.map(g=>g.peakRRPos||0))):MAX_FAV;
   const finRows2=histData.length
-    ?'<tr><td colspan="200" class="divider-label"><div class="dot r" style="flex-shrink:0"></div>Ghost Finalized — phantom SL geraakt · alle ADV milestones backfilled · data altijd bewaard in DB</td></tr>'
+    ?'<tr><td colspan="200" class="divider-label"><div class="dot r" style="flex-shrink:0"></div>Ghost Finalized — DB</td></tr>'
       +histData.map(g=>{
         const ms=g.rrMilestones||{};
         return '<tr>'
