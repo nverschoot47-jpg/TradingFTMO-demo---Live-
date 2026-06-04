@@ -45,7 +45,7 @@ const VERSION = "2.0.0";
 
 // ── Safe numeric parser (handles NaN, null, undefined, "") ────────
 function safeNum(val) {
-  if (val === null || val === undefined || val === "") return null;
+  if (val === null || val === undefined || val === "" || val === "NaN" || val !== val) return null;
   const n = parseFloat(val);
   return isNaN(n) ? null : n;
 }
@@ -71,7 +71,22 @@ let _lastEquitySave = 0;
 // ── Express: start immediately so Railway health check passes ────
 const app = express();
 app.use(helmet({ contentSecurityPolicy: false }));
-app.use(express.json({ limit: "1mb" }));
+// Custom JSON parser — handles NaN from TradingView (invalid JSON but TV sends it)
+app.use((req, res, next) => {
+  if (req.method === "POST" && req.headers["content-type"]?.includes("application/json")) {
+    let raw = "";
+    req.on("data", chunk => raw += chunk);
+    req.on("end", () => {
+      try {
+        const sanitized = raw.replace(/: *NaN/g, ": null").replace(/: *nan/g, ": null");
+        req.body = JSON.parse(sanitized);
+      } catch { try { req.body = JSON.parse(raw); } catch { req.body = {}; } }
+      next();
+    });
+  } else {
+    express.json({ limit: "1mb" })(req, res, next);
+  }
+});
 
 const server = app.listen(PORT, () => {
   console.log(`[PRONTO-AI v${VERSION}] port ${PORT}`);
@@ -315,9 +330,8 @@ async function finalizeGhost(ghost) {
     closedAt:       ghost.slHitAt ?? new Date().toISOString(),
   });
   await db.deleteGhostState(ghost.positionId);
-  // Keep finalized ghost in memory permanently until server restart
-  // After restart: ghost_trades DB is loaded fresh in loadGhostHistory()
-  // So data is NEVER lost — it's always in DB
+  // Keep finalized ghost in memory so dashboard still shows it with SL badge + all milestones
+  // It will be removed from memory after 30 minutes (cleanup cron)
   const pos = openPositions.get(ghost.positionId);
   if (pos) {
     pos.finalizedAt = Date.now();
@@ -693,12 +707,15 @@ app.post("/webhook", async (req, res) => {
   const slPct    = safeNum(sl_pct) ?? 0.003;
 
   // All webhook numeric fields
+  // If session_high/low are NaN (Asia session not yet initialized), fall back to day_high/low
+  const _sessH = safeNum(session_high);
+  const _sessL = safeNum(session_low);
   const wh = {
     slPoints:    safeNum(sl_points),
     vwapUpper:   safeNum(vwap_upper),
     vwapLower:   safeNum(vwap_lower),
-    sessionHigh: safeNum(session_high),
-    sessionLow:  safeNum(session_low),
+    sessionHigh: _sessH ?? safeNum(day_high),
+    sessionLow:  _sessL ?? safeNum(day_low),
     dayHigh:     safeNum(day_high),
     dayLow:      safeNum(day_low),
   };
@@ -1467,7 +1484,7 @@ async function loadGhostTracker(){
   const hdrEl=$('gh-ms-header');if(hdrEl)hdrEl.innerHTML=hdrCells;
   const body=$('gh-active-body');if(!body)return;
 
-  // Split: active (not finalized) and finalized (stays until page reload — always loaded from DB)
+  // Split: active (not finalized) and finalized (stays 30min)
   const activePOS = _pos.filter(p=>!p.ghostFinalized);
   const finalPOS  = _pos.filter(p=>p.ghostFinalized);
 
@@ -1526,7 +1543,7 @@ async function loadGhostTracker(){
 
   const finRows = finalPOS.length
     ? '<tr><td colspan="50" class="divider-label" style="background:rgba(248,81,73,.08);border-top:1px solid rgba(248,81,73,.25);border-bottom:1px solid rgba(248,81,73,.25)">'
-      +'<span style="color:#f85149">SL</span> Ghost Finalized — phantom SL geraakt · alle ADV milestones backfilled'
+      +'<span style="color:#f85149">SL</span> Ghost Finalized — phantom SL geraakt · data blijft 30min zichtbaar · alle ADV backfilled'
       +'</td></tr>'
       + finalPOS.map(p=>ghostRowHtml(p,true)).join('')
     : '';
@@ -1636,7 +1653,7 @@ async function loadPerf(){
 }
 
 // Init
-loadHeader();loadOverview();loadGhostHistory();  // loads all finalized from DB on startup
+loadHeader();loadOverview();loadGhostHistory();
 setInterval(loadHeader,15000);
 setInterval(()=>{
   const a=document.querySelector('.pg.on');if(!a)return;
