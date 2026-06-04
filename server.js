@@ -45,7 +45,7 @@ const VERSION = "2.0.0";
 
 // ── Safe numeric parser (handles NaN, null, undefined, "") ────────
 function safeNum(val) {
-  if (val === null || val === undefined || val === "" || val === "NaN" || val !== val) return null;
+  if (val === null || val === undefined || val === "") return null;
   const n = parseFloat(val);
   return isNaN(n) ? null : n;
 }
@@ -71,22 +71,7 @@ let _lastEquitySave = 0;
 // ── Express: start immediately so Railway health check passes ────
 const app = express();
 app.use(helmet({ contentSecurityPolicy: false }));
-// Custom JSON parser — handles NaN from TradingView (invalid JSON but TV sends it)
-app.use((req, res, next) => {
-  if (req.method === "POST" && req.headers["content-type"]?.includes("application/json")) {
-    let raw = "";
-    req.on("data", chunk => raw += chunk);
-    req.on("end", () => {
-      try {
-        const sanitized = raw.replace(/: *NaN/g, ": null").replace(/: *nan/g, ": null");
-        req.body = JSON.parse(sanitized);
-      } catch { try { req.body = JSON.parse(raw); } catch { req.body = {}; } }
-      next();
-    });
-  } else {
-    express.json({ limit: "1mb" })(req, res, next);
-  }
-});
+app.use(express.json({ limit: "1mb" }));
 
 const server = app.listen(PORT, () => {
   console.log(`[PRONTO-AI v${VERSION}] port ${PORT}`);
@@ -707,15 +692,12 @@ app.post("/webhook", async (req, res) => {
   const slPct    = safeNum(sl_pct) ?? 0.003;
 
   // All webhook numeric fields
-  // If session_high/low are NaN (Asia session not yet initialized), fall back to day_high/low
-  const _sessH = safeNum(session_high);
-  const _sessL = safeNum(session_low);
   const wh = {
     slPoints:    safeNum(sl_points),
     vwapUpper:   safeNum(vwap_upper),
     vwapLower:   safeNum(vwap_lower),
-    sessionHigh: _sessH ?? safeNum(day_high),
-    sessionLow:  _sessL ?? safeNum(day_low),
+    sessionHigh: safeNum(session_high),
+    sessionLow:  safeNum(session_low),
     dayHigh:     safeNum(day_high),
     dayLow:      safeNum(day_low),
   };
@@ -1410,15 +1392,33 @@ async function loadOverview(){
   if($('ov-ct'))$('ov-ct').textContent=_cl.length;
   const body=$('ov-body');if(!body)return;
   const rows=[];
-  // OPEN rows
-  for(const p of _pos){
+  // OPEN rows — only truly open in MT5 (mt5Closed=false and not ghostFinalized)
+  const _openPos = _pos.filter(p => !p.mt5Closed && !p.ghostFinalized);
+  // MT5-closed but ghost still running — show as closed in overview
+  const _mt5ClosedPos = _pos.filter(p => p.mt5Closed || p.ghostFinalized);
+
+  if($('ov-open-badge'))$('ov-open-badge').textContent=_openPos.length+' open';
+
+  for(const p of _openPos){
     const g=p.ghost||{};
     const rr=rrFromPrice(p.entry,p.sl,p.currentPrice,p.direction);
     rows.push('<tr class="row-open"><td><span class="bd-k">'+(p.dailyLabel||'--')+'</span></td><td class="cw fw">'+p.symbol+'</td><td>'+bdType(p.assetType)+'</td><td>'+bdDir(p.direction)+'</td><td>'+bdVwap(p.vwapPosition)+'</td><td>'+bdSess(p.session)+'</td><td class="cd">'+fmt(p.entry,p.assetType==='index'?2:4)+'</td><td class="cr">'+fmt(p.sl,p.assetType==='index'?2:4)+'</td><td class="cg">'+fmt(p.tp,p.assetType==='index'?2:4)+'</td><td>'+rrHtml(rr)+'</td><td>'+(g.peakRRPos>0?'<span class="cg fw">+'+g.peakRRPos.toFixed(2)+'R</span>':'--')+'</td><td>'+(g.peakRRNeg>0?'<span class="cr">-'+(g.peakRRNeg/100).toFixed(2)+'R</span>':'--')+'</td><td class="cd">'+fmt(p.lots,2)+'</td><td class="cd" style="font-size:8px">'+(p.mt5Comment||'--')+'</td><td class="cd" style="font-size:9px">'+fmtTs(p.openedAt)+'</td><td class="cd">—</td></tr>');
   }
-  if(_cl.length)rows.push('<tr><td colspan="16" class="divider-label"><div class="dot r"></div>Closed — '+_cl.length+' trades</td></tr>');
+
+  // Closed section: DB closed trades + MT5-closed ghost positions
+  const totalClosed = _cl.length + _mt5ClosedPos.length;
+  if(totalClosed)rows.push('<tr><td colspan="16" class="divider-label"><div class="dot r"></div>Closed — '+totalClosed+' trades</td></tr>');
+
+  // MT5-closed positions from memory (ghost still running but MT5 already closed)
+  for(const p of _mt5ClosedPos){
+    const g=p.ghost||{};
+    const isTP = p.mt5CloseReason==='tp' || (g.peakRRPos>=1.30);
+    const isSL = !isTP;
+    rows.push('<tr class="'+(isSL?'row-slhit':'')+'"><td><span class="bd-k">'+(p.dailyLabel||'--')+'</span></td><td class="cw fw">'+p.symbol+'</td><td>'+bdType(p.assetType)+'</td><td>'+bdDir(p.direction)+'</td><td>'+bdVwap(p.vwapPosition)+'</td><td>'+bdSess(p.session)+'</td><td class="cd">'+fmt(p.entry,p.assetType==='index'?2:4)+'</td><td class="cr">'+fmt(p.sl,p.assetType==='index'?2:4)+'</td><td class="cg">'+fmt(p.tp,p.assetType==='index'?2:4)+'</td><td>'+(isSL?'<span class="bd bd-sl">SL −1.00R</span>':'<span class="bd bd-tp">TP +1.50R</span>')+'</td><td>'+(g.peakRRPos>0?'<span class="cg fw">+'+g.peakRRPos.toFixed(2)+'R</span>':'--')+'</td><td>'+(g.peakRRNeg>0?'<span class="cr">-'+(g.peakRRNeg/100).toFixed(2)+'R</span>':'--')+'</td><td class="cd">'+fmt(p.lots,2)+'</td><td class="cd" style="font-size:8px">'+(p.mt5Comment||'--')+'</td><td class="cd" style="font-size:9px">'+fmtTs(p.openedAt)+'</td><td class="cd" style="font-size:9px">'+fmtTs(p.ghost?.mt5CloseAt||null)+'</td></tr>');
+  }
+
+  // DB closed trades
   for(const t of _cl){
-    // Determine TP/SL: trust closeReason but also use peakRRPos as extra signal
     const isTP = t.closeReason==='tp' || (t.peakRRPos >= 1.30);
     const isSL = !isTP;
     rows.push('<tr class="'+(isSL?'row-slhit':'')+'"><td><span class="bd-k">'+(t.dailyLabel||'--')+'</span></td><td class="cw fw">'+t.symbol+'</td><td>'+bdType(t.assetType)+'</td><td>'+bdDir(t.direction)+'</td><td>'+bdVwap(t.vwapPosition)+'</td><td>'+bdSess(t.session)+'</td><td class="cd">'+fmt(t.entry,t.assetType==='index'?2:4)+'</td><td class="cr">'+fmt(t.sl,t.assetType==='index'?2:4)+'</td><td class="cg">'+fmt(t.tp,t.assetType==='index'?2:4)+'</td><td>'+(isSL?'<span class="bd bd-sl">SL −1.00R</span>':'<span class="bd bd-tp">TP +1.50R</span>')+'</td><td>'+(t.peakRRPos>0?'<span class="cg fw">+'+t.peakRRPos.toFixed(2)+'R</span>':'--')+'</td><td>'+(t.peakRRNeg>0?'<span class="cr">-'+(t.peakRRNeg/100).toFixed(2)+'R</span>':'--')+'</td><td class="cd">'+fmt(t.lots,2)+'</td><td class="cd" style="font-size:8px">'+(t.mt5Comment||'--')+'</td><td class="cd" style="font-size:9px">'+fmtTs(t.openedAt)+'</td><td class="cd" style="font-size:9px">'+fmtTs(t.closedAt)+'</td></tr>');
