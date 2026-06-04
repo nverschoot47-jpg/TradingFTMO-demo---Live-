@@ -1414,7 +1414,10 @@ async function loadOverview(){
   for(const p of _openMT5){
     const g=p.ghost||{};
     const rr=rrFromPrice(p.entry,p.sl,p.currentPrice,p.direction);
-    rows.push('<tr class="row-open"><td><span class="bd-k">'+(p.dailyLabel||'--')+'</span></td><td class="cw fw">'+p.symbol+'</td><td>'+bdType(p.assetType)+'</td><td>'+bdDir(p.direction)+'</td><td>'+bdVwap(p.vwapPosition)+'</td><td>'+bdSess(p.session)+'</td><td class="cd">'+fmt(p.entry,p.assetType==='index'?2:4)+'</td><td class="cr">'+fmt(p.sl,p.assetType==='index'?2:4)+'</td><td class="cg">'+fmt(p.tp,p.assetType==='index'?2:4)+'</td><td>'+rrHtml(rr)+'</td><td>'+(g.peakRRPos>0?'<span class="cg fw">+'+g.peakRRPos.toFixed(2)+'R</span>':'--')+'</td><td>'+(g.peakRRNeg>0?'<span class="cr">-'+(g.peakRRNeg/100).toFixed(2)+'R</span>':'--')+'</td><td class="cd">'+fmt(p.lots,2)+'</td><td class="cd" style="font-size:8px">'+(p.mt5Comment||'--')+'</td><td class="cd" style="font-size:9px">'+fmtTs(p.openedAt)+'</td><td class="cd">—</td></tr>');
+    // Peak+ / Peak- from MT5 only: use live P&L converted to R
+    const slDist=p.sl&&p.entry?Math.abs(p.entry-p.sl):null;
+    const livePnlR=slDist&&p.lots&&p.livePnl!=null?(p.livePnl/(slDist*p.lots*(p.assetType==='index'?1:100))):null;
+    rows.push('<tr class="row-open"><td><span class="bd-k">'+(p.dailyLabel||'--')+'</span></td><td class="cw fw">'+p.symbol+'</td><td>'+bdType(p.assetType)+'</td><td>'+bdDir(p.direction)+'</td><td>'+bdVwap(p.vwapPosition)+'</td><td>'+bdSess(p.session)+'</td><td class="cd">'+fmt(p.entry,p.assetType==='index'?2:4)+'</td><td class="cr">'+fmt(p.sl,p.assetType==='index'?2:4)+'</td><td class="cg">'+fmt(p.tp,p.assetType==='index'?2:4)+'</td><td>'+rrHtml(rr)+'</td><td>'+(rr!=null&&rr>0?'<span class="cg fw">+'+rr.toFixed(2)+'R</span>':'--')+'</td><td>'+(rr!=null&&rr<0?'<span class="cr">'+rr.toFixed(2)+'R</span>':'--')+'</td><td class="cd">'+fmt(p.lots,2)+'</td><td class="cd" style="font-size:8px">'+(p.mt5Comment||'--')+'</td><td class="cd" style="font-size:9px">'+fmtTs(p.openedAt)+'</td><td class="cd">—</td></tr>');
   }
   const totalClosed = _cl.length + _closedMT5.length;
   if(totalClosed)rows.push('<tr><td colspan="16" class="divider-label"><div class="dot r"></div>Closed — '+totalClosed+' trades</td></tr>');
@@ -1506,9 +1509,6 @@ async function loadGhostTracker(){
     let statusBadge;
     if(isFinalized){
       statusBadge='<span class="bd" style="background:rgba(139,148,158,.15);color:#e6edf3;border:1px solid rgba(139,148,158,.4);padding:2px 7px;font-size:9px;font-weight:700">FINISHED</span>';
-    } else if(g.mt5ClosedTP && (ms['-1.0'] || (g.peakRRNeg||0) >= 100)){
-      // MT5 TP and phantom SL already hit — show FINISHED
-      statusBadge='<span class="bd" style="background:rgba(139,148,158,.15);color:#e6edf3;border:1px solid rgba(139,148,158,.4);padding:2px 7px;font-size:9px;font-weight:700">FINISHED</span>';
     } else if(g.mt5ClosedTP){
       statusBadge='<span class="bd" style="background:rgba(188,140,255,.15);color:#bc8cff;border:1px solid rgba(188,140,255,.3);padding:2px 7px;font-size:9px;font-weight:700">GHOST</span>';
     } else {
@@ -1580,7 +1580,7 @@ async function loadGhostTracker(){
 
   const maxFavH=histData.length?Math.min(20,Math.max(1.5,...histData.map(g=>g.peakRRPos||0))):MAX_FAV;
   const finRows2=histData.length
-    ?'<tr><td colspan="200" class="divider-label"><div class="dot r" style="flex-shrink:0"></div>Ghost Finalized — DB</td></tr>'
+    ?'<tr><td colspan="200" class="divider-label"><div class="dot r" style="flex-shrink:0"></div>Ghost Finalized — phantom SL geraakt · alle ADV milestones backfilled · data altijd bewaard in DB</td></tr>'
       +histData.map(g=>{
         const ms=g.rrMilestones||{};
         return '<tr>'
