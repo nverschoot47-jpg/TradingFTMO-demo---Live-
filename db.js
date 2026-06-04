@@ -279,7 +279,39 @@ async function initDB() {
       ALTER TABLE ghost_state ALTER COLUMN tp DROP NOT NULL
     `).catch(() => {});
 
-    console.log("[DB] Migrations applied");
+    // Data recovery: copy closed_trades → ghost_trades on every startup
+    // Ensures FINISHED data survives every redeploy forever
+    await client.query(`
+      INSERT INTO ghost_trades (
+        position_id, daily_label, optimizer_key, symbol, asset_type,
+        direction, session, vwap_position,
+        entry, sl, tp, lots, risk_eur, sl_pct, sl_dist,
+        vwap_mid, vwap_upper, vwap_lower, vwap_band_pct,
+        session_high, session_low, day_high, day_low,
+        tv_entry, mt5_comment,
+        peak_rr_pos, peak_rr_neg,
+        rr_milestones, mt5_close_reason, opened_at, closed_at
+      )
+      SELECT
+        ct.position_id, ct.daily_label, ct.optimizer_key, ct.symbol, ct.asset_type,
+        ct.direction, ct.session, ct.vwap_position,
+        ct.entry, ct.sl, ct.tp, ct.lots, ct.risk_eur, ct.sl_pct, ct.sl_dist,
+        ct.vwap_mid, ct.vwap_upper, ct.vwap_lower, ct.vwap_band_pct,
+        ct.session_high, ct.session_low, ct.day_high, ct.day_low,
+        ct.tv_entry, ct.mt5_comment,
+        COALESCE(ct.peak_rr_pos, 0),
+        COALESCE(ct.peak_rr_neg, 0),
+        '{}',
+        ct.close_reason,
+        ct.opened_at, ct.closed_at
+      FROM closed_trades ct
+      WHERE ct.position_id IS NOT NULL
+        AND ct.opened_at IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM ghost_trades gt WHERE gt.position_id = ct.position_id
+        )
+    `).catch(()=>{});
+    console.log("[DB] Migrations applied + data recovery done");
 
     // ── Step 3: Indexes (now safe — columns exist) ─────────────────
     await client.query(`
@@ -596,7 +628,7 @@ async function loadGhostTrades(from = null, to = null, limit = 300) {
         time_to_sl_min AS "timeToSLMin",
         mt5_close_reason AS "mt5CloseReason",
         mt5_comment AS "mt5Comment",
-        opened_at AS "openedAt", closed_at AS "closedAt"
+        opened_at AS "openedAt", COALESCE(closed_at, sl_hit_at, created_at) AS "closedAt"
       FROM ghost_trades
       ${where}
       ORDER BY opened_at DESC NULLS LAST
