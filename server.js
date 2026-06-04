@@ -71,7 +71,22 @@ let _lastEquitySave = 0;
 // ── Express: start immediately so Railway health check passes ────
 const app = express();
 app.use(helmet({ contentSecurityPolicy: false }));
-app.use(express.json({ limit: "1mb" }));
+// Raw body parser handles NaN from TradingView (invalid JSON)
+app.use((req, res, next) => {
+  if (req.method === "POST" && req.headers["content-type"]?.includes("application/json")) {
+    let raw = "";
+    req.on("data", chunk => raw += chunk);
+    req.on("end", () => {
+      try {
+        const sanitized = raw.replace(/: *NaN/g, ": null").replace(/: *nan/g, ": null");
+        req.body = JSON.parse(sanitized);
+      } catch { try { req.body = JSON.parse(raw); } catch { req.body = {}; } }
+      next();
+    });
+  } else {
+    express.json({ limit: "1mb" })(req, res, next);
+  }
+});
 
 const server = app.listen(PORT, () => {
   console.log(`[PRONTO-AI v${VERSION}] port ${PORT}`);
@@ -692,12 +707,14 @@ app.post("/webhook", async (req, res) => {
   const slPct    = safeNum(sl_pct) ?? 0.003;
 
   // All webhook numeric fields
+  // Fallback: session_high/low NaN during Asia → use day_high/low
+  const _sH = safeNum(session_high), _sL = safeNum(session_low);
   const wh = {
     slPoints:    safeNum(sl_points),
     vwapUpper:   safeNum(vwap_upper),
     vwapLower:   safeNum(vwap_lower),
-    sessionHigh: safeNum(session_high),
-    sessionLow:  safeNum(session_low),
+    sessionHigh: _sH ?? safeNum(day_high),
+    sessionLow:  _sL ?? safeNum(day_low),
     dayHigh:     safeNum(day_high),
     dayLow:      safeNum(day_low),
   };
@@ -709,13 +726,7 @@ app.post("/webhook", async (req, res) => {
     if (halfBand > 0) vwapBandPct = parseFloat(((Math.abs(tvEntry - vwapMid) / halfBand) * 100).toFixed(2));
   }
 
-  // Safety
-  if (openPositions.size >= 20) {
-    await db.logSignal({ symbol, direction, session, vwapPosition: vwapPos, optimizerKey: optKey,
-      tvEntry, slPct, vwapMid, vwapBandPct, ...wh,
-      outcome: "MAX_POSITIONS", rejectReason: "Max 20 positions", latencyMs: Date.now() - t0 });
-    return res.json({ ok: false, reason: "MAX_POSITIONS" });
-  }
+  // No position limit — unlimited trades allowed
 
   // Get live equity
   if (!circuitOpen()) {
@@ -1392,17 +1403,32 @@ async function loadOverview(){
   if($('ov-ct'))$('ov-ct').textContent=_cl.length;
   const body=$('ov-body');if(!body)return;
   const rows=[];
-  // OPEN rows
-  for(const p of _pos){
+  // OPEN = only MT5 still open (mt5Closed=false)
+  const _openMT5 = _pos.filter(p=>!p.mt5Closed && !p.ghostFinalized);
+  // MT5 closed but ghost may still run — show in closed section
+  const _closedMT5 = _pos.filter(p=>p.mt5Closed || p.ghostFinalized);
+  if($('ov-open-badge'))$('ov-open-badge').textContent=_openMT5.length+' open';
+  if($('ov-closed-badge'))$('ov-closed-badge').textContent=(_cl.length+_closedMT5.length)+' closed';
+  if($('ov-oc'))$('ov-oc').textContent=_openMT5.length;
+
+  for(const p of _openMT5){
     const g=p.ghost||{};
     const rr=rrFromPrice(p.entry,p.sl,p.currentPrice,p.direction);
     rows.push('<tr class="row-open"><td><span class="bd-k">'+(p.dailyLabel||'--')+'</span></td><td class="cw fw">'+p.symbol+'</td><td>'+bdType(p.assetType)+'</td><td>'+bdDir(p.direction)+'</td><td>'+bdVwap(p.vwapPosition)+'</td><td>'+bdSess(p.session)+'</td><td class="cd">'+fmt(p.entry,p.assetType==='index'?2:4)+'</td><td class="cr">'+fmt(p.sl,p.assetType==='index'?2:4)+'</td><td class="cg">'+fmt(p.tp,p.assetType==='index'?2:4)+'</td><td>'+rrHtml(rr)+'</td><td>'+(g.peakRRPos>0?'<span class="cg fw">+'+g.peakRRPos.toFixed(2)+'R</span>':'--')+'</td><td>'+(g.peakRRNeg>0?'<span class="cr">-'+(g.peakRRNeg/100).toFixed(2)+'R</span>':'--')+'</td><td class="cd">'+fmt(p.lots,2)+'</td><td class="cd" style="font-size:8px">'+(p.mt5Comment||'--')+'</td><td class="cd" style="font-size:9px">'+fmtTs(p.openedAt)+'</td><td class="cd">—</td></tr>');
   }
-  if(_cl.length)rows.push('<tr><td colspan="16" class="divider-label"><div class="dot r"></div>Closed — '+_cl.length+' trades</td></tr>');
+  const totalClosed = _cl.length + _closedMT5.length;
+  if(totalClosed)rows.push('<tr><td colspan="16" class="divider-label"><div class="dot r"></div>Closed — '+totalClosed+' trades</td></tr>');
+  // MT5-closed positions still in memory (ghost may still run)
+  for(const p of _closedMT5){
+    const g=p.ghost||{};
+    const isTP=p.mt5CloseReason==='tp'||(g.peakRRPos>=1.30);
+    const isSL=!isTP;
+    rows.push('<tr class="'+(isSL?'row-slhit':'')+'"><td><span class="bd-k">'+(p.dailyLabel||'--')+'</span></td><td class="cw fw">'+p.symbol+'</td><td>'+bdType(p.assetType)+'</td><td>'+bdDir(p.direction)+'</td><td>'+bdVwap(p.vwapPosition)+'</td><td>'+bdSess(p.session)+'</td><td class="cd">'+fmt(p.entry,p.assetType==='index'?2:4)+'</td><td class="cr">'+fmt(p.sl,p.assetType==='index'?2:4)+'</td><td class="cg">'+fmt(p.tp,p.assetType==='index'?2:4)+'</td><td>'+(isSL?'<span class="bd bd-sl">SL −1.00R</span>':'<span class="bd bd-tp">TP +1.50R</span>')+'</td><td>'+(g.peakRRPos>0?'<span class="cg fw">+'+g.peakRRPos.toFixed(2)+'R</span>':'--')+'</td><td>'+(g.peakRRNeg>0?'<span class="cr">-'+(g.peakRRNeg/100).toFixed(2)+'R</span>':'--')+'</td><td class="cd">'+fmt(p.lots,2)+'</td><td class="cd" style="font-size:8px">'+(p.mt5Comment||'--')+'</td><td class="cd" style="font-size:9px">'+fmtTs(p.openedAt)+'</td><td class="cd" style="font-size:9px">'+fmtTs(p.ghost?.mt5CloseAt||null)+'</td></tr>');
+  }
+  // DB closed trades
   for(const t of _cl){
-    // Determine TP/SL: trust closeReason but also use peakRRPos as extra signal
-    const isTP = t.closeReason==='tp' || (t.peakRRPos >= 1.30);
-    const isSL = !isTP;
+    const isTP=t.closeReason==='tp'||(t.peakRRPos>=1.30);
+    const isSL=!isTP;
     rows.push('<tr class="'+(isSL?'row-slhit':'')+'"><td><span class="bd-k">'+(t.dailyLabel||'--')+'</span></td><td class="cw fw">'+t.symbol+'</td><td>'+bdType(t.assetType)+'</td><td>'+bdDir(t.direction)+'</td><td>'+bdVwap(t.vwapPosition)+'</td><td>'+bdSess(t.session)+'</td><td class="cd">'+fmt(t.entry,t.assetType==='index'?2:4)+'</td><td class="cr">'+fmt(t.sl,t.assetType==='index'?2:4)+'</td><td class="cg">'+fmt(t.tp,t.assetType==='index'?2:4)+'</td><td>'+(isSL?'<span class="bd bd-sl">SL −1.00R</span>':'<span class="bd bd-tp">TP +1.50R</span>')+'</td><td>'+(t.peakRRPos>0?'<span class="cg fw">+'+t.peakRRPos.toFixed(2)+'R</span>':'--')+'</td><td>'+(t.peakRRNeg>0?'<span class="cr">-'+(t.peakRRNeg/100).toFixed(2)+'R</span>':'--')+'</td><td class="cd">'+fmt(t.lots,2)+'</td><td class="cd" style="font-size:8px">'+(t.mt5Comment||'--')+'</td><td class="cd" style="font-size:9px">'+fmtTs(t.openedAt)+'</td><td class="cd" style="font-size:9px">'+fmtTs(t.closedAt)+'</td></tr>');
   }
   body.innerHTML=rows.join('')||'<tr><td colspan="16" class="nd">No trades yet</td></tr>';
@@ -1467,8 +1493,9 @@ async function loadGhostTracker(){
   const body=$('gh-active-body');if(!body)return;
 
   // Split: active (not finalized) and finalized (stays 30min)
+  // Active = not finalized. FINISHED always from DB section below.
   const activePOS = _pos.filter(p=>!p.ghostFinalized);
-  const finalPOS  = _pos.filter(p=>p.ghostFinalized);
+  const finalPOS  = []; // DB loads FINISHED — never from memory
 
   function ghostRowHtml(p, isFinalized) {
     const g=p.ghost||{};
@@ -1523,7 +1550,7 @@ async function loadGhostTracker(){
     ? activePOS.map(p=>ghostRowHtml(p,false)).join('')
     : '<tr><td colspan="50" class="nd">No active ghost trades</td></tr>';
 
-  const finRows = ''; // FINISHED always from DB below — never from memory
+  const finRows = ''; // FINISHED rows always from DB — see finRows2 below
 
   // Load finalized from DB and append in same tbody
   const from=$('gh-from')?.value||'', to=$('gh-to')?.value||'';
@@ -1550,16 +1577,11 @@ async function loadGhostTracker(){
 
   const maxFavH=histData.length?Math.min(20,Math.max(1.5,...histData.map(g=>g.peakRRPos||0))):MAX_FAV;
   const finRows2=histData.length
-    ?'<tr><td colspan="200" class="divider-label"><div class="dot r" style="flex-shrink:0"></div>Ghost Finalized — phantom SL geraakt · alle ADV milestones backfilled · data altijd bewaard in DB · nooit weg na redeploy</td></tr>'
+    ?'<tr><td colspan="200" class="divider-label"><div class="dot r" style="flex-shrink:0"></div>Ghost Finalized — phantom SL geraakt · alle ADV milestones backfilled · data altijd bewaard in DB</td></tr>'
       +histData.map(g=>{
         const ms=g.rrMilestones||{};
-        // FINISHED badge if milestones exist, SL badge for reconstructed ones
-        const hasMilestones=ms&&Object.keys(ms).length>0;
-        const badge=hasMilestones
-          ?'<span class="bd" style="background:rgba(139,148,158,.15);color:#e6edf3;border:1px solid rgba(139,148,158,.4);padding:2px 7px;font-size:9px;font-weight:700">FINISHED</span>'
-          :'<span class="bd bd-sl" style="padding:2px 7px;font-size:9px;font-weight:700">SL</span>';
         return '<tr>'
-          +'<td>'+badge+'</td>'
+          +'<td><span class="bd bd-sl" style="padding:2px 7px;font-size:9px;font-weight:700">SL</span></td>'
           +'<td class="cw fw" style="font-size:9px">'+(g.dailyLabel||'--')+'</td>'
           +'<td class="cw fw">'+g.symbol+'</td>'
           +'<td class="cd" style="font-size:8px">'+(g.mt5Comment||'--')+'</td>'
