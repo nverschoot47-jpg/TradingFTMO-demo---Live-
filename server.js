@@ -1392,33 +1392,15 @@ async function loadOverview(){
   if($('ov-ct'))$('ov-ct').textContent=_cl.length;
   const body=$('ov-body');if(!body)return;
   const rows=[];
-  // OPEN rows — only truly open in MT5 (mt5Closed=false and not ghostFinalized)
-  const _openPos = _pos.filter(p => !p.mt5Closed && !p.ghostFinalized);
-  // MT5-closed but ghost still running — show as closed in overview
-  const _mt5ClosedPos = _pos.filter(p => p.mt5Closed || p.ghostFinalized);
-
-  if($('ov-open-badge'))$('ov-open-badge').textContent=_openPos.length+' open';
-
-  for(const p of _openPos){
+  // OPEN rows
+  for(const p of _pos){
     const g=p.ghost||{};
     const rr=rrFromPrice(p.entry,p.sl,p.currentPrice,p.direction);
     rows.push('<tr class="row-open"><td><span class="bd-k">'+(p.dailyLabel||'--')+'</span></td><td class="cw fw">'+p.symbol+'</td><td>'+bdType(p.assetType)+'</td><td>'+bdDir(p.direction)+'</td><td>'+bdVwap(p.vwapPosition)+'</td><td>'+bdSess(p.session)+'</td><td class="cd">'+fmt(p.entry,p.assetType==='index'?2:4)+'</td><td class="cr">'+fmt(p.sl,p.assetType==='index'?2:4)+'</td><td class="cg">'+fmt(p.tp,p.assetType==='index'?2:4)+'</td><td>'+rrHtml(rr)+'</td><td>'+(g.peakRRPos>0?'<span class="cg fw">+'+g.peakRRPos.toFixed(2)+'R</span>':'--')+'</td><td>'+(g.peakRRNeg>0?'<span class="cr">-'+(g.peakRRNeg/100).toFixed(2)+'R</span>':'--')+'</td><td class="cd">'+fmt(p.lots,2)+'</td><td class="cd" style="font-size:8px">'+(p.mt5Comment||'--')+'</td><td class="cd" style="font-size:9px">'+fmtTs(p.openedAt)+'</td><td class="cd">—</td></tr>');
   }
-
-  // Closed section: DB closed trades + MT5-closed ghost positions
-  const totalClosed = _cl.length + _mt5ClosedPos.length;
-  if(totalClosed)rows.push('<tr><td colspan="16" class="divider-label"><div class="dot r"></div>Closed — '+totalClosed+' trades</td></tr>');
-
-  // MT5-closed positions from memory (ghost still running but MT5 already closed)
-  for(const p of _mt5ClosedPos){
-    const g=p.ghost||{};
-    const isTP = p.mt5CloseReason==='tp' || (g.peakRRPos>=1.30);
-    const isSL = !isTP;
-    rows.push('<tr class="'+(isSL?'row-slhit':'')+'"><td><span class="bd-k">'+(p.dailyLabel||'--')+'</span></td><td class="cw fw">'+p.symbol+'</td><td>'+bdType(p.assetType)+'</td><td>'+bdDir(p.direction)+'</td><td>'+bdVwap(p.vwapPosition)+'</td><td>'+bdSess(p.session)+'</td><td class="cd">'+fmt(p.entry,p.assetType==='index'?2:4)+'</td><td class="cr">'+fmt(p.sl,p.assetType==='index'?2:4)+'</td><td class="cg">'+fmt(p.tp,p.assetType==='index'?2:4)+'</td><td>'+(isSL?'<span class="bd bd-sl">SL −1.00R</span>':'<span class="bd bd-tp">TP +1.50R</span>')+'</td><td>'+(g.peakRRPos>0?'<span class="cg fw">+'+g.peakRRPos.toFixed(2)+'R</span>':'--')+'</td><td>'+(g.peakRRNeg>0?'<span class="cr">-'+(g.peakRRNeg/100).toFixed(2)+'R</span>':'--')+'</td><td class="cd">'+fmt(p.lots,2)+'</td><td class="cd" style="font-size:8px">'+(p.mt5Comment||'--')+'</td><td class="cd" style="font-size:9px">'+fmtTs(p.openedAt)+'</td><td class="cd" style="font-size:9px">'+fmtTs(p.ghost?.mt5CloseAt||null)+'</td></tr>');
-  }
-
-  // DB closed trades
+  if(_cl.length)rows.push('<tr><td colspan="16" class="divider-label"><div class="dot r"></div>Closed — '+_cl.length+' trades</td></tr>');
   for(const t of _cl){
+    // Determine TP/SL: trust closeReason but also use peakRRPos as extra signal
     const isTP = t.closeReason==='tp' || (t.peakRRPos >= 1.30);
     const isSL = !isTP;
     rows.push('<tr class="'+(isSL?'row-slhit':'')+'"><td><span class="bd-k">'+(t.dailyLabel||'--')+'</span></td><td class="cw fw">'+t.symbol+'</td><td>'+bdType(t.assetType)+'</td><td>'+bdDir(t.direction)+'</td><td>'+bdVwap(t.vwapPosition)+'</td><td>'+bdSess(t.session)+'</td><td class="cd">'+fmt(t.entry,t.assetType==='index'?2:4)+'</td><td class="cr">'+fmt(t.sl,t.assetType==='index'?2:4)+'</td><td class="cg">'+fmt(t.tp,t.assetType==='index'?2:4)+'</td><td>'+(isSL?'<span class="bd bd-sl">SL −1.00R</span>':'<span class="bd bd-tp">TP +1.50R</span>')+'</td><td>'+(t.peakRRPos>0?'<span class="cg fw">+'+t.peakRRPos.toFixed(2)+'R</span>':'--')+'</td><td>'+(t.peakRRNeg>0?'<span class="cr">-'+(t.peakRRNeg/100).toFixed(2)+'R</span>':'--')+'</td><td class="cd">'+fmt(t.lots,2)+'</td><td class="cd" style="font-size:8px">'+(t.mt5Comment||'--')+'</td><td class="cd" style="font-size:9px">'+fmtTs(t.openedAt)+'</td><td class="cd" style="font-size:9px">'+fmtTs(t.closedAt)+'</td></tr>');
@@ -1541,12 +1523,7 @@ async function loadGhostTracker(){
     ? activePOS.map(p=>ghostRowHtml(p,false)).join('')
     : '<tr><td colspan="50" class="nd">No active ghost trades</td></tr>';
 
-  const finRows = finalPOS.length
-    ? '<tr><td colspan="50" class="divider-label" style="background:rgba(248,81,73,.08);border-top:1px solid rgba(248,81,73,.25);border-bottom:1px solid rgba(248,81,73,.25)">'
-      +'<span style="color:#f85149">SL</span> Ghost Finalized — phantom SL geraakt · data blijft 30min zichtbaar · alle ADV backfilled'
-      +'</td></tr>'
-      + finalPOS.map(p=>ghostRowHtml(p,true)).join('')
-    : '';
+  const finRows = ''; // FINISHED always from DB below — never from memory
 
   // Load finalized from DB and append in same tbody
   const from=$('gh-from')?.value||'', to=$('gh-to')?.value||'';
@@ -1573,11 +1550,16 @@ async function loadGhostTracker(){
 
   const maxFavH=histData.length?Math.min(20,Math.max(1.5,...histData.map(g=>g.peakRRPos||0))):MAX_FAV;
   const finRows2=histData.length
-    ?'<tr><td colspan="200" class="divider-label"><div class="dot r" style="flex-shrink:0"></div>Ghost Finalized — phantom SL geraakt · alle ADV milestones backfilled · data altijd bewaard in DB</td></tr>'
+    ?'<tr><td colspan="200" class="divider-label"><div class="dot r" style="flex-shrink:0"></div>Ghost Finalized — phantom SL geraakt · alle ADV milestones backfilled · data altijd bewaard in DB · nooit weg na redeploy</td></tr>'
       +histData.map(g=>{
         const ms=g.rrMilestones||{};
+        // FINISHED badge if milestones exist, SL badge for reconstructed ones
+        const hasMilestones=ms&&Object.keys(ms).length>0;
+        const badge=hasMilestones
+          ?'<span class="bd" style="background:rgba(139,148,158,.15);color:#e6edf3;border:1px solid rgba(139,148,158,.4);padding:2px 7px;font-size:9px;font-weight:700">FINISHED</span>'
+          :'<span class="bd bd-sl" style="padding:2px 7px;font-size:9px;font-weight:700">SL</span>';
         return '<tr>'
-          +'<td><span class="bd bd-sl" style="padding:2px 7px;font-size:9px;font-weight:700">SL</span></td>'
+          +'<td>'+badge+'</td>'
           +'<td class="cw fw" style="font-size:9px">'+(g.dailyLabel||'--')+'</td>'
           +'<td class="cw fw">'+g.symbol+'</td>'
           +'<td class="cd" style="font-size:8px">'+(g.mt5Comment||'--')+'</td>'
