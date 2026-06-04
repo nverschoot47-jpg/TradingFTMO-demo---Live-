@@ -1528,6 +1528,8 @@ async function loadGhostTracker(){
       +'</tr>';
   }
 
+  // Sort by opened_at ASC — trade #1 on top, newest at bottom
+  activePOS.sort((a,b)=>new Date(a.openedAt||0)-new Date(b.openedAt||0));
   // Build rows: active first, then divider, then finalized
   const activeRows = activePOS.length
     ? activePOS.map(p=>ghostRowHtml(p,false)).join('')
@@ -1560,7 +1562,7 @@ async function loadGhostTracker(){
 
   const maxFavH=histData.length?Math.min(20,Math.max(1.5,...histData.map(g=>g.peakRRPos||0))):MAX_FAV;
   const finRows2=histData.length
-    ?'<tr><td colspan="200" class="divider-label"><div class="dot r" style="flex-shrink:0"></div>Ghost Finalized — phantom SL geraakt · alle ADV milestones backfilled · data altijd bewaard in DB</td></tr>'
+    ?'<tr><td colspan="200" style="padding:2px 8px;background:rgba(248,81,73,.06);border-top:1px solid rgba(139,148,158,.15);border-bottom:1px solid rgba(139,148,158,.15);font-size:8px;color:#6e7681;font-weight:600;letter-spacing:.04em;text-transform:uppercase"><span style="color:#f85149">●</span> Ghost Finished</td></tr>'
       +histData.map(g=>{
         const ms=g.rrMilestones||{};
         return '<tr>'
