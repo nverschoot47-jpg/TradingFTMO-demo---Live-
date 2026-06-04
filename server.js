@@ -1212,16 +1212,7 @@ tr:last-child td{border-bottom:none}
 
 <!-- OVERVIEW -->
 <div class="pg on" id="p-ov">
-  <div class="card">
-    <div class="chdr"><div class="ctitle"><div class="dot g"></div>Account Balance</div></div>
-    <div class="balgrid">
-      <div class="balcard"><div class="bll">Start Balance</div><div class="blv" id="ov-start">--</div><div class="bls">at trading start</div></div>
-      <div class="balcard"><div class="bll">+ Realized P&L</div><div class="blv cg" id="ov-real">--</div><div class="bls"><span id="ov-ct">--</span> closed trades</div></div>
-      <div class="balcard"><div class="bll">= Cash Balance</div><div class="blv" id="ov-cash">--</div><div class="bls">start + closed</div></div>
-      <div class="balcard"><div class="bll">+ Unrealized P&L</div><div class="blv cg" id="ov-unreal">--</div><div class="bls"><span id="ov-oc">--</span> open</div></div>
-      <div class="balcard eq"><div class="bll">= Equity (MT5)</div><div class="blv cb" id="ov-equity">--</div></div>
-    </div>
-  </div>
+
   <div class="card">
     <div class="chdr">
       <div class="ctitle"><div class="dot g"></div>Trades</div>
@@ -1403,36 +1394,25 @@ async function loadOverview(){
   if($('ov-ct'))$('ov-ct').textContent=_cl.length;
   const body=$('ov-body');if(!body)return;
   const rows=[];
-  // OPEN = only MT5 still open (mt5Closed=false)
+  // OPEN = only truly open in MT5 (not closed, not finalized)
   const _openMT5 = _pos.filter(p=>!p.mt5Closed && !p.ghostFinalized);
-  // MT5 closed but ghost may still run — show in closed section
-  const _closedMT5 = _pos.filter(p=>p.mt5Closed || p.ghostFinalized);
   if($('ov-open-badge'))$('ov-open-badge').textContent=_openMT5.length+' open';
-  if($('ov-closed-badge'))$('ov-closed-badge').textContent=(_cl.length+_closedMT5.length)+' closed';
+  if($('ov-closed-badge'))$('ov-closed-badge').textContent=_cl.length+' closed';
   if($('ov-oc'))$('ov-oc').textContent=_openMT5.length;
+  if($('ov-ct'))$('ov-ct').textContent=_cl.length;
 
   for(const p of _openMT5){
-    const g=p.ghost||{};
     const rr=rrFromPrice(p.entry,p.sl,p.currentPrice,p.direction);
-    rows.push('<tr class="row-open"><td><span class="bd-k">'+(p.dailyLabel||'--')+'</span></td><td class="cw fw">'+p.symbol+'</td><td>'+bdType(p.assetType)+'</td><td>'+bdDir(p.direction)+'</td><td>'+bdVwap(p.vwapPosition)+'</td><td>'+bdSess(p.session)+'</td><td class="cd">'+fmt(p.entry,p.assetType==='index'?2:4)+'</td><td class="cr">'+fmt(p.sl,p.assetType==='index'?2:4)+'</td><td class="cg">'+fmt(p.tp,p.assetType==='index'?2:4)+'</td><td>'+rrHtml(rr)+'</td><td>'+(g.peakRRPos>0?'<span class="cg fw">+'+g.peakRRPos.toFixed(2)+'R</span>':'--')+'</td><td>'+(g.peakRRNeg>0?'<span class="cr">-'+(g.peakRRNeg/100).toFixed(2)+'R</span>':'--')+'</td><td class="cd">'+fmt(p.lots,2)+'</td><td class="cd" style="font-size:8px">'+(p.mt5Comment||'--')+'</td><td class="cd" style="font-size:9px">'+fmtTs(p.openedAt)+'</td><td class="cd">—</td></tr>');
+    rows.push('<tr class="row-open"><td><span class="bd-k">'+(p.dailyLabel||'--')+'</span></td><td class="cw fw">'+p.symbol+'</td><td>'+bdType(p.assetType)+'</td><td>'+bdDir(p.direction)+'</td><td>'+bdVwap(p.vwapPosition)+'</td><td>'+bdSess(p.session)+'</td><td class="cd">'+fmt(p.entry,p.assetType==='index'?2:4)+'</td><td class="cr">'+fmt(p.sl,p.assetType==='index'?2:4)+'</td><td class="cg">'+fmt(p.tp,p.assetType==='index'?2:4)+'</td><td>'+rrHtml(rr)+'</td><td>'+(rr!=null&&rr>0?'<span class="cg fw">+'+rr.toFixed(2)+'R</span>':'--')+'</td><td>'+(rr!=null&&rr<0?'<span class="cr">'+rr.toFixed(2)+'R</span>':'--')+'</td><td class="cd">'+fmt(p.lots,2)+'</td><td class="cd" style="font-size:8px">'+(p.mt5Comment||'--')+'</td><td class="cd" style="font-size:9px">'+fmtTs(p.openedAt)+'</td><td class="cd">—</td></tr>');
   }
-  const totalClosed = _cl.length + _closedMT5.length;
-  if(totalClosed)rows.push('<tr><td colspan="16" class="divider-label"><div class="dot r"></div>Closed — '+totalClosed+' trades</td></tr>');
-  // MT5-closed positions still in memory (ghost may still run)
-  for(const p of _closedMT5){
-    const g=p.ghost||{};
-    const isTP=p.mt5CloseReason==='tp'||(g.peakRRPos>=1.30);
-    const isSL=!isTP;
-    rows.push('<tr class="'+(isSL?'row-slhit':'')+'"><td><span class="bd-k">'+(p.dailyLabel||'--')+'</span></td><td class="cw fw">'+p.symbol+'</td><td>'+bdType(p.assetType)+'</td><td>'+bdDir(p.direction)+'</td><td>'+bdVwap(p.vwapPosition)+'</td><td>'+bdSess(p.session)+'</td><td class="cd">'+fmt(p.entry,p.assetType==='index'?2:4)+'</td><td class="cr">'+fmt(p.sl,p.assetType==='index'?2:4)+'</td><td class="cg">'+fmt(p.tp,p.assetType==='index'?2:4)+'</td><td>'+(isSL?'<span class="bd bd-sl">SL −1.00R</span>':'<span class="bd bd-tp">TP +1.50R</span>')+'</td><td>'+(g.peakRRPos>0?'<span class="cg fw">+'+g.peakRRPos.toFixed(2)+'R</span>':'--')+'</td><td>'+(g.peakRRNeg>0?'<span class="cr">-'+(g.peakRRNeg/100).toFixed(2)+'R</span>':'--')+'</td><td class="cd">'+fmt(p.lots,2)+'</td><td class="cd" style="font-size:8px">'+(p.mt5Comment||'--')+'</td><td class="cd" style="font-size:9px">'+fmtTs(p.openedAt)+'</td><td class="cd" style="font-size:9px">'+fmtTs(p.ghost?.mt5CloseAt||null)+'</td></tr>');
-  }
-  // DB closed trades
+  // Closed = DB only, never from memory
+  if(_cl.length)rows.push('<tr><td colspan="16" class="divider-label"><div class="dot r"></div>Closed — '+_cl.length+' trades</td></tr>');
   for(const t of _cl){
+    if(!t.closedAt) continue; // skip trades without close timestamp
     const isTP=t.closeReason==='tp'||(t.peakRRPos>=1.30);
     const isSL=!isTP;
-    // Cap peak at 1.50R for TP trades — ghost runs further but overview shows MT5 reality
-    const ovPeak = isTP ? Math.min(t.peakRRPos||0, 1.50) : (t.peakRRPos||0);
-    const ovPeakNeg = isSL ? 1.00 : (t.peakRRNeg||0);
-    rows.push('<tr class="'+(isSL?'row-slhit':'')+'"><td><span class="bd-k">'+(t.dailyLabel||'--')+'</span></td><td class="cw fw">'+t.symbol+'</td><td>'+bdType(t.assetType)+'</td><td>'+bdDir(t.direction)+'</td><td>'+bdVwap(t.vwapPosition)+'</td><td>'+bdSess(t.session)+'</td><td class="cd">'+fmt(t.entry,t.assetType==='index'?2:4)+'</td><td class="cr">'+fmt(t.sl,t.assetType==='index'?2:4)+'</td><td class="cg">'+fmt(t.tp,t.assetType==='index'?2:4)+'</td><td>'+(isSL?'<span class="bd bd-sl">SL −1.00R</span>':'<span class="bd bd-tp">TP +1.50R</span>')+'</td><td>'+(ovPeak>0?'<span class="cg fw">+'+ovPeak.toFixed(2)+'R</span>':'--')+'</td><td>'+(isSL?'<span class="cr">-'+ovPeakNeg.toFixed(2)+'R</span>':'--')+'</td><td class="cd">'+fmt(t.lots,2)+'</td><td class="cd" style="font-size:8px">'+(t.mt5Comment||'--')+'</td><td class="cd" style="font-size:9px">'+fmtTs(t.openedAt)+'</td><td class="cd" style="font-size:9px">'+fmtTs(t.closedAt)+'</td></tr>');
+    const ovPeak=isTP?Math.min(t.peakRRPos||0,1.50):(t.peakRRPos||0);
+    rows.push('<tr class="'+(isSL?'row-slhit':'')+'"><td><span class="bd-k">'+(t.dailyLabel||'--')+'</span></td><td class="cw fw">'+t.symbol+'</td><td>'+bdType(t.assetType)+'</td><td>'+bdDir(t.direction)+'</td><td>'+bdVwap(t.vwapPosition)+'</td><td>'+bdSess(t.session)+'</td><td class="cd">'+fmt(t.entry,t.assetType==='index'?2:4)+'</td><td class="cr">'+fmt(t.sl,t.assetType==='index'?2:4)+'</td><td class="cg">'+fmt(t.tp,t.assetType==='index'?2:4)+'</td><td>'+(isSL?'<span class="bd bd-sl">SL −1.00R</span>':'<span class="bd bd-tp">TP +1.50R</span>')+'</td><td>'+(ovPeak>0?'<span class="cg fw">+'+ovPeak.toFixed(2)+'R</span>':'--')+'</td><td>'+(isSL?'<span class="cr">-1.00R</span>':'--')+'</td><td class="cd">'+fmt(t.lots,2)+'</td><td class="cd" style="font-size:8px">'+(t.mt5Comment||'--')+'</td><td class="cd" style="font-size:9px">'+fmtTs(t.openedAt)+'</td><td class="cd" style="font-size:9px">'+fmtTs(t.closedAt)+'</td></tr>');
   }
   body.innerHTML=rows.join('')||'<tr><td colspan="16" class="nd">No trades yet</td></tr>';
 }
