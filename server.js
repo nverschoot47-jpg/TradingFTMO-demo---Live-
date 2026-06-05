@@ -380,6 +380,17 @@ async function syncPositions() {
     }
 
     const liveMT5 = await getPositions();
+    // If MetaAPI returns 0 positions but we have open positions in memory,
+    // be suspicious — could be a MetaAPI outage. Only trust if circuit is healthy.
+    if (liveMT5.length === 0 && openPositions.size > 0 && !_circuitOpen) {
+      const activeGhosts = [...openPositions.values()].filter(p => !p.mt5Closed && !p.ghostFinalized);
+      if (activeGhosts.length > 0) {
+        console.warn(`[Sync] MetaAPI returned 0 positions but we have ${activeGhosts.length} open — possible outage, skipping close detection`);
+        // Still update ghost-only positions, but skip close detection
+        const liveIds = new Set();
+        // Fall through to adopt/update but with empty liveIds means no closes processed
+      }
+    }
     const liveIds = new Set(liveMT5.map(p => String(p.id)));
 
     // 1. Detect closed MT5 positions — process in parallel for speed
@@ -387,9 +398,26 @@ async function syncPositions() {
     await Promise.all(closedIds.map(async id => {
       const pos = openPositions.get(id);
       if (!pos) return;
+
+      // SAFETY: if the position was opened less than 90s ago, skip — MetaAPI might not have it yet
+      const ageMs = pos.openedAt ? Date.now() - new Date(pos.openedAt).getTime() : 999999;
+      if (ageMs < 90000) {
+        console.log(`[Sync] Skipping close check for ${id} — only ${Math.round(ageMs/1000)}s old`);
+        return;
+      }
+
+      // VERIFY: check deals to confirm position is really closed
+      // If MetaAPI returns 0 deals, it might just be a temporary glitch
       let closeReason = "sl";
       try {
         const deals = await getDeals(id);
+
+        // If no deals at all → MetaAPI glitch, don't close the position
+        if (!deals.length) {
+          console.log(`[Sync] ${id} not in live positions but has 0 deals — skipping (MetaAPI lag)`);
+          return;
+        }
+
         const closing = deals
           .filter(d => (d.entryType || "").includes("OUT") || (d.type || "").includes("OUT"))
           .sort((a, b) => new Date(b.time || 0) - new Date(a.time || 0))[0]
