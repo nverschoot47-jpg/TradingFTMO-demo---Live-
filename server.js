@@ -382,16 +382,12 @@ async function syncPositions() {
     const liveMT5 = await getPositions();
     // If MetaAPI returns 0 positions but we have open positions in memory,
     // be suspicious — could be a MetaAPI outage. Only trust if circuit is healthy.
-    if (liveMT5.length === 0 && openPositions.size > 0 && !_circuitOpen) {
-      const activeGhosts = [...openPositions.values()].filter(p => !p.mt5Closed && !p.ghostFinalized);
-      if (activeGhosts.length > 0) {
-        console.warn(`[Sync] MetaAPI returned 0 positions but we have ${activeGhosts.length} open — possible outage, skipping close detection`);
-        // Still update ghost-only positions, but skip close detection
-        const liveIds = new Set();
-        // Fall through to adopt/update but with empty liveIds means no closes processed
-      }
-    }
-    const liveIds = new Set(liveMT5.map(p => String(p.id)));
+    // If MetaAPI returns 0 positions but we have open ones → possible outage, skip close detection
+    const liveIds = new Set(
+      (liveMT5.length === 0 && openPositions.size > 0 && !_circuitOpen)
+        ? (console.warn(`[Sync] MetaAPI 0 positions but ${openPositions.size} in memory — skipping close detection`), [])
+        : liveMT5.map(p => String(p.id))
+    );
 
     // 1. Detect closed MT5 positions — process in parallel for speed
     const closedIds = [...openPositions.keys()].filter(id => !liveIds.has(id));
@@ -414,14 +410,24 @@ async function syncPositions() {
 
         // If no deals at all → MetaAPI glitch, don't close the position
         if (!deals.length) {
-          console.log(`[Sync] ${id} not in live positions but has 0 deals — skipping (MetaAPI lag)`);
+          console.log(`[Sync] ${id} not in live positions but 0 deals — skipping (MetaAPI lag)`);
           return;
         }
 
-        const closing = deals
-          .filter(d => (d.entryType || "").includes("OUT") || (d.type || "").includes("OUT"))
-          .sort((a, b) => new Date(b.time || 0) - new Date(a.time || 0))[0]
-          ?? deals[deals.length - 1];
+        // Only use OUT deals — never fall back to opening deal
+        const outDeals = deals.filter(d =>
+          (d.entryType || "").toUpperCase().includes("OUT") ||
+          (d.type || "").toUpperCase().includes("OUT") ||
+          (d.entry || "").toUpperCase().includes("OUT")
+        );
+
+        // No closing deal found → position still open, MetaAPI just didn't return it
+        if (!outDeals.length) {
+          console.log(`[Sync] ${id} missing from live but no OUT deal found — keeping open (MetaAPI lag)`);
+          return;
+        }
+
+        const closing = outDeals.sort((a, b) => new Date(b.time || 0) - new Date(a.time || 0))[0];
         if (closing) {
           const r = (closing.reason || "").toUpperCase();
           if (r.includes("TP") || r.includes("TAKE_PROFIT")) {
@@ -538,6 +544,17 @@ async function syncPositions() {
         // New position not in memory — adopt it
         await adoptPosition(lp);
         continue;
+      }
+
+      // If position was falsely marked as mt5Closed but is still live → reset
+      if (pos.mt5Closed && !pos.ghostFinalized) {
+        console.log(`[Sync] Resetting false-close for ${id} ${pos.symbol}`);
+        pos.mt5Closed = false;
+        if (pos.ghost) {
+          pos.ghost.mt5ClosedTP = false;
+          pos.ghost.mt5CloseAt = null;
+          pos.ghost.mt5CloseReason = null;
+        }
       }
 
       // Update live data
@@ -1637,14 +1654,56 @@ async function loadGhostTracker(){
       +'</tr>';
   }
 
-  body.innerHTML = _pos.length
-    ? _pos.map(ghostRowHtml).join('')
-    : '<tr><td colspan="50" class="nd">No ghost trades yet</td></tr>';
-
-  // Update finalized count from DB for the counter badge
-  const histData = await api('/api/ghost-history?limit=1')||[];
+  // Load finalized from DB (always - survives restarts)
+  const from=$('gh-from')?.value||'', to=$('gh-to')?.value||'';
+  let histUrl='/api/ghost-history?limit=500';
+  if(from)histUrl+='&from='+from; if(to)histUrl+='&to='+to;
+  const histData = await api(histUrl)||[];
   if($('gh-fin'))$('gh-fin').textContent=histData.length||0;
-  if($('nb-gh'))$('nb-gh').textContent=_pos.length||0;
+  if($('nb-gh'))$('nb-gh').textContent=(_pos.length+histData.length)||0;
+
+  // Build DB finalized rows (FINISHED badge)
+  const maxFavH = histData.length ? Math.min(20,Math.max(1.5,...histData.map(g=>g.peakRRPos||0))) : MAX_FAV;
+  const dbRows = histData.length
+    ? '<tr><td colspan="200" style="padding:2px 8px;background:rgba(139,148,158,.06);border-top:1px solid rgba(139,148,158,.15);font-size:8px;color:#6e7681;font-weight:600;text-transform:uppercase"><span style="color:#f85149">●</span> Ghost Finished</td></tr>'
+      + histData.map(g=>{
+          const ms=g.rrMilestones||{};
+          const isIdx=g.assetType==='index';
+          const hasMsData=Object.keys(ms).length>0;
+          const badge=hasMsData
+            ?'<span class="bd" style="background:rgba(139,148,158,.15);color:#e6edf3;border:1px solid rgba(139,148,158,.4);padding:2px 7px;font-size:9px;font-weight:700">FINISHED</span>'
+            :'<span class="bd bd-sl" style="padding:2px 7px;font-size:9px;font-weight:700">SL</span>';
+          return '<tr style="background:rgba(139,148,158,.03)">'
+            +'<td>'+badge+'</td>'
+            +'<td class="cw fw" style="font-size:9px">'+(g.dailyLabel||'--')+'</td>'
+            +'<td class="cw fw">'+g.symbol+'</td>'
+            +'<td class="cd" style="font-size:8px">'+(g.mt5Comment||'--')+'</td>'
+            +'<td>'+bdType(g.assetType)+'</td>'
+            +'<td>'+bdDir(g.direction)+'</td>'
+            +'<td>'+bdVwap(g.vwapPosition||"unknown")+'</td>'
+            +'<td>'+bdSess(g.session)+'</td>'
+            +'<td class="cr fw">-1.00R</td>'
+            +'<td class="cg fw">+'+(g.peakRRPos||0).toFixed(2)+'R</td>'
+            +'<td class="cr">-1.00R</td>'
+            +'<td class="cg">+1.50R</td>'
+            +buildMsRow(ms,Math.min(maxFavH,5))
+            +'<td class="cd" style="font-size:9px">'+fmt(g.tvEntry,isIdx?2:5)+'</td>'
+            +'<td class="cd">'+fmt(g.entry,isIdx?2:5)+'</td>'
+            +'<td class="cr">'+fmt(g.sl,isIdx?2:5)+'</td>'
+            +'<td class="cg">--</td>'
+            +'<td class="cd">'+fmt(g.lots,2)+'</td>'
+            +'<td class="cd" style="font-size:9px">'+fmtTs(g.openedAt)+'</td>'
+            +'<td class="cd">--</td><td class="cd">--</td><td class="cd">--</td>'
+            +'<td class="cd">--</td><td class="cd">--</td><td class="cd">--</td><td class="cd">--</td>'
+            +'<td class="cd">'+(g.vwapBandPct!=null?Number(g.vwapBandPct).toFixed(1)+'%':'--')+'</td>'
+            +'<td class="cd">--</td><td class="cd">--</td>'
+            +'</tr>';
+        }).join('')
+    : '';
+
+  body.innerHTML = (_pos.length ? _pos.map(ghostRowHtml).join('') : '')
+    + dbRows
+    + (!_pos.length && !histData.length ? '<tr><td colspan="50" class="nd">No ghost trades yet</td></tr>' : '');
 }
 
 async function loadGhostHistory(){
@@ -1943,34 +2002,4 @@ async function initBackground() {
   // MetaAPI
   if (META_API_TOKEN && META_ACCOUNT) {
     try {
-      try { await metaFetch(`/users/current/accounts/${META_ACCOUNT}/deploy`, "POST"); await new Promise(r => setTimeout(r, 5000)); } catch {}
-      const acct = await Promise.race([
-        metaFetch(`/users/current/accounts/${META_ACCOUNT}/account-information`),
-        new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 20000)),
-      ]);
-      if (acct?.balance !== undefined) {
-        latestEquity   = parseFloat(acct.equity ?? acct.balance);
-        latestCurrency = acct.currency ?? "USD";
-        _acctCache = acct; _acctCacheTs = Date.now();
-        console.log(`[MetaAPI] Connected — ${acct.balance} ${acct.currency}`);
-        // Adopt live MT5 positions not in memory
-        const live = await getPositions();
-        for (const lp of live) {
-          if (!openPositions.has(String(lp.id))) await adoptPosition(lp);
-        }
-      }
-    } catch (e) { console.error(`[MetaAPI] Startup failed: ${e.message}`); }
-  } else {
-    console.warn("[MetaAPI] META_API_TOKEN or META_ACCOUNT not set — no MetaAPI connection");
-  }
-
-  // Sync every 5s
-  cron.schedule("*/5 * * * * *", syncPositions);
-  // Cleanup finalized ghosts from memory every 5 min
-  cron.schedule("*/5 * * * *", cleanupFinalizedGhosts);
-  console.log("[PRONTO-AI] Cron active — 5s sync");
-}
-
-initBackground().catch(e => {
-  console.error("[FATAL] initBackground:", e.message);
-});
+      try { awai
