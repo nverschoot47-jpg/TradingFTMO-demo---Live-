@@ -2002,4 +2002,34 @@ async function initBackground() {
   // MetaAPI
   if (META_API_TOKEN && META_ACCOUNT) {
     try {
-      try { awai
+      try { await metaFetch(`/users/current/accounts/${META_ACCOUNT}/deploy`, "POST"); await new Promise(r => setTimeout(r, 5000)); } catch {}
+      const acct = await Promise.race([
+        metaFetch(`/users/current/accounts/${META_ACCOUNT}/account-information`),
+        new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 20000)),
+      ]);
+      if (acct?.balance !== undefined) {
+        latestEquity   = parseFloat(acct.equity ?? acct.balance);
+        latestCurrency = acct.currency ?? "USD";
+        _acctCache = acct; _acctCacheTs = Date.now();
+        console.log(`[MetaAPI] Connected — ${acct.balance} ${acct.currency}`);
+        // Adopt live MT5 positions not in memory
+        const live = await getPositions();
+        for (const lp of live) {
+          if (!openPositions.has(String(lp.id))) await adoptPosition(lp);
+        }
+      }
+    } catch (e) { console.error(`[MetaAPI] Startup failed: ${e.message}`); }
+  } else {
+    console.warn("[MetaAPI] META_API_TOKEN or META_ACCOUNT not set — no MetaAPI connection");
+  }
+
+  // Sync every 5s
+  cron.schedule("*/5 * * * * *", syncPositions);
+  // Cleanup finalized ghosts from memory every 5 min
+  cron.schedule("*/5 * * * *", cleanupFinalizedGhosts);
+  console.log("[PRONTO-AI] Cron active — 5s sync");
+}
+
+initBackground().catch(e => {
+  console.error("[FATAL] initBackground:", e.message);
+});
