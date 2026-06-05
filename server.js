@@ -45,7 +45,7 @@ const VERSION = "2.0.0";
 
 // ── Safe numeric parser (handles NaN, null, undefined, "") ────────
 function safeNum(val) {
-  if (val === null || val === undefined || val === "" || val !== val) return null;
+  if (val === null || val === undefined || val === "") return null;
   const n = parseFloat(val);
   return isNaN(n) ? null : n;
 }
@@ -99,8 +99,8 @@ let _circuitOpenAt = 0;
 const CIRCUIT_THRESHOLD = 5;
 const _recentWebhooks = new Map();
 function isDuplicateWebhook(sym, dir) {
-  const key = sym + "_" + dir, now = Date.now(), last = _recentWebhooks.get(key);
-  if (last && now - last < 60000) return true;
+  const key = sym+"_"+dir, now = Date.now(), last = _recentWebhooks.get(key);
+  if (last && now-last < 60000) return true;
   _recentWebhooks.set(key, now);
   for (const [k,v] of _recentWebhooks) if (now-v>120000) _recentWebhooks.delete(k);
   return false;
@@ -168,7 +168,9 @@ async function getPositions() {
 }
 
 async function placeOrder(order) {
-  return metaFetch(`/users/current/accounts/${META_ACCOUNT}/trade`, "POST", order);
+  const result = await metaFetch(`/users/current/accounts/${META_ACCOUNT}/trade`, "POST", order);
+  if (result) console.log(`[PlaceOrder] Response:`, JSON.stringify(result).slice(0,200));
+  return result;
 }
 
 async function getDeals(positionId) {
@@ -565,7 +567,8 @@ async function syncPositions() {
     }
 
   } catch(syncErr) {
-    console.warn("[Sync] Error (not circuit):", syncErr.message);
+    // Sync errors MUST NOT trip the MetaAPI circuit breaker
+    console.warn('[Sync] Non-critical error:', syncErr.message);
   } finally {
     _syncRunning = false;
   }
@@ -625,13 +628,12 @@ async function adoptPosition(lp) {
       );
       if (sig.rows.length) {
         const s=sig.rows[0];
-        const e2={vwapMid:parseFloat(s.vwap_mid)||null,vwapUpper:parseFloat(s.vwap_upper)||null,
+        const en={vwapMid:parseFloat(s.vwap_mid)||null,vwapUpper:parseFloat(s.vwap_upper)||null,
           vwapLower:parseFloat(s.vwap_lower)||null,vwapBandPct:parseFloat(s.vwap_band_pct)||null,
           sessionHigh:parseFloat(s.session_high)||null,sessionLow:parseFloat(s.session_low)||null,
           dayHigh:parseFloat(s.day_high)||null,dayLow:parseFloat(s.day_low)||null,
           tvEntry:parseFloat(s.tv_entry)||pos.tvEntry,slPct:parseFloat(s.sl_pct)||pos.slPct};
-        Object.assign(pos,e2);
-        if(pos.ghost)Object.assign(pos.ghost,e2);
+        Object.assign(pos,en);if(pos.ghost)Object.assign(pos.ghost,en);
       }
     } catch(e){}
   }
@@ -702,7 +704,7 @@ app.post("/webhook", async (req, res) => {
     return res.status(400).json({ error: `Invalid direction: "${direction}"` });
   }
 
-  if (isDuplicateWebhook(rawSym||"", direction)) {
+  if (isDuplicateWebhook(rawSym||"",direction)) {
     return res.json({ ok:false, reason:"DUPLICATE_SIGNAL" });
   }
   // Symbol filter
@@ -836,6 +838,7 @@ app.post("/webhook", async (req, res) => {
       }
     }
     if (!positionId) {
+      console.warn(`[Webhook] ORDER_NOT_CONFIRMED: ${symbol} ${direction} session=${session} circuitOpen=${_circuitOpen}`);
       await db.logSignal({ dailyLabel: null, symbol, assetType: symInfo.type, direction, session,
         vwapPosition: vwapPos, optimizerKey: optKey, tvEntry, slPct, vwapMid, vwapBandPct, ...wh,
         outcome: "ORDER_NOT_CONFIRMED", rejectReason: "No positionId from MetaAPI",
@@ -1426,9 +1429,14 @@ async function loadOverview(){
     rows.push('<tr class="row-open"><td><span class="bd-k">'+(p.dailyLabel||'--')+'</span></td><td class="cw fw">'+p.symbol+'</td><td>'+bdType(p.assetType)+'</td><td>'+bdDir(p.direction)+'</td><td>'+bdVwap(p.vwapPosition)+'</td><td>'+bdSess(p.session)+'</td><td class="cd">'+fmt(p.entry,p.assetType==='index'?2:4)+'</td><td class="cr">'+fmt(p.sl,p.assetType==='index'?2:4)+'</td><td class="cg">'+fmt(p.tp,p.assetType==='index'?2:4)+'</td><td>'+rrHtml(rr)+'</td><td>'+(rr!=null&&rr>0?'<span class="cg fw">+'+rr.toFixed(2)+'R</span>':'--')+'</td><td>'+(rr!=null&&rr<0?'<span class="cr">'+rr.toFixed(2)+'R</span>':'--')+'</td><td class="cd">'+fmt(p.lots,2)+'</td><td class="cd" style="font-size:8px">'+(p.mt5Comment||'--')+'</td><td class="cd" style="font-size:9px">'+fmtTs(p.openedAt)+'</td><td class="cd">—</td></tr>');
   }
   // Closed = DB only, never from memory
-  if(_cl.length)rows.push('<tr><td colspan="16" class="divider-label"><div class="dot r"></div>Closed — '+_cl.length+' trades</td></tr>');
-  for(const t of _cl){
-    if(!t.closedAt) continue; // skip trades without close timestamp
+  // Also skip any DB trade whose positionId is still open in MT5 memory
+  const _openIds=new Set(_openMT5.map(p=>p.positionId));
+  const _clFiltered=_cl.filter(t=>t.closedAt&&!_openIds.has(t.positionId));
+  if($('ov-closed-badge'))$('ov-closed-badge').textContent=_clFiltered.length+' closed';
+  if($('ov-ct'))$('ov-ct').textContent=_clFiltered.length;
+  if(_clFiltered.length)rows.push('<tr><td colspan="16" class="divider-label"><div class="dot r"></div>Closed — '+_clFiltered.length+' trades</td></tr>');
+  for(const t of _clFiltered){
+    if(!t.closedAt) continue;
     const isTP=t.closeReason==='tp'||(t.peakRRPos>=1.30);
     const isSL=!isTP;
     const ovPeak=isTP?Math.min(t.peakRRPos||0,1.50):(t.peakRRPos||0);
@@ -1441,7 +1449,7 @@ async function loadOverview(){
 let _sigAll=[],_sigFilter='all';
 async function loadSignals(){
   const _rawSig=await api('/api/signal-log?limit=500')||[];
-  _sigAll=_rawSig.filter(function(s){return s.symbol==='XAUUSD'||s.symbol==='US100.cash';});
+  _sigAll=_rawSig.filter(s=>s.symbol==='XAUUSD'||s.symbol==='US100.cash');
   if($('nb-sig'))$('nb-sig').textContent=_sigAll.length;
   const placed=_sigAll.filter(s=>s.outcome==='PLACED').length;
   const nopos=_sigAll.filter(s=>s.outcome==='ORDER_NOT_CONFIRMED').length;
