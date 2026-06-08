@@ -96,16 +96,21 @@ const server = app.listen(PORT, () => {
 let _metaFails = 0;
 let _circuitOpen = false;
 let _circuitOpenAt = 0;
-const CIRCUIT_THRESHOLD = 5;
+const CIRCUIT_THRESHOLD = 8; // higher threshold
 const _recentWebhooks = new Map();
+const _processingWebhooks = new Set(); // instant block for simultaneous requests
 function isDuplicateWebhook(sym, dir) {
-  const key = sym+"_"+dir, now = Date.now(), last = _recentWebhooks.get(key);
+  const key = sym+"_"+dir, now = Date.now();
+  if (_processingWebhooks.has(key)) return true;  // race condition guard
+  const last = _recentWebhooks.get(key);
   if (last && now-last < 60000) return true;
+  _processingWebhooks.add(key);
+  setTimeout(() => _processingWebhooks.delete(key), 5000);
   _recentWebhooks.set(key, now);
   for (const [k,v] of _recentWebhooks) if (now-v>120000) _recentWebhooks.delete(k);
   return false;
 }
-const CIRCUIT_RESET_MS  = 60000;
+const CIRCUIT_RESET_MS  = 45000; // 45s reset
 
 function circuitOpen() {
   if (!_circuitOpen) return false;
@@ -581,7 +586,11 @@ async function syncPositions() {
     }
 
     // 3. Ghost-only positions: MT5 TP hit, ghost still tracking to phantom SL
-    // Fetch current price via symbol endpoint — works even without open MT5 position
+    // Only fetch ghost prices every 30s to reduce MetaAPI load
+    const _now30 = Date.now();
+    const _skipGhost = syncPositions._lastGhostPriceFetch && _now30 - syncPositions._lastGhostPriceFetch < 30000;
+    if (!_skipGhost) {
+      syncPositions._lastGhostPriceFetch = _now30;
     const ghostOnlySyms = new Set(
       [...openPositions.values()]
         .filter(p => p.mt5Closed && p.ghost && !p.ghost.phantomSLHit)
@@ -610,6 +619,7 @@ async function syncPositions() {
         await db.saveGhostState(pos.ghost);
       }
     }
+    } // end if(!_skipGhost)
 
   } catch(syncErr) {
     // Sync errors MUST NOT trip the MetaAPI circuit breaker
@@ -785,13 +795,15 @@ app.post("/webhook", async (req, res) => {
 
   // All webhook numeric fields
   // Fallback: session_high/low NaN during Asia → use day_high/low
+  // Asia: session_high/low are NaN (not initialized) → fallback to day_high/low
+  // vwap_upper/lower may equal vwap (band=0) → treated as optional
   const _sH = safeNum(session_high), _sL = safeNum(session_low);
   const wh = {
     slPoints:    safeNum(sl_points),
     vwapUpper:   safeNum(vwap_upper),
     vwapLower:   safeNum(vwap_lower),
-    sessionHigh: _sH ?? safeNum(day_high),
-    sessionLow:  _sL ?? safeNum(day_low),
+    sessionHigh: _sH ?? safeNum(day_high) ?? null,
+    sessionLow:  _sL ?? safeNum(day_low) ?? null,
     dayHigh:     safeNum(day_high),
     dayLow:      safeNum(day_low),
   };
@@ -800,7 +812,8 @@ app.post("/webhook", async (req, res) => {
   let vwapBandPct = null;
   if (tvEntry != null && vwapMid != null && wh.vwapUpper != null) {
     const halfBand = Math.abs(wh.vwapUpper - vwapMid);
-    if (halfBand > 0) vwapBandPct = parseFloat(((Math.abs(tvEntry - vwapMid) / halfBand) * 100).toFixed(2));
+    // Guard: Asia session sends vwap_upper==vwap_lower==vwap → halfBand=0 → skip
+    if (halfBand > 0.001) vwapBandPct = parseFloat(((Math.abs(tvEntry - vwapMid) / halfBand) * 100).toFixed(2));
   }
 
   // No position limit — unlimited trades allowed
@@ -2024,7 +2037,7 @@ async function initBackground() {
   }
 
   // Sync every 5s
-  cron.schedule("*/5 * * * * *", syncPositions);
+  cron.schedule("*/10 * * * * *", syncPositions); // 10s to reduce MetaAPI load
   // Cleanup finalized ghosts from memory every 5 min
   cron.schedule("*/5 * * * *", cleanupFinalizedGhosts);
   console.log("[PRONTO-AI] Cron active — 5s sync");
