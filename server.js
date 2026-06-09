@@ -1698,7 +1698,7 @@ async function loadGhostTracker(){
       +'</tr>';
   }
 
-  // Load finalized from DB (always - survives restarts)
+  // Load finalized from DB
   const from=$('gh-from')?.value||'', to=$('gh-to')?.value||'';
   let histUrl='/api/ghost-history?limit=500';
   if(from)histUrl+='&from='+from; if(to)histUrl+='&to='+to;
@@ -1706,48 +1706,71 @@ async function loadGhostTracker(){
   if($('gh-fin'))$('gh-fin').textContent=histData.length||0;
   if($('nb-gh'))$('nb-gh').textContent=(_pos.length+histData.length)||0;
 
-  // Build DB finalized rows (FINISHED badge)
-  const maxFavH = histData.length ? Math.min(20,Math.max(1.5,...histData.map(g=>g.peakRRPos||0))) : MAX_FAV;
-  const dbRows = histData.length
-    ? '<tr><td colspan="200" style="padding:2px 8px;background:rgba(139,148,158,.06);border-top:1px solid rgba(139,148,158,.15);font-size:8px;color:#6e7681;font-weight:600;text-transform:uppercase"><span style="color:#f85149">●</span> Ghost Finished</td></tr>'
-      + histData.map(g=>{
-          const ms=g.rrMilestones||{};
-          const isIdx=g.assetType==='index';
-          const hasMsData=Object.keys(ms).length>0;
-          const badge=hasMsData
-            ?'<span class="bd" style="background:rgba(139,148,158,.15);color:#e6edf3;border:1px solid rgba(139,148,158,.4);padding:2px 7px;font-size:9px;font-weight:700">FINISHED</span>'
-            :'<span class="bd bd-sl" style="padding:2px 7px;font-size:9px;font-weight:700">SL</span>';
-          return '<tr style="background:rgba(139,148,158,.03)">'
-            +'<td>'+badge+'</td>'
-            +'<td class="cw fw" style="font-size:9px">'+(g.dailyLabel||'--')+'</td>'
-            +'<td class="cw fw">'+g.symbol+'</td>'
-            +'<td class="cd" style="font-size:8px">'+(g.mt5Comment||'--')+'</td>'
-            +'<td>'+bdType(g.assetType)+'</td>'
-            +'<td>'+bdDir(g.direction)+'</td>'
-            +'<td>'+bdVwap(g.vwapPosition||"unknown")+'</td>'
-            +'<td>'+bdSess(g.session)+'</td>'
-            +'<td class="cr fw">-1.00R</td>'
-            +'<td class="cg fw">+'+(g.peakRRPos||0).toFixed(2)+'R</td>'
-            +'<td class="cr">-1.00R</td>'
-            +'<td class="cg">+1.50R</td>'
-            +buildMsRow(ms,Math.min(maxFavH,5))
-            +'<td class="cd" style="font-size:9px">'+fmt(g.tvEntry,isIdx?2:5)+'</td>'
-            +'<td class="cd">'+fmt(g.entry,isIdx?2:5)+'</td>'
-            +'<td class="cr">'+fmt(g.sl,isIdx?2:5)+'</td>'
-            +'<td class="cg">--</td>'
-            +'<td class="cd">'+fmt(g.lots,2)+'</td>'
-            +'<td class="cd" style="font-size:9px">'+fmtTs(g.openedAt)+'</td>'
-            +'<td class="cd">--</td><td class="cd">--</td><td class="cd">--</td>'
-            +'<td class="cd">--</td><td class="cd">--</td><td class="cd">--</td><td class="cd">--</td>'
-            +'<td class="cd">'+(g.vwapBandPct!=null?Number(g.vwapBandPct).toFixed(1)+'%':'--')+'</td>'
-            +'<td class="cd">--</td><td class="cd">--</td>'
-            +'</tr>';
-        }).join('')
-    : '';
+  // Merge memory positions + DB history into ONE sorted list by openedAt
+  // Avoid duplicates: DB entry wins if same positionId exists in memory as ghostFinalized
+  const memIds = new Set(_pos.map(p=>p.positionId));
+  const dbOnlyRows = histData.filter(g => {
+    // Skip if this position is still active in memory (not finalized yet)
+    const memPos = _pos.find(p=>p.positionId===g.positionId);
+    return !memPos || memPos.ghostFinalized;
+  });
 
-  body.innerHTML = (_pos.length ? _pos.map(ghostRowHtml).join('') : '')
-    + dbRows
-    + (!_pos.length && !histData.length ? '<tr><td colspan="50" class="nd">No ghost trades yet</td></tr>' : '');
+  // Build unified row for DB ghost entry
+  const maxFavH = histData.length ? Math.min(5,Math.max(1.5,...histData.map(g=>g.peakRRPos||0))) : MAX_FAV;
+  function dbGhostRow(g){
+    const ms=g.rrMilestones||{};
+    const isIdx=g.assetType==='index';
+    const hasMsData=Object.keys(ms).length>0;
+    const badge=hasMsData
+      ?'<span class="bd" style="background:rgba(139,148,158,.15);color:#e6edf3;border:1px solid rgba(139,148,158,.4);padding:2px 7px;font-size:9px;font-weight:700">FINISHED</span>'
+      :'<span class="bd bd-sl" style="padding:2px 7px;font-size:9px;font-weight:700">SL</span>';
+    return {
+      openedAt: g.openedAt,
+      html: '<tr style="background:rgba(139,148,158,.03)">'
+        +'<td>'+badge+'</td>'
+        +'<td class="cw fw" style="font-size:9px">'+(g.dailyLabel||'--')+'</td>'
+        +'<td class="cw fw">'+g.symbol+'</td>'
+        +'<td class="cd" style="font-size:8px">'+(g.mt5Comment||'--')+'</td>'
+        +'<td>'+bdType(g.assetType)+'</td>'
+        +'<td>'+bdDir(g.direction)+'</td>'
+        +'<td>'+bdVwap(g.vwapPosition||"unknown")+'</td>'
+        +'<td>'+bdSess(g.session)+'</td>'
+        +'<td class="cr fw">-1.00R</td>'
+        +'<td class="cg fw">+'+(g.peakRRPos||0).toFixed(2)+'R</td>'
+        +'<td class="cr">-1.00R</td>'
+        +'<td class="cg">+1.50R</td>'
+        +buildMsRow(ms,Math.min(maxFavH,5))
+        +'<td class="cd" style="font-size:9px">'+fmt(g.tvEntry,isIdx?2:5)+'</td>'
+        +'<td class="cd">'+fmt(g.entry,isIdx?2:5)+'</td>'
+        +'<td class="cr">'+fmt(g.sl,isIdx?2:5)+'</td>'
+        +'<td class="cg">--</td>'
+        +'<td class="cd">'+fmt(g.lots,2)+'</td>'
+        +'<td class="cd" style="font-size:9px">'+fmtTs(g.openedAt)+'</td>'
+        +'<td class="cy" style="font-size:9px">'+(g.vwapMid!=null?fmt(g.vwapMid,isIdx?2:5):'--')+'</td>'
+        +'<td class="cd" style="font-size:9px">'+(g.vwapUpper!=null?fmt(g.vwapUpper,isIdx?2:5):'--')+'</td>'
+        +'<td class="cd" style="font-size:9px">'+(g.vwapLower!=null?fmt(g.vwapLower,isIdx?2:5):'--')+'</td>'
+        +'<td class="cy" style="font-size:9px">'+(g.sessionHigh!=null?fmt(g.sessionHigh,isIdx?2:5):'--')+'</td>'
+        +'<td class="cy" style="font-size:9px">'+(g.sessionLow!=null?fmt(g.sessionLow,isIdx?2:5):'--')+'</td>'
+        +'<td class="cb2" style="font-size:9px">'+(g.dayHigh!=null?fmt(g.dayHigh,isIdx?2:5):'--')+'</td>'
+        +'<td class="cb2" style="font-size:9px">'+(g.dayLow!=null?fmt(g.dayLow,isIdx?2:5):'--')+'</td>'
+        +'<td class="cd">'+(g.vwapBandPct!=null?Number(g.vwapBandPct).toFixed(1)+'%':'--')+'</td>'
+        +'<td class="cd">'+(g.slPct!=null?(g.slPct*100).toFixed(3)+'%':'--')+'</td>'
+        +'<td class="cd">--</td>'
+        +'</tr>'
+    };
+  }
+
+  // Build memory rows with openedAt for sorting
+  const memRows = _pos.map(p=>({openedAt:p.openedAt, html:ghostRowHtml(p)}));
+  // DB rows excluding those already in memory as active
+  const dbRows2 = dbOnlyRows.map(g=>dbGhostRow(g));
+
+  // Merge and sort by openedAt ASC (oldest first = lowest trade number on top)
+  const allRows = [...memRows, ...dbRows2].sort((a,b)=>new Date(a.openedAt||0)-new Date(b.openedAt||0));
+
+  body.innerHTML = allRows.length
+    ? allRows.map(r=>r.html).join('')
+    : '<tr><td colspan="50" class="nd">No ghost trades yet</td></tr>';
 }
 
 async function loadGhostHistory(){
