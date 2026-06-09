@@ -2076,13 +2076,6 @@ async function initBackground() {
       };
       openPositions.set(g.positionId, pos);
     }
-    // Mark ghost states that have mt5ClosedTP=true as mt5Closed in memory
-    // Also pre-mark positions that we know are stuck (have been in 0-deals loop)
-    for (const [id, pos] of openPositions) {
-      if (pos.ghost?.mt5ClosedTP) {
-        pos.mt5Closed = true;
-      }
-    }
     console.log(`[DB] Restored ${openPositions.size} ghost states`);
   } catch (e) { console.error("[DB] restore failed:", e.message); }
 
