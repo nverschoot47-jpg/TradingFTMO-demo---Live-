@@ -180,12 +180,18 @@ async function placeOrder(order) {
 
 async function getDeals(positionId) {
   if (!META_API_TOKEN || !META_ACCOUNT) return [];
+  if (circuitOpen()) return []; // don't call when circuit is open
   try {
     const from = new Date(Date.now() - 30 * 86400000).toISOString();
     const to   = new Date().toISOString();
-    const d    = await metaFetch(
-      `/users/current/accounts/${META_ACCOUNT}/history-deals/position/${positionId}?from=${from}&to=${to}`
-    );
+    const url  = `${META_BASE}/users/current/accounts/${META_ACCOUNT}/history-deals/position/${positionId}?from=${from}&to=${to}`;
+    // Use direct fetch — does NOT count toward circuit breaker
+    const res  = await fetch(url, {
+      headers: { "auth-token": META_API_TOKEN, "Content-Type": "application/json" },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) return [];
+    const d = await res.json().catch(() => null);
     return Array.isArray(d) ? d : (d?.deals ?? []);
   } catch { return []; }
 }
@@ -415,6 +421,8 @@ async function syncPositions() {
       // If MetaAPI returns 0 deals, it might just be a temporary glitch
       let closeReason = "sl";
       try {
+        // Skip deal check if circuit open
+        if (_circuitOpen) { return; }
         const deals = await getDeals(id);
 
         // If no deals at all → MetaAPI glitch, don't close the position
@@ -2040,7 +2048,11 @@ async function initBackground() {
           if (!openPositions.has(String(lp.id))) await adoptPosition(lp);
         }
       }
-    } catch (e) { console.error(`[MetaAPI] Startup failed: ${e.message}`); }
+    } catch (e) {
+      console.error(`[MetaAPI] Startup failed: ${e.message}`);
+      // Reset fail counter - startup failure is expected during MetaAPI outages
+      _metaFails = 0; _circuitOpen = false;
+    }
   } else {
     console.warn("[MetaAPI] META_API_TOKEN or META_ACCOUNT not set — no MetaAPI connection");
   }
@@ -2049,7 +2061,7 @@ async function initBackground() {
   cron.schedule("*/10 * * * * *", syncPositions); // 10s to reduce MetaAPI load
   // Cleanup finalized ghosts from memory every 5 min
   cron.schedule("*/5 * * * *", cleanupFinalizedGhosts);
-  console.log("[PRONTO-AI] Cron active — 5s sync");
+  console.log("[PRONTO-AI] Cron active — 10s sync");
 }
 
 initBackground().catch(e => {
