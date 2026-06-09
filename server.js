@@ -197,7 +197,10 @@ async function getDeals(positionId) {
       headers: { "auth-token": META_API_TOKEN, "Content-Type": "application/json" },
       signal: AbortSignal.timeout(8000),
     });
-    if (!res.ok) return [];
+    if (!res.ok) {
+      if (res.status === 503) console.warn(`[MetaAPI] getDeals 503 for ${positionId} — MetaAPI outage`);
+      return [];
+    }
     const d = await res.json().catch(() => null);
     return Array.isArray(d) ? d : (d?.deals ?? []);
   } catch { return []; }
@@ -1779,7 +1782,7 @@ async function loadGhostTracker(){
   const dbRows2 = dbOnlyRows.map(g=>dbGhostRow(g));
 
   // Merge and sort by openedAt ASC (oldest first = lowest trade number on top)
-  const allRows = [...memRows, ...dbRows2].sort((a,b)=>new Date(a.openedAt||0)-new Date(b.openedAt||0));
+  const allRows = [...memRows, ...dbRows2].sort((a,b)=>new Date(b.openedAt||0)-new Date(a.openedAt||0)); // newest first
 
   body.innerHTML = allRows.length
     ? allRows.map(r=>r.html).join('')
