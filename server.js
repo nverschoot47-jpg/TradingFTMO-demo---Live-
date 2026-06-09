@@ -2076,6 +2076,24 @@ async function initBackground() {
       };
       openPositions.set(g.positionId, pos);
     }
+    // Check: if a ghost state position is also closed in closed_trades with SL,
+    // mark it as finalized so it shows FINISHED in ghost tracker
+    try {
+      const slClosed = await db.pool.query(
+        `SELECT position_id FROM closed_trades WHERE close_reason='sl' AND position_id IS NOT NULL`
+      );
+      const slIds = new Set(slClosed.rows.map(r=>r.position_id));
+      let markedSL = 0;
+      for (const [id, pos] of openPositions) {
+        if (slIds.has(id) && pos.ghost && !pos.ghost.phantomSLHit) {
+          pos.ghost.phantomSLHit = true;
+          pos.ghost.mt5CloseReason = 'sl';
+          pos.ghostFinalized = true;
+          markedSL++;
+        }
+      }
+      if (markedSL > 0) console.log(`[DB] Marked ${markedSL} ghost states as SL-finalized`);
+    } catch(e) { console.warn('[DB] SL check failed:', e.message); }
     console.log(`[DB] Restored ${openPositions.size} ghost states`);
   } catch (e) { console.error("[DB] restore failed:", e.message); }
 
