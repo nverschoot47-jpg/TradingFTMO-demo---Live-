@@ -98,6 +98,7 @@ let _circuitOpen = false;
 let _circuitOpenAt = 0;
 const CIRCUIT_THRESHOLD = 8; // higher threshold
 const _recentWebhooks = new Map();
+const _zeroDealsCount = new Map(); // tracks positions with repeated 0 deals
 const _processingWebhooks = new Set(); // instant block for simultaneous requests
 function isDuplicateWebhook(sym, dir) {
   const key = sym+"_"+dir, now = Date.now();
@@ -427,7 +428,20 @@ async function syncPositions() {
 
         // If no deals at all → MetaAPI glitch, don't close the position
         if (!deals.length) {
-          console.log(`[Sync] ${id} not in live positions but 0 deals — skipping (MetaAPI lag)`);
+          const zeroCount = (_zeroDealsCount.get(id) || 0) + 1;
+          _zeroDealsCount.set(id, zeroCount);
+          if (zeroCount >= 3) {
+            // 3 consecutive syncs with 0 deals = MetaAPI can't find it = mark closed
+            console.warn(`[Sync] ${id} 0 deals for ${zeroCount} syncs — forcing mt5Closed to stop loop`);
+            const pos2 = openPositions.get(id);
+            if (pos2 && !pos2.mt5Closed) {
+              pos2.mt5Closed = true;
+              if (pos2.ghost) { pos2.ghost.mt5ClosedTP = true; pos2.ghost.mt5CloseReason = "unknown"; }
+            }
+            _zeroDealsCount.delete(id);
+          } else {
+            console.log(`[Sync] ${id} 0 deals (${zeroCount}/3) — skipping`);
+          }
           return;
         }
 
