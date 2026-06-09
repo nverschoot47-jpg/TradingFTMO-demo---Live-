@@ -96,7 +96,7 @@ const server = app.listen(PORT, () => {
 let _metaFails = 0;
 let _circuitOpen = false;
 let _circuitOpenAt = 0;
-const CIRCUIT_THRESHOLD = 8; // higher threshold
+const CIRCUIT_THRESHOLD = 15; // very high - circuit should rarely open
 const _recentWebhooks = new Map();
 const _zeroDealsCount = new Map(); // tracks positions with repeated 0 deals
 const _processingWebhooks = new Set(); // instant block for simultaneous requests
@@ -143,8 +143,14 @@ async function metaFetch(path, method = "GET", body = null, retries = 2) {
       return res.json().catch(() => null);
     } catch (e) {
       if (i < retries) { await new Promise(r => setTimeout(r, 1000 * (i + 1))); continue; }
-      _metaFails++;
-      if (_metaFails >= CIRCUIT_THRESHOLD) { _circuitOpen = true; _circuitOpenAt = Date.now(); console.error("[MetaAPI] Circuit OPEN"); }
+      // Only count toward circuit for real errors, not MetaAPI outages (503)
+      const isServerDown = e.message.includes('503') || e.message.includes('Service Unavailable');
+      if (!isServerDown) {
+        _metaFails++;
+        if (_metaFails >= CIRCUIT_THRESHOLD) { _circuitOpen = true; _circuitOpenAt = Date.now(); console.error("[MetaAPI] Circuit OPEN"); }
+      } else {
+        console.warn("[MetaAPI] 503 outage — not counting toward circuit");
+      }
       throw e;
     }
   }
@@ -791,7 +797,14 @@ app.post("/webhook", async (req, res) => {
     return res.json({ ok:false, reason:"DUPLICATE_SIGNAL" });
   }
   if (_circuitOpen) {
-    console.warn(`[Webhook] Circuit OPEN — order blocked for ${rawSym} ${direction}`);
+    // Reset circuit if it opened due to 503 outage (MetaAPI side, not our fault)
+    const circuitAge = Date.now() - _circuitOpenAt;
+    if (circuitAge > 30000) { // 30s is enough to retry
+      console.warn(`[Webhook] Circuit was open ${Math.round(circuitAge/1000)}s — resetting to try order`);
+      _circuitOpen = false; _metaFails = 0;
+    } else {
+      console.warn(`[Webhook] Circuit OPEN (${Math.round(circuitAge/1000)}s) — order blocked for ${rawSym} ${direction}`);
+    }
   }
   // Symbol filter
   const { allowed, reason: blockReason } = canOpenNewTrade(rawSym);
@@ -2059,6 +2072,13 @@ async function initBackground() {
         },
       };
       openPositions.set(g.positionId, pos);
+    }
+    // Mark ghost states that have mt5ClosedTP=true as mt5Closed in memory
+    // Also pre-mark positions that we know are stuck (have been in 0-deals loop)
+    for (const [id, pos] of openPositions) {
+      if (pos.ghost?.mt5ClosedTP) {
+        pos.mt5Closed = true;
+      }
     }
     console.log(`[DB] Restored ${openPositions.size} ghost states`);
   } catch (e) { console.error("[DB] restore failed:", e.message); }
