@@ -400,6 +400,10 @@ async function syncPositions() {
       const pos = openPositions.get(id);
       if (!pos) return;
 
+      // Skip positions already processed as MT5-closed (ghost-only or finalized)
+      // These legitimately don't appear in liveMT5 anymore
+      if (pos.mt5Closed || pos.ghostFinalized) return;
+
       // SAFETY: if the position was opened less than 90s ago, skip — MetaAPI might not have it yet
       const ageMs = pos.openedAt ? Date.now() - new Date(pos.openedAt).getTime() : 999999;
       if (ageMs < 90000) {
@@ -741,6 +745,7 @@ app.post("/webhook", async (req, res) => {
   const t0 = Date.now();
   if (!checkSecret(req, res)) return;
   if (!dbReady) return res.status(503).json({ error: "DB not ready, retry shortly" });
+  console.log(`[Webhook] Received: ${JSON.stringify(req.body).slice(0,120)}`);
 
   // Parse all webhook fields
   const body = req.body ?? {};
@@ -760,7 +765,11 @@ app.post("/webhook", async (req, res) => {
   }
 
   if (isDuplicateWebhook(rawSym||"",direction)) {
+    console.log(`[Webhook] Duplicate skipped: ${rawSym} ${direction}`);
     return res.json({ ok:false, reason:"DUPLICATE_SIGNAL" });
+  }
+  if (_circuitOpen) {
+    console.warn(`[Webhook] Circuit OPEN — order blocked for ${rawSym} ${direction}`);
   }
   // Symbol filter
   const { allowed, reason: blockReason } = canOpenNewTrade(rawSym);
@@ -2015,7 +2024,7 @@ async function initBackground() {
   // MetaAPI
   if (META_API_TOKEN && META_ACCOUNT) {
     try {
-      try { await metaFetch(`/users/current/accounts/${META_ACCOUNT}/deploy`, "POST"); await new Promise(r => setTimeout(r, 5000)); } catch {}
+      // Note: /deploy removed - not needed if account already deployed, causes rate limits
       const acct = await Promise.race([
         metaFetch(`/users/current/accounts/${META_ACCOUNT}/account-information`),
         new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 20000)),
