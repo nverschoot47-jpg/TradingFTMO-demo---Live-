@@ -107,9 +107,16 @@ function isDuplicateWebhook(sym, dir) {
   if (last && now-last < 60000) return true;
   _processingWebhooks.add(key);
   setTimeout(() => _processingWebhooks.delete(key), 5000);
-  _recentWebhooks.set(key, now);
+  // NOTE: _recentWebhooks.set() intentionally removed from here.
+  // We only stamp a key AFTER a trade is confirmed PLACED (see markWebhookPlaced).
+  // This prevents failed signals (MetaAPI 503) from blocking the next real signal for 60s.
   for (const [k,v] of _recentWebhooks) if (now-v>120000) _recentWebhooks.delete(k);
   return false;
+}
+
+function markWebhookPlaced(sym, dir) {
+  const key = sym+"_"+dir;
+  _recentWebhooks.set(key, Date.now());
 }
 const CIRCUIT_RESET_MS  = 45000; // 45s reset
 
@@ -797,6 +804,13 @@ app.post("/webhook", async (req, res) => {
 
   if (isDuplicateWebhook(rawSym||"",direction)) {
     console.log(`[Webhook] Duplicate skipped: ${rawSym} ${direction}`);
+    // Log duplicates to DB so they're visible in the signal log
+    await db.logSignal({
+      symbol: rawSym, direction, session: getSession(),
+      outcome: "DUPLICATE", rejectReason: "Duplicate signal within 60s window",
+      tvEntry: safeNum(tvClose), slPct: safeNum(sl_pct),
+      latencyMs: Date.now() - t0,
+    }).catch(() => {});
     return res.json({ ok:false, reason:"DUPLICATE_SIGNAL" });
   }
   if (_circuitOpen) {
@@ -880,7 +894,14 @@ app.post("/webhook", async (req, res) => {
       spreadAtEntry = parseFloat((q.ask - q.bid).toFixed(6));
       execPrice     = direction === "buy" ? parseFloat(q.ask) : parseFloat(q.bid);
     }
-  } catch {}
+  } catch (e) {
+    // Quote fetch failure must NOT block order placement.
+    // If it was a 503, undo the circuit fail count — quote fetch is not critical.
+    if (e.message?.includes('503') || e.message?.includes('Service Unavailable')) {
+      _metaFails = Math.max(0, _metaFails - 1);
+    }
+    // Fall through — execPrice stays as tvEntry
+  }
   if (!execPrice && tvEntry) execPrice = tvEntry;
   const slippage = tvEntry && execPrice ? Math.abs(execPrice - tvEntry) : 0;
 
@@ -984,6 +1005,8 @@ app.post("/webhook", async (req, res) => {
   });
 
   console.log(`[Placed] ${positionId} ${symbol} ${direction} lots=${lots} entry=${execPrice} sl=${slPrice} tp=${tpPrice} ${dailyLabel}`);
+  // Only stamp the duplicate-guard AFTER confirmed placement
+  markWebhookPlaced(rawSym||"", direction);
   res.json({
     ok: true, positionId, symbol, direction, lots,
     entry: execPrice, sl: slPrice, tp: tpPrice,
