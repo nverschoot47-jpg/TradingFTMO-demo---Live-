@@ -48,7 +48,7 @@ async function initDB() {
         session_low   NUMERIC,
         day_high      NUMERIC,
         day_low       NUMERIC,
-        outcome       TEXT,                         -- PLACED / SYMBOL_NOT_ALLOWED / WEEKEND / ORDER_NOT_CONFIRMED / ERROR
+        outcome       TEXT,                         -- PLACED / SYMBOL_NOT_ALLOWED / WEEKEND / ORDER_NOT_CONFIRMED / ERROR / DUPLICATE
         reject_reason TEXT,
         latency_ms    INTEGER,
         position_id   TEXT
