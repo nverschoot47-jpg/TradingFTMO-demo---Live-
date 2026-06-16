@@ -123,12 +123,65 @@ const BLOCKED_SYMBOLS = new Set([
   "JP225","JPN225","NIKKEI",
 ]);
 
+// Time-based block windows (Brussels wall-clock, hhmm format, end-exclusive)
+// XAUUSD     blocked 14:00–15:00
+// US100.cash blocked 11:00–14:00
+const TIME_BLOCK_WINDOWS = {
+  "XAUUSD":     [{ start: 1400, end: 1500 }],
+  "US100.cash": [{ start: 1100, end: 1400 }],
+};
+
+// Returns the matching window if the symbol is time-blocked right now, else null
+function isTimeBlocked(symbolKey, date = null) {
+  const windows = TIME_BLOCK_WINDOWS[symbolKey];
+  if (!windows) return null;
+  const { hhmm } = getBrusselsComponents(date);
+  for (const w of windows) {
+    if (hhmm >= w.start && hhmm < w.end) return w;
+  }
+  return null;
+}
+
+function _fmtHHMM(n) {
+  const s = String(n).padStart(4, "0");
+  return s.slice(0, 2) + ":" + s.slice(2);
+}
+
+// TP risk-reward per symbol per Brussels time window (end-exclusive).
+// Anything not matched uses DEFAULT_TP_RR.
+//   XAUUSD     09:00-11:00 -> 1.0 RR ,  15:00-17:00 -> 3.0 RR
+//   US100.cash 08:00-10:00 -> 2.0 RR
+const DEFAULT_TP_RR = 1.5;
+const TP_RR_WINDOWS = {
+  "XAUUSD": [
+    { start: 900,  end: 1100, rr: 1.0 },
+    { start: 1500, end: 1700, rr: 3.0 },
+  ],
+  "US100.cash": [
+    { start: 800,  end: 1000, rr: 2.0 },
+  ],
+};
+
+// Resolve the TP RR for a symbol at a given time (defaults to DEFAULT_TP_RR)
+function getTpRR(symbolKey, date = null) {
+  const windows = TP_RR_WINDOWS[symbolKey];
+  if (windows) {
+    const { hhmm } = getBrusselsComponents(date);
+    for (const w of windows) {
+      if (hhmm >= w.start && hhmm < w.end) return w.rr;
+    }
+  }
+  return DEFAULT_TP_RR;
+}
+
 function canOpenNewTrade(rawSymbol, date = null) {
   if (isWeekend(date)) return { allowed: false, reason: "WEEKEND" };
   const upper = (rawSymbol || "").toString().toUpperCase().trim().replace(/[^A-Z0-9./]/g,"");
   if (BLOCKED_SYMBOLS.has(upper)) return { allowed: false, reason: `SYMBOL_NOT_ALLOWED: "${rawSymbol}" — explicitly blocked` };
   const sym = normalizeSymbol(rawSymbol);
   if (!sym) return { allowed: false, reason: `SYMBOL_NOT_ALLOWED: "${rawSymbol}" — only XAUUSD and US100.cash` };
+  const blk = isTimeBlocked(sym, date);
+  if (blk) return { allowed: false, reason: `TIME_BLOCK: ${sym} blocked ${_fmtHHMM(blk.start)}\u2013${_fmtHHMM(blk.end)} Brussels` };
   return { allowed: true, reason: null };
 }
 
@@ -140,4 +193,6 @@ module.exports = {
   normalizeSymbol, getSymbolInfo,
   getVwapPosition, buildOptimizerKey,
   buildDailyLabel, canOpenNewTrade,
+  TIME_BLOCK_WINDOWS, isTimeBlocked,
+  DEFAULT_TP_RR, TP_RR_WINDOWS, getTpRR,
 };
