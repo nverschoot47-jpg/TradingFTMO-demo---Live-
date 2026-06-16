@@ -39,6 +39,7 @@ const {
   normalizeSymbol, getSymbolInfo,
   getVwapPosition, buildOptimizerKey,
   buildDailyLabel, canOpenNewTrade,
+  getTpRR,
 } = require("./session");
 
 const VERSION = "2.0.0";
@@ -503,11 +504,12 @@ async function syncPositions() {
         // If exit price is within 10% of SL distance from SL → it was SL
         if (distToTP < slDist * 0.10) closeReason = "tp";
         else if (distToSL < slDist * 0.10) closeReason = "sl";
-        // Also check ghost peak: if peak >= TP RR it definitely hit TP
+        // Also check ghost peak: if peak got within 0.2R of the actual TP target → TP
+        const tpRRActual = slDist > 0 ? tpDist / slDist : (pos.tpRR ?? 1.5);
         const ghost = pos.ghost;
-        if (ghost && ghost.peakRRPos >= 1.30) closeReason = "tp";
-      } else if (pos.ghost && pos.ghost.peakRRPos >= 1.30) {
-        // Peak RR >= 1.45R means TP (set at 1.5R) was almost certainly hit
+        if (ghost && ghost.peakRRPos >= tpRRActual - 0.2) closeReason = "tp";
+      } else if (pos.ghost && pos.ghost.peakRRPos >= (pos.tpRR ?? 1.5) - 0.2) {
+        // Peak RR within 0.2R of the TP target means TP was almost certainly hit
         closeReason = "tp";
       }
 
@@ -826,9 +828,12 @@ app.post("/webhook", async (req, res) => {
   // Symbol filter
   const { allowed, reason: blockReason } = canOpenNewTrade(rawSym);
   if (!allowed) {
+    const blockOutcome = blockReason.startsWith("SYMBOL") ? "SYMBOL_NOT_ALLOWED"
+      : blockReason.startsWith("TIME_BLOCK") ? "TIME_BLOCKED"
+      : "WEEKEND";
     await db.logSignal({
       symbol: rawSym, direction, session: getSession(),
-      outcome: blockReason.startsWith("SYMBOL") ? "SYMBOL_NOT_ALLOWED" : "WEEKEND",
+      outcome: blockOutcome,
       rejectReason: blockReason,
       tvEntry: safeNum(tvClose),
       slPct: safeNum(sl_pct),
@@ -911,7 +916,7 @@ app.post("/webhook", async (req, res) => {
   const slPrice = direction === "buy"
     ? parseFloat((execPrice - slDist).toFixed(6))
     : parseFloat((execPrice + slDist).toFixed(6));
-  const tpRR    = 1.5;
+  const tpRR    = getTpRR(symbol, new Date());
   const tpPrice = direction === "buy"
     ? parseFloat((execPrice + slDist * tpRR).toFixed(6))
     : parseFloat((execPrice - slDist * tpRR).toFixed(6));
@@ -983,7 +988,7 @@ app.post("/webhook", async (req, res) => {
   const pos = {
     positionId, dailyLabel, symbol, assetType: symInfo.type,
     direction, session, vwapPosition: vwapPos, optimizerKey: optKey,
-    entry: execPrice, sl: slPrice, tp: tpPrice, lots,
+    entry: execPrice, sl: slPrice, tp: tpPrice, lots, tpRR,
     riskPct: DEFAULT_RISK_PCT, riskEur, slPct, slDist,
     tvEntry, executionPrice: execPrice, slippage,
     vwapMid, vwapBandPct, ...wh,
@@ -1565,7 +1570,7 @@ async function loadOverview(){
   if(_clFiltered.length)rows.push('<tr><td colspan="16" class="divider-label"><div class="dot r"></div>Closed — '+_clFiltered.length+' trades</td></tr>');
   for(const t of _clFiltered){
     if(!t.closedAt) continue;
-    const isTP=t.closeReason==='tp'||(t.peakRRPos>=1.30);
+    const isTP=t.closeReason==='tp';
     const isSL=!isTP;
     const ovPeak=isTP?Math.min(t.peakRRPos||0,1.50):(t.peakRRPos||0);
     rows.push('<tr class="'+(isSL?'row-slhit':'')+'"><td><span class="bd-k">'+(t.dailyLabel||'--')+'</span></td><td class="cw fw">'+t.symbol+'</td><td>'+bdType(t.assetType)+'</td><td>'+bdDir(t.direction)+'</td><td>'+bdVwap(t.vwapPosition)+'</td><td>'+bdSess(t.session)+'</td><td class="cd">'+fmt(t.entry,t.assetType==='index'?2:4)+'</td><td class="cr">'+fmt(t.sl,t.assetType==='index'?2:4)+'</td><td class="cg">'+fmt(t.tp,t.assetType==='index'?2:4)+'</td><td>'+(isSL?'<span class="bd bd-sl">SL −1.00R</span>':'<span class="bd bd-tp">TP +1.50R</span>')+'</td><td>'+(ovPeak>0?'<span class="cg fw">+'+ovPeak.toFixed(2)+'R</span>':'--')+'</td><td>'+(isSL?'<span class="cr">-1.00R</span>':'--')+'</td><td class="cd">'+fmt(t.lots,2)+'</td><td class="cd" style="font-size:8px">'+(t.mt5Comment||'--')+'</td><td class="cd" style="font-size:9px">'+fmtTs(t.openedAt)+'</td><td class="cd" style="font-size:9px">'+fmtTs(t.closedAt)+'</td></tr>');
