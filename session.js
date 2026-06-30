@@ -124,11 +124,11 @@ const BLOCKED_SYMBOLS = new Set([
 ]);
 
 // Time-based block windows (Brussels wall-clock, hhmm format, end-exclusive)
-// XAUUSD     blocked 14:00–15:00
-// US100.cash blocked 11:00–14:00
+// XAUUSD     blocked 08:00–13:00  (data: losing window, sits flat until gold's good zone opens)
+// US100.cash blocked 11:00–16:00  (data: worst zone in dataset, merged 11–14 + 14–16 blocks)
 const TIME_BLOCK_WINDOWS = {
-  "XAUUSD":     [{ start: 1400, end: 1500 }],
-  "US100.cash": [{ start: 1100, end: 1400 }],
+  "XAUUSD":     [{ start: 800,  end: 1300 }],
+  "US100.cash": [{ start: 1100, end: 1600 }],
 };
 
 // Returns the matching window if the symbol is time-blocked right now, else null
@@ -149,16 +149,18 @@ function _fmtHHMM(n) {
 
 // TP risk-reward per symbol per Brussels time window (end-exclusive).
 // Anything not matched uses DEFAULT_TP_RR.
-//   XAUUSD     09:00-11:00 -> 1.0 RR ,  15:00-17:00 -> 3.0 RR
-//   US100.cash 08:00-10:00 -> 2.0 RR
+//   XAUUSD     13:00-15:00 -> 1.25 RR ,  15:00-17:00 -> 3.0 RR
+//   US100.cash 08:00-11:00 -> 2.25 RR ,  16:00-18:00 -> 1.25 RR ,  18:00-23:00 -> 2.75 RR
 const DEFAULT_TP_RR = 1.5;
 const TP_RR_WINDOWS = {
   "XAUUSD": [
-    { start: 900,  end: 1100, rr: 1.0 },
+    { start: 1300, end: 1500, rr: 1.25 },
     { start: 1500, end: 1700, rr: 3.0 },
   ],
   "US100.cash": [
-    { start: 800,  end: 1000, rr: 2.0 },
+    { start: 800,  end: 1100, rr: 2.25 },
+    { start: 1600, end: 1800, rr: 1.25 },
+    { start: 1800, end: 2300, rr: 2.75 },
   ],
 };
 
