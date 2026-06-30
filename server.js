@@ -922,7 +922,11 @@ app.post("/webhook", async (req, res) => {
     : parseFloat((execPrice - slDist * tpRR).toFixed(6));
 
   // Lot calculation
-  const riskEur  = parseFloat((latestEquity * DEFAULT_RISK_PCT).toFixed(2));
+  // RISK_EQUITY (Railway env) forces a virtual equity base for sizing.
+  // Set RISK_EQUITY=50000 on a 10k eval to size lots as if it were 50k.
+  // Leave unset on the real 50k account to use live equity as before.
+  const SIZING_EQUITY = safeNum(process.env.RISK_EQUITY) ?? latestEquity;
+  const riskEur  = parseFloat((SIZING_EQUITY * DEFAULT_RISK_PCT).toFixed(2));
   const lotNom   = slDist > 0 ? riskEur / slDist : 0.01;
   const lots     = symInfo.type === "index"
     ? Math.max(0.01, parseFloat(lotNom.toFixed(2)))
