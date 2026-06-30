@@ -127,7 +127,6 @@ const BLOCKED_SYMBOLS = new Set([
 // XAUUSD     blocked 08:00–13:00  (data: losing window, sits flat until gold's good zone opens)
 // US100.cash blocked 11:00–16:00  (data: worst zone in dataset, merged 11–14 + 14–16 blocks)
 const TIME_BLOCK_WINDOWS = {
-  "XAUUSD":     [{ start: 800,  end: 1300 }],
   "US100.cash": [{ start: 1100, end: 1600 }],
 };
 
