@@ -4,7 +4,7 @@
 //
 // Flow:
 // 1. TradingView webhook → /webhook
-//    - symbol filter (XAUUSD / US100 only)
+//    - symbol filter (XAUUSD / US100 / GER40 / UK100 only)
 //    - SL + TP calculation (sl_pct × 1.5 × execPrice)
 //    - lot calculation (riskEUR / slDist)
 //    - placeOrder on MT5 via MetaAPI
@@ -1407,7 +1407,7 @@ tr:last-child td{border-bottom:none}
 <!-- SIGNALS -->
 <div class="pg" id="p-sig">
   <div class="card">
-    <div class="chdr"><div class="ctitle"><div class="dot b"></div>Signal Stats — XAUUSD & US100 only</div></div>
+    <div class="chdr"><div class="ctitle"><div class="dot b"></div>Signal Stats — XAUUSD, US100, GER40 & UK100</div></div>
     <div class="kst" style="grid-template-columns:repeat(5,1fr)">
       <div class="ks"><div class="ksl">Total</div><div class="ksv" id="sg-total">0</div></div>
       <div class="ks"><div class="ksl">Placed</div><div class="ksv cg" id="sg-placed">0</div></div>
@@ -1478,6 +1478,8 @@ tr:last-child td{border-bottom:none}
   <div style="display:flex;gap:4px;margin-bottom:10px" id="perf-tabs"></div>
   <div id="perf-xau"></div>
   <div id="perf-us100" style="display:none"></div>
+  <div id="perf-ger40" style="display:none"></div>
+  <div id="perf-uk100" style="display:none"></div>
 </div>
 
 </div><!-- /main -->
@@ -1586,7 +1588,7 @@ async function loadOverview(){
 let _sigAll=[],_sigFilter='all';
 async function loadSignals(){
   const _rawSig=await api('/api/signal-log?limit=500')||[];
-  _sigAll=_rawSig.filter(s=>s.symbol==='XAUUSD'||s.symbol==='US100.cash');
+  _sigAll=_rawSig.filter(s=>s.symbol==='XAUUSD'||s.symbol==='US100.cash'||s.symbol==='GER40'||s.symbol==='UK100');
   if($('nb-sig'))$('nb-sig').textContent=_sigAll.length;
   const placed=_sigAll.filter(s=>s.outcome==='PLACED').length;
   const nopos=_sigAll.filter(s=>s.outcome==='ORDER_NOT_CONFIRMED').length;
@@ -1844,6 +1846,8 @@ async function loadPerf(){
   if(!ghosts.length){
     if($('perf-xau'))$('perf-xau').innerHTML=noD;
     if($('perf-us100'))$('perf-us100').innerHTML=noD;
+    if($('perf-ger40'))$('perf-ger40').innerHTML=noD;
+    if($('perf-uk100'))$('perf-uk100').innerHTML=noD;
     return;
   }
   var ADV=[];for(var va=0.1;va<=1.0+1e-9;va=Math.round((va+0.1)*10)/10)ADV.push('-'+va.toFixed(1));
@@ -2013,16 +2017,22 @@ async function loadPerf(){
   }
   var xau=ghosts.filter(function(g){return g.symbol==='XAUUSD';});
   var us=ghosts.filter(function(g){return g.symbol==='US100.cash';});
+  var ger=ghosts.filter(function(g){return g.symbol==='GER40';});
+  var uk=ghosts.filter(function(g){return g.symbol==='UK100';});
   var tabEl=$('perf-tabs');
   if(tabEl){
     tabEl.innerHTML='<button id="ptb-xau" class="seg on" style="padding:5px 14px;font-size:10px;border-radius:4px;cursor:pointer">XAUUSD ('+xau.length+')</button>'
-      +' <button id="ptb-us100" class="seg" style="padding:5px 14px;font-size:10px;border-radius:4px;cursor:pointer">US100.cash ('+us.length+')</button>';
+      +' <button id="ptb-us100" class="seg" style="padding:5px 14px;font-size:10px;border-radius:4px;cursor:pointer">US100.cash ('+us.length+')</button>'
+      +' <button id="ptb-ger40" class="seg" style="padding:5px 14px;font-size:10px;border-radius:4px;cursor:pointer">GER40 ('+ger.length+')</button>'
+      +' <button id="ptb-uk100" class="seg" style="padding:5px 14px;font-size:10px;border-radius:4px;cursor:pointer">UK100 ('+uk.length+')</button>';
     document.getElementById('ptb-xau').addEventListener('click',function(){perfShowTab('xau');});
     document.getElementById('ptb-us100').addEventListener('click',function(){perfShowTab('us100');});
+    document.getElementById('ptb-ger40').addEventListener('click',function(){perfShowTab('ger40');});
+    document.getElementById('ptb-uk100').addEventListener('click',function(){perfShowTab('uk100');});
   }
   if(!window.perfShowTab){
     window.perfShowTab=function(t){
-      ['xau','us100'].forEach(function(x){
+      ['xau','us100','ger40','uk100'].forEach(function(x){
         var el=$('perf-'+x);if(el)el.style.display=t===x?'block':'none';
         var btn=$('ptb-'+x);if(btn)btn.classList.toggle('on',t===x);
       });
@@ -2030,6 +2040,8 @@ async function loadPerf(){
   }
   buildSymbol(xau,'perf-xau');
   buildSymbol(us,'perf-us100');
+  buildSymbol(ger,'perf-ger40');
+  buildSymbol(uk,'perf-uk100');
   perfShowTab('xau');
 }
 
