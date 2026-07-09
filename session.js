@@ -1,7 +1,7 @@
 "use strict";
 // ================================================================
 // session.js  v2.0.0  |  PRONTO-AI
-// Only XAUUSD and US100.cash — all other symbols blocked
+// XAUUSD, US100.cash, GER40, UK100 — all other symbols blocked
 // ================================================================
 
 const TIMEZONE = "Europe/Brussels";
@@ -13,13 +13,15 @@ const DEFAULT_RISK_PCT = 0.000375;
 // We multiply by 1.5 to account for spread + timing lag
 const SL_BUFFER_MULT = 1.5;
 
-// Symbol catalog — only 2 pairs
+// Symbol catalog — 4 pairs
 const SYMBOL_CATALOG = {
-  "XAUUSD":      { type: "commodity", mt5: "XAUUSD",     pip: 0.01  },
-  "US100.cash":  { type: "index",     mt5: "US100.cash", pip: 0.10  },
+  "XAUUSD":      { type: "commodity", mt5: "XAUUSD",      pip: 0.01  },
+  "US100.cash":  { type: "index",     mt5: "US100.cash",  pip: 0.10  },
+  "GER40.cash":  { type: "index",     mt5: "GER40.cash",  pip: 0.10  },
+  "UK100.cash":  { type: "index",     mt5: "UK100.cash",  pip: 0.10  },
 };
 
-// All TradingView aliases that map to our 2 pairs
+// All TradingView aliases that map to our 4 pairs
 const SYMBOL_ALIASES = {
   "GOLD":        "XAUUSD",
   "XAUUSD":      "XAUUSD",
@@ -34,6 +36,14 @@ const SYMBOL_ALIASES = {
   "USTEC":       "US100.cash",
   "US100USD":    "US100.cash",
   "NASDAQ100":   "US100.cash",
+  // DE30EUR (TradingView) → GER40.cash (FTMO)
+  "DE30EUR":     "GER40.cash",
+  "GER40":       "GER40.cash",
+  "GER40.CASH":  "GER40.cash",
+  // UK100GBP (TradingView) → UK100.cash (FTMO)
+  "UK100GBP":    "UK100.cash",
+  "UK100":       "UK100.cash",
+  "UK100.CASH":  "UK100.cash",
 };
 
 // Brussels time helpers
@@ -117,8 +127,8 @@ function buildDailyLabel(date, count) {
 // Also explicitly block index signals we don't trade
 const BLOCKED_SYMBOLS = new Set([
   "US30USD","US30","DOW","DJI","DJIA",
-  "DE30EUR","DE30","DAX","GER30","GER40",
-  "UK100GBP","UK100","FTSE","FTSE100",
+  "DE30","DAX","GER30",
+  "FTSE","FTSE100",
   "SP500","SPX","US500","SPX500",
   "JP225","JPN225","NIKKEI",
 ]);
